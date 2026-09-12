@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M8 — platform polish (not started)
+**Current milestone:** M8 — platform polish (in progress: scrolling done)
 **Last finished:** M7 — reactive API and component model
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -342,7 +342,48 @@ magnitude too large that found it (D-45).
 
 ## In progress
 
-Nothing. M7 is closed and M8 has not been started.
+**M8 — platform polish.** Scrolling, momentum and scrollbars are done; the rest of the
+deliverable is not.
+
+- **Scrolling.** `Node` gains `scroll_max` (layout output, from taffy's scrollable overflow
+  rectangle) and `scroll_offset` (user state, survives relayout). `overflow: scroll` is
+  distinguished from `overflow: clip` by a flag on `BoxStyle`, not by asking whether the
+  content is taller than the box — deriving it would make every clipped card with a long word
+  in it scrollable. Paint and hit testing both displace children by the offset, and
+  `absolute_rect` subtracts ancestors' scroll, since its caller is the accesskit bridge.
+- **Chaining.** `scroll_by` returns how far it actually moved, so `scroll_at` can walk outward
+  handing each container the remainder. A list that has hit its end lets the page underneath
+  keep moving instead of swallowing the gesture.
+- **Momentum.** `Fling` decays at the rate the platforms settle on, integrating over the
+  frame rather than holding the speed for it — a fling that went further on a 120Hz display
+  is a bug people feel without being able to name, and a test pins the two rates together.
+  `VelocityTracker` estimates over a 100ms window, so one still frame before the lift does not
+  swallow the flick. **Not for wheel events:** a macOS trackpad has already been through the
+  system's momentum by the time winit reports it.
+- **Scrollbars.** Engine-drawn and overlaid, so content does not reflow when one appears, and
+  taffy is never asked to reserve room. Thumb length is the visible share of the content,
+  floored at 24px — the proportional thumb for a hundred screens is about two pixels.
+
+**The constraint the whole design is arranged around:** a scroll marks `PAINT` and never
+`LAYOUT`. The example asserts it end to end:
+
+```
+  scrolled 60 of 368 available
+  a frame after scrolling laid out 0 nodes
+```
+
+**Still to do for M8:** multi-window, native menus, drag and drop, bidi text, cursor shapes,
+window chrome, packaging (.app, .msi, AppImage) — and then the acceptance, which is the RSS
+measurement.
+
+**One thing measured and left alone.** In the todo example, moving the selection runs one
+effect per row: every row asks "am I the selected one?" and so subscribes to the shared
+signal. The DOM layer absorbs the writes, so the cost is closure calls rather than relayouts,
+but it is linear. That is what this way of modelling a selection costs, not a limit of the
+engine — a list long enough to care would remember the previous row and toggle exactly two.
+Said out loud in a comment rather than quietly shipped.
+
+**Totals:** 475 tests passing
 
 ## Open questions
 
