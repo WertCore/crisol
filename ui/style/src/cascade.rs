@@ -106,6 +106,13 @@ impl StyleEngine {
     ///
     /// Use [`Self::restyle_incremental`] after the first pass: it reuses the styles of
     /// subtrees nothing has invalidated, which is most of a document after most edits.
+    ///
+    /// **This does not mark anything for layout**, and it cannot: it takes `&Tree`. A caller
+    /// that changes a class and then styles with this will get the right styles and a stale
+    /// box, because a style mark no longer implies a layout mark (D-45) and only the
+    /// incremental pass resolves the implication. For the first pass that is fine — a
+    /// freshly built tree is already dirty everywhere. For anything after it, use
+    /// [`Self::restyle_incremental`].
     pub fn restyle(&mut self, tree: &Tree) -> (StyleMap, StyleStats) {
         let mut styles = StyleMap::with_capacity(tree.len());
         let mut stats = StyleStats::default();
