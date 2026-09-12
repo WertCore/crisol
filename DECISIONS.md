@@ -713,3 +713,36 @@ Hover is kept as the whole ancestor chain rather than the deepest node, because 
 container is a real thing authors rely on. Focus is kept as a single node and the chain
 derived, because only one node can have focus but every ancestor is `:focus-within`.
 
+---
+
+## D-34 — Focus order is document order; a positive `tabindex` does nothing
+
+**Status:** Accepted (M5) · **Affects:** M5, M7, M16
+
+ROADMAP §M5's acceptance is *a form with three text inputs is fully keyboard-navigable*, and
+§M5 puts accessibility here rather than in year three precisely because it constrains the
+focus model.
+
+Tab follows **document order**. `tabindex="0"` makes a node focusable and `tabindex="-1"`
+makes it focusable by pointer and script but not by Tab. A **positive** `tabindex` is parsed,
+accepted, and then treated as `0`.
+
+A positive `tabindex` lets an author reorder the keyboard sequence independently of the
+document, which is the single most reliable way to produce an interface that cannot be used
+with a keyboard: the tab order stops matching the reading order, and a screen reader user
+hears one thing while the focus ring goes somewhere else. Every accessibility guideline says
+not to use it. Honouring it would mean the engine's own conformance depended on authors
+declining a feature it offered them.
+
+**Rejected — honour it.** Correct by the letter of the spec, wrong by its purpose, and this
+engine owes the spec nothing (ROADMAP §1).
+
+**Rejected — reject it as a parse error.** Tempting, and it would break real documents that
+carry a harmless `tabindex="1"` on a single element. Treating it as `0` keeps the element
+focusable, which is what the author was reaching for, without letting them reorder anything.
+
+A disabled control is not focusable, a control whose subtree is `visibility: hidden` is
+skipped, and one whose subtree is `display: none` is not there at all — which is what
+`BoxStyle::generates_box` was added for. A focus ring on empty space is worse than no focus
+ring.
+

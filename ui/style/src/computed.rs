@@ -246,6 +246,7 @@ impl ComputedStyle {
                 bottom_left: radius(self.border_radius.bottom_left, border_box.width),
             },
             text_color: self.color.into(),
+            generates_box: !self.is_none(),
             clips_children: self.clips_children(),
             visible: self.visibility == Visibility::Visible,
         }

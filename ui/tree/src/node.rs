@@ -245,6 +245,16 @@ pub struct BoxStyle {
     pub border_width: Edges,
     /// Corner radii.
     pub radii: Corners,
+    /// Whether this node generates a box at all.
+    ///
+    /// False for `display: none`, which is not the same as `visibility: hidden`: a hidden box
+    /// still occupies space and still lays out, while one that generates no box is not in the
+    /// tree as far as layout, painting, hit testing or the keyboard are concerned.
+    ///
+    /// Layout gives such a node a zero-sized box, so hit testing would miss it anyway — but
+    /// the tab order has no geometry to consult, and a keyboard that stops at a control
+    /// nobody can see is exactly the failure this distinction exists to prevent.
+    pub generates_box: bool,
     /// Whether descendants are clipped to this node's border box, as `overflow: hidden`.
     pub clips_children: bool,
     /// Colour for text in this node, inherited from `color`.
@@ -266,6 +276,7 @@ impl Default for BoxStyle {
             background: Color::TRANSPARENT,
             border_color: Edges4::all(Color::TRANSPARENT),
             text_color: Color::BLACK,
+            generates_box: true,
             border_width: Edges::ZERO,
             radii: Corners::ZERO,
             clips_children: false,

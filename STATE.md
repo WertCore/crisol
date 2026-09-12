@@ -179,7 +179,7 @@ display list refers to text by the node's own packed handle, exactly as it refer
 And `ui/paint/tests/text.rs` runs the whole of Track A end to end — parse, cascade, layout,
 shape, paint, rasterise — and looks at the pixels.
 
-**Totals:** 334 tests passing, 0 failing.  clean,  clean,  clean with
+**Totals:** 349 tests passing, 0 failing.  clean,  clean,  clean with
 `RUSTDOCFLAGS=-D warnings`.
 
 ---
@@ -296,6 +296,8 @@ Appended to `DECISIONS.md` in full; summarised here.
   distinct from `KeyDown`.
 - **D-33** — listeners are a trait rather than a boxed closure, and interaction state is a
   side table that `apply_state` writes onto the node for the cascade to read.
+- **D-34** — focus order is document order; a positive `tabindex` is accepted and ignored,
+  because honouring it is how keyboard-unusable interfaces get built.
 
 ---
 

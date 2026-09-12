@@ -88,9 +88,10 @@ fn descend(
     let node = tree.get(id)?;
     let bounds = node.layout.translate(parent_origin);
 
-    // `visibility: hidden` removes a box from hit testing as well as from painting: an
-    // invisible button must not be clickable, which is half the reason the property exists.
-    if !node.style.visible {
+    // A node that generates no box is not there at all. A hidden one is there but not
+    // clickable — half the reason `visibility: hidden` exists is that the button stops
+    // responding.
+    if !node.style.generates_box || !node.style.visible {
         return None;
     }
 

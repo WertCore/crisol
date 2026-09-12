@@ -152,6 +152,7 @@ impl Document {
             border_width: Edges::all(1.0),
             radii: Corners::all(10.0),
             text_color: Color::WHITE,
+            generates_box: true,
             clips_children: true,
             visible: true,
         };

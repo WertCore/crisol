@@ -147,6 +147,12 @@ pub fn paint_subtree(
             // logic error somewhere else into a crash in the frame loop.
             continue;
         };
+        // `display: none` generates no box: the subtree is not laid out, not painted, not
+        // hit tested and not in the tab order. Skipping it here is cheaper than walking it to
+        // emit nothing, which is what happened before the flag existed.
+        if !node.style.generates_box {
+            continue;
+        }
         stats.nodes_visited += 1;
 
         let bounds = node.layout.translate(parent_origin);
