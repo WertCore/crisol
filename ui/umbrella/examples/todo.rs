@@ -91,6 +91,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The font system, honouring the same `CRISOL_REQUIRE_FONTS` the tests use.
+///
+/// Without it a machine with no fonts renders an empty window and reports success, which is
+/// indistinguishable from working.
+fn fonts() -> FontSystem {
+    let fonts = FontSystem::new();
+    if fonts.is_empty() {
+        assert!(
+            std::env::var_os("CRISOL_REQUIRE_FONTS").is_none(),
+            "CRISOL_REQUIRE_FONTS is set and no fonts were found"
+        );
+        eprintln!("warning: no fonts found, so nothing will be legible");
+    }
+    fonts
+}
+
 fn headless() {
     use crisol_ui::display_list::Size;
 
@@ -113,7 +129,7 @@ fn headless() {
     let mut engine = StyleEngine::new();
     engine.add_stylesheet(Stylesheet::parse(CSS).expect("the example's own stylesheet"));
     let mut styles = StyleMap::default();
-    let mut fonts = FontSystem::new();
+    let mut fonts = fonts();
     let mut cache = LayoutCache::new();
 
     let typing = |word: &str| -> Vec<Key> {
@@ -178,7 +194,35 @@ fn headless() {
             tree.len(),
         );
     }
-    println!();
+
+    // Printed numbers are not a check. What the script should have left behind:
+    let labels = runtime.peek(app.todos).expect("todos");
+    let text = |todo: &Todo| runtime.peek(todo.label).unwrap_or_default();
+    // The selection is an index into the *filtered* list, so the three filter steps leave it
+    // on the first visible row rather than where it started. That row is what gets edited and
+    // then removed: "read the roadmap".
+    assert_eq!(
+        labels.iter().map(text).collect::<Vec<_>>(),
+        ["ship M7", "measure idle RSS", "write it down"],
+        "one todo added, the first edited, and the edited one removed"
+    );
+    assert_eq!(
+        runtime.peek(app.filter),
+        Some(Filter::All),
+        "three filter steps return to where they started"
+    );
+    assert_eq!(
+        runtime.peek(app.editing).flatten(),
+        None,
+        "the edit committed"
+    );
+    assert_eq!(
+        runtime.peek(app.draft).as_deref(),
+        Some(""),
+        "and the draft was cleared"
+    );
+
+    println!("  checked: 3 todos, filter all, edit committed, draft empty\n");
 }
 
 // ---- the app ------------------------------------------------------------------------------
@@ -534,10 +578,7 @@ impl State {
         let mut engine = StyleEngine::new();
         engine.add_stylesheet(Stylesheet::parse(CSS).expect("the example's own stylesheet"));
 
-        let fonts = FontSystem::new();
-        if fonts.is_empty() {
-            eprintln!("warning: no fonts found, so nothing will be legible");
-        }
+        let fonts = fonts();
 
         Self {
             surface,

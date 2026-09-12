@@ -60,6 +60,14 @@ jobs:
           CRISOL_REQUIRE_GPU: 1
           CRISOL_REQUIRE_FONTS: 1
 
+      # `cargo test` builds examples but never runs them, so the interaction paths — key
+      # handling, selection, the edit/commit cycle — would compile on three platforms and be
+      # executed on none. The headless mode needs no window and no adapter.
+      - name: Run the example headless
+        run: cargo run -p crisol-ui --example todo -- --headless
+        env:
+          CRISOL_REQUIRE_FONTS: 1
+
       - name: Docs
         run: cargo doc --workspace --no-deps
         env:
