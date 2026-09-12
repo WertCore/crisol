@@ -550,6 +550,7 @@ dependencies = [
  "crisol-display-list",
  "crisol-style",
  "crisol-text",
+ "crisol-text-gpu",
  "crisol-tree",
  "taffy",
 ]
@@ -562,8 +563,14 @@ version = "0.0.0"
 name = "crisol-paint"
 version = "0.0.0"
 dependencies = [
+ "crisol-css",
  "crisol-display-list",
+ "crisol-html",
+ "crisol-layout",
  "crisol-render-wgpu",
+ "crisol-style",
+ "crisol-text",
+ "crisol-text-gpu",
  "crisol-tree",
 ]
 
@@ -573,6 +580,8 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "crisol-display-list",
+ "crisol-text",
+ "crisol-text-gpu",
  "pollster",
  "raw-window-handle",
  "thiserror 2.0.20",
@@ -602,6 +611,12 @@ dependencies = [
 [[package]]
 name = "crisol-text-gpu"
 version = "0.0.0"
+dependencies = [
+ "crisol-display-list",
+ "crisol-text",
+ "glyphon",
+ "wgpu",
+]
 
 [[package]]
 name = "crisol-tree"
@@ -796,6 +811,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "etagere"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ecb5c40d5683a270e077688f53a99eac51c1cb1ae5ba63b55590370cb3536bf"
+dependencies = [
+ "euclid",
+]
+
+[[package]]
+name = "euclid"
+version = "0.22.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -968,6 +1001,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c4ee00b289aba7a9e5306d57c2d05499b2e5dc427f84ac708bd2c090212cf3e"
 dependencies = [
  "gl_generator",
+]
+
+[[package]]
+name = "glyphon"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faea0bba2b305a172098adfc17f1a34a30282361903957da8c7a51049b4fae7b"
+dependencies = [
+ "cosmic-text",
+ "etagere",
+ "lru",
+ "rustc-hash 2.1.3",
+ "wgpu",
 ]
 
 [[package]]
@@ -1295,6 +1341,12 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "lru"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 
 [[package]]
 name = "markup5ever"

@@ -1,7 +1,7 @@
 # Crisol — State
 
-**Current milestone:** M4 — HTML and text (in progress: HTML and the text API done)
-**Last finished:** M3 — CSS and layout
+**Current milestone:** M5 — events, focus, input, accessibility (not started)
+**Last finished:** M4 — HTML and text
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -10,18 +10,19 @@ actually is.
 
 ## Accept criteria for the current milestone
 
-> **M4 — HTML and text.** `html5ever` producing the node tree. `cosmic-text` shaping,
-> `glyphon` rendering. Font loading and fallback chains. Line breaking.
+> **M5 — events, focus, input, accessibility.** All four together, because they read the same
+> tree and focus state.
 >
-> **Public text API** (ROADMAP §2.5): shaped run access, cluster boundaries,
-> `point_to_cursor`, `cursor_to_point`, selection rectangles for a range, line box geometry.
+> Hit testing (respecting clip and transform), capture/bubble propagation, focus order and
+> keyboard navigation, text input with IME preedit rendering, mouse/touch/scroll/drag,
+> clipboard, and the `accesskit` bridge.
 >
-> **Accept:** renders a paragraph with mixed Latin/CJK/emoji correctly; clicking any glyph
-> returns the correct cursor index including at cluster boundaries; selection rectangles are
-> correct across a line wrap.
+> **Accept:** a form with three text inputs is fully keyboard-navigable; IME composition works
+> for Japanese input on all three platforms; VoiceOver/NVDA/Orca announce the tree correctly.
 >
-> Budget 2–3x whatever this seems like it should take. Bidi can be deferred to M8 but the
-> API must not assume LTR.
+> Accessibility here, not in year three — it constrains the tree, focus model and event
+> system, and retrofitting means restructuring. Touch input designed in now (ROADMAP §3.6),
+> even though mobile ships later.
 
 ---
 
@@ -144,64 +145,48 @@ number of pixels.
   `ComputedStyle` allocation* — `a_hundred_identically_styled_nodes_share_one_allocation`:
   101 elements cost 2 allocations and 99 interner hits.
 
-**Totals:** 282 tests passing, 0 failing. `cargo clippy --workspace --all-targets
---all-features -- -D warnings` clean, `cargo fmt --all --check` clean.
+### M4 — HTML and text
+
+*`crisol-html`.* The `TreeSink` driving html5ever into the tree. Comments, processing
+instructions and doctypes are dropped rather than stored — the tree is what the engine
+renders, not an archive of the source. Rooted at `<html>`, because CSS's `:root` means
+`<html>`.
+
+*`crisol-text`.* The public API §2.5 requires: shaped runs, cluster boundaries,
+`point_to_cursor`, `cursor_to_point`, selection rectangles, line box geometry. cosmic-text
+shapes; the vocabulary is ours, and three parts of it are long-lived commitments (D-28):
+byte-offset positions, cursors that carry affinity, and `Direction` on every run even though
+bidi layout is M8's.
+
+*Measurement.* Shaping is wired into taffy's leaf measure, and the shaped result is kept in a
+side table for paint rather than reshaped.
+
+*`crisol-text-gpu` and rendering.* glyphon for the atlas and the draw, with one renderer per
+text run so text keeps painter's order inside the engine's single render pass (D-30). The
+display list refers to text by the node's own packed handle, exactly as it refers to images
+(D-31).
+
+**Accept: met.**
+
+- *renders a paragraph with mixed Latin/CJK/emoji correctly* —
+  `mixed_scripts_shape_without_losing_any_text` and `runs_split_where_the_font_changes`.
+- *clicking any glyph returns the correct cursor index including at cluster boundaries* —
+  `hit_testing_a_multi_byte_character_never_lands_inside_it` sweeps a whole line at half-pixel
+  steps and asserts every answer is a legal caret position.
+- *selection rectangles are correct across a line wrap* —
+  `a_selection_across_a_wrap_produces_one_rectangle_per_line`.
+
+And `ui/paint/tests/text.rs` runs the whole of Track A end to end — parse, cascade, layout,
+shape, paint, rasterise — and looks at the pixels.
+
+**Totals:** 297 tests passing, 0 failing.  clean,  clean,  clean with
+`RUSTDOCFLAGS=-D warnings`.
 
 ---
 
 ## In progress
 
-**M4, the HTML half.** `crisol-html` is the `TreeSink` that drives html5ever into a
-`crisol_tree::Tree`. Nothing re-implements HTML — tree building, implied tags, error
-recovery and entity decoding are all upstream's.
-
-What this crate decides is which parts of the DOM the engine keeps. Comments, processing
-instructions and doctypes have no box and no effect on layout or selectors, so they are
-dropped rather than stored; the tree is what the engine renders, not an archive of the
-source. Quirks mode is recorded and then ignored, so that "this renders oddly" has an answer
-other than a shrug.
-
-Two things in the sink are worth remembering because they were bugs first:
-
-- `elem_name` is called on nearly every token, not just for foreign content — the tree
-  builder asks "what is the current open element?" constantly, and answers about implied end
-  tags and scope depend on it. A stub returning a fixed name silently mis-nests everything.
-  It returns an owned name, because the tree is behind a `RefCell` and `ElemName` hands back
-  references.
-- Comments need a *handle* back from `create_comment` even though the node is not kept. A
-  placeholder that gets appended splits the text run around it into two nodes; the sink
-  records placeholder handles and drops them at `append` instead.
-
-21 tests, including `a_parsed_tree_is_selectable_and_stylable` and `a_parsed_tree_lays_out` —
-what comes out of the parser is the same tree the cascade and layout already work on, with no
-adapter in between.
-
-**M4, the text API.** `crisol-text` wraps `cosmic-text` behind the public surface §2.5
-requires: shaped runs, cluster boundaries, `point_to_cursor`, `cursor_to_point`, selection
-rectangles and line box geometry. Shaping, bidi analysis, line breaking and font fallback are
-cosmic-text's; the vocabulary is ours, and it is a long-lived commitment (D-28).
-
-All three of M4's acceptance criteria have tests:
-
-- *renders a paragraph with mixed Latin/CJK/emoji correctly* —
-  `mixed_scripts_shape_without_losing_any_text` plus `runs_split_where_the_font_changes`,
-  which asserts the runs tile the line's glyphs with no gaps.
-- *clicking any glyph returns the correct cursor index including at cluster boundaries* —
-  `clicking_each_glyph_returns_the_cursor_on_its_leading_edge`,
-  `clicking_the_trailing_half_of_a_glyph_puts_the_caret_after_it`, and
-  `hit_testing_a_multi_byte_character_never_lands_inside_it`, which sweeps the whole line at
-  half-pixel steps and asserts every answer is a legal caret position.
-- *selection rectangles are correct across a line wrap* —
-  `a_selection_across_a_wrap_produces_one_rectangle_per_line`.
-
-28 tests, asserting relations rather than pixel positions so they hold for any installed
-font (D-29). `CRISOL_REQUIRE_FONTS=1` makes a machine with no fonts a failure rather than a
-skip.
-
-**Still to do for M4:** wire text measurement into `measure_leaf` in `crisol-layout`, which
-still returns a zero size for every text node and has a test saying so; a `DrawCommand` for
-glyph runs; and `crisol-text-gpu` (glyphon) to draw them. The rendering half — getting glyphs
-onto the GPU — is what remains.
+Nothing. M4 is closed and M5 has not been started.
 
 ## Open questions
 
@@ -269,22 +254,34 @@ Appended to `DECISIONS.md` in full; summarised here.
   their `measure` reported instead of stretching to the container. CSS still overrides it.
 - **D-25** — a one-rule user-agent stylesheet, `:root { width: 100%; height: 100% }`, and an
   explanation of why exactly one rule qualifies.
+- **D-26** — rounded clipping as a per-fragment test rather than a stencil pass, because a
+  stencil costs an attachment and a second pass over the clipped geometry.
+- **D-27** — borders carry a colour per edge, meeting on the miter diagonal.
+- **D-28** — byte-offset positions, cursors with affinity, `Direction` on every run, clusters
+  as byte ranges.
+- **D-29** — text tests assert relations rather than pixel positions, because the installed
+  fonts differ between machines.
+- **D-30** — one glyphon renderer per text run, so text keeps painter's order without a
+  second render pass.
+- **D-31** — the display list refers to text by handle, exactly as it does to images.
 
 ---
 
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. Start M4, and read ROADMAP §2.5 first. Text is the one milestone the roadmap explicitly
+2. Start M5. Read §M5's note first: accessibility belongs *here*, not in year three, because
+   it constrains the tree, the focus model and the event system, and retrofitting means
+   restructuring. Touch is designed in now too (§3.6), even though mobile ships at M22. Text is the one milestone the roadmap explicitly
    says to over-budget for, and it is the core competency rather than a checkbox: the text
    layer is a *public API*, not an internal detail.
-3. Suggested order:
-   a. ~~`crisol-html`~~ — done.
-   b. ~~`crisol-text`~~ — done.
-   c. Wire text measurement into `measure_leaf` in `crisol-layout`. It needs a `FontSystem`
-      and a `TextStyle` projected from `ComputedStyle`, and the resulting `TextLayout` has to
-      be stored per node — another `NodeMap`, the same shape as the style map — so paint can
-      read it without reshaping.
-   d. A `DrawCommand` for glyph runs, then `crisol-text-gpu`: `glyphon` for the atlas and the
-      draw. Watch the tile-GPU constraint (D-09) — glyphon wants its own render pass by
-      default, and the engine draws everything in one.
+3. Suggested order, because each step makes the next testable:
+   a. Hit testing in `crisol-events`: a point to a node, respecting clips. `crisol-text`
+      already resolves a point *within* a text block to a cursor, so the two compose into
+      "which character did the user click" as soon as the first exists.
+   b. The event model: capture/bubble over the tree, with touch and pointer cancellation in
+      the vocabulary from the start rather than added for M22.
+   c. Focus: order, keyboard navigation, and the `ElementState` bits that M3 put on the node
+      and nothing has written yet — `:hover`, `:focus`, `:focus-within`, `:active` are all
+      matched by the cascade already and all currently always false.
+   d. IME preedit, then the `accesskit` bridge.

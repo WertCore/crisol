@@ -156,6 +156,7 @@ fn overflow_hidden_opens_and_closes_a_clip_around_the_subtree() {
             DrawCommand::Image(_) => "image",
             DrawCommand::PushClip(_) => "push",
             DrawCommand::PopClip => "pop",
+            DrawCommand::Text(_) => "text",
         })
         .collect();
     assert_eq!(kinds, vec!["rect", "rect", "push", "rect", "pop"]);
@@ -234,6 +235,7 @@ fn a_custom_node_paints_itself_inside_an_engine_owned_clip() {
             DrawCommand::PushClip(clip) => format!("push {:?}", clip.rect),
             DrawCommand::PopClip => "pop".to_owned(),
             DrawCommand::Image(_) => "image".to_owned(),
+            DrawCommand::Text(_) => "text".to_owned(),
         })
         .collect();
     assert_eq!(
@@ -319,19 +321,62 @@ fn an_empty_tree_paints_a_clear_and_nothing_else() {
 }
 
 #[test]
-fn text_nodes_are_carried_but_not_drawn_before_m4() {
+fn a_text_node_emits_a_text_command_at_its_box() {
+    let mut tree = Tree::new();
+    let root = tree.create_element("p");
+    tree.set_root(root).unwrap();
+    tree.node_mut(root).layout = Rect::from_xywh(4.0, 6.0, 100.0, 20.0);
+    let text = tree.create_text("hello");
+    tree.append_child(root, text).unwrap();
+    tree.node_mut(text).layout = Rect::from_xywh(2.0, 1.0, 40.0, 16.0);
+    tree.node_mut(text).style.text_color = RED;
+
+    let (list, stats) = paint_with_stats(&tree, &options());
+    assert_eq!(stats.nodes_visited, 2);
+    assert_eq!(stats.boxes_emitted, 0, "a text node has no box of its own");
+    assert_eq!(stats.text_runs, 1);
+
+    let DrawCommand::Text(command) = list.commands()[0] else {
+        panic!("expected a text command, got {:?}", list.commands());
+    };
+    assert_eq!(
+        command.origin,
+        Point::new(6.0, 7.0),
+        "positioned at its absolute box, like everything else"
+    );
+    assert_eq!(command.color, RED);
+    assert_eq!(
+        command.text,
+        crisol_display_list::TextId(text.to_bits()),
+        "referred to by the node's own handle, which is how the renderer finds the layout"
+    );
+}
+
+#[test]
+fn an_empty_text_node_emits_nothing() {
+    let mut tree = Tree::new();
+    let root = tree.create_element("p");
+    tree.set_root(root).unwrap();
+    tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 100.0, 20.0);
+    let text = tree.create_text("");
+    tree.append_child(root, text).unwrap();
+
+    let (list, stats) = paint_with_stats(&tree, &options());
+    assert_eq!(stats.text_runs, 0);
+    assert!(list.is_empty());
+}
+
+#[test]
+fn invisible_text_is_not_drawn() {
     let mut tree = Tree::new();
     let root = tree.create_element("p");
     tree.set_root(root).unwrap();
     tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 100.0, 20.0);
     let text = tree.create_text("hello");
     tree.append_child(root, text).unwrap();
-    tree.node_mut(text).layout = Rect::from_xywh(0.0, 0.0, 40.0, 16.0);
+    tree.node_mut(text).style.visible = false;
 
-    let (list, stats) = paint_with_stats(&tree, &options());
-    assert_eq!(stats.nodes_visited, 2);
-    assert_eq!(stats.boxes_emitted, 0);
-    assert!(list.is_empty());
+    assert_eq!(paint_with_stats(&tree, &options()).1.text_runs, 0);
 }
 
 #[test]

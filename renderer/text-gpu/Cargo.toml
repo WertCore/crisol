@@ -12,3 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-display-list.workspace = true
+crisol-text.workspace = true
+glyphon.workspace = true
+wgpu.workspace = true

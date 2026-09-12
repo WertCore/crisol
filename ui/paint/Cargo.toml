@@ -16,4 +16,10 @@ crisol-display-list.workspace = true
 crisol-tree.workspace = true
 
 [dev-dependencies]
+crisol-css.workspace = true
+crisol-html.workspace = true
+crisol-layout.workspace = true
 crisol-render-wgpu.workspace = true
+crisol-style.workspace = true
+crisol-text.workspace = true
+crisol-text-gpu.workspace = true

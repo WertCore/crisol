@@ -15,6 +15,7 @@ workspace = true
 crisol-display-list.workspace = true
 crisol-style.workspace = true
 crisol-text.workspace = true
+crisol-text-gpu.workspace = true
 crisol-tree.workspace = true
 taffy.workspace = true
 

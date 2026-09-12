@@ -7,8 +7,11 @@
 
 use bytemuck::{Pod, Zeroable};
 use crisol_display_list::{
-    Clip, Color, Corners, DisplayList, DrawCommand, Edges, ImageCommand, ImageId, Rect, RectCommand,
+    Clip, Color, Corners, DisplayList, DrawCommand, Edges, ImageCommand, ImageId, Rect,
+    RectCommand, TextCommand,
 };
+use crisol_text::FontSystem;
+use crisol_text_gpu::{GlyphRenderer, TextArea, TextSource};
 
 use crate::gpu::Gpu;
 use crate::texture::ImageStore;
@@ -72,6 +75,11 @@ enum Batch {
         image: ImageId,
         scissor: Option<Scissor>,
     },
+    /// A run of text, prepared by glyphon under this index.
+    Text {
+        run: usize,
+        scissor: Option<Scissor>,
+    },
 }
 
 /// Where a frame is drawn.
@@ -99,6 +107,10 @@ pub struct FrameStats {
     pub draw_calls: usize,
     /// Image commands skipped because the id was never uploaded.
     pub missing_images: usize,
+    /// Text runs prepared and drawn.
+    pub text_runs: usize,
+    /// Text commands skipped because the id resolved to nothing.
+    pub missing_text: usize,
 }
 
 /// Rasterises display lists.
@@ -113,10 +125,13 @@ pub struct Renderer {
     instance_capacity: usize,
     images: ImageStore,
 
+    glyphs: GlyphRenderer,
+
     // Per-frame scratch, kept across frames so a steady-state frame allocates nothing.
     instances: Vec<Instance>,
     batches: Vec<Batch>,
     clip_stack: Vec<Clip>,
+    text_areas: Vec<TextArea>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -273,6 +288,7 @@ impl Renderer {
         });
 
         Self {
+            glyphs: GlyphRenderer::new(device, &gpu.queue, format),
             gpu: gpu.clone(),
             format,
             rect_pipeline,
@@ -285,6 +301,7 @@ impl Renderer {
             instances: Vec::with_capacity(INITIAL_INSTANCE_CAPACITY),
             batches: Vec::new(),
             clip_stack: Vec::new(),
+            text_areas: Vec::new(),
         }
     }
 
@@ -323,14 +340,45 @@ impl Renderer {
 
     /// Draws `list` into `target`, clearing to the list's background colour first.
     ///
+    /// Any text in the list is skipped and counted, because drawing it needs the fonts it
+    /// was shaped with. Use [`Self::render_text`] when there is text.
+    ///
     /// Returns per-frame counters. Nothing is presented — the caller owns the swapchain.
     pub fn render(&mut self, target: FrameTarget<'_>, list: &DisplayList) -> FrameStats {
+        let mut fonts = None;
+        self.render_inner(target, list, &mut fonts, &())
+    }
+
+    /// Draws `list` into `target`, including its text.
+    ///
+    /// `fonts` has to be the font system the text was shaped with: glyphon rasterises from
+    /// the same faces, and a different one would draw different glyphs or none.
+    pub fn render_text(
+        &mut self,
+        target: FrameTarget<'_>,
+        list: &DisplayList,
+        fonts: &mut FontSystem,
+        source: &impl TextSource,
+    ) -> FrameStats {
+        let mut fonts = Some(fonts);
+        self.render_inner(target, list, &mut fonts, source)
+    }
+
+    fn render_inner(
+        &mut self,
+        target: FrameTarget<'_>,
+        list: &DisplayList,
+        fonts: &mut Option<&mut FontSystem>,
+        source: &impl TextSource,
+    ) -> FrameStats {
         let mut stats = FrameStats {
             commands: list.len(),
             ..FrameStats::default()
         };
 
-        self.build_batches(list, &target, &mut stats);
+        self.glyphs
+            .begin_frame(&self.gpu.queue, target.width, target.height);
+        self.build_batches(list, &target, &mut stats, fonts, source);
         self.upload_frame_data(&target);
 
         let mut encoder = self
@@ -367,9 +415,10 @@ impl Renderer {
             let mut current_pipeline: Option<bool> = None;
 
             for batch in &self.batches {
-                let (scissor, is_rect) = match batch {
-                    Batch::Rects { scissor, .. } => (*scissor, true),
-                    Batch::Image { scissor, .. } => (*scissor, false),
+                let (scissor, pipeline) = match batch {
+                    Batch::Rects { scissor, .. } => (*scissor, Some(true)),
+                    Batch::Image { scissor, .. } => (*scissor, Some(false)),
+                    Batch::Text { scissor, .. } => (*scissor, None),
                 };
 
                 if current_scissor != scissor {
@@ -380,7 +429,9 @@ impl Renderer {
                     current_scissor = scissor;
                 }
 
-                if current_pipeline != Some(is_rect) {
+                if let Some(is_rect) = pipeline
+                    && current_pipeline != Some(is_rect)
+                {
                     pass.set_pipeline(if is_rect {
                         &self.rect_pipeline
                     } else {
@@ -404,11 +455,25 @@ impl Renderer {
                         pass.draw(0..4, *instance..(*instance + 1));
                         stats.draw_calls += 1;
                     }
+                    Batch::Text { run, .. } => {
+                        // glyphon sets its own pipeline and bind groups, so the next
+                        // rectangle batch has to set ours again.
+                        current_pipeline = None;
+                        // A failure here means the atlas was rebuilt between prepare and
+                        // draw. Skipping the run loses this frame's text rather than the
+                        // frame; the next frame re-prepares against the grown atlas.
+                        if self.glyphs.draw(*run, &mut pass).is_ok() {
+                            stats.draw_calls += 1;
+                        }
+                    }
                 }
             }
         }
 
         self.gpu.queue.submit(Some(encoder.finish()));
+        // Glyphs nothing drew this frame can leave the atlas. Without this it grows to the
+        // union of every glyph ever drawn, which for a document is the whole font.
+        self.glyphs.trim();
         stats
     }
 
@@ -418,10 +483,13 @@ impl Renderer {
         list: &DisplayList,
         target: &FrameTarget<'_>,
         stats: &mut FrameStats,
+        fonts: &mut Option<&mut FontSystem>,
+        source: &impl TextSource,
     ) {
         self.instances.clear();
         self.batches.clear();
         self.clip_stack.clear();
+        self.text_areas.clear();
 
         let scale = target.scale_factor;
 
@@ -460,6 +528,38 @@ impl Renderer {
                             count: 1,
                             scissor,
                         }),
+                    }
+                }
+                DrawCommand::Text(text) => {
+                    let Some(scissor) = self.current_scissor(target, scale) else {
+                        continue;
+                    };
+                    let Some(fonts) = fonts.as_deref_mut() else {
+                        stats.missing_text += 1;
+                        continue;
+                    };
+                    // Text is prepared here rather than batched with the next run, because
+                    // painter's order needs each run drawn where it appears. See
+                    // `crisol-text-gpu` for why that costs a renderer per run.
+                    self.text_areas.clear();
+                    self.text_areas
+                        .push(text_area(text, scale, self.clip_stack.last(), target));
+                    match self.glyphs.prepare(
+                        &self.gpu.device,
+                        &self.gpu.queue,
+                        fonts,
+                        source,
+                        &self.text_areas,
+                    ) {
+                        Ok(Some(run)) => {
+                            self.batches.push(Batch::Text { run, scissor });
+                            stats.text_runs += 1;
+                        }
+                        // Nothing resolved: the id was never registered.
+                        Ok(None) => stats.missing_text += 1,
+                        // The atlas is full and will not grow. Losing this frame's text is
+                        // better than losing the frame.
+                        Err(_) => stats.missing_text += 1,
                     }
                 }
                 DrawCommand::Image(image) => {
@@ -603,6 +703,29 @@ impl Instance {
             clip_rect: clip.rect,
             clip_radii: clip.radii,
         }
+    }
+}
+
+/// Converts a text command to physical pixels, clipped to whatever is in force.
+fn text_area(
+    command: &TextCommand,
+    scale: f32,
+    clip: Option<&Clip>,
+    target: &FrameTarget<'_>,
+) -> TextArea {
+    let origin =
+        crisol_display_list::Point::new(command.origin.x * scale, command.origin.y * scale);
+    let bounds = clip.map_or_else(
+        || Rect::from_xywh(0.0, 0.0, target.width as f32, target.height as f32),
+        |clip| clip.rect.scale(scale),
+    );
+    TextArea {
+        text: command.text,
+        origin,
+        color: command.color,
+        clip: bounds,
+        // The text was shaped in logical pixels; glyphon rasterises at the physical size.
+        scale,
     }
 }
 

@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 crisol-display-list.workspace = true
+crisol-text.workspace = true
+crisol-text-gpu.workspace = true
 bytemuck.workspace = true
 pollster.workspace = true
 raw-window-handle.workspace = true

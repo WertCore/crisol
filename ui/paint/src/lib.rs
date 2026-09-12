@@ -24,7 +24,8 @@
 #![doc(html_root_url = "https://docs.rs/crisol-paint/0.0.0")]
 
 use crisol_display_list::{
-    Clip, Color, DisplayList, DisplayListBuilder, Point, Rect, RectCommand, Size,
+    Clip, Color, DisplayList, DisplayListBuilder, Point, Rect, RectCommand, Size, TextCommand,
+    TextId,
 };
 use crisol_tree::{BoxStyle, NodeId, NodeKind, Tree};
 
@@ -71,6 +72,8 @@ pub struct PaintStats {
     pub custom_nodes: usize,
     /// Clip groups opened.
     pub clips: usize,
+    /// Text blocks referred to.
+    pub text_runs: usize,
 }
 
 /// Paints the tree's root into a fresh display list.
@@ -169,7 +172,17 @@ pub fn paint_subtree(
                         stats.boxes_emitted += 1;
                     }
                 }
-                // Text is carried but not drawn until shaping lands at M4.
+                NodeKind::Text(text) if !text.is_empty() => {
+                    // The renderer holds the shaped text; the list refers to it by the same
+                    // handle the node has, so paint does not need to know how it was shaped.
+                    if builder.push_text(TextCommand {
+                        text: TextId(id.to_bits()),
+                        origin: bounds.origin,
+                        color: node.style.text_color,
+                    }) {
+                        stats.text_runs += 1;
+                    }
+                }
                 NodeKind::Text(_) => {}
             }
         }

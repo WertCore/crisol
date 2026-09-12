@@ -11,13 +11,18 @@ use crate::model::{Affinity, CaretGeometry, Cursor, Direction, Glyph, Line, Shap
 /// Immutable: editing means shaping again. M6 adds the caching that makes that cheap for a
 /// document; until then a keystroke reshapes the paragraph, which is correct and slow rather
 /// than fast and wrong.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct TextLayout {
     pub(crate) text: String,
     pub(crate) size: Size,
     pub(crate) lines: Vec<Line>,
     pub(crate) runs: Vec<ShapedRun>,
     pub(crate) glyphs: Vec<Glyph>,
+    /// The shaper's own buffer, kept so a GPU text backend can rasterise from it.
+    ///
+    /// Not `Clone` or `PartialEq`, which is why this type is not either: a shaped buffer is
+    /// a cache of rasterisation state, and duplicating it would duplicate that.
+    pub(crate) buffer: Option<cosmic_text::Buffer>,
 }
 
 impl TextLayout {
@@ -40,6 +45,7 @@ impl TextLayout {
             }],
             runs: Vec::new(),
             glyphs: Vec::new(),
+            buffer: None,
         }
     }
 
@@ -47,6 +53,16 @@ impl TextLayout {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The shaper's own buffer.
+    ///
+    /// An integration point for a GPU text backend — `crisol-text-gpu` hands it to glyphon
+    /// — and not part of the stable surface. `None` when there was nothing to shape.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cosmic_buffer(&self) -> Option<&cosmic_text::Buffer> {
+        self.buffer.as_ref()
     }
 
     /// The size of the text itself: the widest line by the total height.

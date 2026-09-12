@@ -17,6 +17,20 @@ use crisol_tree::Tree;
 pub use style_adapter::StyleRef;
 pub use tree_adapter::{LayoutContext, LayoutStats, TextMap};
 
+/// Looks shaped text up by the handle paint put in the display list.
+///
+/// Paint refers to a text block by its node's packed handle, which is what lets the display
+/// list stay free of glyphs (DECISIONS D-13). This is the other end of that: the map layout
+/// produced, viewed as something the renderer can query.
+#[derive(Clone, Copy, Debug)]
+pub struct ShapedText<'a>(pub &'a TextMap);
+
+impl crisol_text_gpu::TextSource for ShapedText<'_> {
+    fn get(&self, id: crisol_display_list::TextId) -> Option<&crisol_text::TextLayout> {
+        self.0.get(crisol_tree::NodeId::from_bits(id.0)?)
+    }
+}
+
 /// Lays out `tree` into a `viewport`-sized area and writes the boxes back onto the nodes.
 ///
 /// Returns the shaped text alongside the counters, because paint needs it and reshaping to

@@ -72,6 +72,15 @@ impl FontSystem {
         self.inner.db_mut().load_font_data(data);
     }
 
+    /// The shaper's own font system.
+    ///
+    /// An integration point for a GPU text backend, which has to rasterise with the same
+    /// fonts the text was shaped with. Not part of the stable surface.
+    #[doc(hidden)]
+    pub fn cosmic_font_system(&mut self) -> &mut cosmic_text::FontSystem {
+        &mut self.inner
+    }
+
     /// How many faces are loaded.
     #[must_use]
     pub fn face_count(&self) -> usize {
@@ -178,13 +187,13 @@ pub fn shape(
     buffer.set_text(text, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(&mut fonts.inner, false);
 
-    collect(fonts, &buffer, text, style, width)
+    collect(fonts, buffer, text, style, width)
 }
 
 /// Walks cosmic-text's output into ours.
 fn collect(
     fonts: &mut FontSystem,
-    buffer: &Buffer,
+    buffer: Buffer,
     text: &str,
     style: &TextStyle,
     width: Option<f32>,
@@ -299,6 +308,7 @@ fn collect(
         lines,
         runs,
         glyphs,
+        buffer: Some(buffer),
     }
 }
 

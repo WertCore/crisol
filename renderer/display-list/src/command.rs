@@ -5,7 +5,7 @@
 //! range test instead of a tree walk (M6), and a render snapshot test can be written without
 //! constructing a document (DECISIONS D-13).
 
-use crate::geom::{Color, Corners, Edges, Edges4, Rect, Size};
+use crate::geom::{Color, Corners, Edges, Edges4, Point, Rect, Size};
 
 /// An opaque handle to a texture the renderer holds.
 ///
@@ -93,6 +93,26 @@ impl ImageCommand {
     }
 }
 
+/// An opaque handle to a shaped block of text the renderer holds.
+///
+/// The same arrangement as [`ImageId`], and for the same reason: the display list refers to
+/// text, it does not own it. Shaping is expensive and happens during layout; a list that
+/// carried glyphs would either duplicate them every frame or pin the display list to the
+/// lifetime of the layout that produced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TextId(pub u64);
+
+/// A shaped block of text, positioned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextCommand {
+    /// The shaped text.
+    pub text: TextId,
+    /// Where the block's top-left corner goes, in logical pixels.
+    pub origin: Point,
+    /// Colour for glyphs that do not carry one of their own.
+    pub color: Color,
+}
+
 /// A clip region: a rectangle, optionally with rounded corners.
 ///
 /// Rounded clipping is what makes `overflow: hidden` on a card with `border-radius` cut the
@@ -157,6 +177,8 @@ pub enum DrawCommand {
     Rect(RectCommand),
     /// Draw a textured quad.
     Image(ImageCommand),
+    /// Draw a shaped block of text.
+    Text(TextCommand),
     /// Intersect the current clip with a rectangle, which may have rounded corners.
     ///
     /// The axis-aligned bounds become a scissor rectangle, which costs nothing on a tiler.
@@ -272,6 +294,19 @@ impl DisplayListBuilder {
     /// Convenience for a square-cornered solid fill.
     pub fn fill_rect(&mut self, rect: Rect, color: Color) -> bool {
         self.push_rect(RectCommand::solid(rect, color))
+    }
+
+    /// Appends a block of shaped text.
+    ///
+    /// Returns whether the command was kept. Unlike a rectangle, text cannot be culled
+    /// against the clip here: the builder does not know how large the block is — only the
+    /// renderer, which holds the shaped layout, does.
+    pub fn push_text(&mut self, command: TextCommand) -> bool {
+        if command.color.is_transparent() {
+            return false;
+        }
+        self.list.commands.push(DrawCommand::Text(command));
+        true
     }
 
     /// Appends a textured quad, dropping it when it is fully clipped out.

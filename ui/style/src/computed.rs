@@ -245,6 +245,7 @@ impl ComputedStyle {
                 bottom_right: radius(self.border_radius.bottom_right, border_box.width),
                 bottom_left: radius(self.border_radius.bottom_left, border_box.width),
             },
+            text_color: self.color.into(),
             clips_children: self.clips_children(),
             visible: self.visibility == Visibility::Visible,
         }

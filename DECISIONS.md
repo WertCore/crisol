@@ -622,3 +622,45 @@ boundary. Those hold for any font.
 way `CRISOL_REQUIRE_GPU` does for the renderer. A suite where everything silently skipped is
 indistinguishable from one where everything passed.
 
+---
+
+## D-30 — One glyphon renderer per text run, so text keeps painter's order
+
+**Status:** Accepted (M4) · **Affects:** M4, M6, M22
+
+A `glyphon::TextRenderer` prepares a set of text areas and then draws *all of them with one
+call*. A single renderer can therefore only put **all** text above or below **all**
+rectangles — so a label on a card would either vanish behind the next background or float on
+top of a modal that should cover it.
+
+`crisol-text-gpu` pools renderers and uses one per run of text in the display list, drawing
+each where it appears. The pool is kept across frames, so a steady-state frame allocates
+nothing.
+
+**Rejected — one renderer, all text last.** Free, and wrong in a way that only shows up on
+overlapping content, which is exactly the kind of bug that survives to a release.
+
+**Rejected — a render pass per text run.** glyphon's examples sometimes do this. It is a
+mid-pass render target switch, which D-09 rules out for tile-based mobile GPUs.
+
+The atlas, the rasterisation cache and the viewport are shared across all the renderers, so
+the cost of an extra run is a vertex buffer rather than a second copy of every glyph.
+`GlyphRenderer::trim` runs after each frame: without it the atlas grows to the union of every
+glyph ever drawn, which for a document editor is the entire font.
+
+## D-31 — The display list refers to text by handle, exactly as it does to images
+
+**Status:** Accepted (M4) · **Affects:** M4, M6, M16
+
+Shaping is expensive and happens during layout. A display list that carried glyphs would
+either duplicate them every frame or pin the list to the lifetime of the layout that produced
+them, and D-13 says the list is rebuilt every frame and knows nothing about the tree.
+
+`DrawCommand::Text` carries a `TextId`, the same arrangement `ImageId` already uses. Paint
+writes the text node's own packed handle (`NodeId::to_bits`, D-17's integer form), and
+`crisol-layout::ShapedText` looks the shaped layout back up with it.
+
+The correspondence between those two is asserted rather than assumed
+(`paint_refers_to_text_by_the_nodes_own_handle`): if the two ever disagree the text silently
+vanishes, which is not a failure mode worth debugging twice.
+

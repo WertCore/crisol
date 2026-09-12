@@ -151,6 +151,7 @@ impl Document {
             border_color: Edges4::all(EDGE),
             border_width: Edges::all(1.0),
             radii: Corners::all(10.0),
+            text_color: Color::WHITE,
             clips_children: true,
             visible: true,
         };

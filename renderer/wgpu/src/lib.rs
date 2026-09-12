@@ -9,6 +9,7 @@ pub mod surface;
 pub mod testing;
 mod texture;
 
+pub use crisol_text_gpu::TextSource;
 pub use gpu::{Gpu, GpuError, SharedGpu};
 pub use headless::{HEADLESS_FORMAT, HeadlessTarget, Pixels};
 pub use renderer::{FrameStats, FrameTarget, Renderer};

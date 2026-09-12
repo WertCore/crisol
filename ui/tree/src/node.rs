@@ -247,6 +247,11 @@ pub struct BoxStyle {
     pub radii: Corners,
     /// Whether descendants are clipped to this node's border box, as `overflow: hidden`.
     pub clips_children: bool,
+    /// Colour for text in this node, inherited from `color`.
+    ///
+    /// On the box rather than on the text node because a text node has no declarations of
+    /// its own: the colour it draws in is the one its parent element computed.
+    pub text_color: Color,
     /// Whether this node and its descendants are painted at all, as `visibility: hidden`.
     ///
     /// An invisible node still occupies space and still lays out; it just does not draw.
@@ -260,6 +265,7 @@ impl Default for BoxStyle {
         Self {
             background: Color::TRANSPARENT,
             border_color: Edges4::all(Color::TRANSPARENT),
+            text_color: Color::BLACK,
             border_width: Edges::ZERO,
             radii: Corners::ZERO,
             clips_children: false,
