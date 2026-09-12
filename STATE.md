@@ -224,9 +224,16 @@ Nothing. M5 is closed and M6 has not been started.
 
 ## Open questions
 
-- **M1's "window opens on all three platforms" is verified on macOS only.** A window was
-  opened and looked at by hand there; nobody has done that on Windows or Linux. Everything
-  short of the window — device acquisition, pipelines, rasterisation, pixel output — is
+Anything here that is a piece of work rather than a judgement call is filed as an issue, so
+it is trackable rather than buried in a document nobody greps. Current ones:
+[#13](https://github.com/WertCore/crisol/issues/13) IME on a real input method,
+[#14](https://github.com/WertCore/crisol/issues/14) screen readers,
+[#15](https://github.com/WertCore/crisol/issues/15) a window on Windows and Linux,
+[#16](https://github.com/WertCore/crisol/issues/16) nested rounded clips.
+
+
+- **M1's "window opens on all three platforms" is verified on macOS only** — issue
+  [#15](https://github.com/WertCore/crisol/issues/15). Everything short of the window is
   covered offscreen on all three in CI, so what is untested is specifically the `winit`
   surface and swapchain path.
 - **A full `cargo test --workspace` no longer fits on the development machine's disk.**
@@ -240,14 +247,15 @@ Nothing. M5 is closed and M6 has not been started.
   radius by the thicker of its two adjacent borders; CSS uses per-axis elliptical radii. The
   difference shows only on a box with very different adjacent border widths and a large
   radius. Revisit if a real design hits it.
-- **Two parts of M5's acceptance need a human and are outstanding.** The IME state machine is
-  tested with real Japanese composition sequences, but nobody has driven a platform input
-  method through the windowing layer. The accessibility `TreeUpdate` is asserted in detail,
-  but nobody has listened to VoiceOver, NVDA or Orca read it. Neither can run on a CI runner.
-  Both are a morning's work for someone with the three machines, and until then the milestone
-  is *believed* complete on those two points rather than *shown* to be.
-- **Only one rounded clip is honoured at a time** (D-26). Nested rounded clips keep the
-  innermost corners and intersect only their bounds. A test pins the behaviour.
+- **Two parts of M5's acceptance need a human and are outstanding** — issues
+  [#13](https://github.com/WertCore/crisol/issues/13) and
+  [#14](https://github.com/WertCore/crisol/issues/14). The IME state machine is tested with
+  real Japanese composition sequences, but nobody has driven a platform input method through
+  the windowing layer. The accessibility `TreeUpdate` is asserted in detail, but nobody has
+  listened to a screen reader read it. Neither can run on a CI runner. Until then the
+  milestone is *believed* complete on those two points rather than *shown* to be.
+- **Only one rounded clip is honoured at a time** (D-26) — issue
+  [#16](https://github.com/WertCore/crisol/issues/16). A test pins the current behaviour.
 - **`BoxStyle` is a placeholder producer, not a placeholder contract.** M3's cascade
   computes into it; the struct itself should survive. If `ComputedStyle` ends up wanting to
   be the thing stored on the node, that is a change to `crisol-tree` and should be recorded
