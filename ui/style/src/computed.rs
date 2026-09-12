@@ -198,6 +198,26 @@ impl ComputedStyle {
             .resolve(self.font_size.get(), NORMAL_LINE_HEIGHT_RATIO)
     }
 
+    /// Projects onto the text system's style.
+    ///
+    /// `line_height` is resolved here rather than carried as a multiple, because the shaper
+    /// needs a number of pixels and this is the last place that knows the font size it is a
+    /// multiple *of*.
+    #[must_use]
+    pub fn to_text_style(&self) -> crisol_text::TextStyle {
+        crisol_text::TextStyle {
+            font_size: self.font_size.get(),
+            line_height: self.resolved_line_height(),
+            families: self
+                .font_family
+                .iter()
+                .map(|family| family.as_str().to_owned())
+                .collect(),
+            weight: self.font_weight,
+            italic: self.font_style == FontStyle::Italic,
+        }
+    }
+
     /// Projects onto the paint-facing struct the tree carries.
     ///
     /// `border_box` is needed because corner radii can be percentages, and a percentage

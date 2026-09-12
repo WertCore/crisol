@@ -15,6 +15,9 @@ use std::ops::Range;
 
 use crisol_display_list::{Point, Rect};
 
+#[allow(unused_imports, reason = "referenced only from doc links")]
+use crate::TextLayout;
+
 /// Which side of a boundary a cursor sits on.
 ///
 /// One byte offset can be two places on screen. At a soft wrap, the offset after the last

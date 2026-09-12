@@ -21,13 +21,41 @@ pub struct TextLayout {
 }
 
 impl TextLayout {
+    /// A layout with no glyphs: one line, the right height, nothing drawn.
+    ///
+    /// What an empty string produces, and what shaping without a font produces. A caret has
+    /// to go somewhere and an empty paragraph is still one line tall, so this is a real
+    /// answer rather than a failure.
+    pub(crate) fn empty(text: &str, style: &crate::TextStyle, width: Option<f32>) -> Self {
+        let height = style.line_height.max(1.0);
+        Self {
+            text: text.to_owned(),
+            size: Size::new(0.0, height),
+            lines: vec![Line {
+                range: 0..0,
+                bounds: Rect::from_xywh(0.0, 0.0, width.unwrap_or(0.0), height),
+                baseline: height * 0.8,
+                width: 0.0,
+                runs: 0..0,
+            }],
+            runs: Vec::new(),
+            glyphs: Vec::new(),
+        }
+    }
+
     /// The source text.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// The block's size.
+    /// The size of the text itself: the widest line by the total height.
+    ///
+    /// Deliberately not the width the block was given. This is what a layout engine asks for
+    /// when measuring, and answering with the container's width would make every text node
+    /// fill its parent. [`Line::bounds`] is the other one — the full-width line *box*, which
+    /// is what hit testing needs so that clicking past the end of a short line still finds
+    /// it.
     #[must_use]
     pub fn size(&self) -> Size {
         self.size

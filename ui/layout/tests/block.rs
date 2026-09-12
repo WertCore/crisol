@@ -404,17 +404,92 @@ fn inset_shifts_a_relatively_positioned_box_without_moving_its_siblings() {
 // ---- text and leaves -----------------------------------------------------------------
 
 #[test]
-fn a_text_node_lays_out_as_an_empty_leaf_before_m4() {
+fn a_text_node_is_one_line_tall_even_with_no_font_to_shape_it() {
+    // With no fonts there are no glyphs, but a line box still has a height: an empty
+    // paragraph is not zero pixels tall, and neither is one whose font failed to load.
     let mut doc = Doc::new();
     let p = doc.add(doc.root, "p");
     doc.text(p, "hello");
-    assert_layout(
-        &doc.snapshot("p { height: 12px }", VIEWPORT),
-        "
-        body 0 0 200 100
-          p 0 0 200 12
-            #text 0 0 200 0
-        ",
+    let snapshot = doc.snapshot("p { font-size: 10px; line-height: 20px }", VIEWPORT);
+    assert!(
+        snapshot.contains("#text 0 0 0 20"),
+        "the text node should be one 20px line tall and no glyphs wide:\n{snapshot}"
+    );
+}
+
+#[test]
+fn a_text_nodes_height_follows_line_height() {
+    let mut doc = Doc::new();
+    let p = doc.add(doc.root, "p");
+    doc.text(p, "hello");
+    let tall = doc.snapshot("p { line-height: 40px }", VIEWPORT);
+    assert!(tall.contains("#text 0 0 0 40"), "{tall}");
+}
+
+#[test]
+fn text_is_measured_and_sizes_its_parent() {
+    let mut doc = Doc::new();
+    let p = doc.add(doc.root, "p");
+    doc.text(p, "hello world");
+
+    // Real fonts: the width is whatever they shape to, so the assertion is a relation.
+    let snapshot = doc.snapshot_with_fonts("p { font-size: 16px; line-height: 20px }", VIEWPORT);
+    let text_line = snapshot
+        .lines()
+        .find(|line| line.contains("#text"))
+        .expect("a text node in the snapshot");
+    let fields: Vec<f32> = text_line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    if fields[2] == 0.0 {
+        eprintln!("skipping: no fonts installed");
+        return;
+    }
+    assert!(fields[2] > 0.0, "shaped text has a width: {text_line}");
+    assert_eq!(fields[3], 20.0, "and one line of height: {text_line}");
+    assert!(
+        snapshot.contains("p 0 0 200 20"),
+        "the paragraph grows to fit its text:\n{snapshot}"
+    );
+}
+
+#[test]
+fn text_wraps_within_its_containing_block() {
+    let mut doc = Doc::new();
+    let p = doc.add(doc.root, "p");
+    doc.text(p, "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll");
+
+    let narrow = doc.snapshot_with_fonts("p { width: 60px; line-height: 10px }", VIEWPORT);
+    let text_line = narrow
+        .lines()
+        .find(|line| line.contains("#text"))
+        .expect("a text node");
+    let height: f32 = text_line
+        .split_whitespace()
+        .next_back()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.0);
+    if height == 0.0 {
+        eprintln!("skipping: no fonts installed");
+        return;
+    }
+    assert!(
+        height > 10.0,
+        "text in a 60px box should wrap onto several 10px lines, got {height}"
+    );
+}
+
+#[test]
+fn an_empty_text_node_measures_to_nothing() {
+    let mut doc = Doc::new();
+    let p = doc.add(doc.root, "p");
+    doc.text(p, "");
+    let snapshot = doc.snapshot_with_fonts("p { line-height: 20px }", VIEWPORT);
+    assert!(
+        snapshot.contains("#text 0 0 0 0"),
+        "an empty string has no box at all:\n{snapshot}"
     );
 }
 

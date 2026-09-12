@@ -528,6 +528,7 @@ dependencies = [
  "crisol-display-list",
  "crisol-layout",
  "crisol-style",
+ "crisol-text",
  "crisol-tree",
  "html5ever",
  "thiserror 2.0.20",
@@ -548,6 +549,7 @@ dependencies = [
  "crisol-css",
  "crisol-display-list",
  "crisol-style",
+ "crisol-text",
  "crisol-tree",
  "taffy",
 ]
@@ -584,6 +586,7 @@ version = "0.0.0"
 dependencies = [
  "crisol-css",
  "crisol-display-list",
+ "crisol-text",
  "crisol-tree",
  "lightningcss",
 ]

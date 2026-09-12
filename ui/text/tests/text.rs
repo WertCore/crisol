@@ -38,6 +38,44 @@ fn lay_out(fonts: &mut FontSystem, text: &str, width: Option<f32>) -> TextLayout
     shape(fonts, text, &TextStyle::default(), width, Wrapping::Word)
 }
 
+// ---- the font system -------------------------------------------------------------------
+
+#[test]
+fn an_empty_font_system_really_has_no_fonts() {
+    // cosmic-text's `new_with_fonts(empty())` still scans the system, which silently gave a
+    // "no fonts" test the machine's entire font directory to shape with. Pinned because the
+    // difference is invisible until a test that should be deterministic is not.
+    let fonts = FontSystem::empty();
+    assert_eq!(fonts.face_count(), 0);
+    assert!(fonts.is_empty());
+}
+
+#[test]
+fn shaping_with_no_fonts_produces_a_line_but_no_glyphs() {
+    // cosmic-text panics with "no default font found" if asked to shape anything without a
+    // font. An engine must not die because a font file failed to load or an application
+    // shipped without one, so this case is answered before it gets there.
+    let mut fonts = FontSystem::empty();
+    let style = TextStyle {
+        line_height: 20.0,
+        ..TextStyle::default()
+    };
+    let layout = shape(&mut fonts, "hello", &style, Some(200.0), Wrapping::Word);
+    assert!(layout.glyphs().is_empty(), "nothing to shape with");
+    assert_eq!(layout.size().width, 0.0);
+    assert_eq!(
+        layout.size().height,
+        20.0,
+        "a line with no glyphs is still a line tall"
+    );
+    assert_eq!(
+        layout.lines().len(),
+        1,
+        "and the caret still has somewhere to go"
+    );
+    assert_eq!(layout.point_to_cursor(Point::new(50.0, 5.0)).index, 0);
+}
+
 // ---- shaping -------------------------------------------------------------------------
 
 #[test]
@@ -166,6 +204,25 @@ fn line_boxes_stack_without_gaps_or_overlap() {
             expected_top = line.bounds.max_y();
         }
         assert!((layout.size().height - expected_top).abs() < 0.01);
+    });
+}
+
+#[test]
+fn the_layouts_size_is_the_content_not_the_block() {
+    with_fonts(|mut fonts| {
+        // A measure pass asks how big the text is. Answering with the offered width would
+        // make every text node fill its parent.
+        let layout = lay_out(&mut fonts, "a", Some(200.0));
+        assert!(
+            layout.size().width < 200.0,
+            "size() is the glyph extent, got {}",
+            layout.size().width
+        );
+        assert_eq!(
+            layout.lines()[0].bounds.width(),
+            200.0,
+            "but the line box is still the full block width, for hit testing"
+        );
     });
 }
 

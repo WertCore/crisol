@@ -48,14 +48,20 @@ impl FontSystem {
         }
     }
 
-    /// A font system with no system fonts, holding only what is loaded into it.
+    /// A font system with no fonts at all, holding only what is later loaded into it.
     ///
     /// What a deterministic test or a self-contained application binary wants: the same
     /// glyphs on every machine, rather than whatever the host happens to have installed.
+    ///
+    /// Note that cosmic-text's `new_with_fonts(empty())` is *not* this — it still scans the
+    /// system, and quietly gave a "no fonts" test 983 faces to shape with.
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            inner: cosmic_text::FontSystem::new_with_fonts(std::iter::empty()),
+            inner: cosmic_text::FontSystem::new_with_locale_and_db(
+                "en-US".to_owned(),
+                cosmic_text::fontdb::Database::new(),
+            ),
             ids: HashMap::new(),
             next_id: 0,
         }
@@ -140,6 +146,14 @@ pub fn shape(
     width: Option<f32>,
     wrapping: Wrapping,
 ) -> TextLayout {
+    // cosmic-text panics with "no default font found" when asked to shape anything at all
+    // without a font to shape it with. An engine must not die because a font file failed to
+    // load, or because an application shipped without one, so the empty case is answered
+    // here: one line of the right height, no glyphs.
+    if fonts.is_empty() || text.is_empty() {
+        return TextLayout::empty(text, style, width);
+    }
+
     let metrics = Metrics::new(style.font_size.max(1.0), style.line_height.max(1.0));
     let mut buffer = Buffer::new(&mut fonts.inner, metrics);
     buffer.set_wrap(match wrapping {
@@ -259,8 +273,8 @@ fn collect(
         });
     }
 
-    // An empty string still has one line: a caret has to go somewhere, and a block with no
-    // text is still one line tall.
+    // Reachable when the text is entirely unshapeable — every character missing from every
+    // font. `shape` already short-circuits the empty-string and no-font cases.
     if lines.is_empty() {
         lines.push(Line {
             range: 0..0,
@@ -277,7 +291,11 @@ fn collect(
 
     TextLayout {
         text: text.to_owned(),
-        size: Size::new(width.unwrap_or(widest), height),
+        // The *content* extent, not the width that was offered. A measure pass asks how big
+        // the text is, and answering with the container's width makes every text node fill
+        // its parent — which puts centred text in the wrong place and makes a paragraph's
+        // intrinsic width meaningless.
+        size: Size::new(widest, height),
         lines,
         runs,
         glyphs,

@@ -121,8 +121,11 @@ impl StyleEngine {
                 stats.elements += 1;
                 computed
             } else {
-                // A text or custom node has no declarations of its own, so its children —
-                // if any — inherit straight through it.
+                // A text node has no declarations of its own, but it very much has a
+                // computed style: the font, size and line height it inherited are exactly
+                // what the shaper needs. Storing the parent's style under it lets layout ask
+                // one question — "what is this node's style?" — regardless of node kind.
+                styles.insert(id, Arc::clone(&parent_style));
                 parent_style
             };
 

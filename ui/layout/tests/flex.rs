@@ -451,7 +451,12 @@ fn css_can_override_a_custom_nodes_measured_size() {
         crisol_css::stylesheet::Stylesheet::parse("body > * { width: 90px }").unwrap(),
     );
     let (styles, _) = engine.restyle(&doc.tree);
-    crisol_layout::layout(&mut doc.tree, &styles, VIEWPORT);
+    crisol_layout::layout(
+        &mut doc.tree,
+        &styles,
+        &mut crisol_text::FontSystem::empty(),
+        VIEWPORT,
+    );
 
     assert_layout(
         &doc.describe(),

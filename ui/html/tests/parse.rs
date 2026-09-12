@@ -331,7 +331,12 @@ fn a_parsed_tree_lays_out() {
     let mut engine = StyleEngine::new();
     engine.add_stylesheet(Stylesheet::parse("div { height: 20px }").unwrap());
     let (styles, _) = engine.restyle(&document.tree);
-    crisol_layout::layout(&mut document.tree, &styles, Size::new(100.0, 50.0));
+    crisol_layout::layout(
+        &mut document.tree,
+        &styles,
+        &mut crisol_text::FontSystem::empty(),
+        Size::new(100.0, 50.0),
+    );
 
     assert_eq!(
         document.tree.node(div).layout,

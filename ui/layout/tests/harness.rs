@@ -13,6 +13,7 @@ use crisol_css::stylesheet::Stylesheet;
 use crisol_display_list::Size;
 use crisol_layout::layout;
 use crisol_style::StyleEngine;
+use crisol_text::FontSystem;
 use crisol_tree::{NodeId, Tree};
 
 /// A document built from a very small nested syntax, so a case is one readable literal.
@@ -82,11 +83,24 @@ impl Doc {
     }
 
     /// Styles and lays the document out, returning the box tree as text.
+    ///
+    /// Uses an empty font system: these cases are about boxes, and a machine's installed
+    /// fonts must not change where a box lands. The cases that *are* about text say so by
+    /// calling [`Self::snapshot_with_fonts`].
     pub fn snapshot(&mut self, css: &str, viewport: Size) -> String {
+        self.snapshot_with(css, viewport, &mut FontSystem::empty())
+    }
+
+    /// As [`Self::snapshot`], with the system's fonts loaded.
+    pub fn snapshot_with_fonts(&mut self, css: &str, viewport: Size) -> String {
+        self.snapshot_with(css, viewport, &mut FontSystem::new())
+    }
+
+    fn snapshot_with(&mut self, css: &str, viewport: Size, fonts: &mut FontSystem) -> String {
         let mut engine = StyleEngine::new();
         engine.add_stylesheet(Stylesheet::parse(css).expect("the case's CSS must parse"));
         let (styles, _) = engine.restyle(&self.tree);
-        layout(&mut self.tree, &styles, viewport);
+        layout(&mut self.tree, &styles, fonts, viewport);
         self.describe()
     }
 
