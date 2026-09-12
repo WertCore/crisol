@@ -10,6 +10,7 @@ members = [
     "ui/paint",
     "ui/events",
     "ui/a11y",
+    "ui/reactive",
     "ui/umbrella",
     "renderer/display-list",
     "renderer/wgpu",
@@ -58,6 +59,7 @@ crisol-text = { path = "ui/text", version = "0.0.0" }
 crisol-paint = { path = "ui/paint", version = "0.0.0" }
 crisol-events = { path = "ui/events", version = "0.0.0" }
 crisol-a11y = { path = "ui/a11y", version = "0.0.0" }
+crisol-reactive = { path = "ui/reactive", version = "0.0.0" }
 crisol-ui = { path = "ui/umbrella", version = "0.0.0" }
 crisol-display-list = { path = "renderer/display-list", version = "0.0.0" }
 crisol-render-wgpu = { path = "renderer/wgpu", version = "0.0.0" }

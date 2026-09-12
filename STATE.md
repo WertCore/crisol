@@ -1,7 +1,7 @@
 # Crisol — State
 
-**Current milestone:** M7 — reactive API and component model (not started)
-**Last finished:** M6 — incremental everything
+**Current milestone:** M8 — platform polish (not started)
+**Last finished:** M7 — reactive API and component model
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -10,11 +10,14 @@ actually is.
 
 ## Accept criteria for the current milestone
 
-> **M7 — reactive API and component model.** Signals, effects, a component abstraction, and
-> the mutation API that a foreign caller (the JS runtime, later) will drive. Design it as if
-> an external consumer exists, because one will.
+> **M8 — platform polish.** High-DPI, multi-monitor, window lifecycle, clipboard, cursors,
+> file dialogs, and the dozens of small things that separate a demo from an application.
 >
-> **Accept:** a Rust-only todo app with add/remove/filter/edit runs with no full-tree rebuilds.
+> **Accept:** the M5 demo app behaves correctly on all three desktop platforms.
+
+**§7's first kill criterion lands here.** After M8, measure idle RSS against a WebView
+baseline. If it is not meaningfully lower, the core product claim is unsupported and that has
+to be said out loud rather than worked around.
 
 ---
 
@@ -252,11 +255,61 @@ removed. Nothing new was needed.
 
 **Totals:** 398 tests passing
 
+### M7 — reactive API and component model
+
+- **`crisol-dom`** — the mutation API ROADMAP §M7 asks to be designed *as if an external
+  consumer exists*. Create, insert, move, remove, set text, set attributes, toggle classes,
+  and read the tree back. Every write marks what a selector could notice; `Tree::element_mut`
+  cannot, which is why the layer exists (D-42). Writes are compared first, so setting a value
+  to what it already is costs nothing. `DomStats` counts what a caller did.
+- **`crisol-reactive`** — `Signal`, `Memo`, `Effect`, and the `Scope` tree that owns them.
+  Memos are pull-based and lazy: one nobody reads is never computed, and a diamond wakes its
+  effect once with both sides fresh rather than twice with one stale. Dependencies are
+  rebuilt on every run, so a branch that stops reading a signal stops depending on it.
+  Disposal is generational, so a handle outliving its scope is an error rather than a read of
+  whoever took the slot.
+- **The runtime is a value, not a thread-local** (D-43). Reads go through `Track` (pure) or
+  `Cx` (reads plus the DOM), which makes "a memo may not touch the DOM" a type-level fact.
+- **Components run once** (D-44). They build nodes and bind effects; nothing re-renders them.
+  `Keyed` reconciles lists by key, anchoring the longest increasing subsequence so a row moved
+  from the end to the front costs one move rather than a thousand.
+- A new crate at `ui/reactive`, which ROADMAP §4's layout does not name. `crisol-dom` was
+  already there.
+
+**Accept: met.** 1,000 todos, 3,005 nodes, driven through the DOM API, M6's incremental
+restyle, and layout:
+
+```
+  add                dom:    3 created,  0 removed  | list: 1 new, 0 moved, 1000 kept | layout:    8
+  edit (item 500)    dom:    0 created,  1 text     | list: did not run               | layout:    6
+  toggle (item 500)  dom:    0 created,  1 attr     | list: did not run               | layout:    8
+  filter (active)    dom:    0 created,  3 removed  | list: 1 gone,  0 moved, 1000 kept | layout:  3
+  filter (all)       dom:    3 created,  0 removed  | list: 1 new,   0 moved, 1000 kept | layout:  6
+  remove (item 100)  dom:    0 created,  3 removed  | list: 1 gone,  0 moved, 1000 kept | layout:  5
+```
+
+Editing one todo's label runs **one** effect and writes **one** text node out of a thousand.
+Toggling one runs two — its own class binding and the footer count — and the list reconciler
+does not run at all, because under `All` the filter never reads `done` and so never subscribed
+to it.
+
+The test also asserts **node identity** across every step: a rebuild would produce nodes that
+render identically, and only the handles show the difference. A final full restyle is compared
+against what the incremental passes produced, so a missed invalidation cannot pass as a saving.
+
+**One defect this milestone existed to find.** `DirtyFlags::expanded` turned `STYLE` into
+`LAYOUT`, so appending one row to a 1,000-row list invalidated **1,008** layout caches — every
+sibling, because a structural change marks them all for `:nth-child`. It now invalidates 8.
+The flag code looks obviously right; it was the node count coming back three orders of
+magnitude too large that found it (D-45).
+
+**Totals:** 433 tests passing
+
 ---
 
 ## In progress
 
-Nothing. M6 is closed and M7 has not been started.
+Nothing. M7 is closed and M8 has not been started.
 
 ## Open questions
 

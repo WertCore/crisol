@@ -522,6 +522,9 @@ version = "0.0.0"
 [[package]]
 name = "crisol-dom"
 version = "0.0.0"
+dependencies = [
+ "crisol-tree",
+]
 
 [[package]]
 name = "crisol-events"
@@ -600,6 +603,19 @@ dependencies = [
  "crisol-style",
  "crisol-text",
  "crisol-text-gpu",
+ "crisol-tree",
+]
+
+[[package]]
+name = "crisol-reactive"
+version = "0.0.0"
+dependencies = [
+ "crisol-css",
+ "crisol-display-list",
+ "crisol-dom",
+ "crisol-layout",
+ "crisol-style",
+ "crisol-text",
  "crisol-tree",
 ]
 

@@ -916,3 +916,97 @@ child overflowing its parent is the common case. So the test descends — but st
 at a node with `overflow: hidden`, which confines its descendants and therefore cannot hide
 anything that reaches further.
 
+
+## D-42 — All mutation goes through `crisol-dom`, not through `Tree`
+
+**Status:** Accepted (M7) · **Affects:** M7, M16
+
+A mutation has to mark what it invalidates, and the rules are not guessable: changing a class
+affects the node, its descendants and its *following* siblings; inserting a child affects the
+parent's other children through `:nth-child`; text becoming empty affects the parent through
+`:empty` (D-38). `Tree::element_mut` hands out a `&mut` that enforces none of it, and a caller
+who forgets gets a stale style that reads as a cascade bug rather than as a missing call.
+
+`crisol-dom` is the API that cannot forget. It is also the surface ROADMAP §M7 asks to be
+designed *as if an external consumer exists* — the consumer is the JS runtime at M16, and
+having a Rust caller drive it first is how the shape gets corrected while that is still cheap.
+
+**Rejected: a `&mut Tree` with a convention.** Conventions are not enforced by anything, and
+the failure mode is silent and delayed.
+
+Two properties fell out of writing it that were not the original motivation. Writes are
+compared before they are applied, so setting a value to what it already is costs nothing —
+which matters because a reactive system makes redundant writes constantly, and it is what lets
+the reactive layer notify unconditionally rather than requiring `PartialEq` everywhere.
+And the counters (`DomStats`) are what M7's acceptance is actually measured in: an engine that
+rebuilt the world would render the same pixels.
+
+## D-43 — The reactive runtime is a value, not an ambient thread-local
+
+**Status:** Accepted (M7) · **Affects:** M7, M16
+
+Signals are ids into a `Runtime` that is passed by reference. The ergonomic alternative — a
+thread-local current runtime, which is what makes `signal.get()` work without an argument in
+most Rust reactive libraries — was rejected.
+
+Two windows means two runtimes, and an ambient one turns that into a silent cross-wiring
+rather than a type error. More to the point, M16 puts a JS engine behind this: a host function
+has to say which runtime it is driving rather than inherit whichever thread it happens to be
+called on.
+
+The cost is real and visible at every call site: `track.get(signal)` instead of `signal.get()`.
+Reads are threaded through a `Track` (pure, no DOM) or a `Cx` (reads plus the DOM), which also
+makes the purity of memos a type-level fact rather than a rule in a doc comment — a memo runs
+lazily at an unpredictable point inside somebody else's read, and a DOM write from there would
+land at a time no caller could reason about.
+
+**A consequence worth stating:** a read must not hold the arena borrow while the caller's
+closure runs, or a nested read — filtering a list of todos by a flag each one owns — panics
+inside `RefCell`. The value is moved out for the duration of the read and moved back, and a
+write that lands during the read wins. An API whose reads cannot nest is not one a foreign
+caller can drive, and M16's caller will nest them without asking.
+
+## D-44 — Components run once; effects update, not re-renders
+
+**Status:** Accepted (M7) · **Affects:** M7, M17
+
+A component builds its nodes, registers effects that bind specific text and attributes to
+specific signals, and returns. Nothing ever re-runs it. Changing state wakes an effect, which
+writes one text node.
+
+**Rejected: a virtual DOM.** Re-running a component to produce a description and diffing it
+against the last one is the better-known design, and it is what react-dom will do on top of
+this at M17 anyway. Doing it here too would mean the cost is paid twice, and it makes "no
+full-tree rebuilds" an optimisation to be maintained rather than the only thing the design can
+express. Editing one todo's label in a thousand-item list runs **one** effect and writes
+**one** text node, and there is no diff that could have been skipped.
+
+Lists are the case that genuinely needs reconciliation, and `Keyed` does it by key: surviving
+items keep their nodes and their effects. The positions that stay put are a longest increasing
+subsequence of the previous order, so moving one row from the end to the front costs one move
+rather than a thousand.
+
+## D-45 — `STYLE` no longer implies `LAYOUT`
+
+**Status:** Accepted (M7) · **Affects:** M6, M7 · **Supersedes part of** D-18
+
+`DirtyFlags::expanded` used to expand `STYLE` into `LAYOUT` into `PAINT`, on the reasoning
+that a style change can change the box and a box change changes the pixels. The second half is
+sound. The first is not knowable at the point it was being asserted: `mark_dirty` is told a
+style *may* have changed.
+
+Inserting one row into a thousand-row list marks every sibling `STYLE`, because `:nth-child`
+could have moved (D-38) — and so relaid out all thousand. Measured: appending one `<li>` to a
+1,000-item list invalidated **1,008** layout caches. None of those boxes changed.
+
+The implication now happens where the answer is known. `restyle_incremental` compares each
+node's recomputed style against the previous pass and marks `LAYOUT` only where they differ,
+which interning (D-21) makes a pointer comparison. The same append now invalidates **8**.
+
+**Still conservative in one direction:** any style change marks `LAYOUT`, including one that
+only alters a colour. Splitting `ComputedStyle` into layout-affecting and paint-only fields
+would tighten that further; it is not done, and is tracked rather than assumed.
+
+**How it was found:** not by reading the flag code, which looks obviously right, but because
+M7's acceptance counts nodes laid out and the number came back three orders of magnitude too
+large. A milestone that only checked the rendered result would have shipped it.
