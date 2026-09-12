@@ -1010,3 +1010,51 @@ would tighten that further; it is not done, and is tracked rather than assumed.
 **How it was found:** not by reading the flag code, which looks obviously right, but because
 M7's acceptance counts nodes laid out and the number came back three orders of magnitude too
 large. A milestone that only checked the rendered result would have shipped it.
+
+## D-46 — The memory claim is measured as physical footprint, not RSS
+
+**Status:** Accepted (M8) · **Affects:** M8, §7
+
+ROADMAP §M8 says *"< 60MB RSS idle"* and §7 says *"idle RSS … below a WebView2/WKWebView
+baseline"*. Measured literally on macOS, RSS is the wrong number and flatters nobody
+consistently: it counts shared read-only library pages, which every process on the machine
+pays for and which are not the app's cost.
+
+The same crisol example reports **90 MB RSS and 25.5 MB of physical footprint**. The gap is
+Metal, CoreGraphics and the rest, resident once and shared by everything running. Reporting 90
+would have declared the product claim dead on a number that says nothing about the product.
+
+So the recorded figure is `phys_footprint` — what Activity Monitor calls "Memory" — with RSS
+noted alongside. The Linux equivalent is PSS rather than RSS, for the same reason; the Windows
+equivalent is private working set.
+
+**This is not moving the goalposts, and it has to be applied to both sides.** The WebView
+baseline is measured the same way, and the comparison is what §7 actually asks about. A
+measurement that made only our side look good would be worse than none.
+
+**The trap it took a wrong answer to find:** WKWebView is multi-process, and its helpers are
+not its children — they are launched through XPC. Filtering by process name collects every
+browser on the machine, which produced a first "baseline" of 1,037 MB, most of it Safari's.
+Snapshot the WebKit processes before launching and diff.
+
+## D-47 — The response view has to be virtualised for the acceptance to hold
+
+**Status:** Accepted (M8) · **Affects:** M8
+
+`Node` is **328 bytes** (`ui/tree/tests/sizes.rs` keeps that honest). A 5MB JSON response
+expanded one node per token is on the order of 100,000 nodes: **31 MB of arena alone**, before
+styles, taffy's per-node cache, or shaped text. That is half the budget spent on structure the
+user can see forty rows of.
+
+Virtualised, the same response is a window of roughly a thousand nodes — 328 KB — and the
+budget goes almost entirely to the parsed JSON, which is the application's data rather than
+the engine's.
+
+So the acceptance is a statement about the *application*, not only the engine, and the engine's
+job is to make a virtualised list cheap: M6's incremental relayout and M7's keyed reconciler
+already do, and M8's scrolling is what drives it.
+
+**What this is not.** It is not a reason to shrink `Node` in a hurry. Two reductions are
+available — packing `Color` to 8-bit sRGB, which `BoxStyle` spends 96 of its 132 bytes on, and
+interning `BoxStyle` behind an `Arc` the way `ComputedStyle` already is (D-21) — and both are
+worth doing on their own merits. Neither is what decides the number.

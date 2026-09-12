@@ -372,9 +372,50 @@ deliverable is not.
   a frame after scrolling laid out 0 nodes
 ```
 
-**Still to do for M8:** multi-window, native menus, drag and drop, bidi text, cursor shapes,
-window chrome, packaging (.app, .msi, AppImage) — and then the acceptance, which is the RSS
-measurement.
+### Bidirectional text
+
+M4 shipped the API carrying `Direction` and `Affinity` and deferred the layout. Four things
+above cosmic-text were wrong, none of them visible in an all-Latin document: caret direction
+came from the line's first run, affinity was ignored at a direction boundary, selection
+rectangles never split, and a click just inside an RTL run could resolve into the Latin beside
+it. Cursor movement needed nothing — it was already logical rather than visual.
+
+The tests **fail rather than skip** when no font covers Hebrew; a machine without one shapes
+the string to nothing and every assertion passes without testing anything.
+
+### The memory number, measured early
+
+§7's first kill criterion is M8's acceptance, so it was worth taking a reading before building
+the rest of the milestone: if the number is bad, it changes what is worth building.
+
+| | phys_footprint | RSS |
+|---|---|---|
+| wgpu window, **no text** (the GPU floor) | **17 MB** | 83 MB |
+| the todo example, release, 27 rows | **25.5 MB** (peak 30.7) | 90 MB |
+| WKWebView showing equivalent HTML/CSS | **36.0 MB** | — |
+
+**Crisol is about 30% below the WebView baseline for an equivalent app**, and the baseline is
+generous to WebView: this machine was already running Safari, so the new WebView reused
+infrastructure it would otherwise have spawned.
+
+**RSS is the wrong metric and reporting it would have been an error** (D-46). On macOS it
+counts shared read-only library pages that every process pays for; the same binary reads 90 MB
+by RSS and 25.5 MB by footprint. The Linux equivalent is PSS, the Windows one private working
+set.
+
+**Caveats, because this is not yet the acceptance.** macOS only. A 27-row list, not the
+API-client-shaped application §M8 names. No 5MB JSON loaded. What it establishes is that the
+engine's floor leaves roughly 34 MB of headroom, and that the floor is almost entirely wgpu
+rather than anything crisol allocates — the whole tree, styles, layout and text for this app
+cost about 8.5 MB over an empty GPU window.
+
+**What the acceptance will turn on** is virtualising the response view (D-47), not shrinking
+the engine: 5MB of JSON expanded one node per token is ~100k nodes and 31 MB of arena on its
+own. `ui/tree/tests/sizes.rs` keeps `Node` (328 bytes) a tracked figure so that does not drift.
+
+**Still to do for M8:** multi-window, native menus, drag and drop, cursor shapes, window
+chrome, packaging (.app, .msi, AppImage) — and then the acceptance proper: an API-client-shaped
+application with a 5MB response in it, measured on all three platforms.
 
 **One thing measured and left alone.** In the todo example, moving the selection runs one
 effect per row: every row asks "am I the selected one?" and so subscribes to the shared
@@ -383,7 +424,7 @@ but it is linear. That is what this way of modelling a selection costs, not a li
 engine — a list long enough to care would remember the previous row and toggle exactly two.
 Said out loud in a comment rather than quietly shipped.
 
-**Totals:** 475 tests passing
+**Totals:** 492 tests passing
 
 ## Open questions
 
