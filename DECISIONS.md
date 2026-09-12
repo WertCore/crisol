@@ -966,6 +966,20 @@ inside `RefCell`. The value is moved out for the duration of the read and moved 
 write that lands during the read wins. An API whose reads cannot nest is not one a foreign
 caller can drive, and M16's caller will nest them without asking.
 
+**Amended (M8), because the safety half of this was not true as written.** The claim above is
+that an ambient runtime turns two windows into a silent cross-wiring "rather than a type
+error". Building the second window showed that this design had the same hole: a `Signal` was a
+bare index, index 0 exists in every runtime, and handing window A's signal to window B's
+runtime read *B's* value at that index and returned it without complaint. A test that disables
+the fix reports `left: Some(99), right: None` — one window's state appearing in another's,
+which is precisely the failure an ambient runtime was rejected for.
+
+Handles now carry the id of the runtime that issued them, checked on every read, write and
+disposal. Four bytes on a `Copy` handle, and it is a refusal at runtime rather than the type
+error the original text implied — encoding runtime identity in the type would infect every
+signature between here and M16's host functions with a parameter nobody could name. The
+decision stands; the argument for it was doing less work than it claimed.
+
 ## D-44 — Components run once; effects update, not re-renders
 
 **Status:** Accepted (M7) · **Affects:** M7, M17
@@ -1058,3 +1072,38 @@ already do, and M8's scrolling is what drives it.
 available — packing `Color` to 8-bit sRGB, which `BoxStyle` spends 96 of its 132 bytes on, and
 interning `BoxStyle` behind an `Arc` the way `ComputedStyle` already is (D-21) — and both are
 worth doing on their own merits. Neither is what decides the number.
+
+## D-48 — A second window shares the device; it does not share the runtime
+
+**Status:** Accepted (M8) · **Affects:** M8
+
+Opening a second window duplicates exactly what belongs to a window and nothing that belongs
+to the application. The split is not a matter of taste: it is what decides whether window count
+multiplies the memory floor.
+
+**Per application, created once.** The adapter, the logical device and the queue, which D-47's
+table puts at about 17 MB — most of what an idle GPU application costs against the 60 MB the
+product claim allows. (That figure is inherited from a measurement taken before the sampling
+problem below was understood, so treat it as an order of magnitude rather than a reading.)
+The font database, which is a filesystem scan. The style engine, whose
+interner means two windows computing the same style share one `Arc` (D-21). And a renderer per
+*surface format* rather than per window, so two windows on one display share a glyph atlas and
+one set of pipelines.
+
+**Per window.** The surface, the tree, the layout cache, and the reactive runtime with its
+signals. `WindowSurface::with_gpu` is the seam: the first window creates the device, every one
+after it borrows the one already chosen — which also settles presentability, since an adapter
+picked for one window on a multi-GPU laptop is the one attached to that display.
+
+**Verified by identity, not by footprint.** The example asserts `SharedGpu::ptr_eq` between
+the first window's device and every later one — the same allocation, three holders after two
+windows. That check is deterministic. Memory sampling here is not: footprints taken while the
+app idles under `ControlFlow::Wait` moved several MB between runs of the *same* binary, and a
+one-window build at four times the window area measured *lower* than at one times, which cannot
+be true. A measurement that cannot order two configurations known to differ is not evidence
+that a device is shared; a pointer comparison is. The per-window cost is therefore left
+unquantified until there is a deterministic way to sample it.
+
+**What this cost.** Two runtimes is what D-43 said this milestone would need, and it was right
+that the runtimes must be separate — but see the amendment there, because the second window is
+also what exposed that separate runtimes were not yet *safely* separate.

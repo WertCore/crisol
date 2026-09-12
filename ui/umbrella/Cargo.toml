@@ -48,3 +48,7 @@ required-features = ["render"]
 [[example]]
 name = "todo"
 required-features = ["render"]
+
+[[example]]
+name = "windows"
+required-features = ["render"]

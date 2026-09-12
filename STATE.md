@@ -433,9 +433,48 @@ a trap for whoever read it next.
 `winit::Window::set_cursor` takes. The mapping lives in the umbrella because `crisol-style`
 must not know windows exist and `crisol-render-wgpu` must not know a cascade does.
 
-**Still to do for M8:** multi-window, native menus, drag and drop, window chrome, packaging
-(.app, .msi, AppImage) — and then the acceptance proper: an API-client-shaped application with
-a 5MB response in it, measured on all three platforms.
+### Multi-window
+
+A second window duplicates what belongs to a window and nothing that belongs to the
+application (D-48). Per application: the adapter, device and queue — the 17 MB the measurement
+above attributes to the GPU — plus the font database, the style interner, and a renderer per
+*surface format* rather than per window, so two windows on one display share a glyph atlas.
+Per window: the surface, the tree, the layout cache, and the reactive runtime.
+
+`WindowSurface::with_gpu` is the seam. The first window creates the device; every one after it
+borrows the one already chosen, which also settles presentability — an adapter picked for one
+window on a multi-GPU laptop is the one attached to that display.
+
+**Verified by pointer identity, not by memory.** The example asserts `SharedGpu::ptr_eq`
+between window 1's device and every later window's — the same allocation, three holders after
+two windows.
+
+That is deliberate. The first attempt measured footprints instead, and they would not hold
+still: the same binary varied by several MB run to run under `ControlFlow::Wait` depending on
+whether a redraw had landed before the sample, and a one-window build at four times the window
+area measured *lower* than at one times. A number that cannot order two configurations known to
+differ cannot show that a device is shared. The per-window cost stays unquantified until it can
+be sampled deterministically.
+
+### Runtime handles now carry their runtime's identity
+
+The second window is what exposed this. D-43 rejected an ambient thread-local partly because
+two windows would silently cross-wire; the design it chose had the same hole. A `Signal` was a
+bare index, index 0 exists in every runtime, and reading window A's signal through window B's
+runtime returned *B's* value. Disabling the fix makes the test say `left: Some(99), right:
+None`.
+
+Handles carry the id of the issuing runtime, checked on every read, write and disposal. Four
+bytes on a `Copy` handle. D-43 is amended accordingly rather than quietly patched — the
+decision stands, but its safety argument was doing less work than it claimed.
+
+Worth recording how the scope half of that was nearly missed: the first version of the disposal
+test passed with the guard removed, because the second runtime had no scope at that index and
+refused for lack of one. It only tests the guard now that *both* runtimes open a scope.
+
+**Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
+AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
+response in it, measured on all three platforms.
 
 **One thing measured and left alone.** In the todo example, moving the selection runs one
 effect per row: every row asks "am I the selected one?" and so subscribes to the shared
@@ -444,7 +483,7 @@ but it is linear. That is what this way of modelling a selection costs, not a li
 engine — a list long enough to care would remember the previous row and toggle exactly two.
 Said out loud in a comment rather than quietly shipped.
 
-**Totals:** 499 tests passing
+**Totals:** 501 tests passing
 
 ## Open questions
 

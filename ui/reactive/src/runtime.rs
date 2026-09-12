@@ -14,6 +14,30 @@ use crisol_dom::Dom;
 struct Slot {
     index: u32,
     generation: u32,
+    /// Which runtime issued this handle.
+    ///
+    /// The price of D-43's decision. A `Signal` is an index, and an index means something
+    /// different in every runtime — so handing window A's signal to window B's runtime would
+    /// silently read whatever B has in that slot. An ambient thread-local cannot be confused
+    /// that way, so a design that rejected one for being unsafe has to answer for it.
+    ///
+    /// Four bytes on a `Copy` handle, checked on every access, in exchange for a class of bug
+    /// that would look like one window's state leaking into another's.
+    runtime: RuntimeId,
+}
+
+/// Identifies a [`Runtime`], so a handle cannot be used with the wrong one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct RuntimeId(u32);
+
+impl RuntimeId {
+    fn next() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(1);
+        // Relaxed is enough: the only requirement is that two runtimes never agree, and a
+        // fetch_add gives that regardless of ordering between threads.
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 /// A reactive value.
@@ -154,10 +178,23 @@ pub struct RuntimeStats {
 /// Deliberately an ordinary value rather than an ambient thread-local (DECISIONS D-43): a
 /// second window means a second runtime, and the JS runtime at M16 needs to say which one it
 /// is driving rather than inherit it from whichever thread it happens to be on.
-#[derive(Default)]
+///
+/// Handles carry the identity of the runtime that issued them, so using one with a different
+/// runtime fails rather than reading whatever that runtime has in the same slot.
 pub struct Runtime {
+    id: RuntimeId,
     inner: RefCell<Inner>,
     stats: std::cell::Cell<RuntimeStats>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            id: RuntimeId::next(),
+            inner: RefCell::default(),
+            stats: std::cell::Cell::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Runtime {
@@ -228,10 +265,20 @@ impl Runtime {
         if let Some(owner) = owner {
             inner.scopes[owner as usize].nodes.push(index);
         }
-        Slot { index, generation }
+        Slot {
+            index,
+            generation,
+            runtime: self.id,
+        }
     }
 
-    fn live(inner: &Inner, slot: Slot) -> Option<u32> {
+    fn live(&self, inner: &Inner, slot: Slot) -> Option<u32> {
+        // A handle from another runtime names a slot that exists here and means something
+        // else. Rejecting it is the difference between "this signal is not mine" and one
+        // window quietly reading another's state.
+        if slot.runtime != self.id {
+            return None;
+        }
         let node = inner.nodes.get(slot.index as usize)?;
         (node.generation == slot.generation && !matches!(node.kind, Kind::Free))
             .then_some(slot.index)
@@ -272,7 +319,7 @@ impl Runtime {
     /// conspicuous at the call site.
     #[must_use]
     pub fn peek<T: Clone + 'static>(&self, signal: Signal<T>) -> Option<T> {
-        let index = Self::live(&self.inner.borrow(), signal.slot)?;
+        let index = self.live(&self.inner.borrow(), signal.slot)?;
         self.read_value(index, T::clone)
     }
 
@@ -287,7 +334,7 @@ impl Runtime {
     pub fn set<T: 'static>(&self, signal: Signal<T>, value: T) -> bool {
         let index = {
             let mut inner = self.inner.borrow_mut();
-            let Some(index) = Self::live(&inner, signal.slot) else {
+            let Some(index) = self.live(&inner, signal.slot) else {
                 return false;
             };
             inner.nodes[index as usize].value = Some(Box::new(value));
@@ -301,7 +348,7 @@ impl Runtime {
     pub fn set_if_changed<T: PartialEq + 'static>(&self, signal: Signal<T>, value: T) -> bool {
         {
             let inner = self.inner.borrow();
-            let Some(index) = Self::live(&inner, signal.slot) else {
+            let Some(index) = self.live(&inner, signal.slot) else {
                 return false;
             };
             if inner.nodes[index as usize]
@@ -327,7 +374,7 @@ impl Runtime {
     ) -> Option<R> {
         let (index, result) = {
             let mut inner = self.inner.borrow_mut();
-            let index = Self::live(&inner, signal.slot)?;
+            let index = self.live(&inner, signal.slot)?;
             let value = inner.nodes[index as usize]
                 .value
                 .as_mut()?
@@ -558,7 +605,11 @@ impl Runtime {
         };
 
         let generation = self.inner.borrow().scopes[index as usize].generation;
-        let scope = Scope(Slot { index, generation });
+        let scope = Scope(Slot {
+            index,
+            generation,
+            runtime: self.id,
+        });
         let result = body(scope);
         self.inner.borrow_mut().owners.pop();
         (scope, result)
@@ -584,6 +635,9 @@ impl Runtime {
     /// Returns whether the scope was alive.
     pub fn dispose(&self, scope: Scope, dom: &mut Dom<'_>) -> bool {
         let index = {
+            if scope.0.runtime != self.id {
+                return false;
+            }
             let inner = self.inner.borrow();
             let Some(data) = inner.scopes.get(scope.0.index as usize) else {
                 return false;
@@ -682,7 +736,7 @@ impl<'a> Track<'a> {
     /// Reads a signal by reference, subscribing to it, without cloning.
     #[must_use]
     pub fn with<T: 'static, R>(&self, signal: Signal<T>, read: impl FnOnce(&T) -> R) -> Option<R> {
-        let index = Runtime::live(&self.runtime.inner.borrow(), signal.slot)?;
+        let index = self.runtime.live(&self.runtime.inner.borrow(), signal.slot)?;
         self.runtime.track_read(index);
         self.runtime.read_value(index, read)
     }
@@ -701,7 +755,7 @@ impl<'a> Track<'a> {
     /// Reads a memo by reference, recomputing it first if its inputs changed.
     #[must_use]
     pub fn with_memo<T: 'static, R>(&self, memo: Memo<T>, read: impl FnOnce(&T) -> R) -> Option<R> {
-        let index = Runtime::live(&self.runtime.inner.borrow(), memo.slot)?;
+        let index = self.runtime.live(&self.runtime.inner.borrow(), memo.slot)?;
         // Freshen before subscribing, so the memo's own reads register against the memo and
         // not against whoever is asking for it.
         self.runtime.refresh(index);

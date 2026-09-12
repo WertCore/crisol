@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crisol_display_list::Size;
 use winit::window::Window;
 
-use crate::gpu::{Gpu, GpuError};
+use crate::gpu::{Gpu, GpuError, SharedGpu};
 
 /// A window, its surface, and the configuration they were last agreed on.
 #[derive(Debug)]
@@ -19,7 +19,12 @@ pub struct WindowSurface {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    gpu: Gpu,
+    /// Shared, because a second window must not mean a second device.
+    ///
+    /// An adapter and a logical device are the bulk of what an idle GPU application costs —
+    /// about 17 MB of physical footprint on macOS, measured against the 60 MB the product
+    /// claim allows. Giving every window its own would spend that budget on window count.
+    gpu: SharedGpu,
 }
 
 /// What happened when a frame's surface texture was requested.
@@ -50,8 +55,35 @@ impl WindowSurface {
     pub fn new(window: Arc<Window>) -> Result<Self, GpuError> {
         let instance = wgpu::Instance::new(crate::gpu::instance_descriptor());
         let surface = instance.create_surface(Arc::clone(&window))?;
-        let gpu = Gpu::for_surface(instance, &surface)?;
+        let gpu = SharedGpu::new(Gpu::for_surface(instance, &surface)?);
+        Self::configure(window, surface, gpu)
+    }
 
+    /// Opens a surface for `window` on a device that already exists.
+    ///
+    /// What a second window uses. The adapter, the logical device and the queue are the bulk
+    /// of an idle GPU application's memory, and they are per *application*, not per window —
+    /// creating a second set would double the floor for no reason a user could name.
+    ///
+    /// The shared device comes from an existing surface via [`Self::shared_gpu`], which is
+    /// also what guarantees it can present here: an adapter chosen for one window on a
+    /// multi-GPU laptop is the one attached to that display, and a second window on the same
+    /// display wants the same answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError`] when the surface cannot be created or exposes no format we can
+    /// render to.
+    pub fn with_gpu(gpu: SharedGpu, window: Arc<Window>) -> Result<Self, GpuError> {
+        let surface = gpu.instance.create_surface(Arc::clone(&window))?;
+        Self::configure(window, surface, gpu)
+    }
+
+    fn configure(
+        window: Arc<Window>,
+        surface: wgpu::Surface<'static>,
+        gpu: SharedGpu,
+    ) -> Result<Self, GpuError> {
         let capabilities = surface.get_capabilities(&gpu.adapter);
         let format = choose_format(&capabilities).ok_or(GpuError::NoSurfaceFormat)?;
 
@@ -92,6 +124,15 @@ impl WindowSurface {
     #[must_use]
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
+    }
+
+    /// A handle to that device, for opening a second window on it.
+    ///
+    /// See [`Self::with_gpu`]: a second device is the single most expensive thing a second
+    /// window could do.
+    #[must_use]
+    pub fn shared_gpu(&self) -> SharedGpu {
+        SharedGpu::clone(&self.gpu)
     }
 
     /// The colour format to build a [`crate::Renderer`] for.

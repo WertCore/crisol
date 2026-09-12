@@ -482,3 +482,74 @@ fn a_write_during_a_read_is_not_overwritten_when_the_read_returns() {
     assert_eq!(observed, 1, "the read sees the value it started with");
     assert_eq!(runtime.peek(value), Some(99), "and the write survives");
 }
+
+#[test]
+fn a_handle_from_another_runtime_is_refused() {
+    let mut tree = Tree::new();
+    let mut dom = Dom::new(&mut tree);
+    let first = Runtime::new();
+    let second = Runtime::new();
+
+    // Two runtimes are two arenas, and index 0 exists in both. Without the runtime's
+    // identity on the handle, reading `mine` through `second` would return 99 — one window's
+    // state quietly appearing in another's. That is the hole D-43 had to answer for, having
+    // rejected an ambient thread-local partly on safety grounds.
+    let mine = first.signal(7_i32);
+    let theirs = second.signal(99_i32);
+
+    assert_eq!(first.peek(mine), Some(7));
+    assert_eq!(second.peek(theirs), Some(99));
+    assert_eq!(second.peek(mine), None, "not this runtime's signal");
+    assert_eq!(first.peek(theirs), None);
+
+    assert!(!second.set(mine, 1), "and it cannot be written either");
+    assert_eq!(first.peek(mine), Some(7));
+    assert!(second.update(mine, |value: &mut i32| *value = 2).is_none());
+
+    let track = Cx::new(&second, &mut dom);
+    assert_eq!(track.try_get(mine), None);
+}
+
+#[test]
+fn a_scope_from_another_runtime_is_refused() {
+    let mut tree = Tree::new();
+    let mut dom = Dom::new(&mut tree);
+    let first = Runtime::new();
+    let second = Runtime::new();
+    let seen = log();
+
+    // Both runtimes open a scope, so the index `scope` names is alive in each of them. That
+    // is the whole point: with a scope only in `first`, the disposal below would be refused
+    // because `second` has nothing at that index, the runtime's identity would never be
+    // consulted, and the test would pass whether the guard existed or not.
+    let recorder = Rc::clone(&seen);
+    let mine = first.signal(0_i32);
+    let (scope, ()) = first.scope(|_| {
+        first.effect(&mut dom, move |cx| {
+            recorder.borrow_mut().push(format!("first:{}", cx.get(mine)));
+        });
+    });
+
+    let recorder = Rc::clone(&seen);
+    let theirs = second.signal(0_i32);
+    let (_theirs_scope, ()) = second.scope(|_| {
+        second.effect(&mut dom, move |cx| {
+            recorder.borrow_mut().push(format!("second:{}", cx.get(theirs)));
+        });
+    });
+    taken(&seen);
+
+    // Disposing through the wrong runtime would free whatever occupies that index there,
+    // which is one window silently tearing down another window's effects.
+    assert!(!second.dispose(scope, &mut dom), "not this runtime's scope");
+
+    second.set(theirs, 1);
+    second.flush(&mut dom);
+    assert_eq!(taken(&seen), vec!["second:1"], "the other runtime's effect lives");
+
+    first.set(mine, 1);
+    first.flush(&mut dom);
+    assert_eq!(taken(&seen), vec!["first:1"], "and so does its own");
+
+    assert!(first.dispose(scope, &mut dom), "its own runtime still can");
+}
