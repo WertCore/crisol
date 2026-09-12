@@ -461,6 +461,10 @@ impl Renderer {
 
             let mut current_scissor: Option<Scissor> = None;
             let mut current_pipeline: Option<bool> = None;
+            // glyphon draws with its own pipeline, its own bind group at index 0 — where our
+            // globals live — and its own vertex buffer. After any text, all three have to be
+            // restored before a rectangle or an image is drawn.
+            let mut own_state_bound = true;
 
             for batch in &self.batches {
                 let (scissor, pipeline) = match batch {
@@ -491,15 +495,20 @@ impl Renderer {
                     current_scissor = scissor;
                 }
 
-                if let Some(is_rect) = pipeline
-                    && current_pipeline != Some(is_rect)
-                {
-                    pass.set_pipeline(if is_rect {
-                        &self.rect_pipeline
-                    } else {
-                        &self.image_pipeline
-                    });
-                    current_pipeline = Some(is_rect);
+                if let Some(is_rect) = pipeline {
+                    if current_pipeline != Some(is_rect) {
+                        pass.set_pipeline(if is_rect {
+                            &self.rect_pipeline
+                        } else {
+                            &self.image_pipeline
+                        });
+                        current_pipeline = Some(is_rect);
+                    }
+                    if !own_state_bound {
+                        pass.set_bind_group(0, &self.globals_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+                        own_state_bound = true;
+                    }
                 }
 
                 match batch {
@@ -518,9 +527,18 @@ impl Renderer {
                         stats.draw_calls += 1;
                     }
                     Batch::Text { run, .. } => {
-                        // glyphon sets its own pipeline and bind groups, so the next
-                        // rectangle batch has to set ours again.
+                        // glyphon sets its own pipeline, replaces bind group 0 — where our
+                        // globals live — and binds its own vertex buffer. All three have to be
+                        // restored before the next rectangle or image.
+                        //
+                        // Resetting only the pipeline left the rect shader reading the glyph
+                        // atlas where it expected the globals uniform, which wgpu rejects as
+                        // soon as anything is drawn after text; an element with a background
+                        // following a paragraph is enough to reach it. Restoring the bind
+                        // group but not the vertex buffer stopped the panic and drew nothing,
+                        // which is the worse of the two failures.
                         current_pipeline = None;
+                        own_state_bound = false;
                         // A failure here means the atlas was rebuilt between prepare and
                         // draw. Skipping the run loses this frame's text rather than the
                         // frame; the next frame re-prepares against the grown atlas.

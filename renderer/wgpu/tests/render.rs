@@ -812,3 +812,89 @@ fn a_damage_region_outside_the_surface_draws_nothing_and_does_not_panic() {
         assert_eq!(stats.draw_calls, 0, "everything is outside the damage");
     });
 }
+
+// ---- text and rectangles in one pass ------------------------------------------------------
+
+use crisol_display_list::{Point, TextCommand, TextId};
+use crisol_render_wgpu::TextSource;
+use crisol_text::{FontSystem, TextLayout, TextStyle, Wrapping, shape};
+
+/// A [`TextSource`] holding exactly one shaped run.
+struct OneRun {
+    id: TextId,
+    layout: TextLayout,
+}
+
+impl TextSource for OneRun {
+    fn get(&self, id: TextId) -> Option<&TextLayout> {
+        (id == self.id).then_some(&self.layout)
+    }
+}
+
+/// A rectangle drawn *after* text in the same pass.
+///
+/// glyphon binds its glyph atlas at index 0, which is where the globals uniform lives. The
+/// renderer reset its pipeline after a text batch but not its bind group, so the rect shader
+/// read the atlas where it expected the uniform and wgpu rejected the draw.
+///
+/// The shape is ordinary rather than exotic: any element with a background that follows a
+/// paragraph produces it, and so does a scrollbar thumb drawn over a list. Nothing caught it
+/// because this file had no text in it at all and the paint tests stop at the display list.
+#[test]
+fn a_rectangle_drawn_after_text_still_finds_its_globals() {
+    let mut fonts = FontSystem::new();
+    if fonts.is_empty() {
+        let required = std::env::var("CRISOL_REQUIRE_FONTS").is_ok_and(|value| value == "1");
+        assert!(
+            !required,
+            "CRISOL_REQUIRE_FONTS=1 but no fonts are installed"
+        );
+        eprintln!("skipping: no fonts installed");
+        return;
+    }
+    let layout = shape(
+        &mut fonts,
+        "Ag",
+        &TextStyle::default(),
+        None,
+        Wrapping::Word,
+    );
+
+    with_gpu(|gpu| {
+        let green = Color::from_rgba8(0, 200, 0, 255);
+        let logical = Size::new(48.0, 48.0);
+        let mut renderer = Renderer::new(&gpu, HEADLESS_FORMAT);
+        let target = HeadlessTarget::new(&gpu, 48, 48);
+
+        let mut builder = DisplayListBuilder::new(logical);
+        builder.set_background(Color::WHITE);
+        builder.push_text(TextCommand {
+            text: TextId(7),
+            origin: Point::new(2.0, 2.0),
+            color: Color::BLACK,
+        });
+        // The one that used to panic.
+        builder.fill_rect(Rect::from_xywh(30.0, 30.0, 12.0, 12.0), green);
+        let list = builder.build();
+
+        renderer.render_text(
+            FrameTarget {
+                view: target.view(),
+                width: 48,
+                height: 48,
+                scale_factor: 1.0,
+                damage: None,
+            },
+            &list,
+            &mut fonts,
+            &OneRun {
+                id: TextId(7),
+                layout,
+            },
+        );
+
+        let pixels = target.read_pixels(&gpu);
+        pixels.assert_pixel(35, 35, green, TOLERANCE);
+        pixels.assert_pixel(20, 20, Color::WHITE, TOLERANCE);
+    });
+}
