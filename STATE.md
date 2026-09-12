@@ -510,6 +510,46 @@ from the same scripted run: **5.0 MiB (`phys_footprint`), debug, no GPU device**
 comparable with the 25.5 MB in the table above, which was release and had a window; the line
 prints its profile for that reason.
 
+### What a 5 MB response costs, before building the application for it
+
+M8's acceptance puts a 5 MB response in an API-client-shaped application. Whether the obvious
+way to build that works at all is worth knowing first, because if it does not the answer
+changes what to build rather than how to tune it.
+
+The obvious way is what a code viewer does: one element per line, one text node inside it. A
+5 MB pretty-printed JSON body is **240,884 lines**. Measured with the probe above, one
+configuration per process:
+
+| lines | nodes | memory | layout | marginal |
+|---|---|---|---|---|
+| 1,000 | 2,002 | 23.1 MiB | 66 ms | |
+| 10,000 | 20,002 | 158.3 MiB | 1,541 ms | 15,747 bytes/line |
+| 50,000 | 100,002 | 761.8 MiB | 43,328 ms | 15,821 bytes/line |
+
+**About 15.8 KB per line of a 22-byte line**, and the whole response projects to roughly
+**3.7 GiB** against a 60 MB budget. One element per line does not fit, and not by a margin any
+tuning closes: the response pane has to build nodes for the lines *in view* rather than for the
+response.
+
+**Where it goes**, measured in a process that did only this:
+
+| stage | bytes/line | |
+|---|---|---|
+| dom | 1,016 | an element and a text node |
+| style | 16 | interned, so shared between identical lines — D-21 working |
+| **layout** | **14,818** | **box tree, shaped text, cache — 93% of it** |
+
+Layout is the whale, not the `Node` the memory measurement was worrying about earlier. Whatever
+the virtualised pane looks like, what it must avoid building is laid-out and shaped text.
+
+**A process per measurement, because the first version of this was wrong.** Measuring every
+size in one process produced two numbers that disagreed sixfold — ~13 KB per line as a
+difference of totals, ~2.6 KB as a difference of stages. Freeing a 670 MiB tree does not return
+the memory to the operating system, so every later reading was taken against an allocator
+holding an earlier one's pages, and which way that skewed a number depended on which way it was
+being subtracted. Isolated, the two methods now agree to within 1% (15,821 and 15,850), and
+that agreement is the only reason to believe either.
+
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
 response in it, measured on all three platforms.
