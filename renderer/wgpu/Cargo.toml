@@ -12,3 +12,18 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-display-list.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+raw-window-handle.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[dev-dependencies]
+# The window example needs wgpu types (`TextureViewDescriptor`) directly, which the
+# renderer does not re-export on purpose: nothing above it should be touching them.
+wgpu.workspace = true
+
+[[example]]
+name = "window"

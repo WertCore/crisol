@@ -32,7 +32,7 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wertcore/crisol"
 authors = ["Crisol contributors"]
@@ -74,6 +74,14 @@ crisol-async = { path = "runtime/async", version = "0.0.0" }
 crisol-interp = { path = "runtime/interp", version = "0.0.0" }
 crisol-dom = { path = "dom", version = "0.0.0" }
 crisol-host = { path = "host", version = "0.0.0" }
+
+# Third-party. Pinned here so every crate in the workspace agrees on a version.
+wgpu = "30"
+winit = "0.30.13"
+pollster = "1"
+bytemuck = { version = "1.25", features = ["derive"] }
+raw-window-handle = "0.6"
+thiserror = "2"
 
 [profile.release]
 lto = "thin"

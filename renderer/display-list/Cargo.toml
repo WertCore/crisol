@@ -1,6 +1,6 @@
 [package]
 name = "crisol-display-list"
-description = "Backend-independent draw command list."
+description = "Backend-independent draw command list and the geometry types shared across the engine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

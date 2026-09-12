@@ -218,3 +218,54 @@ pipeline without a GPU or a window — a headless layout service, a snapshot tes
 rasterizer — turns it off and does not compile a graphics stack it will not use.
 
 ---
+
+## D-12 — Geometry types live in `crisol-display-list`, not in a separate crate
+
+**Status:** Accepted (M1) · **Affects:** M1, M2, M3, M5
+
+`Point`, `Size`, `Rect`, `Color` and `Transform` are needed by the tree, layout, paint,
+events and the renderer. They could live in a `crisol-geom` crate.
+
+They live in `crisol-display-list` instead, which has no dependencies of its own and sits
+below everything that needs them. A separate geometry crate would be a 26th manifest
+carrying about 300 lines. Revisit if a crate needs geometry but must not depend on the
+display list; nothing does today.
+
+---
+
+## D-13 — The renderer consumes a display list; it does not know about the tree
+
+**Status:** Accepted (M1) · **Affects:** M1, M2, M6, M22
+
+`crisol-render-wgpu` takes a `DisplayList` and nothing else. It has no reference to
+`crisol-tree`, no style, no layout. This keeps the GPU backend swappable, makes render
+snapshot tests possible without constructing a document, and is what lets M6's damage
+regions be expressed as a property of the display list rather than of the renderer.
+
+---
+
+## D-14 — One pipeline, one instanced draw call for rectangles
+
+**Status:** Accepted (M1) · **Affects:** M1, M6, M22
+
+Rounded rectangles, borders and solid fills are drawn by a single shader that
+signed-distance-fields the rounded box, fed by a per-instance vertex buffer. One pipeline,
+one draw call per clip group, no mid-pass render target switches.
+
+This is D-09's tile-GPU constraint applied concretely: a naive "one draw call per node"
+renderer is acceptable on a desktop immediate-mode GPU and pathological on a mobile tiler.
+Building it instanced from the start costs a day at M1 and avoids a rewrite at M22.
+
+---
+
+## D-15 — Premultiplied alpha in the display list, sRGB surface
+
+**Status:** Accepted (M1) · **Affects:** M1, M3, M4
+
+`Color` stores straight (non-premultiplied) `f32` RGBA components in the sRGB color space
+because that is what CSS authors write and what `lightningcss` will hand us. Premultiplication
+happens in the shader, and the surface is configured with an sRGB texture format so the GPU
+does the encode. Blending is therefore correct without any manual gamma arithmetic in the
+display list.
+
+---
