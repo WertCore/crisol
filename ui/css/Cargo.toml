@@ -19,4 +19,8 @@ lightningcss.workspace = true
 precomputed-hash.workspace = true
 selectors.workspace = true
 smallvec.workspace = true
+static-self.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+lightningcss.workspace = true

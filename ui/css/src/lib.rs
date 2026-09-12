@@ -20,6 +20,7 @@ pub mod element;
 pub mod ident;
 pub mod matching;
 pub mod selector;
+pub mod stylesheet;
 
 pub use element::ElementRef;
 pub use ident::CssIdent;
@@ -27,3 +28,4 @@ pub use matching::{MatchCaches, SelectorParseError, parse_selector_list};
 pub use selector::{
     CrisolPseudoClass, CrisolPseudoElement, CrisolSelectors, Selector, SelectorList,
 };
+pub use stylesheet::{Origin, StyleRule, Stylesheet};
