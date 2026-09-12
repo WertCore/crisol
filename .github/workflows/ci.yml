@@ -51,6 +51,11 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features
+        env:
+          # Without this a machine with no GPU adapter *skips* every render test, and a run
+          # where they all skipped is indistinguishable from a run where they all passed.
+          # Linux gets its adapter from the lavapipe software rasteriser installed above.
+          CRISOL_REQUIRE_GPU: 1
 
       - name: Docs
         run: cargo doc --workspace --no-deps
@@ -74,8 +79,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Add target
+        # Not the setup action's `targets:` input: that installs the target for `stable`,
+        # while `rust-toolchain.toml` pins the toolchain cargo actually uses. `rustup target
+        # add` here resolves against the pinned toolchain, which is the one that needs it.
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace --target ${{ matrix.target }}
