@@ -209,6 +209,15 @@ impl StyleEngine {
                 .is_none_or(|old| !Arc::ptr_eq(old, &computed));
             styles.insert(id, Arc::clone(&computed));
 
+            // A style *may* have changed is not the same as it *did*. Marking layout here,
+            // where the interner makes the question a pointer comparison (D-21), is what
+            // stops a structural insert from relaying out every sibling: adding one row to
+            // a list marks all of them for restyle, because `:nth-child` could have moved,
+            // but almost none of them actually compute to a different style.
+            if changed {
+                tree.mark_dirty(id, DirtyFlags::LAYOUT);
+            }
+
             let mut child = tree.get(id).and_then(crisol_tree::Node::last_child);
             while let Some(node) = child {
                 stack.push((node, Arc::clone(&computed), changed));

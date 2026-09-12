@@ -177,16 +177,41 @@ fn marking_a_leaf_dirty_tells_its_ancestors() {
     assert_eq!(tree.dirty(c), DirtyFlags::empty());
 }
 
+/// A style mark is only a style mark.
+///
+/// It reaches layout through the style pass, which marks `LAYOUT` on the nodes whose style
+/// genuinely changed — not through an implication asserted here, where all that is known is
+/// that some selector needs re-evaluating. Inserting a row into a list marks every sibling
+/// for `:nth-child`, and relaying all of them out was the cost of assuming otherwise.
 #[test]
-fn a_style_change_implies_layout_and_paint() {
+fn a_style_change_marks_only_style() {
     let (mut tree, [root, a, b, _]) = three_levels();
     tree.clear_all_dirty();
 
     tree.mark_dirty(b, DirtyFlags::STYLE);
 
-    assert_eq!(tree.dirty(b), DirtyFlags::ALL_SELF);
-    assert_eq!(tree.dirty(a), DirtyFlags::ALL_SUBTREE);
-    assert_eq!(tree.dirty(root), DirtyFlags::ALL_SUBTREE);
+    assert_eq!(tree.dirty(b), DirtyFlags::STYLE);
+    assert_eq!(tree.dirty(a), DirtyFlags::SUBTREE_STYLE);
+    assert_eq!(tree.dirty(root), DirtyFlags::SUBTREE_STYLE);
+}
+
+/// ...and a layout mark still implies paint, because a box that moved leaves pixels behind.
+#[test]
+fn a_layout_change_implies_paint() {
+    let (mut tree, [root, a, b, _]) = three_levels();
+    tree.clear_all_dirty();
+
+    tree.mark_dirty(b, DirtyFlags::LAYOUT);
+
+    assert_eq!(tree.dirty(b), DirtyFlags::LAYOUT | DirtyFlags::PAINT);
+    assert_eq!(
+        tree.dirty(a),
+        DirtyFlags::SUBTREE_LAYOUT | DirtyFlags::SUBTREE_PAINT
+    );
+    assert_eq!(
+        tree.dirty(root),
+        DirtyFlags::SUBTREE_LAYOUT | DirtyFlags::SUBTREE_PAINT
+    );
 }
 
 /// The property M6's acceptance test will lean on: re-marking an already-dirty subtree

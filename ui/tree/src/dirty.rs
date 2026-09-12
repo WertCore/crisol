@@ -55,15 +55,21 @@ impl DirtyFlags {
 
     /// Expands a request into everything it implies.
     ///
-    /// A style change can change the box, and a box change changes the pixels. Callers ask
-    /// for the narrowest thing that is true and get the correct closure, instead of every
-    /// call site having to remember the implication order.
+    /// A box change changes the pixels, so `LAYOUT` implies `PAINT`. Callers ask for the
+    /// narrowest thing that is true and get the correct closure, instead of every call site
+    /// having to remember the implication order.
+    ///
+    /// **`STYLE` does not imply `LAYOUT`**, though a style change often does change the box.
+    /// The implication is real but it is not knowable here: `mark_dirty` is told a style
+    /// *may* have changed, and assuming it did costs a relayout of every node whose
+    /// selectors merely needed re-evaluating. Inserting one row into a thousand-row list
+    /// marks every sibling for restyle, because `:nth-child` could have moved — and none of
+    /// their boxes change. The style pass resolves it instead, marking `LAYOUT` on the nodes
+    /// that genuinely computed to a different style, which interning makes a pointer
+    /// comparison.
     #[must_use]
     pub fn expanded(self) -> Self {
         let mut out = self;
-        if out.contains(Self::STYLE) {
-            out |= Self::LAYOUT;
-        }
         if out.contains(Self::LAYOUT) {
             out |= Self::PAINT;
         }
@@ -76,8 +82,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn style_implies_layout_and_paint() {
-        assert_eq!(DirtyFlags::STYLE.expanded(), DirtyFlags::ALL_SELF);
+    fn layout_implies_paint_but_style_implies_neither() {
+        assert_eq!(
+            DirtyFlags::LAYOUT.expanded(),
+            DirtyFlags::LAYOUT | DirtyFlags::PAINT
+        );
+        // A style change usually does move the box, but `mark_dirty` is only told it *may*
+        // have changed. Assuming it did relaid out every sibling of an inserted list row,
+        // because a structural change marks them all for `:nth-child`. The style pass marks
+        // `LAYOUT` on the ones whose style genuinely differs.
+        assert_eq!(DirtyFlags::STYLE.expanded(), DirtyFlags::STYLE);
     }
 
     #[test]
