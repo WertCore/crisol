@@ -51,7 +51,7 @@ mod runtime;
 mod view;
 
 pub use list::{Keyed, ListStats};
-pub use runtime::{Cx, Effect, Memo, Runtime, RuntimeStats, Scope, Signal, Track};
+pub use runtime::{Cx, Memo, Runtime, RuntimeStats, Scope, Signal, Track};
 pub use view::{
     Mounted, View, append, bind_attribute, bind_class, bind_text, element, element_with_class,
     mount, text,

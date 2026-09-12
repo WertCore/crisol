@@ -70,10 +70,6 @@ impl<T> std::fmt::Debug for Memo<T> {
     }
 }
 
-/// A side effect that re-runs when what it read changes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Effect(Slot);
-
 /// An ownership region. Disposing one drops everything created inside it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Scope(Slot);
@@ -461,10 +457,12 @@ impl Runtime {
     ///
     /// The first run is not an optimisation detail: an effect that has never run has no
     /// dependencies, and would never run again.
-    pub fn effect(&self, dom: &mut Dom<'_>, body: impl FnMut(&mut Cx<'_, '_>) + 'static) -> Effect {
+    ///
+    /// An effect is stopped by disposing the [`Scope`] that owns it, so there is no handle to
+    /// return — one that could not be used for anything would only suggest otherwise.
+    pub fn effect(&self, dom: &mut Dom<'_>, body: impl FnMut(&mut Cx<'_, '_>) + 'static) {
         let slot = self.alloc(Kind::Effect(Some(Box::new(body))), None);
         self.run_effect(slot.index, dom);
-        Effect(slot)
     }
 
     fn run_effect(&self, index: u32, dom: &mut Dom<'_>) {
@@ -734,14 +732,6 @@ impl<'a, 'd> Cx<'a, 'd> {
         Self {
             track: Track { runtime },
             dom,
-        }
-    }
-
-    /// Re-borrows, so a helper can be handed a context without giving up ownership of one.
-    pub fn reborrow(&mut self) -> Cx<'_, 'd> {
-        Cx {
-            track: self.track,
-            dom: self.dom,
         }
     }
 }

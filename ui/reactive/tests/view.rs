@@ -186,3 +186,51 @@ fn a_component_can_mount_another_component_and_own_it() {
     assert_eq!(runtime.stats().effects_run, 0);
     assert!(!dom.is_alive(inner));
 }
+
+#[test]
+fn clearing_a_list_disposes_every_item() {
+    use crisol_reactive::Keyed;
+
+    let mut tree = Tree::new();
+    let mut dom = Dom::new(&mut tree);
+    let runtime = Runtime::new();
+    let list = dom.create_element("ul");
+    dom.set_root(list);
+
+    let labels: Vec<_> = (0..4)
+        .map(|i| runtime.signal(format!("item {i}")))
+        .collect();
+    let keys: Vec<u32> = (0..4).collect();
+    let mut keyed = Keyed::new(list);
+    {
+        let mut cx = Cx::new(&runtime, &mut dom);
+        keyed.reconcile(&mut cx, &keys, |cx, &key| {
+            let row = element(cx, "li");
+            let content = text(cx, "");
+            append(cx, row, content);
+            let label = labels[key as usize];
+            bind_text(cx, content, move |track| track.get(label));
+            row
+        });
+    }
+    let rows = keyed.nodes();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(dom.children(list), rows, "the reconciler owns every child");
+    assert!(!keyed.is_empty() && keyed.len() == 4);
+
+    {
+        let mut cx = Cx::new(&runtime, &mut dom);
+        keyed.clear(&mut cx);
+    }
+    assert!(keyed.is_empty());
+    assert!(dom.children(list).is_empty());
+    assert!(rows.iter().all(|&row| !dom.is_alive(row)));
+
+    // Every item's effects went with it: writing the signals they read wakes nothing.
+    runtime.reset_stats();
+    for (index, label) in labels.iter().enumerate() {
+        runtime.set(*label, format!("changed {index}"));
+    }
+    runtime.flush(&mut dom);
+    assert_eq!(runtime.stats().effects_run, 0);
+}
