@@ -10,14 +10,18 @@ actually is.
 
 ## Accept criteria for the current milestone
 
-> **M8 — platform polish.** High-DPI, multi-monitor, window lifecycle, clipboard, cursors,
-> file dialogs, and the dozens of small things that separate a demo from an application.
+> **M8 — Platform polish.** Momentum scrolling, scrollbars, multi-window, native menus, drag
+> and drop, bidi text, cursor shapes, window chrome, packaging (.app, .msi, AppImage).
 >
-> **Accept:** the M5 demo app behaves correctly on all three desktop platforms.
+> **Accept:** a real API-client-shaped application built entirely in Rust, measured at
+> < 60MB RSS idle with a 5MB JSON response loaded.
+>
+> **Notes:** Record the memory number. It is the product claim and needs to be defensible.
 
-**§7's first kill criterion lands here.** After M8, measure idle RSS against a WebView
-baseline. If it is not meaningfully lower, the core product claim is unsupported and that has
-to be said out loud rather than worked around.
+**§7's first kill criterion lands here**, and it is the acceptance rather than a footnote to
+it: *if idle RSS is not meaningfully below a WebView2/WKWebView baseline for an equivalent
+app, the core product claim is unsupported. Re-evaluate.* The number has to be measured and
+written down, including if it is bad.
 
 ---
 
