@@ -24,10 +24,10 @@
 #![doc(html_root_url = "https://docs.rs/crisol-paint/0.0.0")]
 
 use crisol_display_list::{
-    Clip, Color, DisplayList, DisplayListBuilder, Point, Rect, RectCommand, Size, TextCommand,
-    TextId,
+    Clip, Color, Corners, DisplayList, DisplayListBuilder, Edges, Edges4, Point, Rect, RectCommand,
+    Size, TextCommand, TextId,
 };
-use crisol_tree::{BoxStyle, NodeId, NodeKind, Tree};
+use crisol_tree::{BoxStyle, Node, NodeId, NodeKind, Tree};
 
 /// How a tree is painted.
 ///
@@ -48,6 +48,39 @@ pub struct PaintOptions {
     /// The renderer still has to clip to the same rectangle: culling here removes commands
     /// that cannot touch it, but a command that partly overlaps is kept whole.
     pub damage: Option<Rect>,
+    /// How scrollbars are drawn, or `None` to draw none.
+    ///
+    /// Drawn by the engine rather than described in CSS, and overlaid rather than given
+    /// space in layout — which is why taffy is never told to reserve any. An application
+    /// that wants its own can turn these off and build them out of ordinary nodes.
+    pub scrollbars: Option<ScrollbarStyle>,
+}
+
+/// How an overlay scrollbar looks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarStyle {
+    /// Width of a vertical bar, height of a horizontal one, in logical pixels.
+    pub thickness: f32,
+    /// Gap between the bar and the edges of the container.
+    pub inset: f32,
+    /// Colour of the thumb. The track is not drawn.
+    pub thumb: Color,
+    /// Shortest the thumb is allowed to get, however long the content is.
+    ///
+    /// Without a floor, a long enough document produces a thumb under a pixel tall, which
+    /// is both invisible and impossible to grab.
+    pub min_length: f32,
+}
+
+impl Default for ScrollbarStyle {
+    fn default() -> Self {
+        Self {
+            thickness: 6.0,
+            inset: 2.0,
+            thumb: Color::rgba(0.5, 0.5, 0.5, 0.65),
+            min_length: 24.0,
+        }
+    }
 }
 
 impl PaintOptions {
@@ -58,6 +91,25 @@ impl PaintOptions {
             viewport,
             background: Color::WHITE,
             damage: None,
+            scrollbars: Some(ScrollbarStyle::default()),
+        }
+    }
+
+    /// The same options with a different scrollbar appearance.
+    #[must_use]
+    pub fn with_scrollbars(self, scrollbars: ScrollbarStyle) -> Self {
+        Self {
+            scrollbars: Some(scrollbars),
+            ..self
+        }
+    }
+
+    /// The same options, drawing no scrollbars.
+    #[must_use]
+    pub fn without_scrollbars(self) -> Self {
+        Self {
+            scrollbars: None,
+            ..self
         }
     }
 
@@ -85,6 +137,8 @@ impl PaintOptions {
 pub struct PaintStats {
     /// Nodes the walk descended into.
     pub nodes_visited: usize,
+    /// Scrollbar thumbs drawn.
+    pub scrollbars: usize,
     /// Subtrees skipped whole because they could not touch the damaged rectangle.
     pub subtrees_culled: usize,
     /// Nodes that emitted a box.
@@ -123,7 +177,14 @@ pub fn paint_with_stats(tree: &Tree, options: &PaintOptions) -> (DisplayList, Pa
         true
     });
     let stats = match tree.root() {
-        Some(root) => paint_damaged(tree, root, Point::ZERO, &mut builder, options.damage),
+        Some(root) => paint_damaged(
+            tree,
+            root,
+            Point::ZERO,
+            &mut builder,
+            options.damage,
+            options.scrollbars,
+        ),
         None => PaintStats::default(),
     };
     if clipped {
@@ -147,6 +208,8 @@ enum Step {
     },
     /// Close the clip a node opened.
     PopClip,
+    /// Draw a scroll container's bars, over its content.
+    Scrollbars { id: NodeId, bounds: Rect },
 }
 
 /// Paints the subtree rooted at `root`, positioning it as if its parent's border box
@@ -160,7 +223,14 @@ pub fn paint_subtree(
     origin: Point,
     builder: &mut DisplayListBuilder,
 ) -> PaintStats {
-    paint_damaged(tree, root, origin, builder, None)
+    paint_damaged(
+        tree,
+        root,
+        origin,
+        builder,
+        None,
+        Some(ScrollbarStyle::default()),
+    )
 }
 
 /// As [`paint_subtree`], skipping subtrees that cannot touch `damage`.
@@ -170,6 +240,7 @@ fn paint_damaged(
     origin: Point,
     builder: &mut DisplayListBuilder,
     damage: Option<Rect>,
+    scrollbars: Option<ScrollbarStyle>,
 ) -> PaintStats {
     let mut stats = PaintStats::default();
     let mut stack = vec![Step::Enter {
@@ -178,6 +249,12 @@ fn paint_damaged(
     }];
 
     while let Some(step) = stack.pop() {
+        if let Step::Scrollbars { id, bounds } = step {
+            if let (Some(node), Some(style)) = (tree.get(id), scrollbars) {
+                stats.scrollbars += emit_scrollbars(builder, bounds, node, style);
+            }
+            continue;
+        }
         let Step::Enter { id, parent_origin } = step else {
             builder.pop_clip();
             continue;
@@ -258,6 +335,12 @@ fn paint_damaged(
             stack.push(Step::PopClip);
         }
 
+        // Queued before the children so it pops after them: the bar goes over the content,
+        // and inside the clip, which is what makes a rounded container trim its own bar.
+        if scrollbars.is_some() && node.style.scrolls {
+            stack.push(Step::Scrollbars { id, bounds });
+        }
+
         // Children are painted over their parent and in document order, so they are pushed
         // last-first onto a stack that pops in reverse.
         //
@@ -271,7 +354,7 @@ fn paint_damaged(
                 id: current,
                 parent_origin: child_origin,
             });
-            child = tree.get(current).and_then(crisol_tree::Node::prev_sibling);
+            child = tree.get(current).and_then(Node::prev_sibling);
         }
     }
 
@@ -303,6 +386,68 @@ fn touches_damage(tree: &Tree, id: NodeId, bounds: Rect, damage: Rect) -> bool {
         child = tree.next_sibling(node);
     }
     false
+}
+
+/// Emits a scroll container's thumbs, over its content. Returns how many were drawn.
+///
+/// Overlaid rather than given space in layout, so the content underneath is not reflowed by
+/// a bar appearing — which is why taffy is never asked to reserve room for one.
+fn emit_scrollbars(
+    builder: &mut DisplayListBuilder,
+    bounds: Rect,
+    node: &Node,
+    style: ScrollbarStyle,
+) -> usize {
+    let max = node.scroll_max;
+    let offset = node.scroll_offset;
+    let mut drawn = 0;
+
+    // A thumb's length is the visible share of the content, floored so that a very long
+    // document still leaves something to see and to grab.
+    let mut thumb = |along: f32, across: f32, extent: f32, at: f32, vertical: bool| {
+        let track = along - style.inset * 2.0;
+        let content = along + extent;
+        if track <= 0.0 || content <= 0.0 {
+            return;
+        }
+        let length = (track * (along / content)).max(style.min_length).min(track);
+        let travel = track - length;
+        let start = style.inset + travel * (at / extent).clamp(0.0, 1.0);
+        let side = across - style.thickness - style.inset;
+
+        let rect = if vertical {
+            Rect::from_xywh(
+                bounds.min_x() + side,
+                bounds.min_y() + start,
+                style.thickness,
+                length,
+            )
+        } else {
+            Rect::from_xywh(
+                bounds.min_x() + start,
+                bounds.min_y() + side,
+                length,
+                style.thickness,
+            )
+        };
+        if builder.push_rect(RectCommand {
+            rect,
+            radii: Corners::all(style.thickness / 2.0),
+            fill: style.thumb,
+            border_color: Edges4::all(Color::TRANSPARENT),
+            border_width: Edges::ZERO,
+        }) {
+            drawn += 1;
+        }
+    };
+
+    if max.height > 0.0 {
+        thumb(bounds.height(), bounds.width(), max.height, offset.y, true);
+    }
+    if max.width > 0.0 {
+        thumb(bounds.width(), bounds.height(), max.width, offset.x, false);
+    }
+    drawn
 }
 
 /// Emits a node's background and border. Returns whether the builder kept the command.

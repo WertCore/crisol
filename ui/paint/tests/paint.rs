@@ -674,3 +674,111 @@ fn a_scroll_container_does_not_displace_its_own_box() {
     let blue = painted.iter().find(|(_, color)| *color == BLUE).unwrap();
     assert_eq!(blue.0, Rect::from_xywh(10.0, 100.0, 50.0, 50.0));
 }
+
+// ---- scrollbars ------------------------------------------------------------------------
+
+use crisol_paint::ScrollbarStyle;
+
+/// The thumb is the last rect: it is drawn over the content it belongs to.
+fn thumb(tree: &Tree, options: &PaintOptions) -> Option<Rect> {
+    let painted = rects(&paint(tree, options));
+    let style = options.scrollbars?;
+    painted
+        .last()
+        .filter(|(_, color)| *color == style.thumb)
+        .map(|(rect, _)| *rect)
+}
+
+#[test]
+fn a_scroll_container_draws_a_thumb_sized_to_the_visible_share() {
+    let (tree, _, _) = scroller();
+    let options = options();
+
+    // 200 of viewport, 400 of content: half is visible, so the thumb is half the track.
+    // Track is the box less the inset at each end: 200 - 4 = 196.
+    let bar = thumb(&tree, &options).expect("a thumb");
+    assert_eq!(bar.height(), 98.0);
+    assert_eq!(bar.min_y(), 2.0, "parked at the top");
+    assert_eq!(
+        (bar.min_x(), bar.width()),
+        (192.0, 6.0),
+        "inset from the right edge, overlaying the content rather than displacing it"
+    );
+}
+
+#[test]
+fn the_thumb_travels_the_track_as_the_content_scrolls() {
+    let (mut tree, viewport, _) = scroller();
+    let options = options();
+
+    tree.set_scroll(viewport, Point::new(0.0, 100.0));
+    let half = thumb(&tree, &options).unwrap();
+    assert_eq!(
+        half.min_y(),
+        51.0,
+        "halfway down a 98px travel, plus the inset"
+    );
+
+    tree.set_scroll(viewport, Point::new(0.0, 200.0));
+    let end = thumb(&tree, &options).unwrap();
+    assert_eq!(
+        end.max_y(),
+        198.0,
+        "at the end of the content the thumb is at the end of the track"
+    );
+}
+
+#[test]
+fn a_container_with_nowhere_to_go_draws_no_thumb() {
+    let (mut tree, viewport, _) = scroller();
+    tree.node_mut(viewport).scroll_max = Size::new(0.0, 0.0);
+
+    let (_, stats) = paint_with_stats(&tree, &options());
+    assert_eq!(stats.scrollbars, 0);
+}
+
+#[test]
+fn a_very_long_document_still_gets_a_thumb_worth_grabbing() {
+    let (mut tree, viewport, _) = scroller();
+    // A hundred screens of content. The proportional thumb would be about two pixels.
+    tree.node_mut(viewport).scroll_max = Size::new(0.0, 20_000.0);
+
+    let bar = thumb(&tree, &options()).unwrap();
+    assert_eq!(
+        bar.height(),
+        ScrollbarStyle::default().min_length,
+        "a thumb under a pixel tall is invisible and impossible to grab"
+    );
+    assert!(
+        bar.min_y() >= 2.0 && bar.max_y() <= 198.0,
+        "still inside the track"
+    );
+}
+
+#[test]
+fn both_axes_get_a_thumb_when_both_overflow() {
+    let (mut tree, viewport, _) = scroller();
+    tree.node_mut(viewport).scroll_max = Size::new(200.0, 200.0);
+
+    let (_, stats) = paint_with_stats(&tree, &options());
+    assert_eq!(stats.scrollbars, 2);
+}
+
+#[test]
+fn scrollbars_can_be_turned_off_for_an_application_that_draws_its_own() {
+    let (tree, _, _) = scroller();
+    let (_, stats) = paint_with_stats(&tree, &options().without_scrollbars());
+    assert_eq!(stats.scrollbars, 0);
+}
+
+#[test]
+fn the_thumb_is_drawn_over_the_content_not_under_it() {
+    let (tree, _, _) = scroller();
+    let painted = rects(&paint(&tree, &options()));
+
+    // Painter's order: the container, then the column, then the bar. A thumb emitted with
+    // the node's own box would end up beneath the content it is meant to sit on.
+    assert_eq!(painted[0].1, RED);
+    assert_eq!(painted[1].1, GREEN);
+    assert_eq!(painted[2].1, ScrollbarStyle::default().thumb);
+}

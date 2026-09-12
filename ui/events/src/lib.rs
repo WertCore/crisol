@@ -17,4 +17,4 @@ pub use event::{
 pub use focus::{Direction as FocusDirection, Focusable, focusable, next_focus, tab_order};
 pub use hit::{Hit, TextLookup, hit_test, hit_test_with_text, path_to};
 pub use ime::{ImeCursorArea, ImeEvent, ImeState, Preedit};
-pub use scroll::{Scrolled, scroll_at, scroll_from};
+pub use scroll::{Fling, Scrolled, VelocityTracker, scroll_at, scroll_from};

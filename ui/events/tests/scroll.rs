@@ -156,3 +156,121 @@ fn a_scroll_reports_the_area_that_has_to_be_repainted() {
         scroll_at(&mut tree, Point::new(50.0, 50.0), Point::new(0.0, 40.0)).expect("moved");
     assert_eq!(scrolled.damage, tree.absolute_rect(outer).unwrap());
 }
+
+// ---- momentum ----------------------------------------------------------------------------
+
+use std::time::Duration;
+
+use crisol_events::{Fling, VelocityTracker};
+
+const FRAME: Duration = Duration::from_micros(16_667);
+
+#[test]
+fn a_slow_release_is_not_a_flick() {
+    let (_, _, inner, _) = nested();
+    assert!(Fling::new(inner, Point::new(0.0, 20.0)).is_none());
+    assert!(Fling::new(inner, Point::new(0.0, 400.0)).is_some());
+}
+
+#[test]
+fn a_fling_decays_to_a_stop() {
+    let (mut tree, _, inner, _) = nested();
+    let mut fling = Fling::new(inner, Point::new(0.0, 600.0)).unwrap();
+
+    let mut frames = 0;
+    let mut travelled = 0.0;
+    while let Some(step) = fling.advance(&mut tree, FRAME) {
+        travelled += step.applied.y;
+        frames += 1;
+        assert!(
+            frames < 600,
+            "a fling that never ends is a spinning frame loop"
+        );
+    }
+
+    assert!(fling.is_finished());
+    assert!(travelled > 0.0, "it went somewhere: {travelled}");
+    assert!(
+        (2..=180).contains(&frames),
+        "a flick should settle in well under three seconds, took {frames} frames"
+    );
+}
+
+#[test]
+fn distance_does_not_depend_on_the_frame_rate() {
+    let total = Duration::from_millis(300);
+    let at = |frames: u32| {
+        let (mut tree, _, inner, _) = nested();
+        let mut fling = Fling::new(inner, Point::new(0.0, 500.0)).unwrap();
+        let step = total / frames;
+        for _ in 0..frames {
+            fling.advance(&mut tree, step);
+        }
+        tree.scroll_offset(inner).y
+    };
+
+    // Integrating the decay over the interval rather than holding the speed for the frame
+    // is what makes these agree. A fling that travelled further on a 120Hz display is a bug
+    // people feel without being able to name.
+    let sixty = at(18);
+    let hundred_and_twenty = at(36);
+    assert!(
+        (sixty - hundred_and_twenty).abs() < 1.0,
+        "60Hz went {sixty}, 120Hz went {hundred_and_twenty}"
+    );
+}
+
+#[test]
+fn a_fling_stops_at_the_end_rather_than_chaining_outward() {
+    let (mut tree, outer, inner, _) = nested();
+    tree.set_scroll(inner, Point::new(0.0, 190.0));
+
+    let mut fling = Fling::new(inner, Point::new(0.0, 3_000.0)).unwrap();
+    while fling.advance(&mut tree, FRAME).is_some() {}
+
+    assert_eq!(tree.scroll_offset(inner).y, 200.0);
+    assert_eq!(
+        tree.scroll_offset(outer).y,
+        0.0,
+        "a flick belongs to the list it started in; leaping to the page behind would feel broken"
+    );
+}
+
+#[test]
+fn velocity_is_measured_over_a_window_not_the_last_two_samples() {
+    let mut tracker = VelocityTracker::new();
+    // A steady 600 px/s drag downward, sampled every frame.
+    for frame in 0..10 {
+        let time = FRAME * frame;
+        tracker.sample(time, Point::new(0.0, time.as_secs_f32() * 600.0));
+    }
+    assert!((tracker.velocity().y - 600.0).abs() < 1.0);
+
+    // The finger pauses for one frame before lifting. Reading only the last two samples
+    // would call that a dead stop and swallow the flick.
+    tracker.sample(
+        FRAME * 10,
+        Point::new(0.0, FRAME.as_secs_f32() * 9.0 * 600.0),
+    );
+    assert!(
+        tracker.velocity().y > 300.0,
+        "one still frame should not erase the gesture: {:?}",
+        tracker.velocity()
+    );
+}
+
+#[test]
+fn a_tracker_with_nothing_in_it_reports_no_movement() {
+    let mut tracker = VelocityTracker::new();
+    assert_eq!(tracker.velocity(), Point::ZERO);
+
+    tracker.sample(Duration::ZERO, Point::new(0.0, 10.0));
+    assert_eq!(
+        tracker.velocity(),
+        Point::ZERO,
+        "one sample is not a velocity"
+    );
+
+    tracker.clear();
+    assert_eq!(tracker.velocity(), Point::ZERO);
+}

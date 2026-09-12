@@ -23,8 +23,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crisol_ui::css::stylesheet::Stylesheet;
-use crisol_ui::display_list::{Color, DisplayList};
+use crisol_ui::display_list::{Color, DisplayList, Point};
 use crisol_ui::dom::Dom;
+use crisol_ui::events::{scroll_at, scroll_from};
 use crisol_ui::layout::{LayoutCache, LayoutContext, ShapedText};
 use crisol_ui::paint::{PaintOptions, paint};
 use crisol_ui::reactive::{
@@ -36,7 +37,7 @@ use crisol_ui::style::{StyleEngine, StyleMap};
 use crisol_ui::text::FontSystem;
 use crisol_ui::tree::{NodeId, Tree};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -45,6 +46,7 @@ const CSS: &str = "
     body {
         display: flex;
         flex-direction: column;
+        height: 100%;
         padding-top: 20px; padding-left: 24px; padding-right: 24px;
         background-color: rgb(14, 16, 20);
         color: rgb(226, 232, 240);
@@ -60,7 +62,14 @@ const CSS: &str = "
         border-bottom-width: 2px; border-bottom-color: rgb(97, 175, 239);
     }
     .draft.editing { border-bottom-color: rgb(229, 192, 123) }
-    ul.list { display: flex; flex-direction: column; flex-grow: 1 }
+    ul.list {
+        display: flex; flex-direction: column;
+        flex-grow: 1;
+        /* Without this a flex item refuses to shrink below its content, so a long list
+           would grow the body rather than scrolling inside it. */
+        min-height: 0;
+        overflow: scroll;
+    }
     li.todo {
         display: flex; flex-direction: row;
         height: 26px; line-height: 26px;
@@ -121,6 +130,10 @@ fn headless() {
         let app = build(&runtime, &mut dom);
         for seed in ["read the roadmap", "ship M7", "measure idle RSS"] {
             app.add(&runtime, seed.to_owned());
+        }
+        // Enough to overflow the list, so the scroll steps below have somewhere to go.
+        for index in 0..24 {
+            app.add(&runtime, format!("filler {index}"));
         }
         runtime.flush(&mut dom);
         app
@@ -195,16 +208,69 @@ fn headless() {
         );
     }
 
+    // ---- scrolling -----------------------------------------------------------------
+    //
+    // The list has to have become a scroll container for any of this to mean anything,
+    // which is a statement about the stylesheet above as much as about the engine.
+    assert!(
+        tree.is_scrollable(app.list),
+        "the list should overflow with {} rows in it",
+        runtime
+            .peek(app.todos)
+            .map(|todos| todos.len())
+            .unwrap_or(0)
+    );
+    let reach = tree.scroll_max(app.list).height;
+
+    let scrolled = scroll_from(&mut tree, app.list, Point::new(0.0, 60.0)).expect("moved");
+    assert_eq!(scrolled.applied, Point::new(0.0, 60.0));
+    assert_eq!(tree.scroll_offset(app.list).y, 60.0);
+    println!("  scrolled 60 of {reach:.0} available");
+
+    // Past the end takes only what is left, which is what a caller hands outward.
+    let rest = scroll_from(&mut tree, app.list, Point::new(0.0, 10_000.0)).expect("moved");
+    assert_eq!(rest.applied.y, reach - 60.0);
+    assert_eq!(tree.scroll_offset(app.list).y, reach);
+    assert!(scroll_from(&mut tree, app.list, Point::new(0.0, 1.0)).is_none());
+
+    // Nothing about scrolling is allowed to move a box.
+    let before = tree.get(app.list).map(|node| node.layout);
+    let laid_out = {
+        let mut context = LayoutContext::new(&mut tree, &styles, &mut fonts, &mut cache);
+        context.run(viewport);
+        context.stats().nodes_laid_out
+    };
+    assert_eq!(tree.get(app.list).map(|node| node.layout), before);
+    println!("  a frame after scrolling laid out {laid_out} nodes");
+    assert_eq!(
+        laid_out, 0,
+        "scrolling marks paint, never layout: a fling must not relayout the document"
+    );
+
     // Printed numbers are not a check. What the script should have left behind:
     let labels = runtime.peek(app.todos).expect("todos");
     let text = |todo: &Todo| runtime.peek(todo.label).unwrap_or_default();
     // The selection is an index into the *filtered* list, so the three filter steps leave it
     // on the first visible row rather than where it started. That row is what gets edited and
     // then removed: "read the roadmap".
+    let written: Vec<_> = labels.iter().map(text).collect();
     assert_eq!(
-        labels.iter().map(text).collect::<Vec<_>>(),
-        ["ship M7", "measure idle RSS", "write it down"],
-        "one todo added, the first edited, and the edited one removed"
+        [
+            written.first().map(String::as_str),
+            written.get(1).map(String::as_str),
+            written.last().map(String::as_str),
+        ],
+        [
+            Some("ship M7"),
+            Some("measure idle RSS"),
+            Some("write it down")
+        ],
+        "one todo added at the end, the first edited, and the edited one removed"
+    );
+    assert_eq!(
+        written.len(),
+        27,
+        "3 seeds + 24 fillers + 1 added - 1 removed"
     );
     assert_eq!(
         runtime.peek(app.filter),
@@ -222,7 +288,7 @@ fn headless() {
         "and the draft was cleared"
     );
 
-    println!("  checked: 3 todos, filter all, edit committed, draft empty\n");
+    println!("  checked: 27 todos, filter all, edit committed, draft empty\n");
 }
 
 // ---- the app ------------------------------------------------------------------------------
@@ -277,6 +343,8 @@ impl Filter {
 }
 
 struct App {
+    /// The `<ul>` the rows live in, so a headless run can scroll it without a pointer.
+    list: NodeId,
     todos: Signal<Vec<Todo>>,
     filter: Signal<Filter>,
     visible: Memo<Vec<Todo>>,
@@ -374,6 +442,7 @@ fn build(runtime: &Runtime, dom: &mut Dom<'_>) -> App {
     });
 
     App {
+        list,
         todos,
         filter,
         visible,
@@ -409,7 +478,17 @@ fn row(
     bind_text(cx, label_text, move |track| track.get(todo.label));
 
     bind_class(cx, node, "done", move |track| track.get(todo.done));
+
     // Reads `visible` so the highlight follows the filtered order rather than the raw list.
+    //
+    // **This binding is O(rows) per selection change**, and deliberately left that way. Every
+    // row subscribes to `selected`, so an arrow key wakes all of them — one to gain the class
+    // and one to lose it, and the rest to write nothing. The DOM layer absorbs the writes, so
+    // the cost is closure calls rather than relayouts, but it is still linear.
+    //
+    // That is not a limit of the engine; it is what asking "am *I* the selected one?" once
+    // per row costs. A list long enough to care would keep the previously selected row and
+    // toggle exactly two, which is bookkeeping this example is clearer without.
     bind_class(cx, node, "selected", move |track| {
         let index = track.get(selected);
         track
@@ -549,6 +628,7 @@ impl App {
 // ---- the frame ----------------------------------------------------------------------------
 
 struct State {
+    pointer: Point,
     surface: WindowSurface,
     renderer: Renderer,
     tree: Tree,
@@ -581,6 +661,7 @@ impl State {
         let fonts = fonts();
 
         Self {
+            pointer: Point::ZERO,
             surface,
             renderer,
             tree,
@@ -619,6 +700,22 @@ impl State {
             list.removed,
             list.kept,
             self.runtime.stats().effects_run,
+        );
+        true
+    }
+
+    /// Applies a scroll gesture at the pointer. Returns whether anything moved.
+    fn scroll(&mut self, delta: Point) -> bool {
+        let Some(scrolled) = scroll_at(&mut self.tree, self.pointer, delta) else {
+            return false;
+        };
+        println!(
+            "scroll: {:.0},{:.0} on {:?}  (repaint {:.0}x{:.0})",
+            scrolled.applied.x,
+            scrolled.applied.y,
+            scrolled.node,
+            scrolled.damage.width(),
+            scrolled.damage.height(),
         );
         true
     }
@@ -721,6 +818,24 @@ impl ApplicationHandler for Shell {
                     return;
                 }
                 if state.key(event.logical_key) {
+                    state.surface.window().request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = state.surface.scale_factor();
+                state.pointer = Point::new(position.x as f32 / scale, position.y as f32 / scale);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // A trackpad on macOS has already been through the system's own momentum by
+                // the time this arrives, which is why the engine's `Fling` is for drags the
+                // application tracked itself and must not be layered on top of these.
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => Point::new(x * -40.0, y * -40.0),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        Point::new(-position.x as f32, -position.y as f32)
+                    }
+                };
+                if state.scroll(delta) {
                     state.surface.window().request_redraw();
                 }
             }
