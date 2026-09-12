@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crisol_ui::display_list::{Color, Corners, DisplayList, Edges, Rect, Size};
+use crisol_ui::display_list::{Color, Corners, DisplayList, Edges, Edges4, Rect, Size};
 use crisol_ui::paint::{PaintOptions, paint};
 use crisol_ui::render::{AcquiredFrame, FrameTarget, Renderer, WindowSurface};
 use crisol_ui::tree::{BoxStyle, ColorBox, NodeId, Tree};
@@ -148,7 +148,7 @@ impl Document {
         self.tree.node_mut(panel).layout = Rect::from_xywh(24.0, 24.0, 300.0, 200.0);
         self.tree.node_mut(panel).style = BoxStyle {
             background: PANEL,
-            border_color: EDGE,
+            border_color: Edges4::all(EDGE),
             border_width: Edges::all(1.0),
             radii: Corners::all(10.0),
             clips_children: true,

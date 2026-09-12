@@ -515,3 +515,56 @@ that want to see raw behaviour. An author who wants a content-sized root writes
 `:root { height: auto }`, which wins because author rules beat user-agent rules regardless of
 specificity.
 
+---
+
+## D-26 — Rounded clipping is a per-fragment test, not a stencil pass
+
+**Status:** Accepted (M3 follow-up) · **Affects:** M3, M6, M22 · **Supersedes** the
+axis-aligned-only note in D-14
+
+A card with `border-radius` and `overflow: hidden` has to cut its content at the corners. A
+scissor rectangle cannot: it leaves square corners with the content showing through. Until
+M3 the engine had `border-radius` and `overflow` but clipped square, so this rendered wrong
+without saying so.
+
+The clip's axis-aligned bounds stay a scissor rectangle, and the corners become a
+signed-distance test in the fragment shader, fed by two more instance vectors.
+
+**Rejected — a stencil buffer.** The standard answer, and it costs a depth-stencil
+attachment plus a second pass over the clipped geometry. Mid-pass attachment changes are
+exactly what D-09 rules out for tile-based mobile GPUs.
+
+**Rejected — a separate render pass per rounded clip.** Same objection, worse.
+
+**Consequences accepted:**
+
+- **One set of corners is honoured at a time.** The intersection of two rounded rectangles is
+  not a rounded rectangle, so a rounded clip nested inside another keeps the innermost
+  corners and intersects only the bounds. In practice an outer rounded clip's corners lie
+  outside the inner one; there is a test pinning the intersection behaviour so the day that
+  stops being true is a failing test rather than a rendering artefact.
+- **A clip carries the box its radii were written against**, separately from the intersected
+  bounds. A corner radius belongs to the box it was declared on, and clipping a rounded card
+  to a smaller ancestor must not move its corners.
+- Instances grow by 32 bytes. Still one pipeline, still one draw call per clip group.
+
+## D-27 — Borders carry a colour per edge
+
+**Status:** Accepted (M3 follow-up) · **Affects:** M3, M8
+
+`BoxStyle` originally carried one border colour, taken from the top edge. That makes
+`border-bottom: 1px solid #ddd` — one of the most common declarations there is — render in
+whatever the *top* edge computed to, which is normally black, because the other three edges
+keep their initial `currentColor` while only the bottom has a width.
+
+`Edges4<Color>`, and the shader picks per fragment.
+
+Edges meet on the **miter diagonal**, which is what CSS draws. The fragment belongs to
+whichever edge it has travelled the smallest *fraction* of the way across; comparing
+fractions rather than distances is what makes a thick top and a thin left edge meet on the
+correct slope instead of at forty-five degrees.
+
+**Rejected — four draw commands, one per edge.** No shader change, and it quadruples the
+instance count for every bordered box while making rounded corners a special case at each
+join.
+

@@ -25,11 +25,20 @@ struct InstanceIn {
     @location(1) radii: vec4<f32>,
     // Fill colour for `fs_rect`; tint for `fs_image`.
     @location(2) fill: vec4<f32>,
-    @location(3) border_color: vec4<f32>,
+    // Border colours, one per edge in CSS order. Edges meet on the miter diagonal.
+    @location(3) border_top: vec4<f32>,
+    @location(4) border_right: vec4<f32>,
+    @location(5) border_bottom: vec4<f32>,
+    @location(6) border_left: vec4<f32>,
     // Border widths in physical pixels, in CSS order: top, right, bottom, left.
-    @location(4) border_width: vec4<f32>,
+    @location(7) border_width: vec4<f32>,
     // Source sub-rectangle for `fs_image`: u0, v0, du, dv. Unused by `fs_rect`.
-    @location(5) uv: vec4<f32>,
+    @location(8) uv: vec4<f32>,
+    // Rounded clip: x, y, width, height of the box the clip radii were written against.
+    // Zero width means "no rounded clip"; the scissor rectangle is doing the work.
+    @location(9) clip_rect: vec4<f32>,
+    // Rounded clip radii, CSS order.
+    @location(10) clip_radii: vec4<f32>,
 };
 
 struct VsOut {
@@ -37,11 +46,18 @@ struct VsOut {
     // Position within the instance rect, in physical pixels, origin at its top-left.
     @location(0) local: vec2<f32>,
     @location(1) uv: vec2<f32>,
-    @location(2) @interpolate(flat) size: vec2<f32>,
-    @location(3) @interpolate(flat) radii: vec4<f32>,
-    @location(4) @interpolate(flat) fill: vec4<f32>,
-    @location(5) @interpolate(flat) border_color: vec4<f32>,
-    @location(6) @interpolate(flat) border_width: vec4<f32>,
+    // Position in the render target, for the rounded clip test.
+    @location(2) surface: vec2<f32>,
+    @location(3) @interpolate(flat) size: vec2<f32>,
+    @location(4) @interpolate(flat) radii: vec4<f32>,
+    @location(5) @interpolate(flat) fill: vec4<f32>,
+    @location(6) @interpolate(flat) border_top: vec4<f32>,
+    @location(7) @interpolate(flat) border_right: vec4<f32>,
+    @location(8) @interpolate(flat) border_bottom: vec4<f32>,
+    @location(9) @interpolate(flat) border_left: vec4<f32>,
+    @location(10) @interpolate(flat) border_width: vec4<f32>,
+    @location(11) @interpolate(flat) clip_rect: vec4<f32>,
+    @location(12) @interpolate(flat) clip_radii: vec4<f32>,
 };
 
 // The quad is grown by this many physical pixels on every side so the antialiased edge has
@@ -68,6 +84,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, inst: InstanceIn) -> VsOut 
         1.0,
     );
     out.local = local;
+    out.surface = position;
     // Map the *unpadded* rect onto the source sub-rectangle. The padding ring therefore
     // samples just outside it, which clamp-to-edge addressing handles and which zero
     // coverage multiplies away regardless.
@@ -76,8 +93,13 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, inst: InstanceIn) -> VsOut 
     out.size = size;
     out.radii = inst.radii;
     out.fill = inst.fill;
-    out.border_color = inst.border_color;
+    out.border_top = inst.border_top;
+    out.border_right = inst.border_right;
+    out.border_bottom = inst.border_bottom;
+    out.border_left = inst.border_left;
     out.border_width = inst.border_width;
+    out.clip_rect = inst.clip_rect;
+    out.clip_radii = inst.clip_radii;
     return out;
 }
 
@@ -115,10 +137,53 @@ fn coverage(d: f32) -> f32 {
     return clamp(0.5 - d, 0.0, 1.0);
 }
 
+// Coverage from the rounded clip, if there is one. A zero-width clip rect means the scissor
+// rectangle is already doing the whole job.
+fn clip_coverage(in: VsOut) -> f32 {
+    if in.clip_rect.z <= 0.0 || in.clip_rect.w <= 0.0 {
+        return 1.0;
+    }
+    let half_size = in.clip_rect.zw * 0.5;
+    let centre = in.clip_rect.xy + half_size;
+    return coverage(sd_rounded_box(in.surface - centre, half_size, in.clip_radii));
+}
+
+// Picks the border colour for a fragment inside the border ring.
+//
+// Edges meet on the miter diagonal, which is what CSS draws: the fragment belongs to
+// whichever edge it has travelled the smallest *fraction* of the way across. Comparing
+// fractions rather than distances is what makes a thick top and a thin left edge meet on the
+// correct slope instead of at 45 degrees.
+fn border_colour(in: VsOut) -> vec4<f32> {
+    let bw = in.border_width;
+    let big = 1.0e9;
+    let top = select(big, in.local.y / bw.x, bw.x > 0.0);
+    let right = select(big, (in.size.x - in.local.x) / bw.y, bw.y > 0.0);
+    let bottom = select(big, (in.size.y - in.local.y) / bw.z, bw.z > 0.0);
+    let left = select(big, in.local.x / bw.w, bw.w > 0.0);
+
+    var best = top;
+    var colour = in.border_top;
+    if right < best {
+        best = right;
+        colour = in.border_right;
+    }
+    if bottom < best {
+        best = bottom;
+        colour = in.border_bottom;
+    }
+    if left < best {
+        best = left;
+        colour = in.border_left;
+    }
+    return colour;
+}
+
 @fragment
 fn fs_rect(in: VsOut) -> @location(0) vec4<f32> {
     let half_size = in.size * 0.5;
-    let outer = coverage(sd_rounded_box(in.local - half_size, half_size, in.radii));
+    var outer = coverage(sd_rounded_box(in.local - half_size, half_size, in.radii));
+    outer = outer * clip_coverage(in);
     if outer <= 0.0 {
         discard;
     }
@@ -156,8 +221,8 @@ fn fs_rect(in: VsOut) -> @location(0) vec4<f32> {
     // does, and the border ring paints over it. Doing it in that order is what makes a
     // translucent border composite against the background instead of against the target.
     let background = premultiply(in.fill) * outer;
-    let ring = clamp(outer - inner, 0.0, 1.0);
-    let border = premultiply(in.border_color) * ring;
+    let ring = clamp(outer - inner * clip_coverage(in), 0.0, 1.0);
+    let border = premultiply(border_colour(in)) * ring;
     return border + background * (1.0 - border.a);
 }
 
@@ -167,7 +232,8 @@ fn fs_rect(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_image(in: VsOut) -> @location(0) vec4<f32> {
     let half_size = in.size * 0.5;
-    let outer = coverage(sd_rounded_box(in.local - half_size, half_size, in.radii));
+    let outer = coverage(sd_rounded_box(in.local - half_size, half_size, in.radii))
+        * clip_coverage(in);
     if outer <= 0.0 {
         discard;
     }

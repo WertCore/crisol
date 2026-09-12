@@ -14,7 +14,7 @@ in release builds.
 
 **Status:** Planning. Nothing implemented.
 
-**Audience:** This document is written to be executed by Claude Code across many sessions.
+**Audience:** This document is written to be executed across many sessions.
 Every milestone has a concrete deliverable and a binary acceptance test so progress is
 verifiable without holding the whole system in memory.
 
@@ -651,7 +651,7 @@ Track A: roughly 12–18 months of focused work to M8.
 Track B: roughly 2–4 years to M15 for a small team. This is Static Hermes-scale work.
 Convergence: add 6–12 months.
 
-Claude Code changes the constant factor on any given week substantially. It does not
+Good tooling changes the constant factor on any given week substantially. It does not
 change the order of magnitude, because the work must still be carried across hundreds of
 sessions with a human holding continuity.
 
@@ -679,7 +679,7 @@ Honest checkpoints. If these fail, change the plan rather than pushing through.
 
 ## 8. First session
 
-Paste this into Claude Code to start:
+Start here:
 
 > Read `ROADMAP.md`. We are at M0. Create the Crisol cargo workspace per §4, seed
 > `DECISIONS.md` from §2 and `STATE.md` from the template, and set up CI running

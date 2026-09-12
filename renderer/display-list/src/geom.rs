@@ -363,6 +363,45 @@ impl Edges {
     }
 }
 
+/// A value per box edge, in CSS order, for types that are not `f32`.
+///
+/// [`Edges`] is specialised to lengths because that is all it needed; this is the general
+/// form, used for per-edge border colours.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Edges4<T> {
+    /// Top edge.
+    pub top: T,
+    /// Right edge.
+    pub right: T,
+    /// Bottom edge.
+    pub bottom: T,
+    /// Left edge.
+    pub left: T,
+}
+
+impl<T: Copy> Edges4<T> {
+    /// The same value on all four edges.
+    pub const fn all(value: T) -> Self {
+        Self {
+            top: value,
+            right: value,
+            bottom: value,
+            left: value,
+        }
+    }
+}
+
+impl Edges4<Color> {
+    /// True when no edge can change a pixel.
+    #[must_use]
+    pub fn is_transparent(self) -> bool {
+        self.top.is_transparent()
+            && self.right.is_transparent()
+            && self.bottom.is_transparent()
+            && self.left.is_transparent()
+    }
+}
+
 /// A straight (non-premultiplied) sRGB colour with components in `0.0..=1.0`.
 ///
 /// Straight rather than premultiplied because that is what CSS authors write and what

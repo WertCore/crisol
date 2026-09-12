@@ -207,10 +207,12 @@ impl ComputedStyle {
         let radius = |value: LengthPercentage, basis: f32| value.resolve(basis);
         BoxStyle {
             background: self.background_color.into(),
-            // Paint takes one border colour. Four-colour borders need four draw commands
-            // and are rare enough to wait for a design that asks for them; the top edge is
-            // the one a single-colour border sets.
-            border_color: self.border_color.top.into(),
+            border_color: crisol_display_list::Edges4 {
+                top: self.border_color.top.into(),
+                right: self.border_color.right.into(),
+                bottom: self.border_color.bottom.into(),
+                left: self.border_color.left.into(),
+            },
             border_width: crisol_display_list::Edges {
                 top: self.border_width.top.get(),
                 right: self.border_width.right.get(),

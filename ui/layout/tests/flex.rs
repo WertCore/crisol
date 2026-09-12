@@ -498,7 +498,10 @@ fn layout_writes_the_paint_style_onto_the_node() {
 
     let style = doc.tree.node(card).style;
     assert_eq!(style.background, Color::from_rgba8(255, 0, 0, 255));
-    assert_eq!(style.border_color, Color::from_rgba8(0, 0, 255, 255));
+    assert_eq!(
+        style.border_color,
+        crisol_display_list::Edges4::all(Color::from_rgba8(0, 0, 255, 255))
+    );
     assert_eq!(style.border_width.top, 2.0);
     assert_eq!(style.radii.top_left, 4.0);
     assert!(style.clips_children);

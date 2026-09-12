@@ -144,7 +144,7 @@ number of pixels.
   `ComputedStyle` allocation* — `a_hundred_identically_styled_nodes_share_one_allocation`:
   101 elements cost 2 allocations and 99 interner hits.
 
-**Totals:** 223 tests passing, 0 failing. `cargo clippy --workspace --all-targets
+**Totals:** 233 tests passing, 0 failing. `cargo clippy --workspace --all-targets
 --all-features -- -D warnings` clean, `cargo fmt --all --check` clean.
 
 ---
@@ -165,14 +165,14 @@ Nothing. M3 is closed and M4 has not been started.
   graphics crates and everything else — and CI runs the whole thing. Nothing about the code
   requires this; it is a note so the next session does not rediscover it as a mysterious
   linker failure.
-- **`DisplayList` has no transform command yet.** Clipping is axis-aligned scissor only.
-  `overflow: hidden` on a node with `border-radius` will clip square until either a stencil
-  path or a per-fragment rounded clip exists. Decide at M3, when the CSS that needs it
-  arrives.
+- **`DisplayList` has no transform command.** Rounded clipping landed (D-26); transforms did
+  not, and are not in any milestone's property subset yet.
 - **Per-corner inner border radii are approximated.** The shader shrinks a corner's inner
   radius by the thicker of its two adjacent borders; CSS uses per-axis elliptical radii. The
   difference shows only on a box with very different adjacent border widths and a large
   radius. Revisit if a real design hits it.
+- **Only one rounded clip is honoured at a time** (D-26). Nested rounded clips keep the
+  innermost corners and intersect only their bounds. A test pins the behaviour.
 - **`BoxStyle` is a placeholder producer, not a placeholder contract.** M3's cascade
   computes into it; the struct itself should survive. If `ComputedStyle` ends up wanting to
   be the thing stored on the node, that is a change to `crisol-tree` and should be recorded

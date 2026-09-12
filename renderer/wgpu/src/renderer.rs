@@ -7,7 +7,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use crisol_display_list::{
-    Color, Corners, DisplayList, DrawCommand, Edges, ImageCommand, ImageId, Rect, RectCommand,
+    Clip, Color, Corners, DisplayList, DrawCommand, Edges, ImageCommand, ImageId, Rect, RectCommand,
 };
 
 use crate::gpu::Gpu;
@@ -21,9 +21,15 @@ struct Instance {
     rect: [f32; 4],
     radii: [f32; 4],
     fill: [f32; 4],
-    border_color: [f32; 4],
+    border_top: [f32; 4],
+    border_right: [f32; 4],
+    border_bottom: [f32; 4],
+    border_left: [f32; 4],
     border_width: [f32; 4],
     uv: [f32; 4],
+    /// The box the clip radii were written against, or all zeroes for no rounded clip.
+    clip_rect: [f32; 4],
+    clip_radii: [f32; 4],
 }
 
 /// Uniform block. `viewport.xy` is the physical pixel size of the target; `zw` is padding
@@ -41,6 +47,13 @@ struct Scissor {
     y: u32,
     width: u32,
     height: u32,
+}
+
+/// The rounded clip in force, in physical pixels, or `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RoundedClip {
+    rect: [f32; 4],
+    radii: [f32; 4],
 }
 
 /// A run of instances that can be drawn with one call.
@@ -103,7 +116,7 @@ pub struct Renderer {
     // Per-frame scratch, kept across frames so a steady-state frame allocates nothing.
     instances: Vec<Instance>,
     batches: Vec<Batch>,
-    clip_stack: Vec<Rect>,
+    clip_stack: Vec<Clip>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -120,13 +133,18 @@ impl std::fmt::Debug for Renderer {
 /// that needs fewer keeps the allocation.
 const INITIAL_INSTANCE_CAPACITY: usize = 1024;
 
-const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_array![
     0 => Float32x4,
     1 => Float32x4,
     2 => Float32x4,
     3 => Float32x4,
     4 => Float32x4,
     5 => Float32x4,
+    6 => Float32x4,
+    7 => Float32x4,
+    8 => Float32x4,
+    9 => Float32x4,
+    10 => Float32x4,
 ];
 
 impl Renderer {
@@ -409,14 +427,17 @@ impl Renderer {
 
         for command in list.commands() {
             match command {
-                DrawCommand::PushClip(rect) => {
+                DrawCommand::PushClip(clip) => {
                     // The builder already intersected this with the enclosing clip, but the
                     // renderer must not depend on a producer being well behaved.
-                    let effective = match self.clip_stack.last() {
-                        Some(current) => current.intersection(*rect).unwrap_or(Rect::ZERO),
-                        None => *rect,
+                    let bounds = match self.clip_stack.last() {
+                        Some(current) => current.rect.intersection(clip.rect).unwrap_or(Rect::ZERO),
+                        None => clip.rect,
                     };
-                    self.clip_stack.push(effective);
+                    self.clip_stack.push(Clip {
+                        rect: bounds,
+                        ..*clip
+                    });
                 }
                 DrawCommand::PopClip => {
                     self.clip_stack.pop();
@@ -426,7 +447,8 @@ impl Renderer {
                         continue;
                     };
                     let first = self.instances.len() as u32;
-                    self.instances.push(Instance::from_rect(rect, scale));
+                    let clip = self.rounded_clip(scale);
+                    self.instances.push(Instance::from_rect(rect, scale, clip));
                     match self.batches.last_mut() {
                         Some(Batch::Rects {
                             count,
@@ -449,7 +471,9 @@ impl Renderer {
                         continue;
                     };
                     let instance = self.instances.len() as u32;
-                    self.instances.push(Instance::from_image(image, scale));
+                    let clip = self.rounded_clip(scale);
+                    self.instances
+                        .push(Instance::from_image(image, scale, clip));
                     self.batches.push(Batch::Image {
                         instance,
                         image: image.image,
@@ -460,6 +484,26 @@ impl Renderer {
         }
 
         stats.instances = self.instances.len();
+    }
+
+    /// The rounded clip in force, converted to physical pixels.
+    ///
+    /// All zeroes when there is no rounded clip, which the shader reads as "the scissor
+    /// rectangle is already doing the whole job".
+    fn rounded_clip(&self, scale: f32) -> RoundedClip {
+        let Some(clip) = self.clip_stack.last().filter(|clip| clip.is_rounded()) else {
+            return RoundedClip::default();
+        };
+        let rect = clip.radii_rect.scale(scale);
+        RoundedClip {
+            rect: [
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+            ],
+            radii: corners_to_array(clip.radii.clamped_to(clip.radii_rect.size).scale(scale)),
+        }
     }
 
     /// The scissor for the clip currently in force.
@@ -474,7 +518,7 @@ impl Renderer {
         let Some(clip) = self.clip_stack.last() else {
             return Some(None);
         };
-        Scissor::from_logical(*clip, scale, target.width, target.height).map(Some)
+        Scissor::from_logical(clip.rect, scale, target.width, target.height).map(Some)
     }
 
     /// Writes this frame's uniforms and instances, growing the instance buffer if needed.
@@ -512,7 +556,7 @@ impl Renderer {
 }
 
 impl Instance {
-    fn from_rect(command: &RectCommand, scale: f32) -> Self {
+    fn from_rect(command: &RectCommand, scale: f32, clip: RoundedClip) -> Self {
         let rect = command.rect.scale(scale);
         Self {
             rect: [
@@ -523,13 +567,18 @@ impl Instance {
             ],
             radii: corners_to_array(command.radii.clamped_to(command.rect.size).scale(scale)),
             fill: command.fill.to_array(),
-            border_color: command.border_color.to_array(),
+            border_top: command.border_color.top.to_array(),
+            border_right: command.border_color.right.to_array(),
+            border_bottom: command.border_color.bottom.to_array(),
+            border_left: command.border_color.left.to_array(),
             border_width: edges_to_array(command.border_width.scale(scale)),
             uv: [0.0, 0.0, 0.0, 0.0],
+            clip_rect: clip.rect,
+            clip_radii: clip.radii,
         }
     }
 
-    fn from_image(command: &ImageCommand, scale: f32) -> Self {
+    fn from_image(command: &ImageCommand, scale: f32, clip: RoundedClip) -> Self {
         let rect = command.rect.scale(scale);
         Self {
             rect: [
@@ -540,7 +589,10 @@ impl Instance {
             ],
             radii: corners_to_array(command.radii.clamped_to(command.rect.size).scale(scale)),
             fill: command.tint.to_array(),
-            border_color: [0.0; 4],
+            border_top: [0.0; 4],
+            border_right: [0.0; 4],
+            border_bottom: [0.0; 4],
+            border_left: [0.0; 4],
             border_width: [0.0; 4],
             uv: [
                 command.uv.origin.x,
@@ -548,6 +600,8 @@ impl Instance {
                 command.uv.size.width,
                 command.uv.size.height,
             ],
+            clip_rect: clip.rect,
+            clip_radii: clip.radii,
         }
     }
 }

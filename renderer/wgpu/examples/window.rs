@@ -12,7 +12,8 @@
 use std::sync::Arc;
 
 use crisol_display_list::{
-    Color, Corners, DisplayListBuilder, Edges, ImageCommand, ImageId, Rect, RectCommand, Size,
+    Color, Corners, DisplayListBuilder, Edges, Edges4, ImageCommand, ImageId, Rect, RectCommand,
+    Size,
 };
 use crisol_render_wgpu::testing::checkerboard;
 use crisol_render_wgpu::{AcquiredFrame, FrameTarget, Renderer, WindowSurface};
@@ -146,7 +147,7 @@ fn scene(viewport: Size) -> crisol_display_list::DisplayList {
         rect: content,
         radii: Corners::all(12.0),
         fill: Color::from_rgba8(40, 44, 52, 255),
-        border_color: Color::from_rgba8(80, 88, 100, 255),
+        border_color: Edges4::all(Color::from_rgba8(80, 88, 100, 255)),
         border_width: Edges::all(1.0),
     });
 
@@ -158,7 +159,7 @@ fn scene(viewport: Size) -> crisol_display_list::DisplayList {
             rect: Rect::from_xywh(x, content.min_y() + 16.0, swatch, swatch),
             radii: Corners::all(i as f32 * 6.0),
             fill: Color::from_rgba8(97, 175, 239, 255),
-            border_color: Color::TRANSPARENT,
+            border_color: Edges4::all(Color::TRANSPARENT),
             border_width: Edges::ZERO,
         });
     }
@@ -170,7 +171,7 @@ fn scene(viewport: Size) -> crisol_display_list::DisplayList {
         rect: clip.inflate(40.0),
         radii: Corners::ZERO,
         fill: Color::from_rgba8(224, 108, 117, 255),
-        border_color: Color::TRANSPARENT,
+        border_color: Edges4::all(Color::TRANSPARENT),
         border_width: Edges::ZERO,
     });
     b.pop_clip();

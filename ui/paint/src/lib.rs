@@ -23,7 +23,9 @@
 
 #![doc(html_root_url = "https://docs.rs/crisol-paint/0.0.0")]
 
-use crisol_display_list::{Color, DisplayList, DisplayListBuilder, Point, Rect, RectCommand, Size};
+use crisol_display_list::{
+    Clip, Color, DisplayList, DisplayListBuilder, Point, Rect, RectCommand, Size,
+};
 use crisol_tree::{BoxStyle, NodeId, NodeKind, Tree};
 
 /// How a tree is painted.
@@ -154,7 +156,9 @@ pub fn paint_subtree(
                     if emit_box(builder, bounds, &node.style) {
                         stats.boxes_emitted += 1;
                     }
-                    builder.push_clip(bounds);
+                    // The node is clipped to its own border box, corners included: a rounded
+                    // PDF page must not paint into the corners it does not own.
+                    builder.push_rounded_clip(Clip::rounded(bounds, node.style.radii));
                     custom.node.paint(bounds, builder);
                     builder.pop_clip();
                     stats.custom_nodes += 1;
@@ -174,9 +178,11 @@ pub fn paint_subtree(
         // whose computed visibility is `visible` still paints. After M3 the cascade will
         // have resolved inheritance, so a subtree that should be invisible arrives here
         // already marked invisible node by node.
-        let clips = node.style.clips_children;
-        if clips {
-            builder.push_clip(bounds);
+        // `overflow: hidden` clips to the *padding* box in CSS, but the difference only
+        // shows under a translucent border; clipping to the border box keeps the common case
+        // — a rounded card — exactly right and costs nothing.
+        if node.style.clips_children {
+            builder.push_rounded_clip(Clip::rounded(bounds, node.style.radii));
             stats.clips += 1;
             stack.push(Step::PopClip);
         }

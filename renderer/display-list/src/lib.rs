@@ -11,6 +11,6 @@ pub mod command;
 pub mod geom;
 
 pub use command::{
-    DisplayList, DisplayListBuilder, DrawCommand, ImageCommand, ImageId, RectCommand,
+    Clip, DisplayList, DisplayListBuilder, DrawCommand, ImageCommand, ImageId, RectCommand,
 };
-pub use geom::{Color, Corners, Edges, Point, Rect, Size};
+pub use geom::{Color, Corners, Edges, Edges4, Point, Rect, Size};

@@ -6,7 +6,8 @@
 //! runs in CI on a machine with no display attached.
 
 use crisol_display_list::{
-    Color, Corners, DisplayListBuilder, Edges, ImageCommand, ImageId, Rect, RectCommand, Size,
+    Clip, Color, Corners, DisplayListBuilder, Edges, Edges4, ImageCommand, ImageId, Rect,
+    RectCommand, Size,
 };
 use crisol_render_wgpu::testing::{checkerboard, with_gpu};
 use crisol_render_wgpu::{FrameTarget, Gpu, HEADLESS_FORMAT, HeadlessTarget, Pixels, Renderer};
@@ -222,7 +223,7 @@ fn a_border_paints_inside_the_border_box() {
                 rect: Rect::from_xywh(8.0, 8.0, 16.0, 16.0),
                 radii: Corners::ZERO,
                 fill,
-                border_color: border,
+                border_color: Edges4::all(border),
                 border_width: Edges::all(4.0),
             });
         });
@@ -251,7 +252,7 @@ fn per_edge_border_widths_are_respected() {
                 rect: Rect::from_xywh(4.0, 4.0, 24.0, 24.0),
                 radii: Corners::ZERO,
                 fill,
-                border_color: border,
+                border_color: Edges4::all(border),
                 border_width: Edges {
                     top: 8.0,
                     right: 2.0,
@@ -505,5 +506,178 @@ fn the_instance_buffer_grows_without_dropping_instances() {
         target
             .read_pixels(&gpu)
             .assert_pixel(127, 127, Color::BLACK, TOLERANCE);
+    });
+}
+
+// ---- per-edge border colours ----------------------------------------------------------
+
+/// `border-bottom: 1px solid #ddd` is one of the most common declarations there is. With a
+/// single border colour it renders in whatever the *top* edge computed to, which is usually
+/// black — a bug that is invisible until someone looks at a design.
+#[test]
+fn each_border_edge_uses_its_own_colour() {
+    with_gpu(|gpu| {
+        let top = Color::from_rgba8(255, 0, 0, 255);
+        let right = Color::from_rgba8(0, 255, 0, 255);
+        let bottom = Color::from_rgba8(0, 0, 255, 255);
+        let left = Color::from_rgba8(255, 255, 0, 255);
+
+        let pixels = render(&gpu, Size::new(40.0, 40.0), 1.0, |b| {
+            b.set_background(Color::WHITE);
+            b.push_rect(RectCommand {
+                rect: Rect::from_xywh(4.0, 4.0, 32.0, 32.0),
+                radii: Corners::ZERO,
+                fill: Color::BLACK,
+                border_color: Edges4 {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                },
+                border_width: Edges::all(6.0),
+            });
+        });
+
+        // Middle of each edge, well inside the 6px ring and away from the miter diagonals.
+        pixels.assert_pixel(20, 6, top, TOLERANCE);
+        pixels.assert_pixel(33, 20, right, TOLERANCE);
+        pixels.assert_pixel(20, 33, bottom, TOLERANCE);
+        pixels.assert_pixel(6, 20, left, TOLERANCE);
+        // And the fill is still the fill.
+        pixels.assert_pixel(20, 20, Color::BLACK, TOLERANCE);
+    });
+}
+
+#[test]
+fn a_single_edge_border_does_not_borrow_the_top_colour() {
+    with_gpu(|gpu| {
+        let rule = Color::from_rgba8(221, 221, 221, 255);
+        let pixels = render(&gpu, Size::new(40.0, 40.0), 1.0, |b| {
+            b.set_background(Color::WHITE);
+            b.push_rect(RectCommand {
+                rect: Rect::from_xywh(0.0, 0.0, 40.0, 20.0),
+                radii: Corners::ZERO,
+                fill: Color::WHITE,
+                // Only the bottom edge is drawn. The other three keep the initial colour,
+                // which in CSS is `currentColor` — black. If the shader took the top edge's
+                // colour, this rule would be black instead of #ddd.
+                border_color: Edges4 {
+                    top: Color::BLACK,
+                    right: Color::BLACK,
+                    bottom: rule,
+                    left: Color::BLACK,
+                },
+                border_width: Edges {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 4.0,
+                    left: 0.0,
+                },
+            });
+        });
+
+        pixels.assert_pixel(20, 18, rule, TOLERANCE);
+        pixels.assert_pixel(20, 8, Color::WHITE, TOLERANCE);
+    });
+}
+
+// ---- rounded clipping ------------------------------------------------------------------
+
+/// A card with `border-radius` and `overflow: hidden` must cut its content at the corners.
+/// A scissor rectangle alone leaves square corners with the content showing through.
+#[test]
+fn a_rounded_clip_cuts_the_corners() {
+    with_gpu(|gpu| {
+        let content = Color::from_rgba8(255, 0, 0, 255);
+        let pixels = render(&gpu, Size::new(40.0, 40.0), 1.0, |b| {
+            b.set_background(Color::WHITE);
+            b.push_rounded_clip(Clip::rounded(
+                Rect::from_xywh(4.0, 4.0, 32.0, 32.0),
+                Corners::all(12.0),
+            ));
+            // Content larger than the clip, so only the clip's shape can be showing.
+            b.fill_rect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0), content);
+            b.pop_clip();
+        });
+
+        // The centre and the middle of each edge are inside the rounded box.
+        pixels.assert_pixel(20, 20, content, TOLERANCE);
+        pixels.assert_pixel(20, 5, content, TOLERANCE);
+        pixels.assert_pixel(5, 20, content, TOLERANCE);
+        // The corners are cut: without rounded clipping these would be `content`.
+        pixels.assert_pixel(5, 5, Color::WHITE, TOLERANCE);
+        pixels.assert_pixel(34, 5, Color::WHITE, TOLERANCE);
+        pixels.assert_pixel(5, 34, Color::WHITE, TOLERANCE);
+        pixels.assert_pixel(34, 34, Color::WHITE, TOLERANCE);
+    });
+}
+
+#[test]
+fn a_rounded_clip_survives_being_intersected_with_a_square_one() {
+    with_gpu(|gpu| {
+        let content = Color::from_rgba8(255, 0, 0, 255);
+        let pixels = render(&gpu, Size::new(40.0, 40.0), 1.0, |b| {
+            b.set_background(Color::WHITE);
+            // A square outer clip covering the left half, then a rounded inner one. The
+            // corners must still be cut, and the right half must still be clipped away.
+            b.push_clip(Rect::from_xywh(0.0, 0.0, 20.0, 40.0));
+            b.push_rounded_clip(Clip::rounded(
+                Rect::from_xywh(4.0, 4.0, 32.0, 32.0),
+                Corners::all(12.0),
+            ));
+            b.fill_rect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0), content);
+            b.pop_clip();
+            b.pop_clip();
+        });
+
+        pixels.assert_pixel(10, 20, content, TOLERANCE);
+        pixels.assert_pixel(5, 5, Color::WHITE, TOLERANCE);
+        pixels.assert_pixel(30, 20, Color::WHITE, TOLERANCE);
+    });
+}
+
+#[test]
+fn a_rounded_clip_applies_to_images_too() {
+    with_gpu(|gpu| {
+        let image = ImageId(9);
+        let pixels = render_with(
+            &gpu,
+            Size::new(40.0, 40.0),
+            1.0,
+            |renderer| {
+                renderer.upload_image(image, 1, 1, &[0, 0, 0, 255]);
+            },
+            |b| {
+                b.set_background(Color::WHITE);
+                b.push_rounded_clip(Clip::rounded(
+                    Rect::from_xywh(4.0, 4.0, 32.0, 32.0),
+                    Corners::all(12.0),
+                ));
+                b.push_image(ImageCommand::new(
+                    Rect::from_xywh(0.0, 0.0, 40.0, 40.0),
+                    image,
+                ));
+                b.pop_clip();
+            },
+        );
+
+        pixels.assert_pixel(20, 20, Color::BLACK, TOLERANCE);
+        pixels.assert_pixel(5, 5, Color::WHITE, TOLERANCE);
+    });
+}
+
+#[test]
+fn a_square_clip_still_keeps_its_corners() {
+    with_gpu(|gpu| {
+        let content = Color::from_rgba8(255, 0, 0, 255);
+        let pixels = render(&gpu, Size::new(40.0, 40.0), 1.0, |b| {
+            b.set_background(Color::WHITE);
+            b.push_clip(Rect::from_xywh(4.0, 4.0, 32.0, 32.0));
+            b.fill_rect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0), content);
+            b.pop_clip();
+        });
+        pixels.assert_pixel(5, 5, content, TOLERANCE);
+        pixels.assert_pixel(34, 34, content, TOLERANCE);
+        pixels.assert_pixel(2, 2, Color::WHITE, TOLERANCE);
     });
 }

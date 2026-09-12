@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crisol_display_list::{Color, Corners, Edges, Rect};
+use crisol_display_list::{Color, Corners, Edges, Edges4, Rect};
 
 use crate::atom::Atom;
 
@@ -239,8 +239,8 @@ bitflags::bitflags! {
 pub struct BoxStyle {
     /// Background colour, filling the whole border box.
     pub background: Color,
-    /// Border colour.
-    pub border_color: Color,
+    /// Border colour, per edge.
+    pub border_color: Edges4<Color>,
     /// Per-edge border widths, drawn inside the border box.
     pub border_width: Edges,
     /// Corner radii.
@@ -259,7 +259,7 @@ impl Default for BoxStyle {
     fn default() -> Self {
         Self {
             background: Color::TRANSPARENT,
-            border_color: Color::TRANSPARENT,
+            border_color: Edges4::all(Color::TRANSPARENT),
             border_width: Edges::ZERO,
             radii: Corners::ZERO,
             clips_children: false,

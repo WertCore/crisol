@@ -5,7 +5,7 @@
 //! range test instead of a tree walk (M6), and a render snapshot test can be written without
 //! constructing a document (DECISIONS D-13).
 
-use crate::geom::{Color, Corners, Edges, Rect, Size};
+use crate::geom::{Color, Corners, Edges, Edges4, Rect, Size};
 
 /// An opaque handle to a texture the renderer holds.
 ///
@@ -28,8 +28,12 @@ pub struct RectCommand {
     pub radii: Corners,
     /// Fill colour of the padding box (inside the border).
     pub fill: Color,
-    /// Border colour. Ignored when `border_width` is zero on every edge.
-    pub border_color: Color,
+    /// Border colour, per edge.
+    ///
+    /// Per edge rather than one colour because `border-bottom: 1px solid #ddd` is one of the
+    /// most common declarations there is, and a single colour renders it in whatever the
+    /// *top* edge happened to compute to. Edges meet on the miter diagonal, as CSS says.
+    pub border_color: Edges4<Color>,
     /// Per-edge border widths, drawn inside `rect` as CSS `box-sizing: border-box` does.
     pub border_width: Edges,
 }
@@ -42,7 +46,7 @@ impl RectCommand {
             rect,
             radii: Corners::ZERO,
             fill,
-            border_color: Color::TRANSPARENT,
+            border_color: Edges4::all(Color::TRANSPARENT),
             border_width: Edges::ZERO,
         }
     }
@@ -89,6 +93,60 @@ impl ImageCommand {
     }
 }
 
+/// A clip region: a rectangle, optionally with rounded corners.
+///
+/// Rounded clipping is what makes `overflow: hidden` on a card with `border-radius` cut the
+/// corners instead of leaving square ones. The bounds become a scissor rectangle and the
+/// corners are a per-fragment test in the shader — no stencil buffer, no second render pass,
+/// which is what keeps a tile-based GPU happy (DECISIONS D-09, D-14).
+///
+/// **One set of corners is honoured at a time.** The intersection of two rounded rectangles
+/// is not a rounded rectangle, so a rounded clip nested inside another keeps the innermost
+/// corners and intersects only the bounds. In practice an outer rounded clip's corners lie
+/// outside the inner one anyway; if that assumption ever stops holding, this is the comment
+/// to come back to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clip {
+    /// Axis-aligned bounds, already intersected with any enclosing clip.
+    pub rect: Rect,
+    /// Corner radii. Zero for a plain rectangular clip.
+    pub radii: Corners,
+    /// The rectangle `radii` were written against.
+    ///
+    /// Distinct from `rect` because `rect` is the *intersection* with enclosing clips, and a
+    /// corner radius belongs to the box it was declared on. Clipping a rounded card to the
+    /// viewport must not move its corners.
+    pub radii_rect: Rect,
+}
+
+impl Clip {
+    /// A plain rectangular clip.
+    #[must_use]
+    pub fn rect(rect: Rect) -> Self {
+        Self {
+            rect,
+            radii: Corners::ZERO,
+            radii_rect: rect,
+        }
+    }
+
+    /// A rounded clip.
+    #[must_use]
+    pub fn rounded(rect: Rect, radii: Corners) -> Self {
+        Self {
+            rect,
+            radii: radii.clamped_to(rect.size),
+            radii_rect: rect,
+        }
+    }
+
+    /// Whether this clip has corners the shader has to test.
+    #[must_use]
+    pub fn is_rounded(&self) -> bool {
+        !self.radii.is_zero()
+    }
+}
+
 /// One entry in a display list.
 ///
 /// Clips are a push/pop pair rather than a field on each command so that a subtree's clip is
@@ -99,12 +157,11 @@ pub enum DrawCommand {
     Rect(RectCommand),
     /// Draw a textured quad.
     Image(ImageCommand),
-    /// Intersect the current clip with an axis-aligned rectangle.
+    /// Intersect the current clip with a rectangle, which may have rounded corners.
     ///
-    /// Axis-aligned only: it maps to a scissor rectangle, which costs nothing on a tiler.
-    /// Rounded and transformed clips need either stencil or a per-fragment test and are
-    /// deferred until `overflow` with `border-radius` actually needs them (M3).
-    PushClip(Rect),
+    /// The axis-aligned bounds become a scissor rectangle, which costs nothing on a tiler.
+    /// Corner radii are applied per fragment by the shader; see [`Clip`].
+    PushClip(Clip),
     /// Restore the clip in force before the matching [`DrawCommand::PushClip`].
     PopClip,
 }
@@ -163,7 +220,7 @@ impl DisplayList {
 pub struct DisplayListBuilder {
     list: DisplayList,
     /// Intersected clip rectangles. The last entry is in force.
-    clip_stack: Vec<Rect>,
+    clip_stack: Vec<Clip>,
 }
 
 impl DisplayListBuilder {
@@ -183,7 +240,7 @@ impl DisplayListBuilder {
 
     /// The clip currently in force, or `None` when nothing is clipped.
     #[must_use]
-    pub fn current_clip(&self) -> Option<Rect> {
+    pub fn current_clip(&self) -> Option<Clip> {
         self.clip_stack.last().copied()
     }
 
@@ -195,7 +252,7 @@ impl DisplayListBuilder {
             return true;
         }
         match self.current_clip() {
-            Some(clip) => rect.intersection(clip).is_none(),
+            Some(clip) => rect.intersection(clip.rect).is_none(),
             None => false,
         }
     }
@@ -235,13 +292,40 @@ impl DisplayListBuilder {
     /// painting the subtree entirely, but must still call [`Self::pop_clip`] either way —
     /// the stack entry is pushed regardless so push/pop stay balanced.
     pub fn push_clip(&mut self, rect: Rect) -> bool {
-        let effective = match self.current_clip() {
-            Some(current) => current.intersection(rect).unwrap_or(Rect::ZERO),
-            None => rect,
+        self.push_rounded_clip(Clip::rect(rect))
+    }
+
+    /// Intersects the clip with a rounded rectangle.
+    ///
+    /// The bounds intersect with the enclosing clip as usual. The radii do not: a rounded
+    /// clip inside another rounded clip keeps only the inner one's corners, because the
+    /// intersection of two rounded rectangles is not a rounded rectangle. See [`Clip`].
+    pub fn push_rounded_clip(&mut self, clip: Clip) -> bool {
+        let bounds = match self.current_clip() {
+            Some(current) => current.rect.intersection(clip.rect).unwrap_or(Rect::ZERO),
+            None => clip.rect,
+        };
+        let effective = Clip {
+            rect: bounds,
+            // Keep whichever clip actually has corners; the innermost wins.
+            radii: if clip.radii.is_zero() {
+                self.current_clip()
+                    .map_or(Corners::ZERO, |current| current.radii)
+            } else {
+                clip.radii
+            },
+            // The radii belong to the rectangle they were written for, not to the
+            // intersection, so the shader needs that box to measure against.
+            radii_rect: if clip.radii.is_zero() {
+                self.current_clip()
+                    .map_or(clip.rect, |current| current.radii_rect)
+            } else {
+                clip.rect
+            },
         };
         self.clip_stack.push(effective);
         self.list.commands.push(DrawCommand::PushClip(effective));
-        !effective.is_empty()
+        !effective.rect.is_empty()
     }
 
     /// Ends the clip opened by the matching [`Self::push_clip`].
@@ -298,7 +382,7 @@ mod tests {
             rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             radii: Corners::ZERO,
             fill: Color::TRANSPARENT,
-            border_color: Color::BLACK,
+            border_color: Edges4::all(Color::BLACK),
             border_width: Edges::all(1.0),
         });
         assert_eq!(b.build().len(), 1);
@@ -310,7 +394,7 @@ mod tests {
         assert!(b.push_clip(Rect::from_xywh(0.0, 0.0, 50.0, 50.0)));
         assert!(b.push_clip(Rect::from_xywh(40.0, 40.0, 50.0, 50.0)));
         assert_eq!(
-            b.current_clip(),
+            b.current_clip().map(|clip| clip.rect),
             Some(Rect::from_xywh(40.0, 40.0, 10.0, 10.0))
         );
         // Inside the intersection: kept.

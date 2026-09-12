@@ -3,7 +3,7 @@
 //! These assert on the display list rather than on pixels, so they run without a GPU. The
 //! pixel half of the milestone is `tests/render.rs`.
 
-use crisol_display_list::{Color, Corners, DrawCommand, Edges, Point, Rect, Size};
+use crisol_display_list::{Color, Corners, DrawCommand, Edges, Edges4, Point, Rect, Size};
 use crisol_paint::{PaintOptions, paint, paint_with_stats};
 use crisol_tree::{BoxStyle, ColorBox, NodeId, Tree};
 
@@ -163,7 +163,7 @@ fn overflow_hidden_opens_and_closes_a_clip_around_the_subtree() {
     let DrawCommand::PushClip(clip) = list.commands()[2] else {
         panic!("expected a clip");
     };
-    assert_eq!(clip, Rect::from_xywh(20.0, 20.0, 120.0, 120.0));
+    assert_eq!(clip.rect, Rect::from_xywh(20.0, 20.0, 120.0, 120.0));
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn borders_and_radii_survive_the_walk() {
     tree.node_mut(root).layout = Rect::from_xywh(4.0, 6.0, 50.0, 50.0);
     tree.node_mut(root).style = BoxStyle {
         background: RED,
-        border_color: BLUE,
+        border_color: Edges4::all(BLUE),
         border_width: Edges {
             top: 1.0,
             right: 2.0,
@@ -207,7 +207,7 @@ fn borders_and_radii_survive_the_walk() {
     assert_eq!(command.rect, Rect::from_xywh(4.0, 6.0, 50.0, 50.0));
     assert_eq!(command.border_width.left, 4.0);
     assert_eq!(command.radii, Corners::all(6.0));
-    assert_eq!(command.border_color, BLUE);
+    assert_eq!(command.border_color, Edges4::all(BLUE));
 }
 
 // ---- custom nodes --------------------------------------------------------------------
@@ -231,7 +231,7 @@ fn a_custom_node_paints_itself_inside_an_engine_owned_clip() {
         .iter()
         .map(|command| match command {
             DrawCommand::Rect(r) => format!("rect {:?}", r.rect),
-            DrawCommand::PushClip(r) => format!("push {r:?}"),
+            DrawCommand::PushClip(clip) => format!("push {:?}", clip.rect),
             DrawCommand::PopClip => "pop".to_owned(),
             DrawCommand::Image(_) => "image".to_owned(),
         })
@@ -277,7 +277,7 @@ fn a_custom_node_cannot_paint_outside_its_bounds() {
     let DrawCommand::PushClip(clip) = list.commands()[0] else {
         panic!("expected the engine's clip first");
     };
-    assert_eq!(clip, Rect::from_xywh(50.0, 50.0, 10.0, 10.0));
+    assert_eq!(clip.rect, Rect::from_xywh(50.0, 50.0, 10.0, 10.0));
 
     // The oversized fill is still in the list, but the clip in force bounds it. The
     // renderer's scissor is what makes that true on the GPU; the list records the intent.
@@ -368,5 +368,66 @@ fn paint_subtree_positions_a_fragment_relative_to_a_given_origin() {
             (Rect::from_xywh(120.0, 20.0, 120.0, 120.0), GREEN),
             (Rect::from_xywh(130.0, 30.0, 40.0, 40.0), BLUE),
         ]
+    );
+}
+
+#[test]
+fn overflow_hidden_on_a_rounded_box_produces_a_rounded_clip() {
+    // The defect this pins: a scissor rectangle alone leaves square corners, so a rounded
+    // card's content showed through them.
+    let (mut tree, [_, mid, _]) = nested();
+    tree.node_mut(mid).style.clips_children = true;
+    tree.node_mut(mid).style.radii = Corners::all(8.0);
+
+    let list = paint(&tree, &options());
+    let DrawCommand::PushClip(clip) = list.commands()[2] else {
+        panic!("expected a clip");
+    };
+    assert_eq!(clip.rect, Rect::from_xywh(20.0, 20.0, 120.0, 120.0));
+    assert_eq!(clip.radii, Corners::all(8.0));
+    assert!(clip.is_rounded());
+}
+
+#[test]
+fn a_rounded_clip_keeps_its_own_corners_when_intersected() {
+    // The radii belong to the box they were declared on. Clipping a rounded card to a
+    // smaller ancestor must not move its corners.
+    let mut builder = crisol_display_list::DisplayListBuilder::new(Size::new(200.0, 200.0));
+    builder.push_clip(Rect::from_xywh(0.0, 0.0, 50.0, 200.0));
+    builder.push_rounded_clip(crisol_display_list::Clip::rounded(
+        Rect::from_xywh(10.0, 10.0, 100.0, 100.0),
+        Corners::all(12.0),
+    ));
+    let clip = builder.current_clip().unwrap();
+    assert_eq!(
+        clip.rect,
+        Rect::from_xywh(10.0, 10.0, 40.0, 100.0),
+        "bounds intersect"
+    );
+    assert_eq!(
+        clip.radii_rect,
+        Rect::from_xywh(10.0, 10.0, 100.0, 100.0),
+        "but the corners still belong to the box they were written for"
+    );
+    builder.pop_clip();
+    builder.pop_clip();
+}
+
+#[test]
+fn a_custom_node_is_clipped_to_its_own_rounded_box() {
+    let mut tree = Tree::new();
+    let root = tree.create_custom("canvas", ColorBox::new(Size::new(10.0, 10.0), GREEN));
+    tree.set_root(root).unwrap();
+    tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 40.0, 40.0);
+    tree.node_mut(root).style.radii = Corners::all(6.0);
+
+    let list = paint(&tree, &options());
+    let DrawCommand::PushClip(clip) = list.commands()[0] else {
+        panic!("expected the engine's clip first");
+    };
+    assert_eq!(
+        clip.radii,
+        Corners::all(6.0),
+        "a rounded PDF page must not paint into corners it does not own"
     );
 }
