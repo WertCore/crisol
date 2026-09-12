@@ -29,3 +29,13 @@ crisol-events.workspace = true
 crisol-a11y.workspace = true
 crisol-display-list.workspace = true
 crisol-render-wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The example touches wgpu and winit types directly, which the engine does not re-export:
+# nothing above the renderer should need them.
+wgpu.workspace = true
+winit.workspace = true
+
+[[example]]
+name = "tree"
+required-features = ["render"]

@@ -83,8 +83,10 @@ wgpu = "30"
 winit = { version = "0.30.13", features = ["android-game-activity"] }
 pollster = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
+bitflags = "2"
 raw-window-handle = "0.6"
 thiserror = "2"
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 lto = "thin"

@@ -1,7 +1,7 @@
 # Crisol — State
 
-**Current milestone:** M2 — node tree and display list (not started)
-**Last finished:** M1 — window and triangle
+**Current milestone:** M3 — CSS and layout (not started)
+**Last finished:** M2 — node tree and display list
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -10,15 +10,16 @@ actually is.
 
 ## Accept criteria for the current milestone
 
-> **M2 — node tree and display list.** Arena-allocated node tree with generational `NodeId`
-> handles. Parent/first-child/next-sibling links (**not** `Vec<NodeId>`). `DrawCommand`
-> enum. A hand-built tree of nested coloured rectangles renders through the display list.
+> **M3 — CSS and layout.** `lightningcss` parsing, `selectors` matching, cascade with
+> specificity and inheritance, `ComputedStyle` interned behind `Arc` and shared across
+> nodes. `taffy` integration producing layout rectangles.
 >
-> **Accept:** manually constructed 3-level nested tree renders at correct positions;
-> removing a node and re-rendering produces the expected output.
+> Property subset: `display`, `position`, `width`/`height`/`min`/`max`, `margin`, `padding`,
+> `border`, `flex-*`, `gap`, `justify-content`, `align-items`, `color`, `background-color`,
+> `border-radius`, `opacity`, `overflow`, `visibility`, `font-*`, `line-height`.
 >
-> Define the `CustomNode` trait here (ROADMAP §2.6): `measure`, `layout`, `paint`,
-> `hit_test`, with a stub that draws a fixed-size coloured box.
+> **Accept:** layout snapshot suite of 40+ cases passes; interning verified by asserting
+> that 100 identically-styled nodes share one `ComputedStyle` allocation.
 
 ---
 
@@ -26,76 +27,150 @@ actually is.
 
 ### M0 — skeleton and session state
 
-Workspace, 26 crates per ROADMAP §4, `DECISIONS.md`, CI on macOS/Linux/Windows plus a
-per-commit `cargo check` of the two arm64 mobile targets.
+- Cargo workspace, 26 crates, laid out per ROADMAP §4. Edition 2024, MSRV 1.87, toolchain
+  pinned in `rust-toolchain.toml`.
+- Workspace-inherited package metadata and lints. `missing_docs` is on everywhere and
+  promoted to an error in CI.
+- `DECISIONS.md` seeded from ROADMAP §2 and §3 (D-01…D-09), plus the decisions the
+  implementation forced (D-10…D-19).
+- `README.md`, `.gitignore`, `rustfmt.toml`.
+- CI workflow at `.github/workflows/ci.yml`: fmt, clippy `-D warnings`, test and rustdoc on
+  macOS, Linux and Windows, plus a `cargo check` of the two arm64 mobile targets on every
+  commit so a desktop-only assumption fails the day it is introduced (D-09).
+
+**Accept: met.** CI is green on macOS arm64, Linux x86_64 and Windows x86_64, plus the
+`aarch64-apple-ios` and `aarch64-linux-android` target checks.
 
 ### M1 — window and triangle
 
 - `crisol-display-list`: geometry (`Point`, `Size`, `Rect`, `Corners`, `Edges`, `Color`),
-  `DrawCommand`, `DisplayList`, and a `DisplayListBuilder` that owns the clip stack and
-  culls commands that cannot reach the framebuffer.
+  `DrawCommand`, `DisplayList`, `DisplayListBuilder` with a clip stack and CPU-side culling.
 - `crisol-render-wgpu`:
   - `Gpu` — instance, adapter, device, queue. Requests the WebGPU downlevel baseline rather
     than whatever the local adapter offers, so a desktop-only limit fails here and not at
     M22.
-  - `Renderer` — one instanced pipeline for every rounded and bordered rectangle, a second
-    for textured quads, batched into one draw call per clip group (D-14). `FrameStats`
-    counters.
-  - `WindowSurface` — `winit` window, surface configuration, resize, scale factor, and
+  - `Renderer` — one instanced pipeline for every rounded/bordered rectangle, a second for
+    textured quads, batched into one draw call per clip group (D-14). `FrameStats` counters.
+  - `WindowSurface` — `winit` window, surface configuration, resize, scale factor,
     swapchain recovery from `Outdated`/`Lost`.
-  - `HeadlessTarget` and `Pixels` — offscreen rendering and readback, which is what makes
-    the renderer testable on a machine with no display.
+  - `HeadlessTarget` + `Pixels` — offscreen rendering and readback, which is what makes the
+    renderer testable without a display.
   - `shaders/draw.wgsl` — signed-distance rounded box with per-edge borders, analytic
-    coverage antialiasing, sRGB-to-linear conversion and premultiplied output (D-15).
+    coverage antialiasing, sRGB→linear conversion and premultiplied output (D-15).
 - `examples/window.rs` — a real window with fills, radii, borders, a clip group and a
   textured quad.
 
 **Accept:** 16 offscreen render tests in `renderer/wgpu/tests/render.rs`, including the 1x
-versus 2x DPI equivalence the milestone asks for, a fractional 1.5x case, and an assertion
-that half-alpha white over black lands at sRGB ~188 rather than 128 — the colour-space bug
-that stays invisible until someone compares against a design. A real window was opened and
-verified on macOS arm64 (Apple M2, Metal, 640x400 logical to 1280x800 physical at 2x).
+vs 2x DPI equivalence the milestone asks for, a fractional (1.5x) scale case, and an
+assertion that half-alpha white over black lands at sRGB ~188 rather than 128 — the colour
+bug that is invisible until someone compares against a design. A real window was opened and
+verified on macOS arm64 (Apple M2, Metal, 640x400 logical → 1280x800 physical at 2x).
+
+The offscreen tests run on every CI platform and are not skipped anywhere:
+`CRISOL_REQUIRE_GPU=1` turns a missing adapter into a failure, and the Linux runner
+executes them against the lavapipe software rasteriser. So the pixel assertions — including
+the linear-light blending one — are verified on Metal, on Vulkan and on Windows, not just on
+the machine they were written on.
+
+### M2 — node tree and display list
+
+- `crisol-tree`:
+  - Arena with generational `NodeId` (8 bytes; `Option<NodeId>` also 8). A stale handle
+    fails its liveness check rather than resolving to whatever reused its slot (D-17).
+  - `first_child`/`last_child`/`prev_sibling`/`next_sibling` intrusive links, not
+    `Vec<NodeId>`, so a mid-list insert or remove is O(1).
+  - `append_child`, `insert_before`, `remove_child`, `replace_child`, `detach`,
+    `remove_subtree`. Cycle and stale-handle rejection returns `TreeError` rather than
+    panicking, because at M16 these become DOM exceptions.
+  - `DirtyFlags` with self and subtree bits, implication expansion (`STYLE` ⇒ `LAYOUT` ⇒
+    `PAINT`), and an ancestor walk that stops at the first ancestor that already knows
+    (D-18).
+  - `CustomNode`: `measure` / `layout` / `paint` / `hit_test` (D-06, D-19). `ColorBox` is
+    the stub implementation and doubles as the test fixture.
+  - `TreeStats` counters.
+- `crisol-paint`: iterative tree walk producing a display list. Absolute-position
+  accumulation, `overflow: hidden` clip groups, `visibility` handling, engine-owned clipping
+  around custom nodes, `PaintStats` counters.
+- `crisol-ui`: umbrella re-exporting Track A, with the renderer behind a default-on `render`
+  feature (D-11). `examples/tree.rs` runs the whole `tree → paint → display-list → render`
+  path in a window.
+- `crisol` CLI: `build | dev | run | check | package | doctor`. `doctor` is real today —
+  it reports the platform, the GPU adapter and backend, and the milestone table. The rest
+  exit with code 2 and name the milestone that implements them.
+
+**Accept:** `ui/paint/tests/paint.rs` (16 tests) asserts the display list for a three-level
+nested tree at absolute positions and after a node is removed; `ui/paint/tests/render.rs`
+(5 tests) asserts the same through the GPU to pixels. `ui/tree/tests/tree.rs` (21 tests)
+covers the structural guarantees.
+
+**Totals:** 81 tests passing, 0 failing. `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean. `cargo fmt --all --check` clean. `cargo doc` clean
+with `RUSTDOCFLAGS=-D warnings`.
 
 ---
 
 ## In progress
 
-Nothing.
+Nothing. M2 is closed and M3 has not been started.
 
 ---
 
 ## Open questions
 
-- **The window half of M1's accept is verified on macOS only.** Windows and Linux windows
-  have not been opened by hand. The offscreen half runs anywhere and is what CI gates on;
-  `CRISOL_REQUIRE_GPU=1` turns a missing adapter from a skip into a failure, and CI sets it.
-- **`DisplayList` has no transform command, and clipping is axis-aligned scissor only.**
-  A rounded clip needs either a stencil pass or a per-fragment test. Decide at M3, when the
-  CSS that needs it arrives, rather than guessing now.
+- **M1's "window opens on all three platforms" is verified on macOS only.** A window was
+  opened and looked at by hand there; nobody has done that on Windows or Linux. Everything
+  short of the window — device acquisition, pipelines, rasterisation, pixel output — is
+  covered offscreen on all three in CI, so what is untested is specifically the `winit`
+  surface and swapchain path.
+- **`DisplayList` has no transform command yet.** Clipping is axis-aligned scissor only.
+  `overflow: hidden` on a node with `border-radius` will clip square until either a stencil
+  path or a per-fragment rounded clip exists. Decide at M3, when the CSS that needs it
+  arrives.
 - **Per-corner inner border radii are approximated.** The shader shrinks a corner's inner
   radius by the thicker of its two adjacent borders; CSS uses per-axis elliptical radii. The
   difference shows only on a box with very different adjacent border widths and a large
-  radius.
+  radius. Revisit if a real design hits it.
+- **`BoxStyle` is a placeholder producer, not a placeholder contract.** M3's cascade
+  computes into it; the struct itself should survive. If `ComputedStyle` ends up wanting to
+  be the thing stored on the node, that is a change to `crisol-tree` and should be recorded
+  as a decision.
 
 ---
 
 ## Decisions made this session
 
+Appended to `DECISIONS.md` in full; summarised here.
+
+- **D-10** — edition 2024, workspace-inherited metadata and lints, internal crates declared
+  with both `path` and `version` so publishing later does not mean touching 26 manifests.
+- **D-11** — the umbrella crate gates the renderer behind a `render` feature, so a headless
+  consumer does not compile `wgpu` and `winit`.
 - **D-12** — geometry lives in `crisol-display-list` rather than a separate `crisol-geom`.
 - **D-13** — the renderer consumes a display list and knows nothing about the tree.
-- **D-14** — one instanced pipeline and one draw call per clip group, decided now because
+- **D-14** — one instanced pipeline and one draw call per clip group, decided at M1 because
   retrofitting it at M22 would be a rewrite.
 - **D-15** — straight sRGB colours in the display list, premultiplied linear out of the
   shader, sRGB surface format, linear blending.
 - **D-16** — Android uses `GameActivity`, not `NativeActivity`. Forced by the first CI run:
-  `android-activity` will not compile without the choice. `NativeActivity` cannot properly
-  drive the IME, and ROADMAP §2.5 and §3.6 make soft-keyboard text input non-negotiable.
+  `android-activity` will not compile without the choice, and `NativeActivity` cannot
+  properly drive the IME. Twenty-one milestones before the Android port, which is the
+  per-commit mobile check doing exactly what ROADMAP §3.6 asks of it.
+- **D-17** — generational `NodeId`, intrusive sibling links, no `Vec<NodeId>` children.
+- **D-18** — dirty tracking as per-node flags plus ancestor-marked subtree bits.
+- **D-19** — `CustomNode` as an object-safe measure/layout/paint/hit-test contract, with
+  `measure` taking constraints rather than a fixed size.
 
 ---
 
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. Start M2 in `ui/tree` and `ui/paint`. The `CustomNode` trait is the part to get right:
-   ROADMAP §2.6 calls it the single most important node kind for the eventual product and
-   the hardest to retrofit.
+2. Start M3. Suggested order, because each step makes the next testable:
+   a. `crisol-css`: `lightningcss` parse to a stylesheet representation, `selectors`
+      integration (`Element` impl over `crisol-tree`).
+   b. `crisol-style`: cascade, specificity, inheritance, `Arc`-interned `ComputedStyle`,
+      projection to the existing `BoxStyle`. The interning assertion in the milestone's
+      accept is a design constraint, not a benchmark — write that test first.
+   c. `crisol-layout`: `taffy` integration, with `CustomNode::measure` wired to taffy's
+      measure function.
+   d. The 40+ case layout snapshot suite in `tests/layout-snapshots/`.

@@ -12,3 +12,6 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-display-list.workspace = true
+bitflags.workspace = true
+thiserror.workspace = true

@@ -299,3 +299,53 @@ document editor, so the simpler option is disqualified on the one axis that matt
   touch and IME are designed anyway, this constrains work that has not started rather than
   work that has.
 
+---
+
+## D-17 — Generational `NodeId`, sibling links, no `Vec<NodeId>` children
+
+**Status:** Accepted (M2, mandated by ROADMAP §M2) · **Affects:** M2, M6, M16
+
+Nodes live in an arena. `NodeId` carries a generation counter, so a handle to a removed node
+fails a liveness check rather than silently addressing whatever was allocated into the slot
+next — the failure mode that matters once JS holds DOM handles (M16).
+
+Children are a `first_child` / `last_child` / `next_sibling` / `prev_sibling` intrusive list,
+not a `Vec<NodeId>` on the parent. Inserting or removing in the middle of a 400-page
+document's child list is then O(1) pointer work instead of an O(n) memmove, which is the
+whole point of M6.
+
+---
+
+## D-18 — Dirty tracking is a bitflag set per node plus an ancestor-marked subtree bit
+
+**Status:** Provisional — M6 will extend it (M2) · **Affects:** M2, M3, M6
+
+Each node carries `DirtyFlags` (`STYLE`, `LAYOUT`, `PAINT`, `SUBTREE_*`). Marking a node
+dirty sets its own bit and walks to the root setting the corresponding `SUBTREE_` bit, which
+lets a pass skip a clean subtree in O(1) instead of visiting it.
+
+The walk is O(depth), and it is done on mutation rather than on traversal, because mutation
+is the rarer operation in a document editor's steady state (one keystroke, one dirty text
+node, a 400-page tree that must not be walked).
+
+M6 replaces the "recompute everything dirty" consumers with real invalidation, but the flag
+vocabulary is fixed here so consumers do not have to change.
+
+---
+
+## D-19 — `CustomNode` is an object-safe trait with a measure/layout/paint/hit-test contract
+
+**Status:** Accepted (M2, mandated by ROADMAP §2.6) · **Affects:** M2, M3, M5, M6
+
+`CustomNode` is stored as `Box<dyn CustomNode>` in the node arena. Its four methods are the
+complete protocol between the engine and a node that opts out of CSS layout:
+
+- `measure(constraints) -> Size` — called by layout, mirrors taffy's measure function so M3
+  can hand it straight to taffy
+- `layout(size)` — the node lays out its own interior once the engine has given it a box
+- `paint(bounds, &mut DisplayListBuilder)` — the node emits draw commands directly
+- `hit_test(local_point) -> Option<CustomHit>` — the node resolves a point inside itself to
+  something meaningful, so M5 hit testing does not stop at the custom node's boundary
+
+`measure` takes constraints rather than a fixed size because a document canvas needs to know
+available width to decide its own height. Deciding this at M2 is the point of §2.6.

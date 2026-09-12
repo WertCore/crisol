@@ -16,3 +16,6 @@ name = "crisol"
 path = "src/main.rs"
 
 [dependencies]
+crisol-render-wgpu.workspace = true
+clap.workspace = true
+wgpu.workspace = true
