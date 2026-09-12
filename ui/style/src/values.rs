@@ -251,9 +251,11 @@ impl From<Color> for crisol_display_list::Color {
 
 /// How a box participates in layout.
 ///
-/// A short list because `taffy` implements block, flex and grid, and ROADMAP §1 rules out
-/// tables-as-layout and floats. `inline` is absent because inline layout is M4's problem,
-/// not M3's, and pretending to support it would be worse than rejecting it.
+/// A short list. `inline` is absent because inline layout is M4's problem; `grid` is absent
+/// because none of the `grid-template-*` properties are in M3's subset, so a grid would lay
+/// out as a single column — worse than declining the declaration. ROADMAP §1 rules out
+/// tables-as-layout and floats outright. In every case an unsupported `display` leaves the
+/// property at its previous value rather than quietly laying the box out as something else.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Display {
     /// No box at all. The subtree is not laid out and not painted.
@@ -263,8 +265,6 @@ pub enum Display {
     Block,
     /// Flex layout.
     Flex,
-    /// Grid layout.
-    Grid,
 }
 
 /// How a box is positioned relative to its normal place.

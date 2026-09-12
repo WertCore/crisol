@@ -274,11 +274,17 @@ fn a_custom_node_reports_its_own_size_and_hit() {
         Some(Point::new(4.0, 4.0))
     );
 
-    let id = tree.create_custom(stub);
+    let id = tree.create_custom("canvas", stub);
     assert!(matches!(
         tree.node(id).kind,
         crisol_tree::NodeKind::Custom(_)
     ));
+    // A custom node is still an element: it has a tag, so a selector can reach it and the
+    // cascade can style it.
+    assert_eq!(
+        tree.element(id).map(|data| data.tag.to_string()),
+        Some("canvas".to_owned())
+    );
 }
 
 #[test]

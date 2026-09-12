@@ -93,6 +93,7 @@ lightningcss = { version = "1.0.0-alpha.72", default-features = false, features 
 selectors = "0.40"
 # lightningcss re-exports this trait; the version must match the one it depends on.
 static-self = "0.1"
+taffy = { version = "0.14", default-features = false, features = ["std", "flexbox", "block_layout", "content_size"] }
 cssparser = "0.37"
 smallvec = "1.16"
 # Required by `selectors` for identifier types; must be the same version it uses.

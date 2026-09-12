@@ -177,9 +177,16 @@ impl Tree {
         self.insert(NodeKind::Text(text.into()))
     }
 
-    /// Creates a detached custom node (DECISIONS D-06).
-    pub fn create_custom(&mut self, custom: impl CustomNode) -> NodeId {
-        self.insert(NodeKind::Custom(Box::new(custom)))
+    /// Creates a detached custom element (DECISIONS D-06).
+    ///
+    /// Takes a tag like any other element, because a custom element is still selectable and
+    /// stylable — a PDF page that could not be given a `width` or an `overflow` would not be
+    /// the escape hatch ROADMAP §2.6 asks for.
+    pub fn create_custom(&mut self, tag: &str, custom: impl CustomNode) -> NodeId {
+        self.insert(NodeKind::Custom(crate::node::CustomElement {
+            data: ElementData::new(Atom::lowercase(tag)),
+            node: Box::new(custom),
+        }))
     }
 
     fn insert(&mut self, kind: NodeKind) -> NodeId {
@@ -555,6 +562,38 @@ impl Tree {
         }
         self.detach(child);
         Ok(())
+    }
+
+    // ---- custom nodes ---------------------------------------------------------------
+
+    /// Asks a custom node to measure itself.
+    ///
+    /// Returns `None` when `id` is not a custom node. Takes `&mut self` because
+    /// [`CustomNode::measure`] does: a custom node is allowed to cache what it measured, and
+    /// forcing interior mutability on every implementor to avoid that would be a worse
+    /// trade than threading the mutable borrow through layout.
+    pub fn measure_custom(
+        &mut self,
+        id: NodeId,
+        constraints: crate::custom::MeasureConstraints,
+    ) -> Option<crisol_display_list::Size> {
+        match &mut self.get_mut(id)?.kind {
+            NodeKind::Custom(custom) => Some(custom.node.measure(constraints)),
+            _ => None,
+        }
+    }
+
+    /// Tells a custom node what box it was given, so it can lay out its interior.
+    ///
+    /// Returns whether `id` was a custom node.
+    pub fn layout_custom(&mut self, id: NodeId, size: crisol_display_list::Size) -> bool {
+        match self.get_mut(id).map(|node| &mut node.kind) {
+            Some(NodeKind::Custom(custom)) => {
+                custom.node.layout(size);
+                true
+            }
+            _ => false,
+        }
     }
 
     // ---- invalidation ---------------------------------------------------------------

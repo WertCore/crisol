@@ -454,3 +454,64 @@ the resolved length, so a child with a larger font gets a proportionally larger 
 That is the whole point of writing `line-height: 1.5`, and resolving it during the cascade
 would quietly break it.
 
+---
+
+## D-23 — A custom node is an element with a painter, not a thing outside the document
+
+**Status:** Accepted (M3) · **Affects:** M3, M5, M6, M16
+
+`NodeKind::Custom` originally held only a `Box<dyn CustomNode>`. That made a custom node
+invisible to the cascade: it matched no selector, so it could not be given a `width`, a
+`margin` or an `overflow`, and layout fell back to initial values for it. ROADMAP §2.6 asks
+for an escape hatch that still participates in hit testing, scrolling, focus, clipping and
+accessibility — and clipping is a *style*.
+
+`NodeKind::Custom(CustomElement)`, where `CustomElement` carries an `ElementData` alongside
+the painter. `<canvas>` is the model: an element with a painter attached. It has a tag,
+classes and attributes, it matches selectors, and the cascade styles it.
+
+**Rejected — leave it outside the document and style it some other way.** Every mechanism
+that would have worked — a parallel style API, inheritance-only styling — is a second way to
+say something CSS already says.
+
+**Consequence:** `Tree::create_custom` takes a tag. A PDF page is `create_custom("canvas",
+…)` and `canvas { width: 100% }` applies to it.
+
+## D-24 — Custom nodes are replaced elements
+
+**Status:** Accepted (M3) · **Affects:** M3, M4
+
+A block-level box with `width: auto` stretches to its container. A custom node that did so
+would make a PDF page the width of the window rather than the width of the page, which
+defeats the point of asking it to measure itself.
+
+Custom nodes are therefore *replaced* elements, like `<img>`: `width: auto` resolves to the
+intrinsic size their `measure` reported. `StyleRef` carries a `replaced` bit that the cascade
+cannot know — it is a property of the node kind, not of any declaration — and taffy is told
+`is_block() == false` and `is_compressible_replaced() == true` for them.
+
+CSS still has the final word: an explicit `width` overrides the measured one, because
+`measure` is a request and the engine decides the box. There is a test for each direction.
+
+## D-25 — A one-rule user-agent stylesheet, and why it is exactly one rule
+
+**Status:** Accepted (M3) · **Affects:** M3 onwards
+
+A browser's user-agent stylesheet is hundreds of rules because it has to make a document
+written in 1998 render sensibly. This engine renders applications and owes nothing to that
+(ROADMAP §1), so every rule has to earn its place by describing something true of *this*
+engine rather than of HTML.
+
+Exactly one rule qualifies today: `:root { width: 100%; height: 100% }`.
+
+In a browser the root has `height: auto` and shrinks to its content, with the viewport merely
+being what you can see of it. In an application the root *is* the window: without this, a
+layout has no way to say "fill the space", and every author would open with this rule anyway.
+Leaving it out produces a root box shorter than the window — subtly wrong rather than
+obviously broken, which is the worst kind of default.
+
+`StyleEngine::new()` loads it; `StyleEngine::without_user_agent_styles()` exists for tests
+that want to see raw behaviour. An author who wants a content-sized root writes
+`:root { height: auto }`, which wins because author rules beat user-agent rules regardless of
+specificity.
+

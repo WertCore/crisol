@@ -18,26 +18,38 @@ pub enum NodeKind {
     /// A run of text. Shaping and line breaking arrive at M4; until then the string is
     /// carried but not drawn.
     Text(String),
-    /// A node that lays out and paints itself (DECISIONS D-06).
-    Custom(Box<dyn CustomNode>),
+    /// An element that lays out and paints itself (DECISIONS D-06).
+    ///
+    /// Still an element: it has a tag, classes and attributes, it matches selectors, and the
+    /// cascade styles it. `<canvas>` is the model — an element with a painter attached, not
+    /// a thing outside the document. Without that, `overflow: hidden` or a `width` could not
+    /// be written against a PDF page, which ROADMAP §2.6 requires.
+    Custom(CustomElement),
+}
+
+/// An element with a painter attached.
+#[derive(Debug)]
+pub struct CustomElement {
+    /// Everything a selector can ask about it.
+    pub data: ElementData,
+    /// The painter.
+    pub node: Box<dyn CustomNode>,
 }
 
 impl NodeKind {
     /// The tag name, for elements.
     #[must_use]
     pub fn tag(&self) -> Option<&str> {
-        match self {
-            Self::Element(data) => Some(data.tag.as_str()),
-            _ => None,
-        }
+        self.element().map(|data| data.tag.as_str())
     }
 
-    /// The element data, for elements.
+    /// The element data, for elements — including custom ones.
     #[must_use]
     pub fn element(&self) -> Option<&ElementData> {
         match self {
             Self::Element(data) => Some(data),
-            _ => None,
+            Self::Custom(custom) => Some(&custom.data),
+            Self::Text(_) => None,
         }
     }
 
@@ -46,6 +58,16 @@ impl NodeKind {
     pub fn element_mut(&mut self) -> Option<&mut ElementData> {
         match self {
             Self::Element(data) => Some(data),
+            Self::Custom(custom) => Some(&mut custom.data),
+            Self::Text(_) => None,
+        }
+    }
+
+    /// The painter, for a custom element.
+    #[must_use]
+    pub fn custom(&self) -> Option<&dyn CustomNode> {
+        match self {
+            Self::Custom(custom) => Some(&*custom.node),
             _ => None,
         }
     }

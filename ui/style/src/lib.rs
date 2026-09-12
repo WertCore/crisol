@@ -6,6 +6,7 @@ mod apply;
 pub mod cascade;
 pub mod computed;
 pub mod intern;
+pub mod user_agent;
 pub mod values;
 
 pub use cascade::{StyleEngine, StyleMap, StyleStats};

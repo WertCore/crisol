@@ -12,3 +12,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-display-list.workspace = true
+crisol-style.workspace = true
+crisol-tree.workspace = true
+taffy.workspace = true
+
+[dev-dependencies]
+crisol-css.workspace = true

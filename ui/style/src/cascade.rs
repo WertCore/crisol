@@ -58,9 +58,28 @@ pub struct StyleEngine {
 pub type StyleMap = NodeMap<Arc<ComputedStyle>>;
 
 impl StyleEngine {
-    /// An engine with no stylesheets.
+    /// An engine with the user-agent stylesheet loaded.
+    ///
+    /// The default rather than an opt-in because forgetting it produces a layout that is
+    /// subtly wrong — a root box shorter than the window — rather than one that obviously
+    /// fails. See [`crate::user_agent`].
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: the user-agent stylesheet is a constant and is covered by a test.
     #[must_use]
     pub fn new() -> Self {
+        let mut engine = Self::default();
+        engine.add_stylesheet(
+            Stylesheet::parse_with_origin(crate::user_agent::STYLESHEET, Origin::UserAgent)
+                .expect("the user-agent stylesheet must parse"),
+        );
+        engine
+    }
+
+    /// An engine with nothing loaded at all, for tests that want to see raw behaviour.
+    #[must_use]
+    pub fn without_user_agent_styles() -> Self {
         Self::default()
     }
 

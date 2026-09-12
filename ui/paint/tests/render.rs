@@ -152,7 +152,7 @@ fn a_custom_node_reaches_the_framebuffer() {
         tree.node_mut(root).layout = crisol_display_list::Rect::from_xywh(0.0, 0.0, 200.0, 200.0);
         tree.node_mut(root).style = BoxStyle::filled(RED);
 
-        let custom = tree.create_custom(ColorBox::new(Size::new(40.0, 40.0), GREEN));
+        let custom = tree.create_custom("canvas", ColorBox::new(Size::new(40.0, 40.0), GREEN));
         tree.append_child(root, custom).unwrap();
         tree.node_mut(custom).layout = crisol_display_list::Rect::from_xywh(80.0, 80.0, 40.0, 40.0);
 

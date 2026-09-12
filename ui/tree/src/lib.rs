@@ -36,5 +36,5 @@ pub use custom::{ColorBox, CustomHit, CustomNode, MeasureConstraints};
 pub use dirty::DirtyFlags;
 pub use id::NodeId;
 pub use map::NodeMap;
-pub use node::{Attribute, BoxStyle, ElementData, ElementState, Node, NodeKind};
+pub use node::{Attribute, BoxStyle, CustomElement, ElementData, ElementState, Node, NodeKind};
 pub use tree::{Children, Tree, TreeError, TreeStats};

@@ -219,7 +219,7 @@ fn a_custom_node_paints_itself_inside_an_engine_owned_clip() {
     tree.set_root(root).unwrap();
     tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 200.0, 200.0);
 
-    let custom = tree.create_custom(ColorBox::new(Size::new(40.0, 40.0), GREEN));
+    let custom = tree.create_custom("canvas", ColorBox::new(Size::new(40.0, 40.0), GREEN));
     tree.append_child(root, custom).unwrap();
     tree.node_mut(custom).layout = Rect::from_xywh(25.0, 35.0, 40.0, 40.0);
 
@@ -269,7 +269,7 @@ fn a_custom_node_cannot_paint_outside_its_bounds() {
     tree.set_root(root).unwrap();
     tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 200.0, 200.0);
 
-    let custom = tree.create_custom(Overreaching);
+    let custom = tree.create_custom("canvas", Overreaching);
     tree.append_child(root, custom).unwrap();
     tree.node_mut(custom).layout = Rect::from_xywh(50.0, 50.0, 10.0, 10.0);
 
@@ -290,7 +290,7 @@ fn a_custom_node_cannot_paint_outside_its_bounds() {
 #[test]
 fn a_custom_node_can_have_a_background_of_its_own() {
     let mut tree = Tree::new();
-    let root = tree.create_custom(ColorBox::new(Size::new(10.0, 10.0), GREEN));
+    let root = tree.create_custom("canvas", ColorBox::new(Size::new(10.0, 10.0), GREEN));
     tree.set_root(root).unwrap();
     tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 10.0, 10.0);
     tree.node_mut(root).style = BoxStyle::filled(RED);

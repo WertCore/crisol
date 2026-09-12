@@ -222,12 +222,12 @@ fn convert_display(value: &lc_display::Display) -> Option<Display> {
     };
     match pair.inside {
         lc_display::DisplayInside::Flex(_) => Some(Display::Flex),
-        lc_display::DisplayInside::Grid => Some(Display::Grid),
         lc_display::DisplayInside::Flow | lc_display::DisplayInside::FlowRoot => {
             Some(Display::Block)
         }
-        // Tables, ruby and friends are out of scope (ROADMAP §1). Leaving the property
-        // alone is better than silently laying the box out as something it is not.
+        // Grid needs the `grid-template-*` properties to mean anything and they are not in
+        // M3's subset; tables and ruby are out of scope entirely (ROADMAP §1). Leaving the
+        // property alone is better than silently laying the box out as something it is not.
         _ => None,
     }
 }

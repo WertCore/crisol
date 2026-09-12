@@ -169,7 +169,7 @@ impl Document {
             // A custom node: it decides its own size and paints itself (DECISIONS D-06).
             let badge = self
                 .tree
-                .create_custom(ColorBox::new(Size::new(24.0, 24.0), ACCENT));
+                .create_custom("canvas", ColorBox::new(Size::new(24.0, 24.0), ACCENT));
             self.tree.append_child(card, badge).unwrap();
             self.tree.node_mut(badge).layout = Rect::from_xywh(8.0, 8.0, 24.0, 24.0);
 

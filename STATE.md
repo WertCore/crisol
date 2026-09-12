@@ -1,7 +1,7 @@
 # Crisol — State
 
-**Current milestone:** M3 — CSS and layout (in progress: steps 1 and 2 of 4 done)
-**Last finished:** M2 — node tree and display list
+**Current milestone:** M4 — HTML and text (not started)
+**Last finished:** M3 — CSS and layout
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -10,16 +10,18 @@ actually is.
 
 ## Accept criteria for the current milestone
 
-> **M3 — CSS and layout.** `lightningcss` parsing, `selectors` matching, cascade with
-> specificity and inheritance, `ComputedStyle` interned behind `Arc` and shared across
-> nodes. `taffy` integration producing layout rectangles.
+> **M4 — HTML and text.** `html5ever` producing the node tree. `cosmic-text` shaping,
+> `glyphon` rendering. Font loading and fallback chains. Line breaking.
 >
-> Property subset: `display`, `position`, `width`/`height`/`min`/`max`, `margin`, `padding`,
-> `border`, `flex-*`, `gap`, `justify-content`, `align-items`, `color`, `background-color`,
-> `border-radius`, `opacity`, `overflow`, `visibility`, `font-*`, `line-height`.
+> **Public text API** (ROADMAP §2.5): shaped run access, cluster boundaries,
+> `point_to_cursor`, `cursor_to_point`, selection rectangles for a range, line box geometry.
 >
-> **Accept:** layout snapshot suite of 40+ cases passes; interning verified by asserting
-> that 100 identically-styled nodes share one `ComputedStyle` allocation.
+> **Accept:** renders a paragraph with mixed Latin/CJK/emoji correctly; clicking any glyph
+> returns the correct cursor index including at cluster boundaries; selection rectangles are
+> correct across a line wrap.
+>
+> Budget 2–3x whatever this seems like it should take. Bidi can be deferred to M8 but the
+> API must not assume LTR.
 
 ---
 
@@ -103,42 +105,53 @@ nested tree at absolute positions and after a node is removed; `ui/paint/tests/r
 (5 tests) asserts the same through the GPU to pixels. `ui/tree/tests/tree.rs` (21 tests)
 covers the structural guarantees.
 
-**Totals:** 81 tests passing, 0 failing. `cargo clippy --workspace --all-targets
---all-features -- -D warnings` clean. `cargo fmt --all --check` clean. `cargo doc` clean
-with `RUSTDOCFLAGS=-D warnings`.
+### M3 — CSS and layout
+
+Four steps, landed as three pull requests.
+
+*(a) Selector matching — `crisol-css`.* `crisol_tree::Atom`; `ElementData` with `id`,
+`classes`, `attributes` and an `ElementState` bitflag set; `CrisolSelectors` with a closed
+pseudo-class allowlist (D-20); `ElementRef` as the `selectors::Element` adapter;
+`parse_selector_list` / `matches` / `MatchCaches`.
+
+*(b) Stylesheet parsing — `crisol-css`.* lightningcss for the grammar; selectors re-read into
+our dialect; shorthands flattened to longhands at parse time so the cascade compares like
+with like; `!important` sorted last within a rule; unsupported rules kept as warnings.
+Nesting is lowered by printing the sheet with nesting disabled and reading it back, because
+lightningcss implements that transform in its printer rather than its rule tree.
+
+*(c) The cascade — `crisol-style`.* `ComputedStyle` for the whole M3 property subset,
+`Eq + Hash` so it can be a map key; `StyleInterner`; `StyleEngine::restyle` with precedence
+as `(important, origin, specificity, source order)`; inheritance through text nodes; `em`
+and `rem` resolved, percentages left for layout (D-22); a one-rule user-agent stylesheet
+(D-25). `crisol_tree::NodeMap<T>` is the side table computed style lives in (D-21).
+
+*(d) Layout — `crisol-layout`.* taffy 0.14 driven over the Crisol tree through its trait
+API, so there is no second tree and **no second per-node style allocation**: `StyleRef`
+implements taffy's style traits directly over `ComputedStyle`. `CustomNode::measure` is wired
+to taffy's leaf measure function, custom nodes are replaced elements (D-24), and a custom
+node is a real element with a painter rather than a thing outside the document (D-23).
+Layout writes each node's border box into `Node::layout` and projects computed style onto
+the `BoxStyle` paint reads — which is where a percentage `border-radius` finally becomes a
+number of pixels.
+
+**Accept: met.**
+
+- *Layout snapshot suite of 40+ cases* — **54 cases** in `ui/layout/tests/{block,flex}.rs`,
+  written as box-tree snapshots so a failure shows what moved rather than which number
+  changed.
+- *Interning verified by asserting that 100 identically-styled nodes share one
+  `ComputedStyle` allocation* — `a_hundred_identically_styled_nodes_share_one_allocation`:
+  101 elements cost 2 allocations and 99 interner hits.
+
+**Totals:** 223 tests passing, 0 failing. `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean, `cargo fmt --all --check` clean.
 
 ---
 
 ## In progress
 
-**M3, steps 1 and 2 of four.**
-
-*(a) Selector matching — `crisol-css`.* `crisol_tree::Atom`; `ElementData` with `id`,
-`classes`, `attributes` and an `ElementState` bitflag set; `CrisolSelectors` with a closed
-pseudo-class allowlist (D-20); `ElementRef` as the `selectors::Element` adapter;
-`parse_selector_list` / `matches` / `MatchCaches`. **31 tests.**
-
-*(b) Stylesheet parsing and the cascade — `crisol-css`, `crisol-style`.*
-
-- `Stylesheet::parse` — lightningcss for the grammar, selectors re-read into our dialect,
-  shorthands flattened to longhands at parse time so the cascade compares like with like,
-  `!important` sorted last within a rule, unsupported rules kept as warnings rather than
-  dropped. Nesting is lowered by printing the sheet with nesting disabled and reading it
-  back, since lightningcss implements that transform in its printer rather than its rule
-  tree.
-- `ComputedStyle` — every property in M3's subset, `Eq + Hash` so it can be a map key.
-- `StyleInterner` — **M3's acceptance criterion for interning passes**: a hundred
-  identically-styled paragraphs share one allocation, and a 101-element document costs two.
-- `StyleEngine::restyle` — document-order walk, precedence as
-  `(important, origin, specificity, source order)`, inheritance through text nodes, `em`/`rem`
-  resolved and percentages left for layout (D-22).
-- `crisol_tree::NodeMap<T>` — the side table computed style lives in (D-21).
-
-**35 tests**, 166 across the workspace.
-
-**Still to do for M3:** *(c)* `taffy` integration with `CustomNode::measure` wired to
-taffy's measure function, and `ComputedStyle::to_box_style` called once boxes are known.
-*(d)* the 40+ case layout snapshot suite the milestone's acceptance names.
+Nothing. M3 is closed and M4 has not been started.
 
 ## Open questions
 
@@ -199,18 +212,30 @@ Appended to `DECISIONS.md` in full; summarised here.
 - **D-22** — percentages reach layout unresolved; `em` and `rem` do not. `em` inside
   `font-size` means the parent's, everywhere else it means this element's. `line-height`
   inherits as a multiple, not as a resolved length.
+- **D-23** — a custom node is an element with a painter attached, not a thing outside the
+  document. Without a tag it matched no selector and could not be given a `width` or an
+  `overflow`, which is most of what ROADMAP §2.6 asks the escape hatch to support.
+- **D-24** — custom nodes are *replaced* elements: `width: auto` takes the intrinsic size
+  their `measure` reported instead of stretching to the container. CSS still overrides it.
+- **D-25** — a one-rule user-agent stylesheet, `:root { width: 100%; height: 100% }`, and an
+  explanation of why exactly one rule qualifies.
 
 ---
 
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. Start M3. Suggested order, because each step makes the next testable:
-   a. `crisol-css`: `lightningcss` parse to a stylesheet representation, `selectors`
-      integration (`Element` impl over `crisol-tree`).
-   b. `crisol-style`: cascade, specificity, inheritance, `Arc`-interned `ComputedStyle`,
-      projection to the existing `BoxStyle`. The interning assertion in the milestone's
-      accept is a design constraint, not a benchmark — write that test first.
-   c. `crisol-layout`: `taffy` integration, with `CustomNode::measure` wired to taffy's
-      measure function.
-   d. The 40+ case layout snapshot suite in `tests/layout-snapshots/`.
+2. Start M4, and read ROADMAP §2.5 first. Text is the one milestone the roadmap explicitly
+   says to over-budget for, and it is the core competency rather than a checkbox: the text
+   layer is a *public API*, not an internal detail.
+3. Suggested order:
+   a. `crisol-html`: `html5ever` into the tree. Small, and it makes every later test easier
+      to write — the layout suite currently builds documents through a bespoke fixture
+      because there is no parser yet.
+   b. `crisol-text`: `cosmic-text` shaping behind an API that exposes shaped runs, cluster
+      boundaries, `point_to_cursor`, `cursor_to_point`, selection rectangles and line box
+      geometry. Design the API before the implementation; §2.5 is the requirement, and it
+      must not assume LTR even though bidi can be deferred to M8.
+   c. `crisol-text-gpu`: `glyphon` for the atlas and the draw.
+   d. Wire text measurement into `measure_leaf` in `crisol-layout`, which currently returns
+      a zero size for every text node and has a test saying so.

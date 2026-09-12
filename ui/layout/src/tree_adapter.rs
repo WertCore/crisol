@@ -1,0 +1,425 @@
+//! Driving `taffy` over a Crisol tree.
+//!
+//! `taffy` 0.14 can lay out a tree it does not own, through a set of traits. That is what
+//! this file implements, so there is no second tree to keep in sync — the thing layout
+//! measures is the same arena HTML built, the cascade styled, and paint will walk.
+//!
+//! The custom-node protocol lands here: a node that opts out of CSS layout (DECISIONS D-06,
+//! D-19) is a leaf as far as taffy is concerned, and its measure function is its own
+//! [`CustomNode::measure`](crisol_tree::CustomNode::measure).
+
+use crisol_display_list::{Rect, Size as CrisolSize};
+use crisol_style::values::Display;
+use crisol_style::{ComputedStyle, StyleMap};
+use crisol_tree::{MeasureConstraints, NodeId, NodeKind, NodeMap, Tree};
+use taffy::geometry::Size;
+use taffy::style::AvailableSpace;
+use taffy::tree::{Cache, Layout, LayoutInput, LayoutOutput, NodeId as TaffyId, RunMode};
+use taffy::{
+    CacheTree, LayoutBlockContainer, LayoutFlexboxContainer, LayoutPartialTree, RoundTree,
+    TraversePartialTree, TraverseTree,
+};
+
+use crate::style_adapter::StyleRef;
+
+/// Per-node scratch that only layout needs. Kept in a side table so `crisol-tree` never has
+/// to know what `taffy` is.
+#[derive(Debug, Default)]
+struct NodeLayout {
+    cache: Cache,
+    unrounded: Layout,
+    final_layout: Layout,
+}
+
+/// Counters for one layout pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutStats {
+    /// Nodes taffy computed a layout for, cache misses only.
+    pub nodes_laid_out: usize,
+    /// Custom nodes whose `measure` was called.
+    pub custom_measures: usize,
+    /// Nodes whose box was written back to the tree.
+    pub nodes_written: usize,
+}
+
+/// Borrows a tree and its styles for one or more layout passes.
+///
+/// Holds taffy's caches across passes, so an unchanged subtree is not remeasured — which is
+/// most of what makes M6's incremental relayout possible.
+pub struct LayoutContext<'a> {
+    tree: &'a mut Tree,
+    styles: &'a StyleMap,
+    nodes: NodeMap<NodeLayout>,
+    /// Text and custom nodes have no style of their own and lay out with initial values.
+    fallback: ComputedStyle,
+    stats: LayoutStats,
+}
+
+impl std::fmt::Debug for LayoutContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayoutContext")
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Looks up a style without borrowing the whole context, so the tree stays free for the
+/// mutable borrow a custom node's `measure` needs.
+fn style_of<'s>(
+    styles: &'s StyleMap,
+    fallback: &'s ComputedStyle,
+    id: NodeId,
+) -> &'s ComputedStyle {
+    styles.get(id).map_or(fallback, |style| &**style)
+}
+
+/// Whether this node measures itself rather than being sized by its container.
+fn is_replaced(tree: &Tree, id: NodeId) -> bool {
+    matches!(tree.node(id).kind, NodeKind::Custom(_))
+}
+
+/// The taffy view of a node's style, including the replaced bit the cascade cannot know.
+fn style_ref<'s>(
+    tree: &Tree,
+    styles: &'s StyleMap,
+    fallback: &'s ComputedStyle,
+    id: NodeId,
+) -> StyleRef<'s> {
+    let style = style_of(styles, fallback, id);
+    if is_replaced(tree, id) {
+        StyleRef::replaced(style)
+    } else {
+        StyleRef::new(style)
+    }
+}
+
+fn crisol_id(node: TaffyId) -> NodeId {
+    NodeId::from_bits(u64::from(node)).expect("taffy only sees ids this adapter gave it")
+}
+
+fn taffy_id(id: NodeId) -> TaffyId {
+    TaffyId::from(id.to_bits())
+}
+
+fn definite(space: AvailableSpace) -> Option<f32> {
+    match space {
+        AvailableSpace::Definite(value) => Some(value),
+        AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+    }
+}
+
+/// Whether a node lays its own children out, or is a leaf as far as taffy is concerned.
+///
+/// A custom node is always a leaf: it opted out of CSS layout, and letting taffy lay out
+/// children it does not know about would be the opposite of what ROADMAP §2.6 promises.
+fn is_leaf(tree: &Tree, id: NodeId) -> bool {
+    match &tree.node(id).kind {
+        NodeKind::Custom(_) | NodeKind::Text(_) => true,
+        NodeKind::Element(_) => tree.first_child(id).is_none(),
+    }
+}
+
+impl<'a> LayoutContext<'a> {
+    /// Prepares a context over `tree` using `styles`.
+    #[must_use]
+    pub fn new(tree: &'a mut Tree, styles: &'a StyleMap) -> Self {
+        let capacity = tree.len();
+        Self {
+            tree,
+            styles,
+            nodes: NodeMap::with_capacity(capacity),
+            fallback: ComputedStyle::default(),
+            stats: LayoutStats::default(),
+        }
+    }
+
+    /// This context's counters, accumulated across passes.
+    #[must_use]
+    pub fn stats(&self) -> LayoutStats {
+        self.stats
+    }
+
+    /// The final layout computed for a node, in its parent's coordinate space.
+    #[must_use]
+    pub fn layout_of(&self, id: NodeId) -> Option<Layout> {
+        self.nodes.get(id).map(|node| node.final_layout)
+    }
+
+    /// Lays out the tree's root into `available`, then writes the results back.
+    ///
+    /// Returns `false` when the tree has no root. `available` is the viewport in logical
+    /// pixels.
+    pub fn run(&mut self, available: CrisolSize) -> bool {
+        let Some(root) = self.tree.root() else {
+            return false;
+        };
+
+        taffy::compute_root_layout(
+            self,
+            taffy_id(root),
+            Size {
+                width: AvailableSpace::Definite(available.width),
+                height: AvailableSpace::Definite(available.height),
+            },
+        );
+        // Snap boxes to whole pixels. Without it, a column of 1/3-height rows accumulates
+        // fractional offsets and adjacent borders land on different physical pixels.
+        taffy::round_layout(self, taffy_id(root));
+        self.write_back(root);
+        true
+    }
+
+    /// Copies taffy's boxes onto the nodes, and projects computed style onto `BoxStyle`.
+    ///
+    /// Both happen here rather than in two passes because the projection needs the box:
+    /// a percentage `border-radius` is only a number of pixels once layout has decided the
+    /// border box.
+    fn write_back(&mut self, root: NodeId) {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let Some(layout) = self.nodes.get(id).map(|node| node.final_layout) else {
+                continue;
+            };
+            let rect = Rect::from_xywh(
+                layout.location.x,
+                layout.location.y,
+                layout.size.width,
+                layout.size.height,
+            );
+            let box_style = style_of(self.styles, &self.fallback, id).to_box_style(rect.size);
+
+            if let Some(node) = self.tree.get_mut(id) {
+                node.layout = rect;
+                node.style = box_style;
+            }
+            self.stats.nodes_written += 1;
+
+            // A custom node gets told the box it was given, so it can lay out its interior
+            // now that the size is settled (DECISIONS D-19).
+            self.tree.layout_custom(id, rect.size);
+
+            let mut child = self.tree.first_child(id);
+            while let Some(node) = child {
+                stack.push(node);
+                child = self.tree.next_sibling(node);
+            }
+        }
+    }
+
+    fn entry(&mut self, id: NodeId) -> &mut NodeLayout {
+        if self.nodes.get(id).is_none() {
+            self.nodes.insert(id, NodeLayout::default());
+        }
+        self.nodes
+            .get_mut(id)
+            .expect("inserted above when it was missing")
+    }
+}
+
+/// Iterates a node's children as taffy ids.
+pub struct ChildIter<'a> {
+    tree: &'a Tree,
+    next: Option<NodeId>,
+}
+
+impl Iterator for ChildIter<'_> {
+    type Item = TaffyId;
+
+    fn next(&mut self) -> Option<TaffyId> {
+        let current = self.next?;
+        self.next = self.tree.next_sibling(current);
+        Some(taffy_id(current))
+    }
+}
+
+impl TraversePartialTree for LayoutContext<'_> {
+    type ChildIter<'b>
+        = ChildIter<'b>
+    where
+        Self: 'b;
+
+    fn child_ids(&self, parent: TaffyId) -> Self::ChildIter<'_> {
+        let id = crisol_id(parent);
+        ChildIter {
+            tree: self.tree,
+            next: if is_leaf(self.tree, id) {
+                None
+            } else {
+                self.tree.first_child(id)
+            },
+        }
+    }
+
+    fn child_count(&self, parent: TaffyId) -> usize {
+        self.child_ids(parent).count()
+    }
+
+    fn get_child_id(&self, parent: TaffyId, index: usize) -> TaffyId {
+        self.child_ids(parent)
+            .nth(index)
+            .expect("taffy asked for a child index it got from child_count")
+    }
+}
+
+impl TraverseTree for LayoutContext<'_> {}
+
+impl LayoutPartialTree for LayoutContext<'_> {
+    type CoreContainerStyle<'b>
+        = StyleRef<'b>
+    where
+        Self: 'b;
+    type CustomIdent = String;
+
+    fn get_core_container_style(&self, node: TaffyId) -> Self::CoreContainerStyle<'_> {
+        style_ref(self.tree, self.styles, &self.fallback, crisol_id(node))
+    }
+
+    fn set_unrounded_layout(&mut self, node: TaffyId, layout: &Layout) {
+        let id = crisol_id(node);
+        self.entry(id).unrounded = *layout;
+    }
+
+    fn compute_child_layout(&mut self, node: TaffyId, inputs: LayoutInput) -> LayoutOutput {
+        // An ancestor is `display: none`, so this node is hidden whatever its own display
+        // says. The check has to come before the cache: a hidden pass must not be served
+        // from, or stored into, the cache of a visible one.
+        if inputs.run_mode == RunMode::PerformHiddenLayout {
+            return taffy::compute_hidden_layout(self, node);
+        }
+
+        taffy::compute_cached_layout(self, node, inputs, |context, node, inputs| {
+            let id = crisol_id(node);
+            context.stats.nodes_laid_out += 1;
+
+            let display = style_of(context.styles, &context.fallback, id).display;
+            if display == Display::None {
+                return taffy::compute_hidden_layout(context, node);
+            }
+
+            if is_leaf(context.tree, id) {
+                // Split the borrows by field: the style comes from `styles`/`fallback`,
+                // while the measure closure needs `tree` and `stats` mutably. Going through
+                // `self.method()` would borrow all of `context` and make this impossible.
+                let LayoutContext {
+                    tree,
+                    styles,
+                    fallback,
+                    stats,
+                    ..
+                } = context;
+                let style = if matches!(tree.node(id).kind, NodeKind::Custom(_)) {
+                    StyleRef::replaced(style_of(styles, fallback, id))
+                } else {
+                    StyleRef::new(style_of(styles, fallback, id))
+                };
+                return taffy::compute_leaf_layout(
+                    inputs,
+                    &style,
+                    |_, _| 0.0,
+                    |known, available| measure_leaf(tree, stats, id, known, available),
+                );
+            }
+
+            match display {
+                Display::Flex => taffy::compute_flexbox_layout(context, node, inputs),
+                // Block is the default, and `Display::None` was handled above.
+                _ => taffy::compute_block_layout(context, node, inputs, None),
+            }
+        })
+    }
+}
+
+/// Measures a leaf: a custom node measures itself, everything else is empty.
+fn measure_leaf(
+    tree: &mut Tree,
+    stats: &mut LayoutStats,
+    id: NodeId,
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+) -> Size<f32> {
+    let constraints = MeasureConstraints {
+        width: known.width,
+        height: known.height,
+        available_width: definite(available.width),
+        available_height: definite(available.height),
+    };
+    match tree.measure_custom(id, constraints) {
+        Some(size) => {
+            stats.custom_measures += 1;
+            Size {
+                width: size.width,
+                height: size.height,
+            }
+        }
+        // An empty element, or a text node. Text gets a real measurement at M4, when there
+        // is a shaper to ask.
+        None => Size::ZERO,
+    }
+}
+
+impl CacheTree for LayoutContext<'_> {
+    fn cache_get(&mut self, node: TaffyId, input: &LayoutInput) -> Option<LayoutOutput> {
+        self.entry(crisol_id(node)).cache.get(input)
+    }
+
+    fn cache_store(&mut self, node: TaffyId, input: &LayoutInput, output: LayoutOutput) {
+        let id = crisol_id(node);
+        self.entry(id).cache.store(input, output);
+    }
+
+    fn cache_clear(&mut self, node: TaffyId) {
+        let id = crisol_id(node);
+        self.entry(id).cache.clear();
+    }
+}
+
+impl RoundTree for LayoutContext<'_> {
+    fn get_unrounded_layout(&self, node: TaffyId) -> Layout {
+        self.nodes
+            .get(crisol_id(node))
+            .map_or_else(Layout::new, |node| node.unrounded)
+    }
+
+    fn set_final_layout(&mut self, node: TaffyId, layout: &Layout) {
+        let id = crisol_id(node);
+        self.entry(id).final_layout = *layout;
+    }
+}
+
+impl LayoutFlexboxContainer for LayoutContext<'_> {
+    type FlexboxContainerStyle<'b>
+        = StyleRef<'b>
+    where
+        Self: 'b;
+    type FlexboxItemStyle<'b>
+        = StyleRef<'b>
+    where
+        Self: 'b;
+
+    fn get_flexbox_container_style(&self, node: TaffyId) -> Self::FlexboxContainerStyle<'_> {
+        style_ref(self.tree, self.styles, &self.fallback, crisol_id(node))
+    }
+
+    fn get_flexbox_child_style(&self, child: TaffyId) -> Self::FlexboxItemStyle<'_> {
+        style_ref(self.tree, self.styles, &self.fallback, crisol_id(child))
+    }
+}
+
+impl LayoutBlockContainer for LayoutContext<'_> {
+    type BlockContainerStyle<'b>
+        = StyleRef<'b>
+    where
+        Self: 'b;
+    type BlockItemStyle<'b>
+        = StyleRef<'b>
+    where
+        Self: 'b;
+
+    fn get_block_container_style(&self, node: TaffyId) -> Self::BlockContainerStyle<'_> {
+        style_ref(self.tree, self.styles, &self.fallback, crisol_id(node))
+    }
+
+    fn get_block_child_style(&self, child: TaffyId) -> Self::BlockItemStyle<'_> {
+        style_ref(self.tree, self.styles, &self.fallback, crisol_id(child))
+    }
+}

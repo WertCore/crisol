@@ -155,7 +155,7 @@ pub fn paint_subtree(
                         stats.boxes_emitted += 1;
                     }
                     builder.push_clip(bounds);
-                    custom.paint(bounds, builder);
+                    custom.node.paint(bounds, builder);
                     builder.pop_clip();
                     stats.custom_nodes += 1;
                     stats.clips += 1;

@@ -16,7 +16,7 @@ const MILESTONES: &[(&str, &str, bool)] = &[
     ("M0", "skeleton and session state", true),
     ("M1", "window and triangle", true),
     ("M2", "node tree and display list", true),
-    ("M3", "CSS and layout", false),
+    ("M3", "CSS and layout", true),
     ("M4", "HTML and text", false),
     ("M5", "events, focus, input, accessibility", false),
     ("M6", "incremental everything", false),
