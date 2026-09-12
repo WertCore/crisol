@@ -19,6 +19,8 @@ render = ["dep:crisol-render-wgpu"]
 
 [dependencies]
 crisol-tree.workspace = true
+crisol-dom.workspace = true
+crisol-reactive.workspace = true
 crisol-html.workspace = true
 crisol-css.workspace = true
 crisol-style.workspace = true
@@ -38,4 +40,8 @@ winit.workspace = true
 
 [[example]]
 name = "tree"
+required-features = ["render"]
+
+[[example]]
+name = "todo"
 required-features = ["render"]

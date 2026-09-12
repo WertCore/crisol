@@ -317,6 +317,16 @@ M16's batching note — *mark dirty, run one style/layout/paint pass per frame, 
 per `appendChild`* — is already how this works: nothing touches the tree between flushes, so a
 frame sees one consistent state rather than a half-applied update.
 
+**It also runs, which is the word the acceptance uses.**
+`cargo run -p crisol-ui --example todo` opens a window with the whole of Track A behind it —
+reactive state, the DOM API, the cascade, layout, shaping, paint, GPU — and prints the counters
+on every keystroke, so the claim is checkable while the thing is running. `--headless` drives
+the same code through a scripted sequence with no window and no GPU, which is the only way CI
+ever sees the interaction paths.
+
+Verified on macOS. Windows and Linux are [#15](https://github.com/WertCore/crisol/issues/15),
+which predates this and is unchanged by it.
+
 **One defect this milestone existed to find.** `DirtyFlags::expanded` turned `STYLE` into
 `LAYOUT`, so appending one row to a 1,000-row list invalidated **1,008** layout caches — every
 sibling, because a structural change marks them all for `:nth-child`. It now invalidates 8.

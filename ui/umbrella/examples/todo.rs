@@ -1,0 +1,690 @@
+//! M7's todo app, in a window: `cargo run -p crisol-ui --example todo`
+//!
+//! The whole of Track A end to end — reactive state, the DOM mutation API, the cascade,
+//! layout, text shaping, paint, and the GPU. Nothing above the engine and nothing beside it.
+//!
+//! The point is what does *not* happen. A component runs once; changing state wakes an
+//! effect that writes one text node or toggles one class. Adding a todo appends three nodes
+//! to a list of any length and moves none of the others. The counters print to stdout on
+//! every change, so the claim is checkable while the thing is running.
+//!
+//! ```text
+//!   enter      add what you have typed
+//!   f2         edit the selected todo; enter commits
+//!   up/down    move the selection
+//!   tab        tick the selected todo
+//!   delete     remove the selected todo
+//!   left/right change the filter
+//!   escape     quit
+//! ```
+
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use crisol_ui::css::stylesheet::Stylesheet;
+use crisol_ui::display_list::{Color, DisplayList};
+use crisol_ui::dom::Dom;
+use crisol_ui::layout::{LayoutCache, LayoutContext, ShapedText};
+use crisol_ui::paint::{PaintOptions, paint};
+use crisol_ui::reactive::{
+    Cx, Keyed, ListStats, Memo, Runtime, Scope, Signal, append, bind_class, bind_text,
+    element_with_class, text,
+};
+use crisol_ui::render::{AcquiredFrame, FrameTarget, Renderer, WindowSurface};
+use crisol_ui::style::{StyleEngine, StyleMap};
+use crisol_ui::text::FontSystem;
+use crisol_ui::tree::{NodeId, Tree};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowId};
+
+const CSS: &str = "
+    body {
+        display: flex;
+        flex-direction: column;
+        padding-top: 20px; padding-left: 24px; padding-right: 24px;
+        background-color: rgb(14, 16, 20);
+        color: rgb(226, 232, 240);
+        font-size: 15px;
+        line-height: 22px;
+    }
+    h1 { display: block; font-size: 22px; line-height: 34px; color: rgb(97, 175, 239) }
+    .draft {
+        display: block; height: 30px; line-height: 30px;
+        padding-left: 10px; padding-right: 10px;
+        margin-bottom: 10px;
+        background-color: rgb(24, 28, 34);
+        border-bottom-width: 2px; border-bottom-color: rgb(97, 175, 239);
+    }
+    .draft.editing { border-bottom-color: rgb(229, 192, 123) }
+    ul.list { display: flex; flex-direction: column; flex-grow: 1 }
+    li.todo {
+        display: flex; flex-direction: row;
+        height: 26px; line-height: 26px;
+        padding-left: 8px; padding-right: 8px;
+    }
+    li.selected { background-color: rgb(34, 40, 49) }
+    li.done .label { color: rgb(106, 115, 125) }
+    .mark { display: block; width: 30px; color: rgb(152, 195, 121) }
+    .label { display: block; flex-grow: 1 }
+    p.status {
+        display: block; height: 24px; line-height: 24px;
+        margin-top: 8px;
+        color: rgb(106, 115, 125); font-size: 12px;
+    }
+";
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `--headless` drives the same app through a scripted sequence and prints the counters,
+    // with no window and no GPU. It exists so the interaction paths are exercised somewhere
+    // that does not need a display — which is also the only way CI ever sees them.
+    if std::env::args().any(|argument| argument == "--headless") {
+        headless();
+        return Ok(());
+    }
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    event_loop.run_app(&mut Shell::default())?;
+    Ok(())
+}
+
+fn headless() {
+    use crisol_ui::display_list::Size;
+
+    let viewport = Size {
+        width: 600.0,
+        height: 460.0,
+    };
+    let mut tree = Tree::new();
+    let runtime = Runtime::new();
+    let app = {
+        let mut dom = Dom::new(&mut tree);
+        let app = build(&runtime, &mut dom);
+        for seed in ["read the roadmap", "ship M7", "measure idle RSS"] {
+            app.add(&runtime, seed.to_owned());
+        }
+        runtime.flush(&mut dom);
+        app
+    };
+
+    let mut engine = StyleEngine::new();
+    engine.add_stylesheet(Stylesheet::parse(CSS).expect("the example's own stylesheet"));
+    let mut styles = StyleMap::default();
+    let mut fonts = FontSystem::new();
+    let mut cache = LayoutCache::new();
+
+    let typing = |word: &str| -> Vec<Key> {
+        word.chars()
+            .map(|character| match character {
+                ' ' => Key::Named(NamedKey::Space),
+                other => Key::Character(other.to_string().into()),
+            })
+            .collect()
+    };
+
+    let mut script: Vec<(&str, Vec<Key>)> = vec![
+        ("type a new todo", typing("write it down")),
+        ("add it", vec![Key::Named(NamedKey::Enter)]),
+        ("select the second", vec![Key::Named(NamedKey::ArrowDown)]),
+        ("tick it", vec![Key::Named(NamedKey::Tab)]),
+        ("filter to active", vec![Key::Named(NamedKey::ArrowRight)]),
+        ("filter to done", vec![Key::Named(NamedKey::ArrowRight)]),
+        ("back to all", vec![Key::Named(NamedKey::ArrowRight)]),
+        ("start editing", vec![Key::Named(NamedKey::F2)]),
+        ("clear it", vec![Key::Named(NamedKey::Backspace); 64]),
+    ];
+    script.push(("retype it", typing("edited in place")));
+    script.push(("commit the edit", vec![Key::Named(NamedKey::Enter)]));
+    script.push(("remove it", vec![Key::Named(NamedKey::Delete)]));
+
+    println!("\n{} nodes\n", tree.len());
+    for (name, keys) in script {
+        runtime.reset_stats();
+        app.last.set(ListStats::default());
+        let dom_stats = {
+            let mut dom = Dom::new(&mut tree);
+            dom.reset_stats();
+            for key in keys {
+                app.key(&runtime, &mut dom, key);
+            }
+            runtime.flush(&mut dom);
+            dom.stats()
+        };
+
+        // Once, not twice: the pass consumes the style flags it acted on, so a second call
+        // sees a clean tree, reuses the previous map wholesale and hands back stale styles.
+        styles = engine.restyle_incremental(&mut tree, &styles).0;
+        let laid_out = {
+            let mut context = LayoutContext::new(&mut tree, &styles, &mut fonts, &mut cache);
+            context.run(viewport);
+            context.stats().nodes_laid_out
+        };
+        let list = app.last.get();
+        println!(
+            "  {name:<18} dom: {:>2} created {:>2} removed {:>2} text {:>2} attrs | \
+             list: {} new {} moved {} gone {} kept | effects: {:>2} | layout: {laid_out:>3} of {}",
+            dom_stats.created,
+            dom_stats.removed,
+            dom_stats.text_set,
+            dom_stats.attributes_set,
+            list.created,
+            list.moved,
+            list.removed,
+            list.kept,
+            runtime.stats().effects_run,
+            tree.len(),
+        );
+    }
+    println!();
+}
+
+// ---- the app ------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct Todo {
+    id: u32,
+    label: Signal<String>,
+    done: Signal<bool>,
+    /// Owns `label` and `done`. Separate from the row's scope, because the data outlives a
+    /// filter that hides it.
+    scope: Scope,
+}
+
+impl PartialEq for Todo {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Todo {}
+
+impl std::hash::Hash for Todo {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filter {
+    All,
+    Active,
+    Done,
+}
+
+impl Filter {
+    fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Done => "done",
+        }
+    }
+
+    fn shifted(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::All, true) | (Self::Done, false) => Self::Active,
+            (Self::Active, true) | (Self::All, false) => Self::Done,
+            (Self::Done, true) | (Self::Active, false) => Self::All,
+        }
+    }
+}
+
+struct App {
+    todos: Signal<Vec<Todo>>,
+    filter: Signal<Filter>,
+    visible: Memo<Vec<Todo>>,
+    /// Index into `visible`, not into `todos`: the selection follows what is on screen.
+    selected: Signal<usize>,
+    draft: Signal<String>,
+    /// The todo being edited, if any. `f2` starts it; enter commits.
+    editing: Signal<Option<Todo>>,
+    next_id: Cell<u32>,
+    last: Rc<Cell<ListStats>>,
+}
+
+fn build(runtime: &Runtime, dom: &mut Dom<'_>) -> App {
+    let root = dom.create_element("html");
+    dom.set_root(root);
+    let body = dom.create_element("body");
+    dom.append_child(root, body).unwrap();
+
+    let todos = runtime.signal(Vec::<Todo>::new());
+    let filter = runtime.signal(Filter::All);
+    let selected = runtime.signal(0_usize);
+    let draft = runtime.signal(String::new());
+    let editing = runtime.signal(None::<Todo>);
+
+    let visible = runtime.memo(move |track| {
+        let filter = track.get(filter);
+        track
+            .with(todos, |todos| {
+                todos
+                    .iter()
+                    .copied()
+                    .filter(|todo| match filter {
+                        Filter::All => true,
+                        Filter::Active => !track.get(todo.done),
+                        Filter::Done => track.get(todo.done),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+
+    let list;
+    {
+        let mut cx = Cx::new(runtime, dom);
+
+        let title = element_with_class(&mut cx, "h1", "title");
+        append(&mut cx, body, title);
+        let title_text = text(&mut cx, "todos");
+        append(&mut cx, title, title_text);
+
+        let draft_row = element_with_class(&mut cx, "div", "draft");
+        append(&mut cx, body, draft_row);
+        let draft_text = text(&mut cx, "");
+        append(&mut cx, draft_row, draft_text);
+        bind_text(&mut cx, draft_text, move |track| {
+            let typed = track.get(draft);
+            match track.get(editing) {
+                Some(_) => format!("editing: {typed}_"),
+                None => format!("> {typed}_"),
+            }
+        });
+        bind_class(&mut cx, draft_row, "editing", move |track| {
+            track.get(editing).is_some()
+        });
+
+        list = element_with_class(&mut cx, "ul", "list");
+        append(&mut cx, body, list);
+
+        let status = element_with_class(&mut cx, "p", "status");
+        append(&mut cx, body, status);
+        let status_text = text(&mut cx, "");
+        append(&mut cx, status, status_text);
+        bind_text(&mut cx, status_text, move |track| {
+            let left = track
+                .with(todos, |todos| {
+                    todos.iter().filter(|todo| !track.get(todo.done)).count()
+                })
+                .unwrap_or_default();
+            let filter = track.get(filter);
+            format!(
+                "{left} left  ·  filter: {}  ·  enter add   f2 edit   tab tick   del remove   \
+                 arrows select/filter   esc quit",
+                filter.name()
+            )
+        });
+    }
+
+    let last = Rc::new(Cell::new(ListStats::default()));
+    let recorder = Rc::clone(&last);
+    let mut keyed = Keyed::new(list);
+    runtime.effect(dom, move |cx| {
+        let rows = cx.memo(visible);
+        let stats = keyed.reconcile(cx, &rows, |cx, todo| row(cx, *todo, visible, selected));
+        recorder.set(stats);
+    });
+
+    App {
+        todos,
+        filter,
+        visible,
+        selected,
+        draft,
+        editing,
+        next_id: Cell::new(0),
+        last,
+    }
+}
+
+/// One row. Runs once per todo; nothing re-runs it.
+fn row(
+    cx: &mut Cx<'_, '_>,
+    todo: Todo,
+    visible: Memo<Vec<Todo>>,
+    selected: Signal<usize>,
+) -> NodeId {
+    let node = element_with_class(cx, "li", "todo");
+
+    let mark = element_with_class(cx, "span", "mark");
+    append(cx, node, mark);
+    let mark_text = text(cx, "");
+    append(cx, mark, mark_text);
+    bind_text(cx, mark_text, move |track| {
+        if track.get(todo.done) { "[x]" } else { "[ ]" }.to_owned()
+    });
+
+    let label = element_with_class(cx, "span", "label");
+    append(cx, node, label);
+    let label_text = text(cx, "");
+    append(cx, label, label_text);
+    bind_text(cx, label_text, move |track| track.get(todo.label));
+
+    bind_class(cx, node, "done", move |track| track.get(todo.done));
+    // Reads `visible` so the highlight follows the filtered order rather than the raw list.
+    bind_class(cx, node, "selected", move |track| {
+        let index = track.get(selected);
+        track
+            .with_memo(visible, |rows| rows.get(index) == Some(&todo))
+            .unwrap_or(false)
+    });
+    node
+}
+
+impl App {
+    fn add(&self, runtime: &Runtime, label: String) {
+        if label.trim().is_empty() {
+            return;
+        }
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let (scope, (label, done)) =
+            runtime.scope(|_| (runtime.signal(label), runtime.signal(false)));
+        runtime.update(self.todos, |todos| {
+            todos.push(Todo {
+                id,
+                label,
+                done,
+                scope,
+            });
+        });
+    }
+
+    fn selected_todo(&self, runtime: &Runtime, dom: &mut Dom<'_>) -> Option<Todo> {
+        let index = runtime.peek(self.selected)?;
+        let cx = Cx::new(runtime, dom);
+        cx.with_memo(self.visible, |rows| rows.get(index).copied())?
+    }
+
+    fn remove(&self, runtime: &Runtime, dom: &mut Dom<'_>, todo: Todo) {
+        runtime.update(self.todos, |todos| {
+            todos.retain(|other| other.id != todo.id);
+        });
+        // Flush before disposing: the row's effects read `label` and `done`, and the
+        // reconciler disposes them during the flush. Freeing the signals first would leave
+        // those effects reading handles whose slots had been reused.
+        runtime.flush(dom);
+        runtime.dispose(todo.scope, dom);
+        self.clamp_selection(runtime, dom);
+    }
+
+    fn clamp_selection(&self, runtime: &Runtime, dom: &mut Dom<'_>) {
+        let cx = Cx::new(runtime, dom);
+        let count = cx.with_memo(self.visible, Vec::len).unwrap_or(0);
+        let index = runtime.peek(self.selected).unwrap_or(0);
+        runtime.set_if_changed(self.selected, index.min(count.saturating_sub(1)));
+    }
+
+    fn move_selection(&self, runtime: &Runtime, dom: &mut Dom<'_>, down: bool) {
+        let cx = Cx::new(runtime, dom);
+        let count = cx.with_memo(self.visible, Vec::len).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let index = runtime.peek(self.selected).unwrap_or(0);
+        let next = if down {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        runtime.set_if_changed(self.selected, next);
+    }
+
+    /// Applies one key. Returns whether anything might have changed.
+    fn key(&self, runtime: &Runtime, dom: &mut Dom<'_>, key: Key) -> bool {
+        match key.as_ref() {
+            Key::Named(NamedKey::Enter) => {
+                let typed = runtime.peek(self.draft).unwrap_or_default();
+                match runtime.peek(self.editing).flatten() {
+                    // Committing an edit writes one signal, which wakes one effect, which
+                    // writes one text node. No row is rebuilt.
+                    Some(todo) if !typed.trim().is_empty() => {
+                        runtime.set(todo.label, typed);
+                        runtime.set(self.editing, None);
+                    }
+                    Some(_) => {
+                        runtime.set(self.editing, None);
+                    }
+                    None => self.add(runtime, typed),
+                }
+                runtime.set(self.draft, String::new());
+            }
+            Key::Named(NamedKey::Backspace) => {
+                runtime.update(self.draft, |draft| {
+                    draft.pop();
+                });
+            }
+            Key::Named(NamedKey::F2) => {
+                let Some(todo) = self.selected_todo(runtime, dom) else {
+                    return false;
+                };
+                runtime.set(self.draft, runtime.peek(todo.label).unwrap_or_default());
+                runtime.set(self.editing, Some(todo));
+            }
+            Key::Named(NamedKey::Tab) => {
+                let Some(todo) = self.selected_todo(runtime, dom) else {
+                    return false;
+                };
+                let done = runtime.peek(todo.done).unwrap_or_default();
+                runtime.set(todo.done, !done);
+                self.clamp_selection(runtime, dom);
+            }
+            Key::Named(NamedKey::Delete) => {
+                let Some(todo) = self.selected_todo(runtime, dom) else {
+                    return false;
+                };
+                self.remove(runtime, dom, todo);
+            }
+            Key::Named(NamedKey::ArrowDown) => self.move_selection(runtime, dom, true),
+            Key::Named(NamedKey::ArrowUp) => self.move_selection(runtime, dom, false),
+            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowLeft) => {
+                let forward = matches!(key.as_ref(), Key::Named(NamedKey::ArrowRight));
+                let next = runtime
+                    .peek(self.filter)
+                    .unwrap_or(Filter::All)
+                    .shifted(forward);
+                runtime.set(self.filter, next);
+                self.clamp_selection(runtime, dom);
+            }
+            Key::Named(NamedKey::Space) => {
+                runtime.update(self.draft, |draft| draft.push(' '));
+            }
+            Key::Character(typed) => {
+                runtime.update(self.draft, |draft| draft.push_str(typed));
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+// ---- the frame ----------------------------------------------------------------------------
+
+struct State {
+    surface: WindowSurface,
+    renderer: Renderer,
+    tree: Tree,
+    runtime: Runtime,
+    app: App,
+    engine: StyleEngine,
+    styles: StyleMap,
+    fonts: FontSystem,
+    cache: LayoutCache,
+}
+
+impl State {
+    fn new(surface: WindowSurface) -> Self {
+        let renderer = Renderer::new(surface.gpu(), surface.format());
+        let mut tree = Tree::new();
+        let runtime = Runtime::new();
+        let app = {
+            let mut dom = Dom::new(&mut tree);
+            let app = build(&runtime, &mut dom);
+            for seed in ["read the roadmap", "ship M7", "measure idle RSS"] {
+                app.add(&runtime, seed.to_owned());
+            }
+            runtime.flush(&mut dom);
+            app
+        };
+
+        let mut engine = StyleEngine::new();
+        engine.add_stylesheet(Stylesheet::parse(CSS).expect("the example's own stylesheet"));
+
+        let fonts = FontSystem::new();
+        if fonts.is_empty() {
+            eprintln!("warning: no fonts found, so nothing will be legible");
+        }
+
+        Self {
+            surface,
+            renderer,
+            tree,
+            runtime,
+            app,
+            engine,
+            styles: StyleMap::default(),
+            fonts,
+            cache: LayoutCache::new(),
+        }
+    }
+
+    fn key(&mut self, key: Key) -> bool {
+        let mut dom = Dom::new(&mut self.tree);
+        dom.reset_stats();
+        self.runtime.reset_stats();
+        self.app.last.set(ListStats::default());
+
+        if !self.app.key(&self.runtime, &mut dom, key) {
+            return false;
+        }
+        self.runtime.flush(&mut dom);
+
+        let dom_stats = dom.stats();
+        let list = self.app.last.get();
+        println!(
+            "dom: {} created, {} removed, {} text, {} attrs ({} no-ops)  |  \
+             list: {} new, {} moved, {} gone, {} kept  |  effects: {}",
+            dom_stats.created,
+            dom_stats.removed,
+            dom_stats.text_set,
+            dom_stats.attributes_set,
+            dom_stats.no_ops,
+            list.created,
+            list.moved,
+            list.removed,
+            list.kept,
+            self.runtime.stats().effects_run,
+        );
+        true
+    }
+
+    fn draw(&mut self) {
+        let AcquiredFrame::Frame(frame) = self.surface.acquire() else {
+            return;
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let viewport = self.surface.logical_size();
+
+        // Anything queued by a key press has already been flushed; this catches work an
+        // effect queued on the way out.
+        {
+            let mut dom = Dom::new(&mut self.tree);
+            self.runtime.flush(&mut dom);
+        }
+
+        let (styles, _) = self
+            .engine
+            .restyle_incremental(&mut self.tree, &self.styles);
+        self.styles = styles;
+        {
+            let mut context = LayoutContext::new(
+                &mut self.tree,
+                &self.styles,
+                &mut self.fonts,
+                &mut self.cache,
+            );
+            context.run(viewport);
+        }
+
+        let list: DisplayList = paint(
+            &self.tree,
+            &PaintOptions::new(viewport).with_background(Color::rgb(0.055, 0.063, 0.078)),
+        );
+        self.renderer.render_text(
+            FrameTarget {
+                view: &view,
+                width: self.surface.width(),
+                height: self.surface.height(),
+                scale_factor: self.surface.scale_factor(),
+                damage: None,
+            },
+            &list,
+            &mut self.fonts,
+            &ShapedText(self.cache.text()),
+        );
+        self.surface.present(frame);
+    }
+}
+
+#[derive(Default)]
+struct Shell {
+    state: Option<State>,
+}
+
+impl ApplicationHandler for Shell {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Crisol — M7: signals, effects, components")
+                        .with_inner_size(winit::dpi::LogicalSize::new(600.0, 460.0)),
+                )
+                .expect("could not create a window"),
+        );
+        let surface = WindowSurface::new(window).expect("could not create a surface");
+        self.state = Some(State::new(surface));
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                state.surface.resize(size.width, size.height);
+                // The viewport changed, so every box has to be measured against it again.
+                state.tree.mark_subtree_dirty(
+                    state.tree.root().expect("a root"),
+                    crisol_ui::tree::DirtyFlags::LAYOUT,
+                );
+                state.surface.window().request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                state.surface.refresh();
+                state.surface.window().request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+                    event_loop.exit();
+                    return;
+                }
+                if state.key(event.logical_key) {
+                    state.surface.window().request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => state.draw(),
+            _ => {}
+        }
+    }
+}
