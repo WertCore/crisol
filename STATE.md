@@ -266,7 +266,7 @@ removed. Nothing new was needed.
   and read the tree back. Every write marks what a selector could notice; `Tree::element_mut`
   cannot, which is why the layer exists (D-42). Writes are compared first, so setting a value
   to what it already is costs nothing. `DomStats` counts what a caller did.
-- **`crisol-reactive`** — `Signal`, `Memo`, `Effect`, and the `Scope` tree that owns them.
+- **`crisol-reactive`** — `Signal`, `Memo`, effects, and the `Scope` tree that owns them.
   Memos are pull-based and lazy: one nobody reads is never computed, and a diamond wakes its
   effect once with both sides fresh rather than twice with one stale. Dependencies are
   rebuilt on every run, so a branch that stops reading a signal stops depending on it.
@@ -321,11 +321,14 @@ frame sees one consistent state rather than a half-applied update.
 `cargo run -p crisol-ui --example todo` opens a window with the whole of Track A behind it —
 reactive state, the DOM API, the cascade, layout, shaping, paint, GPU — and prints the counters
 on every keystroke, so the claim is checkable while the thing is running. `--headless` drives
-the same code through a scripted sequence with no window and no GPU, which is the only way CI
-ever sees the interaction paths.
+the same code through a scripted sequence with no window and no GPU, and asserts what it should
+have left behind. **CI runs that step**, because `cargo test` builds examples and never executes
+them — so the key handling, selection and edit/commit paths would otherwise compile on three
+platforms and run on none.
 
-Verified on macOS. Windows and Linux are [#15](https://github.com/WertCore/crisol/issues/15),
-which predates this and is unchanged by it.
+So the interaction paths are exercised on macOS, Linux and Windows. The *windowed* path is
+verified on macOS only; Windows and Linux remain
+[#15](https://github.com/WertCore/crisol/issues/15), which predates this and is unchanged by it.
 
 **One defect this milestone existed to find.** `DirtyFlags::expanded` turned `STYLE` into
 `LAYOUT`, so appending one row to a 1,000-row list invalidated **1,008** layout caches — every
