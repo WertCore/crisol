@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M4 — HTML and text (not started)
+**Current milestone:** M4 — HTML and text (in progress: HTML done, text not started)
 **Last finished:** M3 — CSS and layout
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -144,14 +144,43 @@ number of pixels.
   `ComputedStyle` allocation* — `a_hundred_identically_styled_nodes_share_one_allocation`:
   101 elements cost 2 allocations and 99 interner hits.
 
-**Totals:** 233 tests passing, 0 failing. `cargo clippy --workspace --all-targets
+**Totals:** 254 tests passing, 0 failing. `cargo clippy --workspace --all-targets
 --all-features -- -D warnings` clean, `cargo fmt --all --check` clean.
 
 ---
 
 ## In progress
 
-Nothing. M3 is closed and M4 has not been started.
+**M4, the HTML half.** `crisol-html` is the `TreeSink` that drives html5ever into a
+`crisol_tree::Tree`. Nothing re-implements HTML — tree building, implied tags, error
+recovery and entity decoding are all upstream's.
+
+What this crate decides is which parts of the DOM the engine keeps. Comments, processing
+instructions and doctypes have no box and no effect on layout or selectors, so they are
+dropped rather than stored; the tree is what the engine renders, not an archive of the
+source. Quirks mode is recorded and then ignored, so that "this renders oddly" has an answer
+other than a shrug.
+
+Two things in the sink are worth remembering because they were bugs first:
+
+- `elem_name` is called on nearly every token, not just for foreign content — the tree
+  builder asks "what is the current open element?" constantly, and answers about implied end
+  tags and scope depend on it. A stub returning a fixed name silently mis-nests everything.
+  It returns an owned name, because the tree is behind a `RefCell` and `ElemName` hands back
+  references.
+- Comments need a *handle* back from `create_comment` even though the node is not kept. A
+  placeholder that gets appended splits the text run around it into two nodes; the sink
+  records placeholder handles and drops them at `append` instead.
+
+21 tests, including `a_parsed_tree_is_selectable_and_stylable` and `a_parsed_tree_lays_out` —
+what comes out of the parser is the same tree the cascade and layout already work on, with no
+adapter in between.
+
+**Still to do for M4, and it is the larger half:** `crisol-text` (the public API of ROADMAP
+§2.5 — shaped runs, cluster boundaries, `point_to_cursor`, `cursor_to_point`, selection
+rectangles, line box geometry), `crisol-text-gpu` (glyphon), font loading and fallback, line
+breaking, and wiring text measurement into `measure_leaf` in `crisol-layout`, which still
+returns a zero size for every text node and has a test saying so.
 
 ## Open questions
 
@@ -229,9 +258,7 @@ Appended to `DECISIONS.md` in full; summarised here.
    says to over-budget for, and it is the core competency rather than a checkbox: the text
    layer is a *public API*, not an internal detail.
 3. Suggested order:
-   a. `crisol-html`: `html5ever` into the tree. Small, and it makes every later test easier
-      to write — the layout suite currently builds documents through a bespoke fixture
-      because there is no parser yet.
+   a. ~~`crisol-html`~~ — done.
    b. `crisol-text`: `cosmic-text` shaping behind an API that exposes shaped runs, cluster
       boundaries, `point_to_cursor`, `cursor_to_point`, selection rectangles and line box
       geometry. Design the API before the implementation; §2.5 is the requirement, and it
