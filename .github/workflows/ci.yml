@@ -36,7 +36,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev \
             libxcursor-dev libgl1-mesa-dev mesa-vulkan-drivers vulkan-tools \
-            fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji
+            fonts-dejavu-core fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji
 
       - uses: dtolnay/rust-toolchain@stable
         with:
