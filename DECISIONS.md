@@ -396,3 +396,61 @@ Absent on purpose:
 `:is()` and `:where()` are supported: they are how a stylesheet avoids the combinatorial
 blow-up that makes large selector lists slow.
 
+---
+
+## D-21 — Computed style is an interned `Arc` in a side table, not a field on the node
+
+**Status:** Accepted (M3) · **Affects:** M3, M6, M16
+
+ROADMAP §M3 requires that a hundred identically-styled nodes share one `ComputedStyle`
+allocation, and is explicit that this is not an optimisation to add later: per-node computed
+style at document-editor scale is hundreds of megabytes, which contradicts the entire product
+thesis. A four-hundred-page document is mostly paragraphs that compute to the same style.
+
+`StyleEngine` holds a `StyleInterner`, a hash map keyed on the style itself. `restyle`
+produces a `NodeMap<Arc<ComputedStyle>>` — a side table indexed by arena slot — rather than
+writing a style onto each `Node`.
+
+**Rejected — a `ComputedStyle` field on `Node`.** Simpler to reach, and it would put the
+allocation back per node, which is the thing being avoided. It would also force `crisol-tree`
+to depend on `crisol-style`, inverting the layering: the tree is below the cascade and has to
+stay usable without it.
+
+**Rejected — interning by hash only, without storing the key.** Half the memory, and a hash
+collision silently gives two different styles the same allocation. A rendering bug that
+appears only for particular pairs of styles is not worth the saving.
+
+**Consequences, accepted now:**
+
+- **`ComputedStyle` and everything in it must be `Eq + Hash`.** That is why `crisol-style`
+  has `Px` and `Number` newtypes rather than bare `f32`: floats are compared and hashed by
+  bit pattern, which is a true equivalence relation only if no NaN is present. `Px::new`
+  therefore rejects non-finite input — `calc(1px / 0)` can produce one — and normalises
+  `-0.0` to `0.0`, since the two have different bit patterns and would otherwise be two
+  distinct styles that look identical.
+- **The side table does not hear about node removal.** `NodeMap` guarantees that a new node
+  reusing a slot never reads its predecessor's value, which is the property that matters. A
+  handle to a removed node still reads its own stale entry until the slot is reused. Passes
+  clear the map, or check the tree first — which they do anyway, since they need the node.
+- **The interner needs sweeping.** Restyling churns styles, and without
+  `StyleInterner::collect_unused` the map grows for the life of the process. M6 decides when
+  to call it.
+
+## D-22 — Percentages reach layout unresolved; font-relative units do not
+
+**Status:** Accepted (M3) · **Affects:** M3, M4
+
+A percentage resolves against a containing block that layout has not measured when the
+cascade runs, so `width: 50%` stays a percentage in `ComputedStyle` and `taffy` does the
+arithmetic. `em` and `rem` resolve against font sizes, which the cascade *does* know, so
+they become pixels immediately.
+
+The consequence worth remembering is that `em` inside `font-size` means the **parent's**
+font size, while `em` everywhere else means this element's — otherwise `font-size: 1.5em`
+would be circular. There is a test for each.
+
+`line-height` is the exception that proves the rule: it inherits as the *multiple*, not as
+the resolved length, so a child with a larger font gets a proportionally larger line box.
+That is the whole point of writing `line-height: 1.5`, and resolving it during the cascade
+would quietly break it.
+

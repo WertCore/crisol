@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M3 — CSS and layout (in progress: selector matching done)
+**Current milestone:** M3 — CSS and layout (in progress: steps 1 and 2 of 4 done)
 **Last finished:** M2 — node tree and display list
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -111,22 +111,34 @@ with `RUSTDOCFLAGS=-D warnings`.
 
 ## In progress
 
-**M3, step (a) of four.** `crisol-css` matches selectors against a `crisol-tree`:
+**M3, steps 1 and 2 of four.**
 
-- `crisol_tree::Atom` — refcounted name with a cached hash, for tags, ids, classes and
-  attribute names.
-- `ElementData` grew what a selector can ask about: `id`, `classes`, `attributes`, and an
-  `ElementState` bitflag set for `:hover` and friends. Nothing writes the state before M5;
-  it exists so the matcher is complete rather than quietly answering `false`.
-- `CrisolSelectors` — our `SelectorImpl`, with a closed pseudo-class allowlist (D-20).
-- `ElementRef` — the `selectors::Element` adapter over the tree.
-- `matching` — `parse_selector_list`, `matches`, `matches_any`, and `MatchCaches` for
-  matching many elements without throwing away the `:nth-child` index cache.
+*(a) Selector matching — `crisol-css`.* `crisol_tree::Atom`; `ElementData` with `id`,
+`classes`, `attributes` and an `ElementState` bitflag set; `CrisolSelectors` with a closed
+pseudo-class allowlist (D-20); `ElementRef` as the `selectors::Element` adapter;
+`parse_selector_list` / `matches` / `MatchCaches`. **31 tests.**
 
-31 tests. Still to do for M3: (b) the cascade and interned `ComputedStyle`, (c) `taffy`
-integration, (d) the 40+ case layout snapshot suite.
+*(b) Stylesheet parsing and the cascade — `crisol-css`, `crisol-style`.*
 
----
+- `Stylesheet::parse` — lightningcss for the grammar, selectors re-read into our dialect,
+  shorthands flattened to longhands at parse time so the cascade compares like with like,
+  `!important` sorted last within a rule, unsupported rules kept as warnings rather than
+  dropped. Nesting is lowered by printing the sheet with nesting disabled and reading it
+  back, since lightningcss implements that transform in its printer rather than its rule
+  tree.
+- `ComputedStyle` — every property in M3's subset, `Eq + Hash` so it can be a map key.
+- `StyleInterner` — **M3's acceptance criterion for interning passes**: a hundred
+  identically-styled paragraphs share one allocation, and a 101-element document costs two.
+- `StyleEngine::restyle` — document-order walk, precedence as
+  `(important, origin, specificity, source order)`, inheritance through text nodes, `em`/`rem`
+  resolved and percentages left for layout (D-22).
+- `crisol_tree::NodeMap<T>` — the side table computed style lives in (D-21).
+
+**35 tests**, 166 across the workspace.
+
+**Still to do for M3:** *(c)* `taffy` integration with `CustomNode::measure` wired to
+taffy's measure function, and `ComputedStyle::to_box_style` called once boxes are known.
+*(d)* the 40+ case layout snapshot suite the milestone's acceptance names.
 
 ## Open questions
 
@@ -135,6 +147,11 @@ integration, (d) the 40+ case layout snapshot suite.
   short of the window — device acquisition, pipelines, rasterisation, pixel output — is
   covered offscreen on all three in CI, so what is untested is specifically the `winit`
   surface and swapchain path.
+- **A full `cargo test --workspace` no longer fits on the development machine's disk.**
+  wgpu, naga and lightningcss together overflow it. Local runs go in two halves — the
+  graphics crates and everything else — and CI runs the whole thing. Nothing about the code
+  requires this; it is a note so the next session does not rediscover it as a mysterious
+  linker failure.
 - **`DisplayList` has no transform command yet.** Clipping is axis-aligned scissor only.
   `overflow: hidden` on a node with `border-radius` will clip square until either a stencil
   path or a per-fragment rounded clip exists. Decide at M3, when the CSS that needs it
@@ -176,6 +193,12 @@ Appended to `DECISIONS.md` in full; summarised here.
   `parcel_selectors`, whose `SelectorImpl` is unnameable from outside. Owning the impl means
   owning the dialect: the pseudo-class list is a closed allowlist mirroring
   `ElementState`, and anything else is a parse error rather than a silent non-match.
+- **D-21** — computed style is an interned `Arc` in a `NodeMap` side table, not a field on
+  the node. Forces `ComputedStyle` to be `Eq + Hash`, which is why lengths are newtypes that
+  reject NaN and normalise negative zero.
+- **D-22** — percentages reach layout unresolved; `em` and `rem` do not. `em` inside
+  `font-size` means the parent's, everywhere else it means this element's. `line-height`
+  inherits as a multiple, not as a resolved length.
 
 ---
 

@@ -27,6 +27,7 @@ pub mod atom;
 pub mod custom;
 pub mod dirty;
 pub mod id;
+pub mod map;
 pub mod node;
 pub mod tree;
 
@@ -34,5 +35,6 @@ pub use atom::Atom;
 pub use custom::{ColorBox, CustomHit, CustomNode, MeasureConstraints};
 pub use dirty::DirtyFlags;
 pub use id::NodeId;
+pub use map::NodeMap;
 pub use node::{Attribute, BoxStyle, ElementData, ElementState, Node, NodeKind};
 pub use tree::{Children, Tree, TreeError, TreeStats};

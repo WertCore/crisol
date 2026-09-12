@@ -532,6 +532,12 @@ dependencies = [
 [[package]]
 name = "crisol-style"
 version = "0.0.0"
+dependencies = [
+ "crisol-css",
+ "crisol-display-list",
+ "crisol-tree",
+ "lightningcss",
+]
 
 [[package]]
 name = "crisol-text"

@@ -12,3 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-css.workspace = true
+crisol-display-list.workspace = true
+crisol-tree.workspace = true
+lightningcss.workspace = true
