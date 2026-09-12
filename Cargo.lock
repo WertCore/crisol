@@ -507,6 +507,16 @@ version = "0.0.0"
 [[package]]
 name = "crisol-events"
 version = "0.0.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "crisol-css",
+ "crisol-display-list",
+ "crisol-html",
+ "crisol-layout",
+ "crisol-style",
+ "crisol-text",
+ "crisol-tree",
+]
 
 [[package]]
 name = "crisol-frontend"

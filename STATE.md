@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M5 — events, focus, input, accessibility (not started)
+**Current milestone:** M5 — events, focus, input, accessibility (in progress)
 **Last finished:** M4 — HTML and text
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -179,14 +179,42 @@ display list refers to text by the node's own packed handle, exactly as it refer
 And `ui/paint/tests/text.rs` runs the whole of Track A end to end — parse, cascade, layout,
 shape, paint, rasterise — and looks at the pixels.
 
-**Totals:** 297 tests passing, 0 failing.  clean,  clean,  clean with
+**Totals:** 334 tests passing, 0 failing.  clean,  clean,  clean with
 `RUSTDOCFLAGS=-D warnings`.
 
 ---
 
 ## In progress
 
-Nothing. M4 is closed and M5 has not been started.
+**M5, hit testing and the event model.**
+
+*Hit testing.* A point to a node, walking in reverse paint order — last sibling first,
+children before parents — because the last thing painted is the top thing on screen.
+Respects clips, `visibility: hidden` and `display: none`; a custom node resolves the point
+itself and may declare it a miss, which is how it says it has holes (D-19). With a text
+lookup it also returns the cursor position, composing straight into "which character did the
+user click".
+
+*The event model (D-32).* Pointers, not mice: a finger, a stylus and a mouse all produce
+`PointerEvent`s that differ by `PointerKind`, so an application written against a mouse today
+is already written against a finger. `PointerCancel` is its own event rather than a variant
+of `PointerUp`, and `TextInput` is separate from `KeyDown` because a key press may produce no
+text and an IME produces text with no key press.
+
+*Dispatch.* Capture down, target, bubble up, with `stop_propagation`,
+`stop_immediate_propagation` and `prevent_default`. `Listener` is a trait rather than a boxed
+closure, because at M16 a listener is a JavaScript function (D-33).
+
+*The payoff.* `EventSystem::apply_state` writes the `ElementState` bits M3 put on the node
+and nothing has written until now — the cascade has been matching `:hover`, `:focus`,
+`:focus-within` and `:active` against them all along and always getting `false`.
+`a_hover_selector_matches_once_the_state_is_applied` moves a pointer, applies the state,
+restyles, and watches the background change from white to red.
+
+37 tests.
+
+**Still to do for M5:** focus order and keyboard navigation (Tab through a form, which is
+what the milestone's acceptance names), IME preedit, and the `accesskit` bridge.
 
 ## Open questions
 
@@ -264,6 +292,10 @@ Appended to `DECISIONS.md` in full; summarised here.
 - **D-30** — one glyphon renderer per text run, so text keeps painter's order without a
   second render pass.
 - **D-31** — the display list refers to text by handle, exactly as it does to images.
+- **D-32** — pointers, not mice; `PointerCancel` distinct from `PointerUp`; `TextInput`
+  distinct from `KeyDown`.
+- **D-33** — listeners are a trait rather than a boxed closure, and interaction state is a
+  side table that `apply_state` writes onto the node for the cascade to read.
 
 ---
 

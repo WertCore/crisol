@@ -664,3 +664,52 @@ The correspondence between those two is asserted rather than assumed
 (`paint_refers_to_text_by_the_nodes_own_handle`): if the two ever disagree the text silently
 vanishes, which is not a failure mode worth debugging twice.
 
+---
+
+## D-32 — Pointers, not mice
+
+**Status:** Accepted (M5) · **Affects:** M5, M7, M16, M22
+
+ROADMAP §3.6 requires touch and gesture input designed into the event model at M5 rather
+than bolted on for M22. This is what that means concretely: **there is no mouse event.**
+
+A finger, a stylus and a mouse all produce `PointerEvent`s carrying a `PointerKind` and a
+`PointerId`. An application written against a mouse today is already written against a
+finger, and multi-touch needs no new event type — only more ids.
+
+**`PointerCancel` is a distinct event, not a variant of `PointerUp`.** The system takes the
+pointer away when a gesture is recognised, a call arrives, or the window loses focus
+mid-drag. A cancelled press is *not* a click, and conflating the two is why so many
+interfaces leave a button stuck looking pressed after an interruption. §3.6 names pointer
+cancellation specifically.
+
+**Rejected — mouse events now, touch events beside them at M22.** What the web did, and the
+reason every web application carries a compatibility layer reconciling the two. The engine
+would have inherited that at exactly the point it could least afford to.
+
+`TextInput` is likewise separate from `KeyDown`, because they are not the same question: a
+key press may produce no text, and text may arrive with no key press at all — which is
+precisely what an IME does.
+
+## D-33 — Listeners are a trait, and interaction state is a side table
+
+**Status:** Accepted (M5) · **Affects:** M5, M7, M16
+
+`Listener` is a trait, not a `Box<dyn FnMut>`. At M16 a listener is a JavaScript function and
+the runtime decides how to call it; an engine that had baked a Rust closure into its dispatch
+signature would need rewriting to get there. A blanket impl means a closure still works
+wherever one is convenient.
+
+Hover, focus and press state live in `EventSystem`, not on the node — the same arrangement
+as computed style (D-21), and for the same reason: `crisol-tree` sits below the event system
+and has to stay usable without it.
+
+`apply_state` then writes those into each element's `ElementState`, which is what the cascade
+has been matching `:hover`, `:focus`, `:focus-within` and `:active` against since M3 and
+always getting `false` for. It touches only the four interaction bits; `DISABLED`, `CHECKED`
+and `INVALID` belong to whoever set them.
+
+Hover is kept as the whole ancestor chain rather than the deepest node, because `:hover` on a
+container is a real thing authors rely on. Focus is kept as a single node and the chain
+derived, because only one node can have focus but every ancestor is `:focus-within`.
+
