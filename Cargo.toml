@@ -87,6 +87,14 @@ bitflags = "2"
 raw-window-handle = "0.6"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+# lightningcss owns the CSS grammar; `selectors` owns matching. They agree on
+# cssparser 0.37, so there is exactly one tokenizer in the graph. See DECISIONS D-20.
+lightningcss = { version = "1.0.0-alpha.72", default-features = false }
+selectors = "0.40"
+cssparser = "0.37"
+smallvec = "1.16"
+# Required by `selectors` for identifier types; must be the same version it uses.
+precomputed-hash = "0.1"
 
 [profile.release]
 lto = "thin"
@@ -95,3 +103,7 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
+# Full debug info for this dependency graph is gigabytes: wgpu, naga and lightningcss are
+# all large, and almost none of it is ever stepped through. Line tables keep backtraces
+# readable — file and line for every frame — at a fraction of the size.
+debug = "line-tables-only"

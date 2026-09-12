@@ -1,6 +1,10 @@
 //! The node itself: what it is, how it looks, and where it ended up.
 
+use std::borrow::Cow;
+
 use crisol_display_list::{Color, Corners, Edges, Rect};
+
+use crate::atom::Atom;
 
 use crate::custom::CustomNode;
 use crate::dirty::DirtyFlags;
@@ -23,7 +27,25 @@ impl NodeKind {
     #[must_use]
     pub fn tag(&self) -> Option<&str> {
         match self {
-            Self::Element(data) => Some(&data.tag),
+            Self::Element(data) => Some(data.tag.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The element data, for elements.
+    #[must_use]
+    pub fn element(&self) -> Option<&ElementData> {
+        match self {
+            Self::Element(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// The element data, mutably.
+    #[must_use]
+    pub fn element_mut(&mut self) -> Option<&mut ElementData> {
+        match self {
+            Self::Element(data) => Some(data),
             _ => None,
         }
     }
@@ -38,14 +60,152 @@ impl NodeKind {
     }
 }
 
-/// Element-specific data.
+/// Element-specific data: everything a selector can ask about a node.
 ///
-/// Deliberately thin at M2. Attributes, id, and class live here from M3, when the cascade
-/// needs something to match selectors against.
+/// `id` and `classes` are separate fields rather than entries in `attributes` because the
+/// matcher asks about them far more often than about anything else, and a linear scan of an
+/// attribute list per candidate is the difference between matching a stylesheet in
+/// microseconds and in milliseconds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ElementData {
     /// Lowercase tag name.
-    pub tag: String,
+    pub tag: Atom,
+    /// The `id` attribute, if present.
+    pub id: Option<Atom>,
+    /// The `class` attribute, split on whitespace.
+    ///
+    /// A `Vec` rather than a set: real elements carry two or three classes, and a linear
+    /// scan over three entries beats hashing every one of them.
+    pub classes: Vec<Atom>,
+    /// Everything else, in document order.
+    pub attributes: Vec<Attribute>,
+    /// Interaction state the matcher reads for `:hover`, `:focus` and friends.
+    ///
+    /// Nothing sets these before M5, when there is an event loop to set them from. They
+    /// exist now so the selector matcher is complete rather than quietly answering `false`
+    /// to half the pseudo-classes it is asked about.
+    pub state: ElementState,
+}
+
+impl ElementData {
+    /// An element with the given tag name and nothing else.
+    #[must_use]
+    pub fn new(tag: impl Into<Atom>) -> Self {
+        Self {
+            tag: tag.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The value of an attribute, by name.
+    ///
+    /// Answers for `id` and `class` too, so a caller that does not care where they are
+    /// stored does not have to know. `class` is the only one that can allocate, and only
+    /// when an element has two or more classes and someone asks for the joined string —
+    /// which is `[class="a b"]`, a rare selector. Presence tests go through
+    /// [`Self::has_attribute`] and never allocate.
+    #[must_use]
+    pub fn attribute(&self, name: &str) -> Option<Cow<'_, str>> {
+        match name {
+            "id" => return self.id.as_ref().map(|id| Cow::Borrowed(id.as_str())),
+            "class" => {
+                return match self.classes.as_slice() {
+                    [] => None,
+                    [single] => Some(Cow::Borrowed(single.as_str())),
+                    many => Some(Cow::Owned(
+                        many.iter().map(Atom::as_str).collect::<Vec<_>>().join(" "),
+                    )),
+                };
+            }
+            _ => {}
+        }
+        self.attributes
+            .iter()
+            .find(|attribute| attribute.name == *name)
+            .map(|attribute| Cow::Borrowed(attribute.value.as_str()))
+    }
+
+    /// Whether an attribute is present, without reading its value.
+    ///
+    /// Separate from [`Self::attribute`] because `[class]` asks only about presence, and an
+    /// element with several classes should not have to build a string to answer it.
+    #[must_use]
+    pub fn has_attribute(&self, name: &str) -> bool {
+        match name {
+            "id" => self.id.is_some(),
+            "class" => !self.classes.is_empty(),
+            _ => self
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name == *name),
+        }
+    }
+
+    /// Sets `class`, splitting on ASCII whitespace as HTML does.
+    pub fn set_class(&mut self, value: &str) {
+        self.classes.clear();
+        self.classes
+            .extend(value.split_ascii_whitespace().map(Atom::new));
+    }
+
+    /// True when `name` is one of this element's classes.
+    #[must_use]
+    pub fn has_class(&self, name: &str, case_sensitive: bool) -> bool {
+        self.classes.iter().any(|class| {
+            if case_sensitive {
+                class.as_str() == name
+            } else {
+                class.as_str().eq_ignore_ascii_case(name)
+            }
+        })
+    }
+}
+
+/// A name/value pair on an element.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attribute {
+    /// Lowercase attribute name.
+    pub name: Atom,
+    /// The value as written.
+    pub value: Atom,
+}
+
+impl Attribute {
+    /// A new attribute, lowercasing the name as HTML does.
+    #[must_use]
+    pub fn new(name: &str, value: &str) -> Self {
+        Self {
+            name: Atom::lowercase(name),
+            value: Atom::new(value),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Interaction state a selector can ask about.
+    ///
+    /// One bitflag rather than separate booleans because M6 has to answer "did anything a
+    /// selector cares about change?" in one comparison, and because the set is small and
+    /// closed — see `crisol-css`'s pseudo-class list, which this mirrors.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct ElementState: u16 {
+        /// The pointer is over the element.
+        const HOVER = 1 << 0;
+        /// A pointer is held down on the element.
+        const ACTIVE = 1 << 1;
+        /// The element has keyboard focus.
+        const FOCUS = 1 << 2;
+        /// The element, or something inside it, has keyboard focus.
+        const FOCUS_WITHIN = 1 << 3;
+        /// Focus arrived by a route that should show a focus ring.
+        const FOCUS_VISIBLE = 1 << 4;
+        /// The element does not accept input.
+        const DISABLED = 1 << 5;
+        /// A checkbox or radio is checked.
+        const CHECKED = 1 << 6;
+        /// A control's value fails its constraints.
+        const INVALID = 1 << 7;
+    }
 }
 
 /// Everything paint needs to know about a node's box.

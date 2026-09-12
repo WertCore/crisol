@@ -23,14 +23,16 @@
 
 #![doc(html_root_url = "https://docs.rs/crisol-tree/0.0.0")]
 
+pub mod atom;
 pub mod custom;
 pub mod dirty;
 pub mod id;
 pub mod node;
 pub mod tree;
 
+pub use atom::Atom;
 pub use custom::{ColorBox, CustomHit, CustomNode, MeasureConstraints};
 pub use dirty::DirtyFlags;
 pub use id::NodeId;
-pub use node::{BoxStyle, ElementData, Node, NodeKind};
+pub use node::{Attribute, BoxStyle, ElementData, ElementState, Node, NodeKind};
 pub use tree::{Children, Tree, TreeError, TreeStats};

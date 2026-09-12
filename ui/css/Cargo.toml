@@ -12,3 +12,11 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-display-list.workspace = true
+crisol-tree.workspace = true
+cssparser.workspace = true
+lightningcss.workspace = true
+precomputed-hash.workspace = true
+selectors.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true

@@ -4,6 +4,7 @@ use core::num::NonZeroU32;
 
 use crisol_display_list::Rect;
 
+use crate::atom::Atom;
 use crate::custom::CustomNode;
 use crate::dirty::DirtyFlags;
 use crate::id::NodeId;
@@ -98,8 +99,77 @@ impl Tree {
     // ---- creation -------------------------------------------------------------------
 
     /// Creates a detached element node.
-    pub fn create_element(&mut self, tag: impl Into<String>) -> NodeId {
-        self.insert(NodeKind::Element(ElementData { tag: tag.into() }))
+    ///
+    /// The tag is lowercased, because HTML tag names are ASCII case-insensitive and a
+    /// hand-built tree must match the same selectors a parsed one does.
+    pub fn create_element(&mut self, tag: &str) -> NodeId {
+        self.insert(NodeKind::Element(ElementData::new(Atom::lowercase(tag))))
+    }
+
+    /// The element data for `id`, or `None` when it is not an element.
+    #[must_use]
+    pub fn element(&self, id: NodeId) -> Option<&ElementData> {
+        self.get(id)?.kind.element()
+    }
+
+    /// The element data for `id`, mutably.
+    #[must_use]
+    pub fn element_mut(&mut self, id: NodeId) -> Option<&mut ElementData> {
+        self.get_mut(id)?.kind.element_mut()
+    }
+
+    /// The nearest ancestor of `id` that is an element, skipping text and custom nodes.
+    ///
+    /// Selector matching walks the *element* tree, not the node tree.
+    #[must_use]
+    pub fn parent_element(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = self.parent(id);
+        while let Some(node) = current {
+            if self.element(node).is_some() {
+                return Some(node);
+            }
+            current = self.parent(node);
+        }
+        None
+    }
+
+    /// The previous sibling of `id` that is an element.
+    #[must_use]
+    pub fn prev_sibling_element(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = self.get(id)?.prev_sibling();
+        while let Some(node) = current {
+            if self.element(node).is_some() {
+                return Some(node);
+            }
+            current = self.get(node)?.prev_sibling();
+        }
+        None
+    }
+
+    /// The next sibling of `id` that is an element.
+    #[must_use]
+    pub fn next_sibling_element(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = self.next_sibling(id);
+        while let Some(node) = current {
+            if self.element(node).is_some() {
+                return Some(node);
+            }
+            current = self.next_sibling(node);
+        }
+        None
+    }
+
+    /// The first child of `id` that is an element.
+    #[must_use]
+    pub fn first_child_element(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = self.first_child(id);
+        while let Some(node) = current {
+            if self.element(node).is_some() {
+                return Some(node);
+            }
+            current = self.next_sibling(node);
+        }
+        None
     }
 
     /// Creates a detached text node.

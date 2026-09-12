@@ -349,3 +349,50 @@ complete protocol between the engine and a node that opts out of CSS layout:
 
 `measure` takes constraints rather than a fixed size because a document canvas needs to know
 available width to decide its own height. Deciding this at M2 is the point of §2.6.
+
+---
+
+## D-20 — Match with the upstream `selectors` crate and a closed selector dialect
+
+**Status:** Accepted (M3) · **Affects:** M3, M5, M6
+
+ROADMAP §2.4 says to use `lightningcss` for CSS parsing and Servo's `selectors` for matching.
+Those turn out not to be the same crate: lightningcss embeds `parcel_selectors`, Parcel's
+fork, and defines its `SelectorImpl` in a private module. The type is reachable through
+public aliases but cannot be *named*, so `selectors::Element` cannot be implemented against
+lightningcss's already-parsed selectors from outside the crate.
+
+lightningcss parses stylesheets and declarations. Matching uses the upstream `selectors`
+crate with a `SelectorImpl` of our own. Both depend on `cssparser` 0.37, so there is exactly
+one tokenizer in the dependency graph.
+
+**Rejected — vendor or fork lightningcss** to expose its `SelectorImpl`. Cheap today,
+a merge burden on every upgrade of a crate that is still pre-1.0.
+
+**Rejected — Servo's `stylo`** for the whole cascade. It solves this and much more, and it
+is an enormous dependency built around Gecko's constraints. ROADMAP §2.4's list is about not
+writing a parser or a matcher, not about not owning a cascade.
+
+**Rejected — write the matcher.** §2.4 says no, and it is right: selector matching is
+subtle in exactly the ways that produce bugs nobody can reproduce.
+
+**Consequence, and the reason this is a decision rather than a workaround:** owning the
+`SelectorImpl` means owning the *dialect*. The supported pseudo-classes are an explicit
+allowlist — `:hover`, `:active`, `:focus`, `:focus-within`, `:focus-visible`, `:disabled`,
+`:enabled`, `:checked`, `:invalid` — and everything else is a parse error with a source
+location rather than a selector that silently never matches. That list is deliberately the
+same set as `crisol-tree`'s `ElementState` bitflags: a pseudo-class the engine cannot answer
+from a node does not exist.
+
+Absent on purpose:
+
+- `:visited`, `:target` — there is no history and no fragment navigation (ROADMAP §1).
+- `::before`, `::after` — generated content needs a box in the tree. Adding them is a tree
+  change, not a parser change, so they fail loudly until that work is done.
+- `:has()` — it makes the matcher look *down* the tree, which turns invalidation from an
+  ancestor walk into a subtree scan. Revisit at M6, when invalidation exists and the cost
+  can be measured rather than guessed.
+
+`:is()` and `:where()` are supported: they are how a stylesheet avoids the combinatorial
+blow-up that makes large selector lists slow.
+

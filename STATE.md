@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M3 — CSS and layout (not started)
+**Current milestone:** M3 — CSS and layout (in progress: selector matching done)
 **Last finished:** M2 — node tree and display list
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -111,7 +111,20 @@ with `RUSTDOCFLAGS=-D warnings`.
 
 ## In progress
 
-Nothing. M2 is closed and M3 has not been started.
+**M3, step (a) of four.** `crisol-css` matches selectors against a `crisol-tree`:
+
+- `crisol_tree::Atom` — refcounted name with a cached hash, for tags, ids, classes and
+  attribute names.
+- `ElementData` grew what a selector can ask about: `id`, `classes`, `attributes`, and an
+  `ElementState` bitflag set for `:hover` and friends. Nothing writes the state before M5;
+  it exists so the matcher is complete rather than quietly answering `false`.
+- `CrisolSelectors` — our `SelectorImpl`, with a closed pseudo-class allowlist (D-20).
+- `ElementRef` — the `selectors::Element` adapter over the tree.
+- `matching` — `parse_selector_list`, `matches`, `matches_any`, and `MatchCaches` for
+  matching many elements without throwing away the `:nth-child` index cache.
+
+31 tests. Still to do for M3: (b) the cascade and interned `ComputedStyle`, (c) `taffy`
+integration, (d) the 40+ case layout snapshot suite.
 
 ---
 
@@ -159,6 +172,10 @@ Appended to `DECISIONS.md` in full; summarised here.
 - **D-18** — dirty tracking as per-node flags plus ancestor-marked subtree bits.
 - **D-19** — `CustomNode` as an object-safe measure/layout/paint/hit-test contract, with
   `measure` taking constraints rather than a fixed size.
+- **D-20** — match with the upstream `selectors` crate rather than lightningcss's embedded
+  `parcel_selectors`, whose `SelectorImpl` is unnameable from outside. Owning the impl means
+  owning the dialect: the pseudo-class list is a closed allowlist mirroring
+  `ElementState`, and anything else is a parse error rather than a silent non-match.
 
 ---
 
