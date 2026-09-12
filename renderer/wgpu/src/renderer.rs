@@ -52,6 +52,22 @@ struct Scissor {
     height: u32,
 }
 
+/// How much of the surface this frame is allowed to touch.
+///
+/// Three states, not two. An `Option<Scissor>` would have to mean both "no damage region, so
+/// redraw everything" and "the damage region clips to nothing, so draw nothing" — which are
+/// opposites, and conflating them makes an off-screen damage rectangle repaint the whole
+/// surface. That bug was live until a test asked for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Damage {
+    /// No damage region was given: clear and redraw everything.
+    Everything,
+    /// Redraw only this region, preserving the rest.
+    Region(Scissor),
+    /// The damage region does not intersect the surface: there is nothing to do.
+    Nothing,
+}
+
 /// The rounded clip in force, in physical pixels, or `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct RoundedClip {
@@ -94,6 +110,13 @@ pub struct FrameTarget<'a> {
     /// Logical-to-physical pixel ratio. Display lists are authored in logical pixels; this
     /// is the only place the conversion happens.
     pub scale_factor: f32,
+    /// Redraw only this region, in logical pixels, keeping the rest of the surface as it was.
+    ///
+    /// `None` redraws everything, which is what the first frame and a resize want. Anything
+    /// else requires the surface to still hold the previous frame — true for an offscreen
+    /// target, and true for a swapchain only when the present mode preserves it. A caller
+    /// that is not sure should pass `None`; a stale region is a worse bug than a slow frame.
+    pub damage: Option<Rect>,
 }
 
 /// Counters for one frame, for the instrumentation M6's acceptance test needs.
@@ -376,6 +399,19 @@ impl Renderer {
             ..FrameStats::default()
         };
 
+        let damage = match target.damage {
+            None => Damage::Everything,
+            Some(rect) => {
+                Scissor::from_logical(rect, target.scale_factor, target.width, target.height)
+                    .map_or(Damage::Nothing, Damage::Region)
+            }
+        };
+        if damage == Damage::Nothing {
+            // Nothing on screen can change. Submitting an empty pass would still cost a
+            // load and a store of the whole attachment, which on a tiler is the expensive
+            // part (DECISIONS D-09).
+            return stats;
+        }
         self.glyphs
             .begin_frame(&self.gpu.queue, target.width, target.height);
         self.build_batches(list, &target, &mut stats, fonts, source);
@@ -398,7 +434,19 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color(list.background)),
+                        // A damaged frame loads what is already there; a full frame clears.
+                        // Clearing a damaged frame would wipe the parts being kept, which is
+                        // the whole saving — a load op ignores the scissor and covers the
+                        // entire attachment.
+                        //
+                        // The damaged region still has to be cleared to the background before
+                        // anything is drawn over it, and `crisol-paint` emits a rectangle for
+                        // exactly that when it is given a damage region. Doing it there rather
+                        // than here keeps the background colour in one place.
+                        load: match damage {
+                            Damage::Region(_) => wgpu::LoadOp::Load,
+                            _ => wgpu::LoadOp::Clear(clear_color(list.background)),
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -421,6 +469,20 @@ impl Renderer {
                     Batch::Text { scissor, .. } => (*scissor, None),
                 };
 
+                // Every scissor is intersected with the damaged region, so nothing outside
+                // it can be touched however a producer built the list.
+                let scissor = match (scissor, damage) {
+                    (Some(a), Damage::Region(b)) => match a.intersection(b) {
+                        Some(intersected) => Some(intersected),
+                        // This batch lies entirely outside the damage.
+                        None => continue,
+                    },
+                    (Some(only), Damage::Everything) => Some(only),
+                    (None, Damage::Region(only)) => Some(only),
+                    (None, Damage::Everything) => None,
+                    // Handled before the pass was begun.
+                    (_, Damage::Nothing) => unreachable!("an empty damage region returns early"),
+                };
                 if current_scissor != scissor {
                     match scissor {
                         Some(s) => pass.set_scissor_rect(s.x, s.y, s.width, s.height),
@@ -772,6 +834,23 @@ fn clear_color(color: Color) -> wgpu::Color {
 }
 
 impl Scissor {
+    /// The overlap with another scissor, or `None` when they do not overlap.
+    fn intersection(self, other: Self) -> Option<Self> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = (self.x + self.width).min(other.x + other.width);
+        let y1 = (self.y + self.height).min(other.y + other.height);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Self {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    }
+
     /// Converts a logical-pixel clip to an integer physical-pixel scissor clamped to the
     /// target, or `None` when nothing survives.
     ///

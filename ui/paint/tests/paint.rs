@@ -476,3 +476,132 @@ fn a_custom_node_is_clipped_to_its_own_rounded_box() {
         "a rounded PDF page must not paint into corners it does not own"
     );
 }
+
+// ---- damage culling ---------------------------------------------------------------------
+
+#[test]
+fn a_damaged_paint_skips_subtrees_that_cannot_touch_it() {
+    let mut tree = Tree::new();
+    let root = tree.create_element("div");
+    tree.set_root(root).unwrap();
+    tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 200.0, 200.0);
+
+    // Twenty stacked boxes; only one of them is damaged.
+    let mut boxes = Vec::new();
+    for i in 0..20 {
+        let child = tree.create_element("div");
+        tree.append_child(root, child).unwrap();
+        tree.node_mut(child).layout = Rect::from_xywh(0.0, i as f32 * 10.0, 200.0, 10.0);
+        tree.node_mut(child).style = BoxStyle::filled(RED);
+        boxes.push(child);
+    }
+
+    let (list, stats) = paint_with_stats(
+        &tree,
+        &options().with_damage(Rect::from_xywh(0.0, 50.0, 200.0, 10.0)),
+    );
+
+    assert!(
+        stats.subtrees_culled >= 15,
+        "most of the document should be skipped, culled {}",
+        stats.subtrees_culled
+    );
+    // The clip, the background fill, and the one box that was damaged.
+    let rect_count = list
+        .commands()
+        .iter()
+        .filter(|c| matches!(c, DrawCommand::Rect(_)))
+        .count();
+    assert!(
+        rect_count <= 3,
+        "only the damaged box should be drawn: {rect_count}"
+    );
+}
+
+#[test]
+fn a_damaged_paint_clips_and_repaints_the_background_itself() {
+    // The renderer *loads* rather than clears on a damaged frame, because a clear ignores
+    // the scissor and would wipe the region being kept. So paint has to put the background
+    // back inside the damage before anything is drawn over it.
+    let (tree, _) = nested();
+    let damage = Rect::from_xywh(10.0, 10.0, 20.0, 20.0);
+    let list = paint(&tree, &options().with_background(BLUE).with_damage(damage));
+
+    let DrawCommand::PushClip(clip) = list.commands()[0] else {
+        panic!("a damaged paint should clip to the damage first");
+    };
+    assert_eq!(clip.rect, damage);
+
+    let DrawCommand::Rect(background) = list.commands()[1] else {
+        panic!("and then repaint the background inside it");
+    };
+    assert_eq!(background.rect, damage);
+    assert_eq!(background.fill, BLUE);
+}
+
+#[test]
+fn a_child_overflowing_its_parent_is_not_culled_with_it() {
+    // `overflow: visible` is the initial value, so a child outside its parent's box is the
+    // common case rather than an exotic one. Culling on the parent's box alone loses it.
+    let mut tree = Tree::new();
+    let root = tree.create_element("div");
+    tree.set_root(root).unwrap();
+    tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 200.0, 200.0);
+
+    let parent = tree.create_element("div");
+    tree.append_child(root, parent).unwrap();
+    tree.node_mut(parent).layout = Rect::from_xywh(0.0, 0.0, 10.0, 10.0);
+
+    let overflowing = tree.create_element("div");
+    tree.append_child(parent, overflowing).unwrap();
+    // Sticks out well past the parent, into the damaged region.
+    tree.node_mut(overflowing).layout = Rect::from_xywh(0.0, 100.0, 50.0, 50.0);
+    tree.node_mut(overflowing).style = BoxStyle::filled(RED);
+
+    let (list, _) = paint_with_stats(
+        &tree,
+        &options().with_damage(Rect::from_xywh(0.0, 120.0, 50.0, 10.0)),
+    );
+    assert!(
+        rects(&list).iter().any(|(_, color)| *color == RED),
+        "the overflowing child touches the damage and must be painted"
+    );
+}
+
+#[test]
+fn a_clipping_parent_that_misses_the_damage_takes_its_children_with_it() {
+    // The other side of the same coin: a node with `overflow: hidden` confines its
+    // descendants, so if its box misses there is nothing beneath it to find.
+    let mut tree = Tree::new();
+    let root = tree.create_element("div");
+    tree.set_root(root).unwrap();
+    tree.node_mut(root).layout = Rect::from_xywh(0.0, 0.0, 200.0, 200.0);
+
+    let parent = tree.create_element("div");
+    tree.append_child(root, parent).unwrap();
+    tree.node_mut(parent).layout = Rect::from_xywh(0.0, 0.0, 10.0, 10.0);
+    tree.node_mut(parent).style.clips_children = true;
+
+    let child = tree.create_element("div");
+    tree.append_child(parent, child).unwrap();
+    tree.node_mut(child).layout = Rect::from_xywh(0.0, 100.0, 50.0, 50.0);
+    tree.node_mut(child).style = BoxStyle::filled(RED);
+
+    let (list, stats) = paint_with_stats(
+        &tree,
+        &options().with_damage(Rect::from_xywh(0.0, 120.0, 50.0, 10.0)),
+    );
+    assert!(stats.subtrees_culled > 0);
+    assert!(
+        !rects(&list).iter().any(|(_, color)| *color == RED),
+        "the child is clipped away by its parent, so it cannot reach the damage"
+    );
+}
+
+#[test]
+fn painting_without_damage_is_unchanged() {
+    let (tree, _) = nested();
+    let (list, stats) = paint_with_stats(&tree, &options());
+    assert_eq!(stats.subtrees_culled, 0);
+    assert_eq!(rects(&list).len(), 3, "the whole document, as before");
+}

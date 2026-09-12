@@ -36,6 +36,7 @@ fn draw(gpu: &Gpu, tree: &Tree, scale: f32) -> Pixels {
             width,
             height,
             scale_factor: scale,
+            damage: None,
         },
         &list,
     );

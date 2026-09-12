@@ -53,6 +53,7 @@ fn render_with(
             width,
             height,
             scale_factor: scale,
+            damage: None,
         },
         &list,
     );
@@ -348,6 +349,7 @@ fn an_image_that_was_never_uploaded_is_counted_and_skipped() {
                 width: 8,
                 height: 8,
                 scale_factor: 1.0,
+                damage: None,
             },
             &list,
         );
@@ -387,6 +389,7 @@ fn rectangles_sharing_a_clip_collapse_into_one_draw_call() {
                 width: 64,
                 height: 64,
                 scale_factor: 1.0,
+                damage: None,
             },
             &list,
         );
@@ -422,6 +425,7 @@ fn each_clip_group_is_its_own_draw_call() {
                 width: 64,
                 height: 64,
                 scale_factor: 1.0,
+                damage: None,
             },
             &list,
         );
@@ -458,6 +462,7 @@ fn rendering_into_a_sequence_of_sizes_does_not_panic_or_leak_state() {
                     width: w,
                     height: h,
                     scale_factor: 1.0,
+                    damage: None,
                 },
                 &list,
             );
@@ -497,6 +502,7 @@ fn the_instance_buffer_grows_without_dropping_instances() {
                 width: 128,
                 height: 128,
                 scale_factor: 1.0,
+                damage: None,
             },
             &list,
         );
@@ -679,5 +685,130 @@ fn a_square_clip_still_keeps_its_corners() {
         pixels.assert_pixel(5, 5, content, TOLERANCE);
         pixels.assert_pixel(34, 34, content, TOLERANCE);
         pixels.assert_pixel(2, 2, Color::WHITE, TOLERANCE);
+    });
+}
+
+// ---- damaged frames ---------------------------------------------------------------------
+
+/// The second half of M6's acceptance: *repaints only the damaged rectangle*. Being fast is
+/// not enough — the pixels outside the damage have to survive, and the ones inside have to be
+/// right. Both are checked here, because a renderer that skipped the work *and* the correctness
+/// would pass a timing test happily.
+#[test]
+fn a_damaged_frame_redraws_inside_and_preserves_outside() {
+    with_gpu(|gpu| {
+        let mut renderer = Renderer::new(&gpu, HEADLESS_FORMAT);
+        let target = HeadlessTarget::new(&gpu, 64, 64);
+        let logical = Size::new(64.0, 64.0);
+
+        let red = Color::from_rgba8(255, 0, 0, 255);
+        let blue = Color::from_rgba8(0, 0, 255, 255);
+        let green = Color::from_rgba8(0, 255, 0, 255);
+
+        // Frame one: a red left half and a blue right half, drawn in full.
+        let mut builder = DisplayListBuilder::new(logical);
+        builder.set_background(Color::WHITE);
+        builder.fill_rect(Rect::from_xywh(0.0, 0.0, 32.0, 64.0), red);
+        builder.fill_rect(Rect::from_xywh(32.0, 0.0, 32.0, 64.0), blue);
+        renderer.render(
+            FrameTarget {
+                view: target.view(),
+                width: 64,
+                height: 64,
+                scale_factor: 1.0,
+                damage: None,
+            },
+            &builder.build(),
+        );
+        let first = target.read_pixels(&gpu);
+        first.assert_pixel(10, 32, red, TOLERANCE);
+        first.assert_pixel(50, 32, blue, TOLERANCE);
+
+        // Frame two: only the right half is damaged, and it becomes green. The list still
+        // contains both rectangles — culling is the producer's optimisation, and the renderer
+        // must clip correctly even when handed everything.
+        let mut builder = DisplayListBuilder::new(logical);
+        builder.set_background(Color::WHITE);
+        builder.fill_rect(Rect::from_xywh(0.0, 0.0, 32.0, 64.0), red);
+        builder.fill_rect(Rect::from_xywh(32.0, 0.0, 32.0, 64.0), green);
+        renderer.render(
+            FrameTarget {
+                view: target.view(),
+                width: 64,
+                height: 64,
+                scale_factor: 1.0,
+                damage: Some(Rect::from_xywh(32.0, 0.0, 32.0, 64.0)),
+            },
+            &builder.build(),
+        );
+
+        let second = target.read_pixels(&gpu);
+        second.assert_pixel(50, 32, green, TOLERANCE);
+        second.assert_pixel(10, 32, red, TOLERANCE);
+    });
+}
+
+#[test]
+fn a_damaged_frame_does_not_let_a_draw_escape_the_damage() {
+    with_gpu(|gpu| {
+        let mut renderer = Renderer::new(&gpu, HEADLESS_FORMAT);
+        let target = HeadlessTarget::new(&gpu, 64, 64);
+        let logical = Size::new(64.0, 64.0);
+        let red = Color::from_rgba8(255, 0, 0, 255);
+
+        let mut builder = DisplayListBuilder::new(logical);
+        builder.set_background(Color::WHITE);
+        renderer.render(
+            FrameTarget {
+                view: target.view(),
+                width: 64,
+                height: 64,
+                scale_factor: 1.0,
+                damage: None,
+            },
+            &builder.build(),
+        );
+
+        // A list that covers the whole surface, but a damage region of one corner. Nothing
+        // outside that corner may be touched, however the list was built.
+        let mut builder = DisplayListBuilder::new(logical);
+        builder.fill_rect(Rect::from_xywh(0.0, 0.0, 64.0, 64.0), red);
+        renderer.render(
+            FrameTarget {
+                view: target.view(),
+                width: 64,
+                height: 64,
+                scale_factor: 1.0,
+                damage: Some(Rect::from_xywh(0.0, 0.0, 16.0, 16.0)),
+            },
+            &builder.build(),
+        );
+
+        let pixels = target.read_pixels(&gpu);
+        pixels.assert_pixel(8, 8, red, TOLERANCE);
+        pixels.assert_pixel(40, 40, Color::WHITE, TOLERANCE);
+        pixels.assert_pixel(8, 40, Color::WHITE, TOLERANCE);
+    });
+}
+
+#[test]
+fn a_damage_region_outside_the_surface_draws_nothing_and_does_not_panic() {
+    with_gpu(|gpu| {
+        let mut renderer = Renderer::new(&gpu, HEADLESS_FORMAT);
+        let target = HeadlessTarget::new(&gpu, 32, 32);
+        let mut builder = DisplayListBuilder::new(Size::new(32.0, 32.0));
+        builder.fill_rect(Rect::from_xywh(0.0, 0.0, 32.0, 32.0), Color::BLACK);
+
+        let stats = renderer.render(
+            FrameTarget {
+                view: target.view(),
+                width: 32,
+                height: 32,
+                scale_factor: 1.0,
+                damage: Some(Rect::from_xywh(500.0, 500.0, 10.0, 10.0)),
+            },
+            &builder.build(),
+        );
+        assert_eq!(stats.draw_calls, 0, "everything is outside the damage");
     });
 }

@@ -873,3 +873,46 @@ with an empty font system every string measures to nothing, so no box ever chang
 assertion held vacuously. Worth remembering: a test whose fixture cannot produce the
 condition it checks for is not a test.
 
+---
+
+## D-40 — A damaged frame loads and repaints its own background
+
+**Status:** Accepted (M6) · **Affects:** M6, M8
+
+A render pass's load op covers the **whole attachment** and ignores the scissor. So a damaged
+frame cannot clear: doing so would wipe exactly the region it is trying to preserve. It loads
+instead, and `crisol-paint` emits a background rectangle covering the damaged region before
+anything is drawn over it.
+
+Putting that in paint rather than the renderer keeps the background colour in one place. The
+renderer would otherwise have to inject an instance at index zero and shift every batch index
+to match.
+
+**The precondition, which a caller has to satisfy:** the surface must still hold the previous
+frame. That is true of an offscreen target and true of a swapchain only when the present mode
+preserves it. `FrameTarget::damage` documents that a caller who is unsure should pass `None` —
+a stale region on screen is a worse bug than a slow frame.
+
+## D-41 — Damage has three states, not two
+
+**Status:** Accepted (M6) · **Affects:** M6
+
+`Option<Scissor>` had to mean both *no damage region, so redraw everything* and *the damage
+region clips to nothing, so draw nothing*. Those are opposites, and conflating them made an
+off-screen damage rectangle repaint the entire surface — the exact opposite of what was asked
+for.
+
+`Damage` is therefore `Everything | Region(..) | Nothing`, and the `Nothing` case returns
+before a pass is even begun: submitting an empty pass still costs a load and a store of the
+whole attachment, which on a tile-based GPU is the expensive part (D-09).
+
+The bug was live and invisible until a test asked what happens when the damage is entirely
+off screen. Worth remembering as a shape: an `Option` whose `None` means two different things
+is a bug waiting for the second meaning to occur.
+
+Paint's culling has the mirror-image subtlety. A subtree whose own box misses the damage may
+still contain something that hits it, because `overflow: visible` is the initial value and a
+child overflowing its parent is the common case. So the test descends — but stops immediately
+at a node with `overflow: hidden`, which confines its descendants and therefore cannot hide
+anything that reaches further.
+

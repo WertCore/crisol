@@ -1,7 +1,7 @@
 # Crisol — State
 
-**Current milestone:** M6 — incremental everything (in progress)
-**Last finished:** M5 — events, focus, input, accessibility
+**Current milestone:** M7 — reactive API and component model (not started)
+**Last finished:** M6 — incremental everything
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -10,14 +10,11 @@ actually is.
 
 ## Accept criteria for the current milestone
 
-> **M6 — incremental everything.** Dirty flagging, style invalidation (which selectors can be
-> affected by which mutation), partial relayout, damage regions, glyph and texture caching.
+> **M7 — reactive API and component model.** Signals, effects, a component abstraction, and
+> the mutation API that a foreign caller (the JS runtime, later) will drive. Design it as if
+> an external consumer exists, because one will.
 >
-> **Accept:** in a 10,000-node tree, mutating one text node's content triggers relayout of
-> fewer than 20 nodes and repaints only the damaged rectangle. Instrumented counters prove it.
->
-> This is the line between a demo and something you can build a real app on. A 400-page
-> document reflowing on every keystroke is the workload that kills naive engines.
+> **Accept:** a Rust-only todo app with add/remove/filter/edit runs with no full-tree rebuilds.
 
 ---
 
@@ -214,38 +211,29 @@ with skipped wrappers' children floating up to take their place.
   is asserted: roles, labels, nesting, state, focus and bounds. Whether they *say* it right
   needs a human with a screen reader; see *Open questions*.
 
-**Totals:** 390 tests passing
+### M6 — incremental everything
 
----
+`DirtyFlags` had been on the node since M2 waiting for a consumer. This is it.
 
-## In progress
+*Marking (D-38).* A class or state change dirties the node, its descendants and its
+**following** siblings — nothing else, because no combinator in the dialect looks backwards or
+upwards. That is what excluding `:has()` bought (D-20). Text becoming empty dirties the
+parent's style for `:empty`; an ordinary edit dirties no style at all. Inserting a child
+dirties the parent's other children for `:nth-child`, but not their subtrees.
 
-**M6, invalidation and damage.** `DirtyFlags` has been on the node since M2 waiting for a
-consumer; this is it.
+*Restyle.* `restyle_incremental` reuses whole subtrees. The subtle part is inheritance: a
+clean subtree still needs recomputing if its parent's style changed, so the walk carries
+whether the inherited style *actually* changed — a pointer comparison, thanks to the interner.
 
-*Marking (D-38).* Mutations now mark exactly what they can affect. A class or state change
-dirties the node, its descendants and its **following** siblings — and nothing else, because
-no combinator in the dialect looks backwards or upwards. That is why `:has()` is excluded
-(D-20): one selector would turn an O(subtree) walk into an O(document) one on every class
-toggle. Text becoming empty dirties the parent's style for `:empty`; an ordinary edit dirties
-no style at all. Inserting a child dirties the parent's other children for `:nth-child`, but
-not their subtrees.
+*Layout (D-37).* `LayoutCache` moved out to the caller, because the sequence M6 is about —
+lay out, mutate, lay out — is impossible while the context holds `&mut Tree`. Found by writing
+the acceptance test and discovering it could not be expressed.
 
-*Incremental restyle.* `StyleEngine::restyle_incremental` reuses the styles of subtrees
-nothing invalidated. The subtle part is inheritance: a clean subtree still needs recomputing
-if its parent's style changed, so the walk carries whether the inherited style *actually*
-changed — a pointer comparison, thanks to the interner (D-21).
+*Damage (D-39, D-40, D-41).* The union of where each changed box was and is, in absolute
+coordinates. Paint culls subtrees that cannot touch it and repaints the background inside it;
+the renderer loads rather than clears and intersects every scissor with it.
 
-*Layout.* `LayoutCache` moved out of `LayoutContext` to the caller (D-37), because the one
-sequence M6 is about — lay out, mutate, lay out — is impossible while the context holds
-`&mut Tree`. Found by writing the acceptance test and discovering it could not be expressed.
-The pass then invalidates taffy's cache for every dirty node *and its ancestors* (a node's
-size feeds its parent's) and leaves everything else alone.
-
-*Damage (D-39).* The union of where each changed box **was** and **is**, in absolute
-coordinates. Taking only the new box leaves a ghost of the old one.
-
-**Accept: the layout half is met.**
+**Accept: met.**
 
 ```
 10,002 nodes; one text edit
@@ -253,13 +241,22 @@ coordinates. Taking only the new box leaves a ghost of the old one.
   second pass: 4 caches invalidated, 4 laid out, 10,002 boxes unchanged
 ```
 
-Four is the edited text node plus `p`, `body`, `html` — the ancestor chain exactly. The
-milestone asks for fewer than twenty.
+Four is the edited text node plus `p`, `body`, `html` — the ancestor chain exactly; the
+milestone asks for fewer than twenty. `a_damaged_frame_redraws_inside_and_preserves_outside`
+checks the other half at pixel level: the damaged region changes and the rest of the surface
+survives.
 
-**Still to do for M6:** paint and the renderer do not yet use the damage rectangle — paint
-rebuilds the whole display list every frame and the renderer redraws the whole surface. The
-number exists and is correct; nothing consumes it. Also glyph and texture caching, which
-glyphon and the `ImageStore` already do but which nothing measures.
+*Glyph and texture caching*, also named by the milestone, were already in place — glyphon's
+atlas persists across frames and is trimmed (D-30), and `ImageStore` holds uploads until
+removed. Nothing new was needed.
+
+**Totals:** 398 tests passing
+
+---
+
+## In progress
+
+Nothing. M6 is closed and M7 has not been started.
 
 ## Open questions
 
@@ -366,6 +363,11 @@ Appended to `DECISIONS.md` in full; summarised here.
 - **D-38** — invalidation is conservative in a shape the selector dialect guarantees:
   descendants and *following* siblings only, which is what excluding `:has()` bought.
 - **D-39** — damage is the union of old and new boxes, in absolute coordinates.
+- **D-40** — a damaged frame loads rather than clears, and paint repaints the background
+  inside the damaged region, because a load op ignores the scissor.
+- **D-41** — damage has three states, not two: an `Option` whose `None` meant both "redraw
+  everything" and "draw nothing" made an off-screen damage rectangle repaint the whole
+  surface.
 
 ---
 

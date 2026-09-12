@@ -105,6 +105,7 @@ impl State {
                 width: self.surface.width(),
                 height: self.surface.height(),
                 scale_factor: self.surface.scale_factor(),
+                damage: None,
             },
             &list,
         );

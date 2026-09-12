@@ -39,6 +39,15 @@ pub struct PaintOptions {
     pub viewport: Size,
     /// Colour the surface is cleared to before anything is drawn.
     pub background: Color,
+    /// Only paint what intersects this rectangle.
+    ///
+    /// `None` repaints everything, which is what the first frame and a resize want. A damage
+    /// rectangle from the last layout pass (D-39) lets a frame after a small edit skip most
+    /// of the document — the roadmap's *repaints only the damaged rectangle*.
+    ///
+    /// The renderer still has to clip to the same rectangle: culling here removes commands
+    /// that cannot touch it, but a command that partly overlaps is kept whole.
+    pub damage: Option<Rect>,
 }
 
 impl PaintOptions {
@@ -48,6 +57,7 @@ impl PaintOptions {
         Self {
             viewport,
             background: Color::WHITE,
+            damage: None,
         }
     }
 
@@ -55,6 +65,15 @@ impl PaintOptions {
     #[must_use]
     pub fn with_background(self, background: Color) -> Self {
         Self { background, ..self }
+    }
+
+    /// The same options, painting only what touches `damage`.
+    #[must_use]
+    pub fn with_damage(self, damage: Rect) -> Self {
+        Self {
+            damage: Some(damage),
+            ..self
+        }
     }
 }
 
@@ -66,6 +85,8 @@ impl PaintOptions {
 pub struct PaintStats {
     /// Nodes the walk descended into.
     pub nodes_visited: usize,
+    /// Subtrees skipped whole because they could not touch the damaged rectangle.
+    pub subtrees_culled: usize,
     /// Nodes that emitted a box.
     pub boxes_emitted: usize,
     /// Custom nodes given a chance to paint themselves.
@@ -81,12 +102,7 @@ pub struct PaintStats {
 /// An empty tree, or a tree with no root, produces a list that clears and draws nothing.
 #[must_use]
 pub fn paint(tree: &Tree, options: &PaintOptions) -> DisplayList {
-    let mut builder = DisplayListBuilder::new(options.viewport);
-    builder.set_background(options.background);
-    if let Some(root) = tree.root() {
-        paint_subtree(tree, root, Point::ZERO, &mut builder);
-    }
-    builder.build()
+    paint_with_stats(tree, options).0
 }
 
 /// As [`paint`], but also returns the pass's counters.
@@ -94,10 +110,25 @@ pub fn paint(tree: &Tree, options: &PaintOptions) -> DisplayList {
 pub fn paint_with_stats(tree: &Tree, options: &PaintOptions) -> (DisplayList, PaintStats) {
     let mut builder = DisplayListBuilder::new(options.viewport);
     builder.set_background(options.background);
+    // Clipping to the damage keeps the renderer's scissor honest for the whole frame,
+    // whatever the rest of this function emits.
+    //
+    // The background rectangle matters as much as the clip. A damaged frame *loads* the
+    // previous contents rather than clearing, because a clear ignores the scissor and would
+    // wipe the region being kept — so the damaged region has to be painted back to the
+    // background here, before anything is drawn over it.
+    let clipped = options.damage.is_some_and(|damage| {
+        builder.push_clip(damage);
+        builder.fill_rect(damage, options.background);
+        true
+    });
     let stats = match tree.root() {
-        Some(root) => paint_subtree(tree, root, Point::ZERO, &mut builder),
+        Some(root) => paint_damaged(tree, root, Point::ZERO, &mut builder, options.damage),
         None => PaintStats::default(),
     };
+    if clipped {
+        builder.pop_clip();
+    }
     (builder.build(), stats)
 }
 
@@ -129,6 +160,17 @@ pub fn paint_subtree(
     origin: Point,
     builder: &mut DisplayListBuilder,
 ) -> PaintStats {
+    paint_damaged(tree, root, origin, builder, None)
+}
+
+/// As [`paint_subtree`], skipping subtrees that cannot touch `damage`.
+fn paint_damaged(
+    tree: &Tree,
+    root: NodeId,
+    origin: Point,
+    builder: &mut DisplayListBuilder,
+    damage: Option<Rect>,
+) -> PaintStats {
     let mut stats = PaintStats::default();
     let mut stack = vec![Step::Enter {
         id: root,
@@ -153,9 +195,19 @@ pub fn paint_subtree(
         if !node.style.generates_box {
             continue;
         }
-        stats.nodes_visited += 1;
-
         let bounds = node.layout.translate(parent_origin);
+
+        // A subtree whose *own* box misses the damage may still contain something that hits
+        // it: a child can overflow its parent. So the test is on the union of this box and
+        // everything beneath it, which is what `paint_bounds` computes — and which is cheap
+        // because it stops as soon as it finds an intersection.
+        if let Some(damage) = damage
+            && !touches_damage(tree, id, bounds, damage)
+        {
+            stats.subtrees_culled += 1;
+            continue;
+        }
+        stats.nodes_visited += 1;
 
         if node.style.visible {
             match &node.kind {
@@ -219,6 +271,33 @@ pub fn paint_subtree(
     }
 
     stats
+}
+
+/// Whether a subtree can touch the damaged rectangle.
+///
+/// Checks the node's own box first and descends only if it misses, because a child may
+/// overflow its parent — `overflow: visible` is the initial value, so this is the common case
+/// rather than an exotic one. Stops at the first intersection.
+fn touches_damage(tree: &Tree, id: NodeId, bounds: Rect, damage: Rect) -> bool {
+    if bounds.intersection(damage).is_some() {
+        return true;
+    }
+    // A clipping node confines its descendants to its own box, so if that missed, they all
+    // miss and there is nothing to descend into.
+    if tree.get(id).is_some_and(|node| node.style.clips_children) {
+        return false;
+    }
+    let mut child = tree.first_child(id);
+    while let Some(node) = child {
+        let Some(entry) = tree.get(node) else {
+            break;
+        };
+        if touches_damage(tree, node, entry.layout.translate(bounds.origin), damage) {
+            return true;
+        }
+        child = tree.next_sibling(node);
+    }
+    false
 }
 
 /// Emits a node's background and border. Returns whether the builder kept the command.
