@@ -303,7 +303,7 @@ sibling, because a structural change marks them all for `:nth-child`. It now inv
 The flag code looks obviously right; it was the node count coming back three orders of
 magnitude too large that found it (D-45).
 
-**Totals:** 433 tests passing
+**Totals:** 438 tests passing
 
 ---
 
