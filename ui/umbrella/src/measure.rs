@@ -219,10 +219,11 @@ mod platform {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     pub(super) fn current() -> Option<Footprint> {
-        let mut counters = PROCESS_MEMORY_COUNTERS_EX {
-            cb: u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX>()).ok()?,
-            ..unsafe { std::mem::zeroed() }
-        };
+        // SAFETY: every member of `PROCESS_MEMORY_COUNTERS_EX` is an integer, and an all-zero
+        // bit pattern is a valid value for each of them. `cb` is given its real value on the
+        // next line, before anything reads the struct.
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        counters.cb = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX>()).ok()?;
 
         // SAFETY: `cb` tells the call how much room it has, and it is this struct's own size.
         // The cast to the base type is what the API expects for the extended struct; the call
@@ -235,8 +236,13 @@ mod platform {
             )
         };
 
-        (ok != 0).then(|| Footprint {
-            bytes: counters.PrivateUsage as u64,
+        if ok == 0 {
+            return None;
+        }
+        Some(Footprint {
+            // `PrivateUsage` is a `usize`; the conversion is lossless on every target this
+            // builds for and refused rather than truncated if that ever stops being true.
+            bytes: u64::try_from(counters.PrivateUsage).ok()?,
             metric: Metric::WindowsPrivateUsage,
         })
     }
@@ -323,13 +329,13 @@ mod tests {
     fn vm_rss_is_parsed_from_a_real_status_block() {
         let sample = "Name:\tcrisol\nVmPeak:\t 2097152 kB\nVmSize:\t 1048576 kB\n\
                       VmRSS:\t   26180 kB\nVmData:\t  524288 kB\n";
-        assert_eq!(super::platform::parse_vm_rss(sample), Some(26180 * 1024));
+        assert_eq!(platform::parse_vm_rss(sample), Some(26180 * 1024));
 
         // VmRSS must not be matched by prefix against its neighbours.
-        assert_eq!(super::platform::parse_vm_rss("VmRSSAnon:\t 100 kB\n"), None);
+        assert_eq!(platform::parse_vm_rss("VmRSSAnon:\t 100 kB\n"), None);
         // An unexpected unit is refused rather than assumed.
-        assert_eq!(super::platform::parse_vm_rss("VmRSS:\t 26180 MB\n"), None);
-        assert_eq!(super::platform::parse_vm_rss("VmRSS:\t kB\n"), None);
-        assert_eq!(super::platform::parse_vm_rss("Name:\tcrisol\n"), None);
+        assert_eq!(platform::parse_vm_rss("VmRSS:\t 26180 MB\n"), None);
+        assert_eq!(platform::parse_vm_rss("VmRSS:\t kB\n"), None);
+        assert_eq!(platform::parse_vm_rss("Name:\tcrisol\n"), None);
     }
 }
