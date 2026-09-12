@@ -269,3 +269,33 @@ does the encode. Blending is therefore correct without any manual gamma arithmet
 display list.
 
 ---
+
+---
+
+## D-16 — Android entrypoint: GameActivity, not NativeActivity
+
+**Status:** Accepted (M1) · **Affects:** M5, M22
+
+`android-activity` refuses to compile unless the application picks one, so this was forced
+the first time CI checked the `aarch64-linux-android` target — which is exactly what that
+per-commit check exists to do (D-09). Deciding it at M1 rather than M22 is the point.
+
+`winit`'s `android-game-activity` feature, which selects AndroidX `GameActivity`.
+
+**Rejected — `NativeActivity`.** Simpler, no AndroidX dependency, and the obvious default.
+But its text input is the part of the Android platform it handles worst: it cannot properly
+drive the IME, which is why `GameActivity` exists. ROADMAP §2.5 says text is the core
+competency and §3.6 requires soft-keyboard and IME input designed into the event model at
+M5. A document editor that cannot take dictation from the Android keyboard is not a
+document editor, so the simpler option is disqualified on the one axis that matters most.
+
+**Consequences accepted:**
+
+- Packaging at M22 must pull in the AndroidX `games-activity` AAR; a bare NDK build will not
+  be enough.
+- `GameActivity` compiles C++ glue, so an Android build needs the NDK's toolchain, not just
+  the Rust target.
+- The M5 event model must be written against `GameActivity`'s input API. Since M5 is where
+  touch and IME are designed anyway, this constrains work that has not started rather than
+  work that has.
+

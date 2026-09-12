@@ -77,7 +77,10 @@ crisol-host = { path = "host", version = "0.0.0" }
 
 # Third-party. Pinned here so every crate in the workspace agrees on a version.
 wgpu = "30"
-winit = "0.30.13"
+# `android-game-activity` is not optional decoration: `android-activity` refuses to
+# compile unless exactly one entrypoint model is chosen. See DECISIONS D-16. The feature is
+# inert off Android, where the dependency is not in the graph at all.
+winit = { version = "0.30.13", features = ["android-game-activity"] }
 pollster = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
 raw-window-handle = "0.6"

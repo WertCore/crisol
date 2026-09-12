@@ -87,6 +87,9 @@ Nothing.
   retrofitting it at M22 would be a rewrite.
 - **D-15** — straight sRGB colours in the display list, premultiplied linear out of the
   shader, sRGB surface format, linear blending.
+- **D-16** — Android uses `GameActivity`, not `NativeActivity`. Forced by the first CI run:
+  `android-activity` will not compile without the choice. `NativeActivity` cannot properly
+  drive the IME, and ROADMAP §2.5 and §3.6 make soft-keyboard text input non-negotiable.
 
 ---
 
