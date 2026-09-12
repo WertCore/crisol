@@ -413,9 +413,29 @@ cost about 8.5 MB over an empty GPU window.
 the engine: 5MB of JSON expanded one node per token is ~100k nodes and 31 MB of arena on its
 own. `ui/tree/tests/sizes.rs` keeps `Node` (328 bytes) a tracked figure so that does not drift.
 
-**Still to do for M8:** multi-window, native menus, drag and drop, cursor shapes, window
-chrome, packaging (.app, .msi, AppImage) — and then the acceptance proper: an API-client-shaped
-application with a 5MB response in it, measured on all three platforms.
+### Cursor shapes
+
+The CSS `cursor` property, every keyword of it. Lives on `ComputedStyle` rather than
+`BoxStyle`: the former is `Arc`-interned (D-21) so a field there costs nothing per node, and
+the memory measurement above had just established that `BoxStyle` is the largest part of a
+`Node`.
+
+Inherited, as CSS says — without that the pointer flickers back to an arrow as it crosses a
+button's own label. `auto` is the only value whose meaning depends on what is under it, and
+`resolve(over_text)` is what makes it an I-beam over text and an arrow elsewhere; an explicit
+keyword beats it either way, because an author who wrote `cursor: default` meant the arrow.
+
+Named `CursorIcon`, not `Cursor`: `crisol-events` already has a `Cursor` meaning a *caret
+position in text*, and `hit.cursor` beside `style.cursor` meaning two unrelated things would be
+a trap for whoever read it next.
+
+`crisol_ui::platform_cursor` maps it to `cursor_icon::CursorIcon`, which is what
+`winit::Window::set_cursor` takes. The mapping lives in the umbrella because `crisol-style`
+must not know windows exist and `crisol-render-wgpu` must not know a cascade does.
+
+**Still to do for M8:** multi-window, native menus, drag and drop, window chrome, packaging
+(.app, .msi, AppImage) — and then the acceptance proper: an API-client-shaped application with
+a 5MB response in it, measured on all three platforms.
 
 **One thing measured and left alone.** In the todo example, moving the selection runs one
 effect per row: every row asks "am I the selected one?" and so subscribes to the shared
@@ -424,7 +444,7 @@ but it is linear. That is what this way of modelling a selection costs, not a li
 engine — a list long enough to care would remember the previous row and toggle exactly two.
 Said out loud in a comment rather than quietly shipped.
 
-**Totals:** 492 tests passing
+**Totals:** 499 tests passing
 
 ## Open questions
 

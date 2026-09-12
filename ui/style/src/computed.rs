@@ -5,8 +5,8 @@ use std::sync::Arc;
 use crisol_tree::{Atom, BoxStyle};
 
 use crate::values::{
-    AlignItems, Color, CornerRadii, Dimension, Display, FlexDirection, FlexWrap, FontStyle,
-    JustifyContent, LengthPercentage, LineHeight, Number, Overflow, Position, Px, Sides,
+    AlignItems, Color, CornerRadii, CursorIcon, Dimension, Display, FlexDirection, FlexWrap,
+    FontStyle, JustifyContent, LengthPercentage, LineHeight, Number, Overflow, Position, Px, Sides,
     Visibility,
 };
 
@@ -88,6 +88,8 @@ pub struct ComputedStyle {
     pub border_radius: CornerRadii,
     /// Opacity of the whole subtree, `0.0..=1.0`.
     pub opacity: Number,
+    /// The pointer shape over this element. Inherited.
+    pub cursor: CursorIcon,
     /// Horizontal overflow handling.
     pub overflow_x: Overflow,
     /// Vertical overflow handling.
@@ -143,6 +145,7 @@ impl Default for ComputedStyle {
             border_color: Sides::all(Color::BLACK),
             border_radius: CornerRadii::default(),
             opacity: Number::ONE,
+            cursor: CursorIcon::Auto,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             visibility: Visibility::Visible,
@@ -167,6 +170,9 @@ impl ComputedStyle {
         Self {
             color: parent.color,
             visibility: parent.visibility,
+            // Inherited, as CSS says: setting `cursor: pointer` on a button has to reach the
+            // text inside it, or the pointer flickers back to an arrow over the label.
+            cursor: parent.cursor,
             font_family: Arc::clone(&parent.font_family),
             font_size: parent.font_size,
             font_weight: parent.font_weight,

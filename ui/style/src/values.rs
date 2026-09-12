@@ -466,3 +466,113 @@ mod tests {
         assert_eq!(doubled.left, 8.0);
     }
 }
+
+/// The pointer shape over an element, from the CSS `cursor` property.
+///
+/// Named `CursorIcon` rather than `Cursor` because `crisol-events` already has a `Cursor`
+/// meaning a *caret position in text*, and `hit.cursor` next to `style.cursor` meaning two
+/// unrelated things one word apart is a trap laid for whoever reads it next. winit calls this
+/// one `CursorIcon` too.
+///
+/// Every keyword CSS defines is here rather than a useful-looking subset. A missing one is
+/// not a missing feature, it is a stylesheet that says `col-resize` and silently gets an
+/// arrow — and the platform layer already supports all of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CursorIcon {
+    /// The initial value, and the only one whose meaning depends on what is under it: an
+    /// I-beam over text and an arrow elsewhere. [`Self::resolve`] does that.
+    #[default]
+    Auto,
+    /// No pointer is drawn at all.
+    None,
+    /// The ordinary arrow.
+    Default,
+    /// A context menu is available.
+    ContextMenu,
+    /// Help is available.
+    Help,
+    /// Something to click, conventionally a hand.
+    Pointer,
+    /// Busy, but still interactive.
+    Progress,
+    /// Busy, and not interactive.
+    Wait,
+    /// A table cell may be selected.
+    Cell,
+    /// Crosshairs, for precise selection.
+    Crosshair,
+    /// Text may be selected. The I-beam.
+    Text,
+    /// Vertical text may be selected.
+    VerticalText,
+    /// An alias or shortcut will be made.
+    Alias,
+    /// A copy will be made.
+    Copy,
+    /// The thing under the pointer will be moved.
+    Move,
+    /// A drop is not allowed here.
+    NoDrop,
+    /// The action is not allowed.
+    NotAllowed,
+    /// Something can be grabbed.
+    Grab,
+    /// Something is being grabbed.
+    Grabbing,
+    /// Resize eastward.
+    EResize,
+    /// Resize northward.
+    NResize,
+    /// Resize north-east.
+    NeResize,
+    /// Resize north-west.
+    NwResize,
+    /// Resize southward.
+    SResize,
+    /// Resize south-east.
+    SeResize,
+    /// Resize south-west.
+    SwResize,
+    /// Resize westward.
+    WResize,
+    /// Resize along the east-west axis.
+    EwResize,
+    /// Resize along the north-south axis.
+    NsResize,
+    /// Resize along the north-east/south-west axis.
+    NeswResize,
+    /// Resize along the north-west/south-east axis.
+    NwseResize,
+    /// Resize a column.
+    ColResize,
+    /// Resize a row.
+    RowResize,
+    /// Scroll in any direction.
+    AllScroll,
+    /// Zoom in.
+    ZoomIn,
+    /// Zoom out.
+    ZoomOut,
+}
+
+impl CursorIcon {
+    /// What to actually show, given whether the pointer is over text.
+    ///
+    /// Only [`Self::Auto`] depends on the answer. Every browser shows an I-beam over text
+    /// under the initial value, and an author who wrote `cursor: default` meant the arrow
+    /// even over a paragraph — which is why this is a resolution step and not a lookup.
+    #[must_use]
+    pub fn resolve(self, over_text: bool) -> Self {
+        match self {
+            Self::Auto if over_text => Self::Text,
+            Self::Auto => Self::Default,
+            other => other,
+        }
+    }
+
+    /// Whether the pointer should be hidden entirely.
+    #[must_use]
+    pub fn is_hidden(self) -> bool {
+        self == Self::None
+    }
+}

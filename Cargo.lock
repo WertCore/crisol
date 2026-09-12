@@ -689,6 +689,7 @@ dependencies = [
  "crisol-style",
  "crisol-text",
  "crisol-tree",
+ "cursor-icon",
  "wgpu",
  "winit",
 ]

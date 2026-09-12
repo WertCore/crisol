@@ -25,17 +25,18 @@ use std::sync::Arc;
 use crisol_ui::css::stylesheet::Stylesheet;
 use crisol_ui::display_list::{Color, DisplayList, Point};
 use crisol_ui::dom::Dom;
-use crisol_ui::events::{scroll_at, scroll_from};
+use crisol_ui::events::{hit_test, scroll_at, scroll_from};
 use crisol_ui::layout::{LayoutCache, LayoutContext, ShapedText};
 use crisol_ui::paint::{PaintOptions, paint};
+use crisol_ui::platform_cursor;
 use crisol_ui::reactive::{
     Cx, Keyed, ListStats, Memo, Runtime, Scope, Signal, append, bind_class, bind_text,
     element_with_class, text,
 };
 use crisol_ui::render::{AcquiredFrame, FrameTarget, Renderer, WindowSurface};
-use crisol_ui::style::{StyleEngine, StyleMap};
+use crisol_ui::style::{CursorIcon, StyleEngine, StyleMap};
 use crisol_ui::text::FontSystem;
-use crisol_ui::tree::{NodeId, Tree};
+use crisol_ui::tree::{NodeId, NodeKind, Tree};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -55,6 +56,7 @@ const CSS: &str = "
     }
     h1 { display: block; font-size: 22px; line-height: 34px; color: rgb(97, 175, 239) }
     .draft {
+        cursor: text;
         display: block; height: 30px; line-height: 30px;
         padding-left: 10px; padding-right: 10px;
         margin-bottom: 10px;
@@ -71,13 +73,14 @@ const CSS: &str = "
         overflow: scroll;
     }
     li.todo {
+        cursor: pointer;
         display: flex; flex-direction: row;
         height: 26px; line-height: 26px;
         padding-left: 8px; padding-right: 8px;
     }
     li.selected { background-color: rgb(34, 40, 49) }
     li.done .label { color: rgb(106, 115, 125) }
-    .mark { display: block; width: 30px; color: rgb(152, 195, 121) }
+    .mark { cursor: cell; display: block; width: 30px; color: rgb(152, 195, 121) }
     .label { display: block; flex-grow: 1 }
     p.status {
         display: block; height: 24px; line-height: 24px;
@@ -246,6 +249,45 @@ fn headless() {
         laid_out, 0,
         "scrolling marks paint, never layout: a fling must not relayout the document"
     );
+
+    // ---- the pointer shape -----------------------------------------------------------
+    //
+    // `li.todo { cursor: pointer }` has to reach the label inside the row. If it did not,
+    // the pointer would flicker to an arrow as it crossed each piece of text, which is the
+    // whole reason CSS makes the property inherited.
+    // Back to the top first: the scroll steps above left the list at its end, so the first
+    // row is clipped out of view and a hit test correctly misses it.
+    tree.set_scroll(app.list, Point::ZERO);
+    let row = tree.first_child(app.list).expect("a row");
+    let label = tree
+        .first_child(row)
+        .and_then(|m| tree.next_sibling(m))
+        .expect("the label");
+    let text = tree.first_child(label).expect("the label's text");
+    let box_of = tree.absolute_rect(text).expect("laid out");
+    let at = Point::new(box_of.min_x() + 1.0, box_of.min_y() + box_of.height() * 0.5);
+
+    let hit = hit_test(&tree, at).expect("something under the pointer");
+    assert_eq!(hit.node, text, "the point should land on the label's text");
+    let over_text = tree
+        .get(hit.node)
+        .is_some_and(|node| matches!(node.kind, NodeKind::Text(_)));
+    assert!(over_text);
+    let icon = styles
+        .get(hit.node)
+        .expect("styled")
+        .cursor
+        .resolve(over_text);
+    assert_eq!(
+        icon,
+        CursorIcon::Pointer,
+        "an explicit keyword beats `auto`'s I-beam even over text"
+    );
+    assert_eq!(
+        platform_cursor(icon),
+        Some(cursor_icon::CursorIcon::Pointer)
+    );
+    println!("  pointer over a row label: {icon:?}");
 
     // Printed numbers are not a check. What the script should have left behind:
     let labels = runtime.peek(app.todos).expect("todos");
@@ -629,6 +671,9 @@ impl App {
 
 struct State {
     pointer: Point,
+    /// What the window is currently showing, so a mouse move that changes nothing does not
+    /// talk to the window server sixty times a second.
+    cursor: Option<cursor_icon::CursorIcon>,
     surface: WindowSurface,
     renderer: Renderer,
     tree: Tree,
@@ -662,6 +707,7 @@ impl State {
 
         Self {
             pointer: Point::ZERO,
+            cursor: Some(cursor_icon::CursorIcon::Default),
             surface,
             renderer,
             tree,
@@ -702,6 +748,38 @@ impl State {
             self.runtime.stats().effects_run,
         );
         true
+    }
+
+    /// Points the mouse cursor at whatever is under it.
+    ///
+    /// `cursor` is inherited, so the value on the text inside a row is the row's — without
+    /// that the pointer would flicker back to an arrow as it crossed each label.
+    fn update_cursor(&mut self) {
+        let icon = hit_test(&self.tree, self.pointer)
+            .and_then(|hit| {
+                let over_text = self
+                    .tree
+                    .get(hit.node)
+                    .is_some_and(|node| matches!(node.kind, NodeKind::Text(_)));
+                self.styles
+                    .get(hit.node)
+                    .map(|style| style.cursor.resolve(over_text))
+            })
+            .unwrap_or(CursorIcon::Default);
+
+        let shape = platform_cursor(icon);
+        if shape == self.cursor {
+            return;
+        }
+        self.cursor = shape;
+        match shape {
+            Some(shape) => {
+                self.surface.window().set_cursor(shape);
+                self.surface.window().set_cursor_visible(true);
+            }
+            // `cursor: none` is not a shape to fall back from — the pointer goes away.
+            None => self.surface.window().set_cursor_visible(false),
+        }
     }
 
     /// Applies a scroll gesture at the pointer. Returns whether anything moved.
@@ -824,6 +902,7 @@ impl ApplicationHandler for Shell {
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = state.surface.scale_factor();
                 state.pointer = Point::new(position.x as f32 / scale, position.y as f32 / scale);
+                state.update_cursor();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // A trackpad on macOS has already been through the system's own momentum by

@@ -15,6 +15,7 @@ use lightningcss::properties::font as lc_font;
 use lightningcss::properties::overflow as lc_overflow;
 use lightningcss::properties::position as lc_position;
 use lightningcss::properties::size as lc_size;
+use lightningcss::properties::ui as lc_ui;
 use lightningcss::traits::ToCss;
 use lightningcss::values::color::CssColor;
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto, LengthValue};
@@ -22,8 +23,8 @@ use lightningcss::values::percentage::DimensionPercentage;
 
 use crate::computed::{ComputedStyle, INITIAL_FONT_SIZE};
 use crate::values::{
-    AlignItems, Color, Dimension, Display, FlexDirection, FlexWrap, FontStyle, JustifyContent,
-    LengthPercentage as Lp, LineHeight, Number, Overflow, Position, Px, Visibility,
+    AlignItems, Color, CursorIcon, Dimension, Display, FlexDirection, FlexWrap, FontStyle,
+    JustifyContent, LengthPercentage as Lp, LineHeight, Number, Overflow, Position, Px, Visibility,
 };
 
 /// Applies one declaration, leaving `style` unchanged when the property or value is outside
@@ -142,6 +143,11 @@ pub(crate) fn apply(style: &mut ComputedStyle, property: &Property<'_>, parent: 
         Property::Opacity(value) => {
             style.opacity = Number::new(alpha(value)).clamped_unit();
         }
+        // Only the keyword forms. `cursor` also takes a list of images to try first, which
+        // needs an image cache and a hotspot and is not what M8 asks for; the keyword at the
+        // end of that list is the mandatory fallback, so reading it is the right subset
+        // rather than an approximation of one.
+        Property::Cursor(value) => style.cursor = convert_cursor(&value.keyword),
         Property::OverflowX(value) => style.overflow_x = convert_overflow(value),
         Property::OverflowY(value) => style.overflow_y = convert_overflow(value),
         Property::Visibility(value) => {
@@ -481,5 +487,52 @@ fn font_weight(value: &lc_font::FontWeight, parent_weight: u16) -> Option<u16> {
             550..=749 => 400,
             _ => 700,
         }),
+    }
+}
+
+/// Maps a parsed `cursor` keyword onto ours.
+///
+/// Exhaustive rather than defaulted: a `_ => CursorIcon::Default` arm turns a keyword nobody
+/// has mapped yet into an arrow at runtime, where this makes it a compile error the day
+/// lightningcss adds one.
+fn convert_cursor(value: &lc_ui::CursorKeyword) -> CursorIcon {
+    use lc_ui::CursorKeyword as K;
+    match value {
+        K::Auto => CursorIcon::Auto,
+        K::Default => CursorIcon::Default,
+        K::None => CursorIcon::None,
+        K::ContextMenu => CursorIcon::ContextMenu,
+        K::Help => CursorIcon::Help,
+        K::Pointer => CursorIcon::Pointer,
+        K::Progress => CursorIcon::Progress,
+        K::Wait => CursorIcon::Wait,
+        K::Cell => CursorIcon::Cell,
+        K::Crosshair => CursorIcon::Crosshair,
+        K::Text => CursorIcon::Text,
+        K::VerticalText => CursorIcon::VerticalText,
+        K::Alias => CursorIcon::Alias,
+        K::Copy => CursorIcon::Copy,
+        K::Move => CursorIcon::Move,
+        K::NoDrop => CursorIcon::NoDrop,
+        K::NotAllowed => CursorIcon::NotAllowed,
+        K::Grab => CursorIcon::Grab,
+        K::Grabbing => CursorIcon::Grabbing,
+        K::EResize => CursorIcon::EResize,
+        K::NResize => CursorIcon::NResize,
+        K::NeResize => CursorIcon::NeResize,
+        K::NwResize => CursorIcon::NwResize,
+        K::SResize => CursorIcon::SResize,
+        K::SeResize => CursorIcon::SeResize,
+        K::SwResize => CursorIcon::SwResize,
+        K::WResize => CursorIcon::WResize,
+        K::EwResize => CursorIcon::EwResize,
+        K::NsResize => CursorIcon::NsResize,
+        K::NeswResize => CursorIcon::NeswResize,
+        K::NwseResize => CursorIcon::NwseResize,
+        K::ColResize => CursorIcon::ColResize,
+        K::RowResize => CursorIcon::RowResize,
+        K::AllScroll => CursorIcon::AllScroll,
+        K::ZoomIn => CursorIcon::ZoomIn,
+        K::ZoomOut => CursorIcon::ZoomOut,
     }
 }

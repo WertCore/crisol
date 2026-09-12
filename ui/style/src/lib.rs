@@ -13,7 +13,7 @@ pub use cascade::{StyleEngine, StyleMap, StyleStats};
 pub use computed::{ComputedStyle, INITIAL_FONT_SIZE, NORMAL_LINE_HEIGHT_RATIO};
 pub use intern::StyleInterner;
 pub use values::{
-    AlignItems, Color, CornerRadii, Dimension, Display, FlexDirection, FlexWrap, FontStyle,
-    JustifyContent, LengthPercentage, LineHeight, Number, Overflow, Position, Px, Sides,
+    AlignItems, Color, CornerRadii, CursorIcon, Dimension, Display, FlexDirection, FlexWrap,
+    FontStyle, JustifyContent, LengthPercentage, LineHeight, Number, Overflow, Position, Px, Sides,
     Visibility,
 };
