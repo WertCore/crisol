@@ -16,6 +16,10 @@ default = ["render"]
 # The GPU renderer pulls in wgpu + winit. Downstream users embedding only the
 # tree/layout/paint pipeline can turn it off.
 render = ["dep:crisol-render-wgpu"]
+# Reading this process's own memory, for reproducing the acceptance figure. Off by
+# default: an embedder has no use for it, but the product's headline claim is a memory
+# number and a claim nobody can re-run is not evidence. See `measure`.
+measure = ["dep:mach2", "dep:windows-sys"]
 
 [dependencies]
 crisol-tree.workspace = true
@@ -34,6 +38,20 @@ crisol-render-wgpu = { workspace = true, optional = true }
 # Just an enum, no platform code — the vocabulary winit and every other windowing
 # crate already speak, so the mapping below produces the type they want.
 cursor-icon.workspace = true
+
+# Only for the `measure` feature. `mach2` is bindings and nothing else — no dependencies
+# of its own — and it is preferred to hand-declaring the structs because `task_vm_info` is
+# `repr(C, packed(4))`: a hand-rolled `repr(C)` copy would differ in alignment and could
+# report the wrong field without ever failing. `libc`'s mach bindings are deprecated in
+# favour of exactly this crate.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+mach2 = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true, features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # The example touches wgpu and winit types directly, which the engine does not re-export:

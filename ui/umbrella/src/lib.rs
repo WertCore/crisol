@@ -25,6 +25,9 @@ pub use crisol_tree as tree;
 #[cfg(feature = "render")]
 pub use crisol_render_wgpu as render;
 
+#[cfg(feature = "measure")]
+pub mod measure;
+
 /// The platform pointer shape for a computed [`style::CursorIcon`], or `None` to hide it.
 ///
 /// The mapping lives here rather than in `crisol-style`, which must not know that windows

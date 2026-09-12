@@ -472,6 +472,44 @@ Worth recording how the scope half of that was nearly missed: the first version 
 test passed with the guard removed, because the second runtime had no scope at that index and
 refused for lack of one. It only tests the guard now that *both* runtimes open a scope.
 
+### The memory instrument
+
+M8's acceptance is a memory measurement on three platforms, so the measurement itself had to
+be worth something first. `crisol_ui::measure` reads this process's own memory, behind a
+`measure` feature that is off by default.
+
+**Why in-process.** Sampling from outside with `footprint(1)` cannot name the moment it
+samples, and a GUI process under `ControlFlow::Wait` differs by megabytes either side of its
+first frame. That is not a theoretical worry: it is what produced the contradiction in the
+multi-window work, where a one-window build at four times the window area read *lower* than the
+same build at one times.
+
+**And it was worse than noise.** Instrumenting the windows example showed the reading was never
+taken after a frame at all — the print never fired, because the windows were never asked to
+redraw and `ControlFlow::Wait` never volunteered. Every external figure taken there described a
+process that had drawn nothing. The example now requests its first frame, which it should have
+done anyway.
+
+**The metric is not portable and the module says so.** macOS `phys_footprint`, Linux `VmRSS`,
+Windows `PrivateUsage` are three different quantities; `Metric` is returned alongside the
+number so a table comparing them cannot silently compare unlike things.
+
+**Two bugs the tests caught, both of the kind that reads as plausible:**
+
+- The offset of `phys_footprint` in `task_vm_info` is **144**, not the 152 arithmetic said. A
+  hardcoded 152 would have reported `compressed_lifetime` as a memory figure. The probe
+  computes the offset and asserts it; `mach2` supplies the struct, which is `repr(C, packed(4))`
+  and would not have matched a hand-rolled `repr(C)` copy.
+- The cross-check against `vmmap` first passed *while deliberately reading the wrong field* —
+  its tolerance had a 4 MiB floor and the test process is 1.7 MiB, so a tolerance wider than the
+  whole quantity. Tightened to 5%, it now fails on the neighbouring field. Measured, the two
+  agree to within a few hundred bytes.
+
+CI runs the headless todo example with the feature on, so all three platforms print a figure
+from the same scripted run: **5.0 MiB (`phys_footprint`), debug, no GPU device**. That is not
+comparable with the 25.5 MB in the table above, which was release and had a window; the line
+prints its profile for that reason.
+
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
 response in it, measured on all three platforms.
@@ -483,7 +521,7 @@ but it is linear. That is what this way of modelling a selection costs, not a li
 engine — a list long enough to care would remember the previous row and toggle exactly two.
 Said out loud in a comment rather than quietly shipped.
 
-**Totals:** 501 tests passing
+**Totals:** 506 tests passing
 
 ## Open questions
 

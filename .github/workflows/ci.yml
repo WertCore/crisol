@@ -64,7 +64,10 @@ jobs:
       # handling, selection, the edit/commit cycle — would compile on three platforms and be
       # executed on none. The headless mode needs no window and no adapter.
       - name: Run the example headless
-        run: cargo run -p crisol-ui --example todo -- --headless
+        # `measure` is added here and nowhere else: it is off by default because an embedder
+        # has no use for it, but this is the run that produces the acceptance figure, and CI
+        # is the only place all three platforms are available.
+        run: cargo run -p crisol-ui --example todo --features measure -- --headless
         env:
           CRISOL_REQUIRE_FONTS: 1
 

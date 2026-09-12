@@ -330,7 +330,33 @@ fn headless() {
         "and the draft was cleared"
     );
 
-    println!("  checked: 27 todos, filter all, edit committed, draft empty\n");
+    println!("  checked: 27 todos, filter all, edit committed, draft empty");
+
+    // The acceptance figure, taken here rather than sampled from outside.
+    //
+    // This point in the run is a stated one: the whole scripted sequence has happened, the
+    // tree is built, styled and laid out, and nothing is in flight. A sampler outside the
+    // process cannot name a moment like that, which is how the earlier readings ended up
+    // describing a process that had not drawn anything yet.
+    //
+    // CI runs this on macOS, Linux and Windows, so the three numbers are comparable runs of
+    // the same script — but not the same quantity: see `Metric`.
+    #[cfg(feature = "measure")]
+    {
+        // The profile is part of the reading, not a footnote. A debug build carries overflow
+        // checks and unoptimised layout, and D-47's table was taken in release — quoting one
+        // beside the other without saying which is how a memory claim stops meaning anything.
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        match crisol_ui::measure::current() {
+            Some(reading) => println!("  memory after the scripted run: {reading}, {profile}"),
+            None => println!("  memory after the scripted run: unmeasured on this platform"),
+        }
+    }
+    println!();
 }
 
 // ---- the app ------------------------------------------------------------------------------

@@ -1107,3 +1107,40 @@ unquantified until there is a deterministic way to sample it.
 **What this cost.** Two runtimes is what D-43 said this milestone would need, and it was right
 that the runtimes must be separate — but see the amendment there, because the second window is
 also what exposed that separate runtimes were not yet *safely* separate.
+
+## D-49 — The memory number is read from inside the process
+
+**Status:** Accepted (M8) · **Affects:** M8, §7
+
+§7's first kill criterion is a memory figure, so the figure has to be one that can be
+re-derived rather than one that was once observed. `crisol_ui::measure` reads this process's
+own memory; the `measure` feature is off by default, because an embedder has no use for it,
+and ships anyway because a claim nobody can re-run is not evidence.
+
+**Rejected — sampling from outside.** `footprint(1)` and `vmmap` are the obvious instruments
+and are what produced D-47's table. They share a defect that only showed up when two readings
+had to be compared: the sampler picks the moment, and a GUI process under `ControlFlow::Wait`
+differs by megabytes depending on whether it has drawn a frame. Measured that way, a one-window
+build at four times the window area reported **less** memory than the same build at one times.
+Instrumenting the process showed why — it had never drawn at all, and neither had the runs it
+was being compared against. An instrument that cannot order two configurations known to differ
+is not measuring the configuration.
+
+**The metric is per-platform and is returned with the number.** macOS `phys_footprint`, Linux
+`VmRSS`, Windows `PrivateUsage`. These are not the same quantity — the first counts compressed
+pages, the last counts commit charge whether resident or not — and a table that puts them in
+one column without saying so is comparing unlike things. `Metric` makes that impossible to do
+by accident.
+
+**On trusting an unsafe binding.** The Mach struct is taken from `mach2` rather than declared
+here: `task_vm_info` is `repr(C, packed(4))`, and a hand-rolled `repr(C)` copy differs in
+alignment without differing in any way a compiler would mention. The offset of `phys_footprint`
+is computed and asserted rather than written down — the assertion caught it at 144 where the
+arithmetic in the comment above it said 152, which as a hardcoded constant would have reported
+`compressed_lifetime` as a memory footprint. A wrong memory number is worse than no memory
+number, because it still gets quoted.
+
+**A tolerance can be wider than the thing it bounds.** The cross-check against `vmmap` passed
+while deliberately reading the wrong field, because its tolerance had a 4 MiB floor and the
+test process weighs 1.7 MiB. Any tolerance expressed as an absolute floor needs checking
+against the smallest case it will ever see, not the largest.

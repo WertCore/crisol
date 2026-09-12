@@ -100,6 +100,11 @@ cosmic-text = "0.19"
 glyphon = "0.12"
 html5ever = "0.40"
 cursor-icon = "1.2"
+# Only used by crisol-ui's optional `measure` feature, for reading this process's own
+# memory. `mach2` is pure bindings with no dependencies; `windows-sys` is already in the
+# graph via winit.
+mach2 = "0.6"
+windows-sys = "0.61"
 taffy = { version = "0.14", default-features = false, features = ["std", "flexbox", "block_layout", "content_size"] }
 cssparser = "0.37"
 smallvec = "1.16"

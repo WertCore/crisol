@@ -60,6 +60,9 @@ struct Document {
     count: Signal<i32>,
     styles: StyleMap,
     cache: LayoutCache,
+    /// Frames drawn, so a measurement can be taken at a stated point rather than whenever
+    /// a sampler outside the process happened to look.
+    frames: u32,
 }
 
 impl Document {
@@ -104,6 +107,7 @@ impl Document {
             count,
             styles: StyleMap::default(),
             cache: LayoutCache::new(),
+            frames: 0,
         }
     }
 
@@ -139,6 +143,7 @@ impl Document {
             &self.tree,
             &PaintOptions::new(viewport).with_background(Color::rgb(0.07, 0.08, 0.10)),
         );
+        self.frames += 1;
         renderer.render_text(
             FrameTarget {
                 view: &view,
@@ -152,6 +157,17 @@ impl Document {
             &ShapedText(self.cache.text()),
         );
         self.surface.present(frame);
+
+        // One reading, after the first frame, from inside the process. Sampling from outside
+        // with `footprint(1)` cannot say whether a frame has been drawn yet, and an idle GUI
+        // process differs by megabytes either side of that line.
+        #[cfg(feature = "measure")]
+        if self.frames == 1 {
+            match crisol_ui::measure::current() {
+                Some(reading) => println!("after frame 1: {reading}"),
+                None => println!("after frame 1: this platform has no measurement"),
+            }
+        }
     }
 }
 
@@ -219,6 +235,11 @@ impl Shell {
             .or_insert_with(|| Renderer::new(surface.gpu(), format));
 
         let id = surface.window().id();
+        // Ask for the first frame explicitly. Under `ControlFlow::Wait` a window is not
+        // guaranteed a `RedrawRequested` just for existing, and without this the windows can
+        // sit blank until something else wakes them — which is also how a memory sample taken
+        // from outside ends up describing a process that has never drawn anything.
+        surface.window().request_redraw();
         self.windows.insert(id, Document::new(surface, &title));
         println!(
             "{} window(s), 1 device, {} renderer(s)",
