@@ -736,7 +736,9 @@ impl<'a> Track<'a> {
     /// Reads a signal by reference, subscribing to it, without cloning.
     #[must_use]
     pub fn with<T: 'static, R>(&self, signal: Signal<T>, read: impl FnOnce(&T) -> R) -> Option<R> {
-        let index = self.runtime.live(&self.runtime.inner.borrow(), signal.slot)?;
+        let index = self
+            .runtime
+            .live(&self.runtime.inner.borrow(), signal.slot)?;
         self.runtime.track_read(index);
         self.runtime.read_value(index, read)
     }

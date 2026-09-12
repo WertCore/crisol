@@ -526,7 +526,9 @@ fn a_scope_from_another_runtime_is_refused() {
     let mine = first.signal(0_i32);
     let (scope, ()) = first.scope(|_| {
         first.effect(&mut dom, move |cx| {
-            recorder.borrow_mut().push(format!("first:{}", cx.get(mine)));
+            recorder
+                .borrow_mut()
+                .push(format!("first:{}", cx.get(mine)));
         });
     });
 
@@ -534,7 +536,9 @@ fn a_scope_from_another_runtime_is_refused() {
     let theirs = second.signal(0_i32);
     let (_theirs_scope, ()) = second.scope(|_| {
         second.effect(&mut dom, move |cx| {
-            recorder.borrow_mut().push(format!("second:{}", cx.get(theirs)));
+            recorder
+                .borrow_mut()
+                .push(format!("second:{}", cx.get(theirs)));
         });
     });
     taken(&seen);
@@ -545,7 +549,11 @@ fn a_scope_from_another_runtime_is_refused() {
 
     second.set(theirs, 1);
     second.flush(&mut dom);
-    assert_eq!(taken(&seen), vec!["second:1"], "the other runtime's effect lives");
+    assert_eq!(
+        taken(&seen),
+        vec!["second:1"],
+        "the other runtime's effect lives"
+    );
 
     first.set(mine, 1);
     first.flush(&mut dom);

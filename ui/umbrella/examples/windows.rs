@@ -23,7 +23,9 @@ use crisol_ui::display_list::Color;
 use crisol_ui::dom::Dom;
 use crisol_ui::layout::{LayoutCache, LayoutContext, ShapedText};
 use crisol_ui::paint::{PaintOptions, paint};
-use crisol_ui::reactive::{Cx, Runtime, Signal, append, bind_text, element_with_class, mount, text};
+use crisol_ui::reactive::{
+    Cx, Runtime, Signal, append, bind_text, element_with_class, mount, text,
+};
 use crisol_ui::render::{AcquiredFrame, FrameTarget, Renderer, SharedGpu, WindowSurface};
 use crisol_ui::style::{StyleEngine, StyleMap};
 use crisol_ui::text::FontSystem;
