@@ -868,6 +868,8 @@ fn a_rectangle_drawn_after_text_still_finds_its_globals() {
 
         let mut builder = DisplayListBuilder::new(logical);
         builder.set_background(Color::WHITE);
+        // Top-left, so however large a font shapes it the ink stays clear of both the
+        // rectangle below-right and the control below-left.
         builder.push_text(TextCommand {
             text: TextId(7),
             origin: Point::new(2.0, 2.0),
@@ -895,6 +897,9 @@ fn a_rectangle_drawn_after_text_still_finds_its_globals() {
 
         let pixels = target.read_pixels(&gpu);
         pixels.assert_pixel(35, 35, green, TOLERANCE);
-        pixels.assert_pixel(20, 20, Color::WHITE, TOLERANCE);
+        // The control sits in the bottom-left, clear of both. Anywhere near the text is
+        // font-dependent: the runners shape `Ag` larger than this machine does, and a
+        // control at (20, 20) landed on the ink.
+        pixels.assert_pixel(4, 44, Color::WHITE, TOLERANCE);
     });
 }
