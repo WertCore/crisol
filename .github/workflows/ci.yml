@@ -35,7 +35,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev \
-            libxcursor-dev libgl1-mesa-dev mesa-vulkan-drivers vulkan-tools
+            libxcursor-dev libgl1-mesa-dev mesa-vulkan-drivers vulkan-tools \
+            fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,10 +53,12 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
         env:
-          # Without this a machine with no GPU adapter *skips* every render test, and a run
-          # where they all skipped is indistinguishable from a run where they all passed.
-          # Linux gets its adapter from the lavapipe software rasteriser installed above.
+          # Without these, a machine missing a GPU adapter or a font *skips* the tests that
+          # need them, and a run where everything skipped is indistinguishable from a run
+          # where everything passed. Linux gets its adapter from the lavapipe software
+          # rasteriser and its fonts from the package installed above.
           CRISOL_REQUIRE_GPU: 1
+          CRISOL_REQUIRE_FONTS: 1
 
       - name: Docs
         run: cargo doc --workspace --no-deps
