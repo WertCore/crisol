@@ -112,9 +112,15 @@ fn descend(
     }
 
     // Children first, last to first: the last painted is the topmost.
+    //
+    // Displaced by the scroll offset, so the test matches where the content was drawn
+    // rather than where it was laid out. The two are the same everywhere except inside a
+    // scroll container, and a hit test that used the laid-out position would click whatever
+    // used to be under the pointer before the user scrolled.
+    let child_origin = bounds.origin - node.scroll_offset;
     let mut child = node.last_child();
     while let Some(current) = child {
-        if let Some(hit) = descend(tree, current, bounds.origin, clip, point, text) {
+        if let Some(hit) = descend(tree, current, child_origin, clip, point, text) {
             return Some(hit);
         }
         child = tree.get(current).and_then(crisol_tree::Node::prev_sibling);

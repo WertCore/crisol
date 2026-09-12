@@ -605,3 +605,72 @@ fn painting_without_damage_is_unchanged() {
     assert_eq!(stats.subtrees_culled, 0);
     assert_eq!(rects(&list).len(), 3, "the whole document, as before");
 }
+
+// ---- scrolling -------------------------------------------------------------------------
+
+/// A 200x200 red viewport that scrolls, holding a 200x400 green column.
+fn scroller() -> (Tree, NodeId, NodeId) {
+    let mut tree = Tree::new();
+    let viewport = tree.create_element("div");
+    tree.set_root(viewport).unwrap();
+    tree.node_mut(viewport).layout = Rect::from_xywh(0.0, 0.0, 200.0, 200.0);
+    tree.node_mut(viewport).style = BoxStyle::filled(RED);
+    tree.node_mut(viewport).style.clips_children = true;
+    tree.node_mut(viewport).style.scrolls = true;
+    tree.node_mut(viewport).scroll_max = Size::new(0.0, 200.0);
+
+    let column = tree.create_element("div");
+    tree.append_child(viewport, column).unwrap();
+    tree.node_mut(column).layout = Rect::from_xywh(0.0, 0.0, 200.0, 400.0);
+    tree.node_mut(column).style = BoxStyle::filled(GREEN);
+
+    (tree, viewport, column)
+}
+
+#[test]
+fn scrolled_content_is_drawn_where_it_was_scrolled_to() {
+    let (mut tree, viewport, column) = scroller();
+
+    let before = rects(&paint(&tree, &options()));
+    assert_eq!(
+        before[1].0.min_y(),
+        0.0,
+        "unscrolled, the column starts at 0"
+    );
+
+    tree.scroll_by(viewport, Point::new(0.0, 120.0));
+    let after = rects(&paint(&tree, &options()));
+
+    assert_eq!(
+        after[1].0,
+        Rect::from_xywh(0.0, -120.0, 200.0, 400.0),
+        "the box did not change; it is painted somewhere else"
+    );
+    assert_eq!(
+        tree.get(column).unwrap().layout,
+        Rect::from_xywh(0.0, 0.0, 200.0, 400.0),
+        "and the laid-out box is untouched, which is what makes scrolling free"
+    );
+    assert_eq!(
+        after[0].0,
+        Rect::from_xywh(0.0, 0.0, 200.0, 200.0),
+        "the container itself does not move"
+    );
+}
+
+#[test]
+fn a_scroll_container_does_not_displace_its_own_box() {
+    let (mut tree, viewport, _) = scroller();
+    // Nested one level down, so a bug that applied the offset to the node rather than to
+    // its children would move the wrong thing.
+    let inner = tree.create_element("div");
+    tree.append_child(viewport, inner).unwrap();
+    tree.node_mut(inner).layout = Rect::from_xywh(10.0, 300.0, 50.0, 50.0);
+    tree.node_mut(inner).style = BoxStyle::filled(BLUE);
+
+    tree.scroll_by(viewport, Point::new(0.0, 200.0));
+    let painted = rects(&paint(&tree, &options()));
+
+    let blue = painted.iter().find(|(_, color)| *color == BLUE).unwrap();
+    assert_eq!(blue.0, Rect::from_xywh(10.0, 100.0, 50.0, 50.0));
+}

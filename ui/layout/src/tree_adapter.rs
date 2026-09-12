@@ -360,13 +360,29 @@ impl<'a> LayoutContext<'a> {
             }
             self.stats.nodes_written += 1;
 
+            // How far this node's content can scroll, which taffy derives from the
+            // scrollable overflow rectangle. Clamps the existing offset if the content
+            // shrank beneath it.
+            self.tree.set_scroll_max(
+                id,
+                CrisolSize {
+                    width: layout.scroll_width(),
+                    height: layout.scroll_height(),
+                },
+            );
+
             // A custom node gets told the box it was given, so it can lay out its interior
             // now that the size is settled (DECISIONS D-19).
             self.tree.layout_custom(id, rect.size);
 
+            // Children descend from where they are *painted*, not from where they were laid
+            // out. The two differ inside a scroll container, and the origin threaded here is
+            // what damage rectangles are built from — so ignoring the scroll would damage
+            // the place a box would have been if nobody had scrolled.
+            let child_origin = absolute.origin - self.tree.scroll_offset(id);
             let mut child = self.tree.first_child(id);
             while let Some(node) = child {
-                stack.push((node, absolute.origin));
+                stack.push((node, child_origin));
                 child = self.tree.next_sibling(node);
             }
         }

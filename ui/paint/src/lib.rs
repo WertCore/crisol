@@ -260,11 +260,16 @@ fn paint_damaged(
 
         // Children are painted over their parent and in document order, so they are pushed
         // last-first onto a stack that pops in reverse.
+        //
+        // Displaced by the scroll offset, which is the whole of what scrolling does to
+        // paint: no box moved, the content is simply drawn somewhere else. The clip pushed
+        // just above is what stops it being drawn outside the container.
+        let child_origin = bounds.origin - node.scroll_offset;
         let mut child = node.last_child();
         while let Some(current) = child {
             stack.push(Step::Enter {
                 id: current,
-                parent_origin: bounds.origin,
+                parent_origin: child_origin,
             });
             child = tree.get(current).and_then(crisol_tree::Node::prev_sibling);
         }

@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crisol_display_list::{Color, Corners, Edges, Edges4, Rect};
+use crisol_display_list::{Color, Corners, Edges, Edges4, Point, Rect, Size};
 
 use crate::atom::Atom;
 
@@ -257,6 +257,13 @@ pub struct BoxStyle {
     pub generates_box: bool,
     /// Whether descendants are clipped to this node's border box, as `overflow: hidden`.
     pub clips_children: bool,
+    /// Whether this node is a scroll container, as `overflow: scroll`.
+    ///
+    /// Separate from [`Self::clips_children`] because `overflow: clip` does both halves of
+    /// `hidden` except the scrolling: it clips and stays put. Deciding scrollability from
+    /// "clips, and its content is taller than its box" would make every clipped card with a
+    /// long word in it scrollable.
+    pub scrolls: bool,
     /// Colour for text in this node, inherited from `color`.
     ///
     /// On the box rather than on the text node because a text node has no declarations of
@@ -280,6 +287,7 @@ impl Default for BoxStyle {
             border_width: Edges::ZERO,
             radii: Corners::ZERO,
             clips_children: false,
+            scrolls: false,
             visible: true,
         }
     }
@@ -319,6 +327,18 @@ pub struct Node {
     /// Relative rather than absolute because that is what `taffy` produces at M3 and
     /// because moving a subtree then costs one write instead of one per descendant.
     pub layout: Rect,
+    /// How far this node's content can be scrolled before running out, per axis.
+    ///
+    /// Layout output: taffy computes it from the scrollable overflow rectangle. Zero for
+    /// anything that is not a scroll container, and for one whose content fits.
+    pub scroll_max: Size,
+    /// How far this node's content is currently scrolled, per axis. Always within
+    /// `0..=scroll_max`.
+    ///
+    /// User state, not layout output — it survives a relayout, because a list that jumped
+    /// back to the top every time something above it resized would be unusable. Layout only
+    /// touches it to clamp when the content shrank beneath it.
+    pub scroll_offset: Point,
 
     pub(crate) dirty: DirtyFlags,
 }
@@ -334,6 +354,8 @@ impl Node {
             kind,
             style: BoxStyle::default(),
             layout: Rect::ZERO,
+            scroll_max: Size::ZERO,
+            scroll_offset: Point::ZERO,
             // A brand new node has never been styled, laid out or painted.
             dirty: DirtyFlags::ALL_SELF,
         }

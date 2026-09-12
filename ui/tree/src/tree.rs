@@ -2,7 +2,7 @@
 
 use core::num::NonZeroU32;
 
-use crisol_display_list::Rect;
+use crisol_display_list::{Point, Rect, Size};
 
 use crate::atom::Atom;
 use crate::custom::CustomNode;
@@ -347,7 +347,11 @@ impl Tree {
         false
     }
 
-    /// The node's border box in absolute coordinates, by summing ancestor origins.
+    /// The node's border box in absolute coordinates — where it is actually drawn.
+    ///
+    /// Sums ancestor origins and subtracts their scroll offsets, because the question this
+    /// answers is "where is this on screen": a control scrolled out of view is somewhere
+    /// else, and a screen reader told otherwise would point at the wrong place.
     ///
     /// O(depth). Paint accumulates offsets as it descends instead of calling this per node;
     /// this exists for one-off queries such as "where is the focused element".
@@ -357,10 +361,110 @@ impl Tree {
         let mut current = self.parent(id);
         while let Some(node) = current {
             let parent = self.get(node)?;
-            rect = rect.translate(parent.layout.origin);
+            rect = rect.translate(parent.layout.origin - parent.scroll_offset);
             current = parent.parent();
         }
         Some(rect)
+    }
+
+    // ---- scrolling ------------------------------------------------------------------
+
+    /// How far `id`'s content is scrolled.
+    #[must_use]
+    pub fn scroll_offset(&self, id: NodeId) -> Point {
+        self.get(id).map_or(Point::ZERO, |node| node.scroll_offset)
+    }
+
+    /// The furthest `id`'s content can be scrolled, per axis.
+    #[must_use]
+    pub fn scroll_max(&self, id: NodeId) -> Size {
+        self.get(id).map_or(Size::ZERO, |node| node.scroll_max)
+    }
+
+    /// Whether `id` is a scroll container with somewhere to go on either axis.
+    #[must_use]
+    pub fn is_scrollable(&self, id: NodeId) -> bool {
+        self.get(id).is_some_and(|node| {
+            node.style.scrolls && (node.scroll_max.width > 0.0 || node.scroll_max.height > 0.0)
+        })
+    }
+
+    /// Scrolls `id` by `delta`, clamped to what it has left. Returns how far it actually
+    /// moved.
+    ///
+    /// Returning the *applied* delta rather than a bool is what makes scroll chaining
+    /// possible: a caller hands the remainder to the next scrollable ancestor, and a nested
+    /// list that has hit its end passes the gesture outward instead of swallowing it.
+    ///
+    /// Marks `PAINT` and never `LAYOUT`. Scrolling moves where content is drawn; it does not
+    /// change a single box, and treating it as a layout change would relayout the document
+    /// sixty times a second during a fling.
+    pub fn scroll_by(&mut self, id: NodeId, delta: Point) -> Point {
+        let Some(node) = self.get(id) else {
+            return Point::ZERO;
+        };
+        if !node.style.scrolls {
+            return Point::ZERO;
+        }
+        let before = node.scroll_offset;
+        let max = node.scroll_max;
+        let after = Point {
+            x: (before.x + delta.x).clamp(0.0, max.width.max(0.0)),
+            y: (before.y + delta.y).clamp(0.0, max.height.max(0.0)),
+        };
+        let applied = after - before;
+        if applied.x == 0.0 && applied.y == 0.0 {
+            return Point::ZERO;
+        }
+        self.node_mut(id).scroll_offset = after;
+        self.mark_dirty(id, DirtyFlags::PAINT);
+        applied
+    }
+
+    /// Sets `id`'s scroll offset outright, clamped to its range. Returns whether it moved.
+    pub fn set_scroll(&mut self, id: NodeId, offset: Point) -> bool {
+        let Some(node) = self.get(id) else {
+            return false;
+        };
+        if !node.style.scrolls {
+            return false;
+        }
+        let max = node.scroll_max;
+        let clamped = Point {
+            x: offset.x.clamp(0.0, max.width.max(0.0)),
+            y: offset.y.clamp(0.0, max.height.max(0.0)),
+        };
+        if clamped == node.scroll_offset {
+            return false;
+        }
+        self.node_mut(id).scroll_offset = clamped;
+        self.mark_dirty(id, DirtyFlags::PAINT);
+        true
+    }
+
+    /// Records the scroll extent layout computed, clamping the offset if the content shrank.
+    ///
+    /// Called by layout. The clamp is the part that matters: a list scrolled to the bottom
+    /// whose content then shrinks would otherwise be looking at blank space below the end.
+    pub fn set_scroll_max(&mut self, id: NodeId, max: Size) -> bool {
+        let Some(node) = self.get(id) else {
+            return false;
+        };
+        if node.scroll_max == max {
+            return false;
+        }
+        let offset = node.scroll_offset;
+        let clamped = Point {
+            x: offset.x.clamp(0.0, max.width.max(0.0)),
+            y: offset.y.clamp(0.0, max.height.max(0.0)),
+        };
+        let node = self.node_mut(id);
+        node.scroll_max = max;
+        if clamped != offset {
+            node.scroll_offset = clamped;
+            self.mark_dirty(id, DirtyFlags::PAINT);
+        }
+        true
     }
 
     // ---- mutation -------------------------------------------------------------------
@@ -594,7 +698,7 @@ impl Tree {
         &mut self,
         id: NodeId,
         constraints: crate::custom::MeasureConstraints,
-    ) -> Option<crisol_display_list::Size> {
+    ) -> Option<Size> {
         match &mut self.get_mut(id)?.kind {
             NodeKind::Custom(custom) => Some(custom.node.measure(constraints)),
             _ => None,
@@ -604,7 +708,7 @@ impl Tree {
     /// Tells a custom node what box it was given, so it can lay out its interior.
     ///
     /// Returns whether `id` was a custom node.
-    pub fn layout_custom(&mut self, id: NodeId, size: crisol_display_list::Size) -> bool {
+    pub fn layout_custom(&mut self, id: NodeId, size: Size) -> bool {
         match self.get_mut(id).map(|node| &mut node.kind) {
             Some(NodeKind::Custom(custom)) => {
                 custom.node.layout(size);

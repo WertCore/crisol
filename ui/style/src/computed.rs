@@ -248,6 +248,7 @@ impl ComputedStyle {
             text_color: self.color.into(),
             generates_box: !self.is_none(),
             clips_children: self.clips_children(),
+            scrolls: self.overflow_x == Overflow::Scroll || self.overflow_y == Overflow::Scroll,
             visible: self.visibility == Visibility::Visible,
         }
     }
