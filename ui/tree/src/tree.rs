@@ -389,6 +389,7 @@ impl Tree {
 
         self.mark_dirty(parent, DirtyFlags::LAYOUT);
         self.mark_dirty(child, DirtyFlags::ALL_SELF);
+        self.mark_structural_change(parent);
         Ok(())
     }
 
@@ -433,6 +434,7 @@ impl Tree {
 
         self.mark_dirty(parent, DirtyFlags::LAYOUT);
         self.mark_dirty(child, DirtyFlags::ALL_SELF);
+        self.mark_structural_change(parent);
         Ok(())
     }
 
@@ -498,6 +500,22 @@ impl Tree {
         // The parent lost a child, so its layout changed even though nothing about the
         // parent itself did.
         self.mark_dirty(parent, DirtyFlags::LAYOUT);
+        self.mark_structural_change(parent);
+    }
+
+    /// Marks the style of a parent's children after one was added or removed.
+    ///
+    /// `:first-child`, `:last-child`, `:nth-child` and `:empty` all depend on a node's
+    /// position among its siblings, so inserting or removing one can change whether any of
+    /// them match. Only the children need marking, not their subtrees: a descendant's
+    /// position among *its* siblings did not change.
+    fn mark_structural_change(&mut self, parent: NodeId) {
+        self.mark_dirty(parent, DirtyFlags::STYLE);
+        let mut child = self.first_child(parent);
+        while let Some(node) = child {
+            self.mark_dirty(node, DirtyFlags::STYLE);
+            child = self.next_sibling(node);
+        }
     }
 
     /// Removes `id` and everything beneath it, freeing their slots.
@@ -594,6 +612,91 @@ impl Tree {
             }
             _ => false,
         }
+    }
+
+    // ---- content mutation -------------------------------------------------------------
+
+    /// Replaces a text node's content, marking exactly what that can affect.
+    ///
+    /// Returns whether `id` was a text node.
+    ///
+    /// Changing text affects the node's own measurement and appearance, and nothing else —
+    /// with one exception. `:empty` matches on whether an element has content, so a text node
+    /// becoming empty or stopping being empty changes whether its *parent* matches, and that
+    /// is a style change rather than a layout one. Missing it means a rule that should have
+    /// applied does not, which is the kind of bug that survives because it only shows in one
+    /// state.
+    pub fn set_text(&mut self, id: NodeId, text: impl Into<String>) -> bool {
+        let text = text.into();
+        let Some(node) = self.get_mut(id) else {
+            return false;
+        };
+        let NodeKind::Text(existing) = &mut node.kind else {
+            return false;
+        };
+        if *existing == text {
+            // Setting the same text is not a change, and marking it dirty would make an
+            // idempotent write cost a relayout.
+            return true;
+        }
+        let emptiness_changed = existing.is_empty() != text.is_empty();
+        *existing = text;
+
+        self.mark_dirty(id, DirtyFlags::LAYOUT);
+        if emptiness_changed && let Some(parent) = self.parent(id) {
+            self.mark_dirty(parent, DirtyFlags::STYLE);
+        }
+        true
+    }
+
+    /// Marks a node's style dirty after something a selector can see has changed on it —
+    /// a class, an id, an attribute, or an interaction state bit.
+    ///
+    /// Conservative on purpose, and the shape of the conservatism is the interesting part.
+    /// Changing a class can affect:
+    ///
+    /// - the node itself, obviously;
+    /// - its **descendants**, through descendant and child combinators (`.open .panel`);
+    /// - its **following siblings**, through the sibling combinators (`.open + .panel`,
+    ///   `.open ~ .panel`).
+    ///
+    /// It cannot affect its ancestors or its *preceding* siblings, because no combinator in
+    /// the supported dialect looks backwards or upwards — which is exactly why `:has()` is
+    /// not in it (D-20). That one selector would turn this from an O(subtree) walk into an
+    /// O(document) one.
+    pub fn mark_selector_state_changed(&mut self, id: NodeId) {
+        self.mark_subtree_dirty(id, DirtyFlags::STYLE);
+
+        let mut sibling = self.next_sibling(id);
+        while let Some(node) = sibling {
+            self.mark_subtree_dirty(node, DirtyFlags::STYLE);
+            sibling = self.next_sibling(node);
+        }
+    }
+
+    /// Marks `id` and everything beneath it.
+    pub fn mark_subtree_dirty(&mut self, id: NodeId, flags: DirtyFlags) {
+        let mut stack = vec![id];
+        while let Some(node) = stack.pop() {
+            self.mark_dirty(node, flags);
+            let mut child = self.first_child(node);
+            while let Some(current) = child {
+                stack.push(current);
+                child = self.next_sibling(current);
+            }
+        }
+    }
+
+    /// Whether anything in this subtree needs the given pass.
+    ///
+    /// The whole point of the `SUBTREE_` bits: a pass asks this once per node and skips a
+    /// clean subtree in constant time instead of walking it (DECISIONS D-17).
+    #[must_use]
+    pub fn subtree_needs(&self, id: NodeId, flags: DirtyFlags) -> bool {
+        let Some(node) = self.get(id) else {
+            return false;
+        };
+        node.dirty.intersects(flags | flags.as_subtree())
     }
 
     // ---- invalidation ---------------------------------------------------------------

@@ -15,7 +15,7 @@ use crisol_text::FontSystem;
 use crisol_tree::Tree;
 
 pub use style_adapter::StyleRef;
-pub use tree_adapter::{LayoutContext, LayoutStats, TextMap};
+pub use tree_adapter::{LayoutCache, LayoutContext, LayoutStats, TextMap};
 
 /// Looks shaped text up by the handle paint put in the display list.
 ///
@@ -36,16 +36,20 @@ impl crisol_text_gpu::TextSource for ShapedText<'_> {
 /// Returns the shaped text alongside the counters, because paint needs it and reshaping to
 /// get it back would be the most expensive mistake available here.
 ///
-/// Convenience for a one-off pass. Hold a [`LayoutContext`] instead when laying out
-/// repeatedly, so taffy's measurement caches survive between passes.
+/// Convenience for a one-off pass: it builds a [`LayoutCache`], uses it once and throws it
+/// away. A frame loop should own the cache and construct a [`LayoutContext`] per pass, which
+/// is what lets an unchanged subtree cost nothing the second time.
 pub fn layout(
     tree: &mut Tree,
     styles: &StyleMap,
     fonts: &mut FontSystem,
     viewport: Size,
 ) -> (TextMap, LayoutStats) {
-    let mut context = LayoutContext::new(tree, styles, fonts);
-    context.run(viewport);
-    let stats = context.stats();
-    (context.take_text(), stats)
+    let mut cache = LayoutCache::new();
+    let stats = {
+        let mut context = LayoutContext::new(tree, styles, fonts, &mut cache);
+        context.run(viewport);
+        context.stats()
+    };
+    (cache.take_text(), stats)
 }

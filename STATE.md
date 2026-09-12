@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M6 — incremental everything (not started)
+**Current milestone:** M6 — incremental everything (in progress)
 **Last finished:** M5 — events, focus, input, accessibility
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -214,13 +214,52 @@ with skipped wrappers' children floating up to take their place.
   is asserted: roles, labels, nesting, state, focus and bounds. Whether they *say* it right
   needs a human with a screen reader; see *Open questions*.
 
-**Totals:** 374 tests passing
+**Totals:** 390 tests passing
 
 ---
 
 ## In progress
 
-Nothing. M5 is closed and M6 has not been started.
+**M6, invalidation and damage.** `DirtyFlags` has been on the node since M2 waiting for a
+consumer; this is it.
+
+*Marking (D-38).* Mutations now mark exactly what they can affect. A class or state change
+dirties the node, its descendants and its **following** siblings — and nothing else, because
+no combinator in the dialect looks backwards or upwards. That is why `:has()` is excluded
+(D-20): one selector would turn an O(subtree) walk into an O(document) one on every class
+toggle. Text becoming empty dirties the parent's style for `:empty`; an ordinary edit dirties
+no style at all. Inserting a child dirties the parent's other children for `:nth-child`, but
+not their subtrees.
+
+*Incremental restyle.* `StyleEngine::restyle_incremental` reuses the styles of subtrees
+nothing invalidated. The subtle part is inheritance: a clean subtree still needs recomputing
+if its parent's style changed, so the walk carries whether the inherited style *actually*
+changed — a pointer comparison, thanks to the interner (D-21).
+
+*Layout.* `LayoutCache` moved out of `LayoutContext` to the caller (D-37), because the one
+sequence M6 is about — lay out, mutate, lay out — is impossible while the context holds
+`&mut Tree`. Found by writing the acceptance test and discovering it could not be expressed.
+The pass then invalidates taffy's cache for every dirty node *and its ancestors* (a node's
+size feeds its parent's) and leaves everything else alone.
+
+*Damage (D-39).* The union of where each changed box **was** and **is**, in absolute
+coordinates. Taking only the new box leaves a ghost of the old one.
+
+**Accept: the layout half is met.**
+
+```
+10,002 nodes; one text edit
+  first pass:  10,002 laid out
+  second pass: 4 caches invalidated, 4 laid out, 10,002 boxes unchanged
+```
+
+Four is the edited text node plus `p`, `body`, `html` — the ancestor chain exactly. The
+milestone asks for fewer than twenty.
+
+**Still to do for M6:** paint and the renderer do not yet use the damage rectangle — paint
+rebuilds the whole display list every frame and the renderer redraws the whole surface. The
+number exists and is correct; nothing consumes it. Also glyph and texture caching, which
+glyphon and the `ImageStore` already do but which nothing measures.
 
 ## Open questions
 
@@ -322,6 +361,11 @@ Appended to `DECISIONS.md` in full; summarised here.
   rather than appends, a cancel is not an empty commit, and moving focus abandons it.
 - **D-36** — the accessibility tree is a second, smaller tree, built in full rather than
   incrementally until M6 owns invalidation.
+- **D-37** — the layout cache belongs to the caller, because a frame loop has to mutate the
+  tree between passes and a context holding `&mut Tree` makes that impossible.
+- **D-38** — invalidation is conservative in a shape the selector dialect guarantees:
+  descendants and *following* siblings only, which is what excluding `:has()` bought.
+- **D-39** — damage is the union of old and new boxes, in absolute coordinates.
 
 ---
 

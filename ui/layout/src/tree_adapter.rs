@@ -12,7 +12,7 @@ use crisol_display_list::{Rect, Size as CrisolSize};
 use crisol_style::values::Display;
 use crisol_style::{ComputedStyle, StyleMap};
 use crisol_text::{FontSystem, TextLayout, Wrapping};
-use crisol_tree::{MeasureConstraints, NodeId, NodeKind, NodeMap, Tree};
+use crisol_tree::{DirtyFlags, MeasureConstraints, NodeId, NodeKind, NodeMap, Tree};
 use taffy::geometry::Size;
 use taffy::style::AvailableSpace;
 use taffy::tree::{Cache, Layout, LayoutInput, LayoutOutput, NodeId as TaffyId, RunMode};
@@ -43,6 +43,13 @@ pub struct LayoutStats {
     pub text_shaped: usize,
     /// Nodes whose box was written back to the tree.
     pub nodes_written: usize,
+    /// Nodes whose cached measurement was thrown away because something changed.
+    ///
+    /// The number M6's acceptance is about: after one text edit in a large document this
+    /// should be the edited node and its ancestors, and nothing else.
+    pub caches_invalidated: usize,
+    /// Nodes whose box came out the same as last time.
+    pub unchanged: usize,
 }
 
 /// The shaped text of every text node in a tree.
@@ -52,17 +59,52 @@ pub struct LayoutStats {
 /// which is the whole point of keeping it.
 pub type TextMap = NodeMap<TextLayout>;
 
-/// Borrows a tree and its styles for one or more layout passes.
+/// Everything layout remembers between passes.
 ///
-/// Holds taffy's caches across passes, so an unchanged subtree is not remeasured — which is
-/// most of what makes M6's incremental relayout possible.
+/// Owned by the caller rather than by [`LayoutContext`], because a frame loop has to lay
+/// out, *mutate the tree*, and lay out again — and a context holding `&mut Tree` makes the
+/// middle step impossible. Keeping the caches out here is what lets them survive an edit,
+/// which is the entire premise of M6.
+#[derive(Debug, Default)]
+pub struct LayoutCache {
+    nodes: NodeMap<NodeLayout>,
+    text: TextMap,
+}
+
+impl LayoutCache {
+    /// An empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The shaped text from the last pass, which paint reads.
+    #[must_use]
+    pub fn text(&self) -> &TextMap {
+        &self.text
+    }
+
+    /// Takes the shaped text out, leaving the cache without it.
+    #[must_use]
+    pub fn take_text(&mut self) -> TextMap {
+        std::mem::take(&mut self.text)
+    }
+
+    /// Throws everything away, forcing the next pass to be a full one.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.text.clear();
+    }
+}
+
+/// Borrows a tree, its styles and a cache for one layout pass.
 pub struct LayoutContext<'a> {
     tree: &'a mut Tree,
     styles: &'a StyleMap,
     fonts: &'a mut FontSystem,
-    nodes: NodeMap<NodeLayout>,
-    /// Shaped text, produced during measurement and kept for paint.
-    text: TextMap,
+    cache: &'a mut LayoutCache,
+    /// The union of every box that moved or resized this pass, in logical pixels.
+    damage: Option<Rect>,
     /// Text and custom nodes have no style of their own and lay out with initial values.
     fallback: ComputedStyle,
     stats: LayoutStats,
@@ -127,6 +169,48 @@ fn definite(space: AvailableSpace) -> Option<f32> {
     }
 }
 
+/// Collects every node whose layout is dirty, plus every ancestor of one.
+///
+/// Returns them deepest-last, which does not matter for clearing a cache but makes the list
+/// readable when a test prints it.
+fn collect_dirty(tree: &Tree, root: NodeId, out: &mut Vec<NodeId>) -> bool {
+    let Some(node) = tree.get(root) else {
+        return false;
+    };
+    // Nothing in this subtree wants layout: skip it whole, which is the entire point of the
+    // subtree bits (DECISIONS D-17).
+    if !node
+        .dirty()
+        .intersects(DirtyFlags::LAYOUT | DirtyFlags::SUBTREE_LAYOUT)
+    {
+        return false;
+    }
+
+    let mut any = node.dirty().contains(DirtyFlags::LAYOUT);
+    let mut child = tree.first_child(root);
+    while let Some(current) = child {
+        any |= collect_dirty(tree, current, out);
+        child = tree.next_sibling(current);
+    }
+    if any {
+        out.push(root);
+    }
+    any
+}
+
+/// Clears the layout bits the pass just consumed.
+fn clear_layout_flags(tree: &mut Tree, root: NodeId) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        tree.clear_dirty(id, DirtyFlags::LAYOUT | DirtyFlags::SUBTREE_LAYOUT);
+        let mut child = tree.first_child(id);
+        while let Some(node) = child {
+            stack.push(node);
+            child = tree.next_sibling(node);
+        }
+    }
+}
+
 /// Whether a node lays its own children out, or is a leaf as far as taffy is concerned.
 ///
 /// A custom node is always a leaf: it opted out of CSS layout, and letting taffy lay out
@@ -139,31 +223,59 @@ fn is_leaf(tree: &Tree, id: NodeId) -> bool {
 }
 
 impl<'a> LayoutContext<'a> {
-    /// Prepares a context over `tree` using `styles`.
+    /// Prepares a pass over `tree` using `styles`, reusing whatever `cache` remembers.
     #[must_use]
-    pub fn new(tree: &'a mut Tree, styles: &'a StyleMap, fonts: &'a mut FontSystem) -> Self {
-        let capacity = tree.len();
+    pub fn new(
+        tree: &'a mut Tree,
+        styles: &'a StyleMap,
+        fonts: &'a mut FontSystem,
+        cache: &'a mut LayoutCache,
+    ) -> Self {
         Self {
             tree,
             styles,
             fonts,
-            nodes: NodeMap::with_capacity(capacity),
-            text: TextMap::with_capacity(capacity),
+            cache,
+            damage: None,
             fallback: ComputedStyle::default(),
             stats: LayoutStats::default(),
         }
     }
 
-    /// The shaped text produced by the last pass.
+    /// The shaped text produced by this pass.
     #[must_use]
     pub fn text(&self) -> &TextMap {
-        &self.text
+        &self.cache.text
     }
 
-    /// Takes the shaped text, leaving the context empty of it.
+    /// The rectangle covering everything that moved or resized in the last pass.
+    ///
+    /// `None` when nothing did, which is the answer a frame with no changes wants: there is
+    /// nothing to repaint. The union of the old and new boxes of each changed node, because
+    /// a box that shrank leaves behind pixels that have to be painted over.
     #[must_use]
-    pub fn take_text(&mut self) -> TextMap {
-        std::mem::take(&mut self.text)
+    pub fn damage(&self) -> Option<Rect> {
+        self.damage
+    }
+
+    /// Throws away the cached measurement of every node whose layout is dirty, and of every
+    /// ancestor of one.
+    ///
+    /// The ancestors matter and are easy to forget: a node's size feeds its parent's, so a
+    /// paragraph growing a line changes the height of everything containing it. Stopping at
+    /// the dirty node leaves taffy serving a stale size to its parent.
+    ///
+    /// Everything else keeps its cache, and taffy then does no work for it at all — which is
+    /// what makes a one-word edit in a four-hundred-page document cost a handful of nodes
+    /// rather than all of them.
+    fn invalidate_dirty(&mut self, root: NodeId) -> usize {
+        let mut invalidated = Vec::new();
+        collect_dirty(self.tree, root, &mut invalidated);
+        let count = invalidated.len();
+        for node in invalidated {
+            self.entry(node).cache.clear();
+        }
+        count
     }
 
     /// This context's counters, accumulated across passes.
@@ -175,7 +287,7 @@ impl<'a> LayoutContext<'a> {
     /// The final layout computed for a node, in its parent's coordinate space.
     #[must_use]
     pub fn layout_of(&self, id: NodeId) -> Option<Layout> {
-        self.nodes.get(id).map(|node| node.final_layout)
+        self.cache.nodes.get(id).map(|node| node.final_layout)
     }
 
     /// Lays out the tree's root into `available`, then writes the results back.
@@ -186,6 +298,9 @@ impl<'a> LayoutContext<'a> {
         let Some(root) = self.tree.root() else {
             return false;
         };
+
+        self.damage = None;
+        self.stats.caches_invalidated += self.invalidate_dirty(root);
 
         taffy::compute_root_layout(
             self,
@@ -208,9 +323,12 @@ impl<'a> LayoutContext<'a> {
     /// a percentage `border-radius` is only a number of pixels once layout has decided the
     /// border box.
     fn write_back(&mut self, root: NodeId) {
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            let Some(layout) = self.nodes.get(id).map(|node| node.final_layout) else {
+        // (node, absolute origin of its parent). Boxes are stored relative to the parent,
+        // which is what makes moving a subtree one write — but damage has to be absolute,
+        // because the renderer scissors with it.
+        let mut stack = vec![(root, crisol_display_list::Point::ZERO)];
+        while let Some((id, parent_origin)) = stack.pop() {
+            let Some(layout) = self.cache.nodes.get(id).map(|node| node.final_layout) else {
                 continue;
             };
             let rect = Rect::from_xywh(
@@ -219,11 +337,26 @@ impl<'a> LayoutContext<'a> {
                 layout.size.width,
                 layout.size.height,
             );
+            let absolute = rect.translate(parent_origin);
             let box_style = style_of(self.styles, &self.fallback, id).to_box_style(rect.size);
 
             if let Some(node) = self.tree.get_mut(id) {
-                node.layout = rect;
-                node.style = box_style;
+                if node.layout == rect && node.style == box_style {
+                    self.stats.unchanged += 1;
+                } else {
+                    // Both boxes are damaged: the new one has to be drawn, and the old one
+                    // has to be painted over, which a box that shrank or moved leaves behind.
+                    // In absolute coordinates, because that is the space the renderer clips
+                    // in — unioning parent-relative rectangles produces a region that means
+                    // nothing.
+                    let was = node.layout.translate(parent_origin);
+                    node.layout = rect;
+                    node.style = box_style;
+                    self.damage = Some(match self.damage {
+                        Some(current) => current.union(was).union(absolute),
+                        None => was.union(absolute),
+                    });
+                }
             }
             self.stats.nodes_written += 1;
 
@@ -233,17 +366,21 @@ impl<'a> LayoutContext<'a> {
 
             let mut child = self.tree.first_child(id);
             while let Some(node) = child {
-                stack.push(node);
+                stack.push((node, absolute.origin));
                 child = self.tree.next_sibling(node);
             }
         }
+
+        // Layout consumed them; paint has its own.
+        clear_layout_flags(self.tree, root);
     }
 
     fn entry(&mut self, id: NodeId) -> &mut NodeLayout {
-        if self.nodes.get(id).is_none() {
-            self.nodes.insert(id, NodeLayout::default());
+        if self.cache.nodes.get(id).is_none() {
+            self.cache.nodes.insert(id, NodeLayout::default());
         }
-        self.nodes
+        self.cache
+            .nodes
             .get_mut(id)
             .expect("inserted above when it was missing")
     }
@@ -337,11 +474,12 @@ impl LayoutPartialTree for LayoutContext<'_> {
                     tree,
                     styles,
                     fonts,
-                    text,
+                    cache,
                     fallback,
                     stats,
                     ..
                 } = context;
+                let text = &mut cache.text;
                 let computed = style_of(styles, fallback, id);
                 let style = if is_replaced(tree, id) {
                     StyleRef::replaced(computed)
@@ -448,7 +586,8 @@ impl CacheTree for LayoutContext<'_> {
 
 impl RoundTree for LayoutContext<'_> {
     fn get_unrounded_layout(&self, node: TaffyId) -> Layout {
-        self.nodes
+        self.cache
+            .nodes
             .get(crisol_id(node))
             .map_or_else(Layout::new, |node| node.unrounded)
     }

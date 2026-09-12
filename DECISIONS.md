@@ -804,3 +804,72 @@ they consume — roles, labels, nesting, state and focus. If that is right, the 
 the platform's problem. Verifying it against a real screen reader is a manual step and is
 recorded in `STATE.md` as outstanding.
 
+---
+
+## D-37 — The layout cache belongs to the caller, not to the pass
+
+**Status:** Accepted (M6) · **Affects:** M6, M7, M8
+
+`LayoutContext` held taffy's measurement caches and borrowed `&mut Tree`. That makes the one
+sequence M6 is about impossible: lay out, **mutate the tree**, lay out again. The mutation
+needs the tree, and the context is holding it.
+
+`LayoutCache` is now a separate thing the caller owns and lends to each pass. A frame loop
+keeps one; the convenience `layout()` builds one, uses it and throws it away, which is honest
+about being a full pass every time.
+
+This was found by writing M6's acceptance test and discovering it could not be expressed.
+That is the useful kind of test failure — the API was wrong, not the assertion.
+
+## D-38 — Invalidation is conservative in a shape the selector dialect guarantees
+
+**Status:** Accepted (M6) · **Affects:** M6, M7
+
+A change to something a selector can see — a class, an id, an attribute, a state bit — can
+affect:
+
+- **the node itself**;
+- **its descendants**, through descendant and child combinators (`.open .panel`);
+- **its following siblings**, through the sibling combinators (`.open + .panel`, `.open ~ x`).
+
+It cannot affect its ancestors or its *preceding* siblings, because **no combinator in the
+supported dialect looks backwards or upwards**. That is not an accident: it is why `:has()` is
+excluded (D-20). One selector would turn this from an O(subtree) walk into an O(document)
+one, and the cost would be paid on every class toggle rather than only by documents that use
+it.
+
+Two other invalidation rules, each corresponding to a selector that would otherwise go stale:
+
+- **Text becoming empty or stopping being empty dirties its parent's style**, because
+  `:empty` matches on whether an element has content. An ordinary edit — non-empty to
+  non-empty — dirties no style at all, which is what makes a keystroke in a large document
+  cost zero cascade work.
+- **Inserting or removing a child dirties all of the parent's children**, because
+  `:first-child`, `:last-child` and `:nth-child` depend on position among siblings. Their
+  *descendants* are left alone: a grandchild's position among its own siblings did not
+  change.
+
+**Inheritance is what makes the style walk subtle.** A subtree can be entirely clean and still
+need recomputing, because its parent's style changed and half the properties inherit. So the
+walk carries whether the inherited style actually changed, and stops descending only when the
+subtree is clean *and* the inherited style is the same allocation as last time — which the
+interner (D-21) makes a pointer comparison rather than a field-by-field one.
+
+## D-39 — Damage is the union of old and new boxes, in absolute coordinates
+
+**Status:** Accepted (M6) · **Affects:** M6, M8
+
+A box that shrank or moved leaves pixels behind that have to be painted over, so the damaged
+region is the union of where a box **was** and where it **is**. Taking only the new box leaves
+a ghost of the old one on screen.
+
+Boxes are stored relative to their parent (D-16), which is what makes moving a subtree one
+write. Damage cannot be: the renderer scissors in absolute coordinates, and unioning
+parent-relative rectangles produces a region that means nothing. The write-back walk
+therefore accumulates the absolute origin as it descends.
+
+That bug was live and passing its test until the test was strengthened to use real fonts —
+with an empty font system every string measures to nothing, so no box ever changed and the
+assertion held vacuously. Worth remembering: a test whose fixture cannot produce the
+condition it checks for is not a test.
+
