@@ -301,6 +301,22 @@ The test also asserts **node identity** across every step: a rebuild would produ
 render identically, and only the handles show the difference. A final full restyle is compared
 against what the incremental passes produced, so a missed invalidation cannot pass as a saving.
 
+**Measured against M16's minimum surface**, since §M7 asks for this to be designed for that
+consumer. `crisol-dom` has `createElement`, `createTextNode`, `appendChild`, `insertBefore`,
+`removeChild`, `replaceChild`, `nodeType`, `parentNode`, `firstChild`, `nextSibling`,
+`setAttribute`, `removeAttribute` and `classList`. Three things are missing and each is real
+work rather than a wrapper:
+
+- **`createElementNS`** — the tree has no namespace concept at all.
+- **`style`, the CSSOM subset** — there is nowhere to put an inline style; it needs storage on
+  `ElementData` and a slot in the cascade above author rules.
+- **`addEventListener`** — `crisol-events` already dispatches with real capture and bubble and
+  has `preventDefault`/`stopPropagation` (M5), but nothing registers listeners.
+
+M16's batching note — *mark dirty, run one style/layout/paint pass per frame, never relayout
+per `appendChild`* — is already how this works: nothing touches the tree between flushes, so a
+frame sees one consistent state rather than a half-applied update.
+
 **One defect this milestone existed to find.** `DirtyFlags::expanded` turned `STYLE` into
 `LAYOUT`, so appending one row to a 1,000-row list invalidated **1,008** layout caches — every
 sibling, because a structural change marks them all for `:nth-child`. It now invalidates 8.
