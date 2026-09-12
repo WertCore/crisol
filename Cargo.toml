@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = [
+    "ui/tree",
+    "ui/html",
+    "ui/css",
+    "ui/style",
+    "ui/layout",
+    "ui/text",
+    "ui/paint",
+    "ui/events",
+    "ui/a11y",
+    "ui/umbrella",
+    "renderer/display-list",
+    "renderer/wgpu",
+    "renderer/text-gpu",
+    "compiler/frontend",
+    "compiler/ir",
+    "compiler/opt",
+    "compiler/codegen",
+    "compiler/diag",
+    "runtime/gc",
+    "runtime/value",
+    "runtime/builtins",
+    "runtime/async",
+    "runtime/interp",
+    "dom",
+    "host",
+    "cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wertcore/crisol"
+authors = ["Crisol contributors"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# Denied in CI via `-D warnings`; kept as `warn` locally so editors stay usable.
+undocumented_unsafe_blocks = "warn"
+todo = "warn"
+dbg_macro = "warn"
+
+[workspace.dependencies]
+# Internal crates. Path + version so the workspace can be published later.
+crisol-tree = { path = "ui/tree", version = "0.0.0" }
+crisol-html = { path = "ui/html", version = "0.0.0" }
+crisol-css = { path = "ui/css", version = "0.0.0" }
+crisol-style = { path = "ui/style", version = "0.0.0" }
+crisol-layout = { path = "ui/layout", version = "0.0.0" }
+crisol-text = { path = "ui/text", version = "0.0.0" }
+crisol-paint = { path = "ui/paint", version = "0.0.0" }
+crisol-events = { path = "ui/events", version = "0.0.0" }
+crisol-a11y = { path = "ui/a11y", version = "0.0.0" }
+crisol-ui = { path = "ui/umbrella", version = "0.0.0" }
+crisol-display-list = { path = "renderer/display-list", version = "0.0.0" }
+crisol-render-wgpu = { path = "renderer/wgpu", version = "0.0.0" }
+crisol-text-gpu = { path = "renderer/text-gpu", version = "0.0.0" }
+crisol-frontend = { path = "compiler/frontend", version = "0.0.0" }
+crisol-ir = { path = "compiler/ir", version = "0.0.0" }
+crisol-opt = { path = "compiler/opt", version = "0.0.0" }
+crisol-codegen = { path = "compiler/codegen", version = "0.0.0" }
+crisol-diag = { path = "compiler/diag", version = "0.0.0" }
+crisol-gc = { path = "runtime/gc", version = "0.0.0" }
+crisol-value = { path = "runtime/value", version = "0.0.0" }
+crisol-builtins = { path = "runtime/builtins", version = "0.0.0" }
+crisol-async = { path = "runtime/async", version = "0.0.0" }
+crisol-interp = { path = "runtime/interp", version = "0.0.0" }
+crisol-dom = { path = "dom", version = "0.0.0" }
+crisol-host = { path = "host", version = "0.0.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

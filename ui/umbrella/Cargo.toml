@@ -1,0 +1,31 @@
+[package]
+name = "crisol-ui"
+description = "Umbrella crate re-exporting the Crisol UI engine (Track A) so it can be consumed standalone."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["render"]
+# The GPU renderer pulls in wgpu + winit. Downstream users embedding only the
+# tree/layout/paint pipeline can turn it off.
+render = ["dep:crisol-render-wgpu"]
+
+[dependencies]
+crisol-tree.workspace = true
+crisol-html.workspace = true
+crisol-css.workspace = true
+crisol-style.workspace = true
+crisol-layout.workspace = true
+crisol-text.workspace = true
+crisol-paint.workspace = true
+crisol-events.workspace = true
+crisol-a11y.workspace = true
+crisol-display-list.workspace = true
+crisol-render-wgpu = { workspace = true, optional = true }

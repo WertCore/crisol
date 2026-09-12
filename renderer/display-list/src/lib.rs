@@ -1,0 +1,5 @@
+//! Backend-independent draw command list.
+//!
+//! Scheduled for **M2**. See `ROADMAP.md` and `STATE.md` for the current position.
+
+#![doc(html_root_url = "https://docs.rs/crisol-display-list/0.0.0")]
