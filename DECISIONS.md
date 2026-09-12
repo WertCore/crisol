@@ -746,3 +746,61 @@ skipped, and one whose subtree is `display: none` is not there at all — which 
 `BoxStyle::generates_box` was added for. A focus ring on empty space is worse than no focus
 ring.
 
+---
+
+## D-35 — Composition is a state machine, not a stream of keystrokes
+
+**Status:** Accepted (M5) · **Affects:** M5, M16
+
+ROADMAP §M5's acceptance names IME composition for Japanese on all three platforms, and it is
+called out because an input method is not a keyboard with extra steps. The user types several
+keys, the system shows *provisional* text that is not in the document, and only later does
+that text commit — or get abandoned.
+
+An engine that treats composition as ordinary key input gets three things wrong at once: the
+provisional text ends up in the document, undo gets an entry per keystroke instead of per
+word, and cancelling leaves the abandoned text behind.
+
+So `ImeState` holds the preedit, and `apply` returns text to insert **only** on a commit.
+Three consequences that each correspond to a bug applications actually ship:
+
+- **A preedit replaces rather than appends.** An input method sends the whole provisional
+  string each time, not a delta. Appending is how `にほん` becomes `にには ほにほん`.
+- **A cancel is not an empty commit.** They mean opposite things to undo: an abandoned
+  composition never happened, while an empty commit is a deletion.
+- **Moving focus resets composition.** The provisional text belongs to the node that was
+  focused; carrying it across pastes half a word into the next one.
+
+`TextInput` being a separate event from `KeyDown` (D-32) is the other half of this: while
+composition is in progress, ordinary key handling must not also run, or the character is
+typed twice.
+
+## D-36 — The accessibility tree is a second, smaller tree
+
+**Status:** Accepted (M5) · **Affects:** M5, M6, M7
+
+§M5 puts accessibility at M5 rather than in year three because *it constrains the tree, focus
+model, and event system, and retrofitting means restructuring*. By the time the bridge was
+written those constraints had already been paid — focus order is document order (D-34),
+`display: none` genuinely removes a node, and the tree walks in reading order — so the bridge
+is a translation rather than a redesign. That is the point of doing it now.
+
+What a screen reader gets is a **second tree**, smaller than the box tree: only the things a
+user can perceive and act on. A `<div>` used for spacing is not one of those, and a tree that
+announced every one would drown the content in structure. Skipped nodes' children float up to
+take their place, so a wrapper disappears without taking its contents with it.
+
+**Full updates, not incremental ones.** M6 owns invalidation; building a diff now would mean
+maintaining a cache against a story that does not exist yet, and the failure mode is a button
+that announces the wrong label to one user and is never reproduced by anyone else.
+
+**Node handles are the same packed integers** taffy takes and JavaScript will get at M16
+(D-17). A screen reader routes "activate this" back by id, and a mapping that is not
+reversible sends the action nowhere; there is a test for the round trip.
+
+**What cannot be tested here:** whether VoiceOver, NVDA and Orca actually announce it
+correctly. No CI runner has a screen reader attached. What is asserted is the `TreeUpdate`
+they consume — roles, labels, nesting, state and focus. If that is right, the announcement is
+the platform's problem. Verifying it against a real screen reader is a manual step and is
+recorded in `STATE.md` as outstanding.
+

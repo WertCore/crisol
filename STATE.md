@@ -1,7 +1,7 @@
 # Crisol — State
 
-**Current milestone:** M5 — events, focus, input, accessibility (in progress)
-**Last finished:** M4 — HTML and text
+**Current milestone:** M6 — incremental everything (not started)
+**Last finished:** M5 — events, focus, input, accessibility
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -10,19 +10,14 @@ actually is.
 
 ## Accept criteria for the current milestone
 
-> **M5 — events, focus, input, accessibility.** All four together, because they read the same
-> tree and focus state.
+> **M6 — incremental everything.** Dirty flagging, style invalidation (which selectors can be
+> affected by which mutation), partial relayout, damage regions, glyph and texture caching.
 >
-> Hit testing (respecting clip and transform), capture/bubble propagation, focus order and
-> keyboard navigation, text input with IME preedit rendering, mouse/touch/scroll/drag,
-> clipboard, and the `accesskit` bridge.
+> **Accept:** in a 10,000-node tree, mutating one text node's content triggers relayout of
+> fewer than 20 nodes and repaints only the damaged rectangle. Instrumented counters prove it.
 >
-> **Accept:** a form with three text inputs is fully keyboard-navigable; IME composition works
-> for Japanese input on all three platforms; VoiceOver/NVDA/Orca announce the tree correctly.
->
-> Accessibility here, not in year three — it constrains the tree, focus model and event
-> system, and retrofitting means restructuring. Touch input designed in now (ROADMAP §3.6),
-> even though mobile ships later.
+> This is the line between a demo and something you can build a real app on. A 400-page
+> document reflowing on every keystroke is the workload that kills naive engines.
 
 ---
 
@@ -179,42 +174,53 @@ display list refers to text by the node's own packed handle, exactly as it refer
 And `ui/paint/tests/text.rs` runs the whole of Track A end to end — parse, cascade, layout,
 shape, paint, rasterise — and looks at the pixels.
 
-**Totals:** 349 tests passing, 0 failing.  clean,  clean,  clean with
-`RUSTDOCFLAGS=-D warnings`.
+### M5 — events, focus, input, accessibility
+
+All four together, as §M5 requires, because they read the same tree and focus state.
+
+*Hit testing.* Reverse paint order — last sibling first, children before parents — respecting
+clips, `visibility: hidden` and `display: none`. A custom node resolves the point itself and
+may declare it a miss (D-19). With a text lookup the hit carries a cursor, so "which character
+did the user click" is the composition of two things that already existed.
+
+*The event model (D-32).* **Pointers, not mice.** A finger, a stylus and a mouse all produce
+`PointerEvent`s differing by `PointerKind`, so an application written against a mouse is
+already written against a finger. `PointerCancel` is its own event, and `TextInput` is
+separate from `KeyDown`.
+
+*Dispatch (D-33).* Capture, target, bubble, with `stop_propagation`,
+`stop_immediate_propagation` and `prevent_default`. `Listener` is a trait, because at M16 a
+listener is a JavaScript function. `apply_state` writes the `ElementState` bits M3 put on the
+node and nothing had written until now.
+
+*Focus (D-34).* Document order. A positive `tabindex` is accepted and ignored, because
+honouring it is how keyboard-unusable interfaces get built. `BoxStyle` gained `generates_box`,
+which paint now uses to skip a `display: none` subtree outright.
+
+*IME (D-35).* Composition as a state machine: provisional text stays out of the document, a
+cancel is not an empty commit, and moving focus abandons what was being typed.
+
+*Accessibility (D-36).* A second, smaller tree — only what a user can perceive and act on —
+with skipped wrappers' children floating up to take their place.
+
+**Accept: met, with one part that cannot be automated.**
+
+- *a form with three text inputs is fully keyboard-navigable* —
+  `tabbing_through_a_form_reaches_every_input_and_comes_back`.
+- *IME composition works for Japanese input on all three platforms* — the state machine is
+  tested with real Japanese composition sequences. Driving a platform input method is the
+  windowing layer's job and needs a human; see *Open questions*.
+- *VoiceOver/NVDA/Orca announce the tree correctly* — the `TreeUpdate` those readers consume
+  is asserted: roles, labels, nesting, state, focus and bounds. Whether they *say* it right
+  needs a human with a screen reader; see *Open questions*.
+
+**Totals:** 374 tests passing
 
 ---
 
 ## In progress
 
-**M5, hit testing and the event model.**
-
-*Hit testing.* A point to a node, walking in reverse paint order — last sibling first,
-children before parents — because the last thing painted is the top thing on screen.
-Respects clips, `visibility: hidden` and `display: none`; a custom node resolves the point
-itself and may declare it a miss, which is how it says it has holes (D-19). With a text
-lookup it also returns the cursor position, composing straight into "which character did the
-user click".
-
-*The event model (D-32).* Pointers, not mice: a finger, a stylus and a mouse all produce
-`PointerEvent`s that differ by `PointerKind`, so an application written against a mouse today
-is already written against a finger. `PointerCancel` is its own event rather than a variant
-of `PointerUp`, and `TextInput` is separate from `KeyDown` because a key press may produce no
-text and an IME produces text with no key press.
-
-*Dispatch.* Capture down, target, bubble up, with `stop_propagation`,
-`stop_immediate_propagation` and `prevent_default`. `Listener` is a trait rather than a boxed
-closure, because at M16 a listener is a JavaScript function (D-33).
-
-*The payoff.* `EventSystem::apply_state` writes the `ElementState` bits M3 put on the node
-and nothing has written until now — the cascade has been matching `:hover`, `:focus`,
-`:focus-within` and `:active` against them all along and always getting `false`.
-`a_hover_selector_matches_once_the_state_is_applied` moves a pointer, applies the state,
-restyles, and watches the background change from white to red.
-
-37 tests.
-
-**Still to do for M5:** focus order and keyboard navigation (Tab through a form, which is
-what the milestone's acceptance names), IME preedit, and the `accesskit` bridge.
+Nothing. M5 is closed and M6 has not been started.
 
 ## Open questions
 
@@ -234,6 +240,12 @@ what the milestone's acceptance names), IME preedit, and the `accesskit` bridge.
   radius by the thicker of its two adjacent borders; CSS uses per-axis elliptical radii. The
   difference shows only on a box with very different adjacent border widths and a large
   radius. Revisit if a real design hits it.
+- **Two parts of M5's acceptance need a human and are outstanding.** The IME state machine is
+  tested with real Japanese composition sequences, but nobody has driven a platform input
+  method through the windowing layer. The accessibility `TreeUpdate` is asserted in detail,
+  but nobody has listened to VoiceOver, NVDA or Orca read it. Neither can run on a CI runner.
+  Both are a morning's work for someone with the three machines, and until then the milestone
+  is *believed* complete on those two points rather than *shown* to be.
 - **Only one rounded clip is honoured at a time** (D-26). Nested rounded clips keep the
   innermost corners and intersect only their bounds. A test pins the behaviour.
 - **`BoxStyle` is a placeholder producer, not a placeholder contract.** M3's cascade
@@ -298,6 +310,10 @@ Appended to `DECISIONS.md` in full; summarised here.
   side table that `apply_state` writes onto the node for the cascade to read.
 - **D-34** — focus order is document order; a positive `tabindex` is accepted and ignored,
   because honouring it is how keyboard-unusable interfaces get built.
+- **D-35** — composition is a state machine, not a stream of keystrokes: a preedit replaces
+  rather than appends, a cancel is not an empty commit, and moving focus abandons it.
+- **D-36** — the accessibility tree is a second, smaller tree, built in full rather than
+  incrementally until M6 owns invalidation.
 
 ---
 

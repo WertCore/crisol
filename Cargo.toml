@@ -93,6 +93,7 @@ lightningcss = { version = "1.0.0-alpha.72", default-features = false, features 
 selectors = "0.40"
 # lightningcss re-exports this trait; the version must match the one it depends on.
 static-self = "0.1"
+accesskit = "0.25"
 cosmic-text = "0.19"
 glyphon = "0.12"
 html5ever = "0.40"
