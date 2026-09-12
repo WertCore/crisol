@@ -11,6 +11,7 @@
 use crisol_display_list::{Rect, Size as CrisolSize};
 use crisol_style::values::Display;
 use crisol_style::{ComputedStyle, StyleMap};
+use crisol_text::{FontSystem, TextLayout, Wrapping};
 use crisol_tree::{MeasureConstraints, NodeId, NodeKind, NodeMap, Tree};
 use taffy::geometry::Size;
 use taffy::style::AvailableSpace;
@@ -38,9 +39,18 @@ pub struct LayoutStats {
     pub nodes_laid_out: usize,
     /// Custom nodes whose `measure` was called.
     pub custom_measures: usize,
+    /// Text nodes that were shaped.
+    pub text_shaped: usize,
     /// Nodes whose box was written back to the tree.
     pub nodes_written: usize,
 }
+
+/// The shaped text of every text node in a tree.
+///
+/// A side table for the same reason computed style is one (DECISIONS D-21): `crisol-tree`
+/// has no business knowing what a shaped glyph is. Paint reads it rather than reshaping,
+/// which is the whole point of keeping it.
+pub type TextMap = NodeMap<TextLayout>;
 
 /// Borrows a tree and its styles for one or more layout passes.
 ///
@@ -49,7 +59,10 @@ pub struct LayoutStats {
 pub struct LayoutContext<'a> {
     tree: &'a mut Tree,
     styles: &'a StyleMap,
+    fonts: &'a mut FontSystem,
     nodes: NodeMap<NodeLayout>,
+    /// Shaped text, produced during measurement and kept for paint.
+    text: TextMap,
     /// Text and custom nodes have no style of their own and lay out with initial values.
     fallback: ComputedStyle,
     stats: LayoutStats,
@@ -74,8 +87,14 @@ fn style_of<'s>(
 }
 
 /// Whether this node measures itself rather than being sized by its container.
+///
+/// Text as well as custom nodes. Without inline layout, a text node is the closest thing the
+/// engine has to a replaced element: its box should be the extent of its glyphs, so that
+/// `align-items: center` centres the text rather than a full-width box containing it. The
+/// container's width still reaches the shaper — as the available space to wrap within —
+/// which is the part that matters.
 fn is_replaced(tree: &Tree, id: NodeId) -> bool {
-    matches!(tree.node(id).kind, NodeKind::Custom(_))
+    matches!(tree.node(id).kind, NodeKind::Custom(_) | NodeKind::Text(_))
 }
 
 /// The taffy view of a node's style, including the replaced bit the cascade cannot know.
@@ -122,15 +141,29 @@ fn is_leaf(tree: &Tree, id: NodeId) -> bool {
 impl<'a> LayoutContext<'a> {
     /// Prepares a context over `tree` using `styles`.
     #[must_use]
-    pub fn new(tree: &'a mut Tree, styles: &'a StyleMap) -> Self {
+    pub fn new(tree: &'a mut Tree, styles: &'a StyleMap, fonts: &'a mut FontSystem) -> Self {
         let capacity = tree.len();
         Self {
             tree,
             styles,
+            fonts,
             nodes: NodeMap::with_capacity(capacity),
+            text: TextMap::with_capacity(capacity),
             fallback: ComputedStyle::default(),
             stats: LayoutStats::default(),
         }
+    }
+
+    /// The shaped text produced by the last pass.
+    #[must_use]
+    pub fn text(&self) -> &TextMap {
+        &self.text
+    }
+
+    /// Takes the shaped text, leaving the context empty of it.
+    #[must_use]
+    pub fn take_text(&mut self) -> TextMap {
+        std::mem::take(&mut self.text)
     }
 
     /// This context's counters, accumulated across passes.
@@ -303,20 +336,25 @@ impl LayoutPartialTree for LayoutContext<'_> {
                 let LayoutContext {
                     tree,
                     styles,
+                    fonts,
+                    text,
                     fallback,
                     stats,
                     ..
                 } = context;
-                let style = if matches!(tree.node(id).kind, NodeKind::Custom(_)) {
-                    StyleRef::replaced(style_of(styles, fallback, id))
+                let computed = style_of(styles, fallback, id);
+                let style = if is_replaced(tree, id) {
+                    StyleRef::replaced(computed)
                 } else {
-                    StyleRef::new(style_of(styles, fallback, id))
+                    StyleRef::new(computed)
                 };
                 return taffy::compute_leaf_layout(
                     inputs,
                     &style,
                     |_, _| 0.0,
-                    |known, available| measure_leaf(tree, stats, id, known, available),
+                    |known, available| {
+                        measure_leaf(tree, fonts, text, computed, stats, id, known, available)
+                    },
                 );
             }
 
@@ -329,9 +367,17 @@ impl LayoutPartialTree for LayoutContext<'_> {
     }
 }
 
-/// Measures a leaf: a custom node measures itself, everything else is empty.
+/// Measures a leaf: a custom node measures itself, a text node is shaped, and an empty
+/// element is empty.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the borrows are split by field on purpose"
+)]
 fn measure_leaf(
     tree: &mut Tree,
+    fonts: &mut FontSystem,
+    text_map: &mut TextMap,
+    style: &ComputedStyle,
     stats: &mut LayoutStats,
     id: NodeId,
     known: Size<Option<f32>>,
@@ -343,17 +389,44 @@ fn measure_leaf(
         available_width: definite(available.width),
         available_height: definite(available.height),
     };
-    match tree.measure_custom(id, constraints) {
-        Some(size) => {
-            stats.custom_measures += 1;
-            Size {
-                width: size.width,
-                height: size.height,
-            }
-        }
-        // An empty element, or a text node. Text gets a real measurement at M4, when there
-        // is a shaper to ask.
-        None => Size::ZERO,
+    if let Some(size) = tree.measure_custom(id, constraints) {
+        stats.custom_measures += 1;
+        return Size {
+            width: size.width,
+            height: size.height,
+        };
+    }
+
+    let Some(content) = tree.get(id).and_then(|node| node.kind.text()) else {
+        // An empty element.
+        return Size::ZERO;
+    };
+    if content.is_empty() {
+        return Size::ZERO;
+    }
+
+    // A definite width wins over the available space; an unbounded axis means "as wide as
+    // it wants", which is what taffy asks for during intrinsic sizing.
+    let width = known.width.or_else(|| definite(available.width));
+    let layout = crisol_text::shape(
+        fonts,
+        content,
+        &style.to_text_style(),
+        width,
+        // Text in a box wraps. A node that must not wrap says so with `white-space`, which
+        // is not in M3's property subset yet.
+        Wrapping::Word,
+    );
+    let size = layout.size();
+    text_map.insert(id, layout);
+    stats.text_shaped += 1;
+
+    Size {
+        // Report the glyph extent, not the width that was offered: a short line of text in a
+        // wide box is a narrow box, and reporting otherwise makes `align-items: center` put
+        // it in the wrong place.
+        width: size.width,
+        height: size.height,
     }
 }
 
