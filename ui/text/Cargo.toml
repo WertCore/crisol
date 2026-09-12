@@ -12,3 +12,5 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-display-list.workspace = true
+cosmic-text.workspace = true

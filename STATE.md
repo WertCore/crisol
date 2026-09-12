@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M4 — HTML and text (in progress: HTML done, text not started)
+**Current milestone:** M4 — HTML and text (in progress: HTML and the text API done)
 **Last finished:** M3 — CSS and layout
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -144,7 +144,7 @@ number of pixels.
   `ComputedStyle` allocation* — `a_hundred_identically_styled_nodes_share_one_allocation`:
   101 elements cost 2 allocations and 99 interner hits.
 
-**Totals:** 254 tests passing, 0 failing. `cargo clippy --workspace --all-targets
+**Totals:** 282 tests passing, 0 failing. `cargo clippy --workspace --all-targets
 --all-features -- -D warnings` clean, `cargo fmt --all --check` clean.
 
 ---
@@ -176,11 +176,32 @@ Two things in the sink are worth remembering because they were bugs first:
 what comes out of the parser is the same tree the cascade and layout already work on, with no
 adapter in between.
 
-**Still to do for M4, and it is the larger half:** `crisol-text` (the public API of ROADMAP
-§2.5 — shaped runs, cluster boundaries, `point_to_cursor`, `cursor_to_point`, selection
-rectangles, line box geometry), `crisol-text-gpu` (glyphon), font loading and fallback, line
-breaking, and wiring text measurement into `measure_leaf` in `crisol-layout`, which still
-returns a zero size for every text node and has a test saying so.
+**M4, the text API.** `crisol-text` wraps `cosmic-text` behind the public surface §2.5
+requires: shaped runs, cluster boundaries, `point_to_cursor`, `cursor_to_point`, selection
+rectangles and line box geometry. Shaping, bidi analysis, line breaking and font fallback are
+cosmic-text's; the vocabulary is ours, and it is a long-lived commitment (D-28).
+
+All three of M4's acceptance criteria have tests:
+
+- *renders a paragraph with mixed Latin/CJK/emoji correctly* —
+  `mixed_scripts_shape_without_losing_any_text` plus `runs_split_where_the_font_changes`,
+  which asserts the runs tile the line's glyphs with no gaps.
+- *clicking any glyph returns the correct cursor index including at cluster boundaries* —
+  `clicking_each_glyph_returns_the_cursor_on_its_leading_edge`,
+  `clicking_the_trailing_half_of_a_glyph_puts_the_caret_after_it`, and
+  `hit_testing_a_multi_byte_character_never_lands_inside_it`, which sweeps the whole line at
+  half-pixel steps and asserts every answer is a legal caret position.
+- *selection rectangles are correct across a line wrap* —
+  `a_selection_across_a_wrap_produces_one_rectangle_per_line`.
+
+28 tests, asserting relations rather than pixel positions so they hold for any installed
+font (D-29). `CRISOL_REQUIRE_FONTS=1` makes a machine with no fonts a failure rather than a
+skip.
+
+**Still to do for M4:** wire text measurement into `measure_leaf` in `crisol-layout`, which
+still returns a zero size for every text node and has a test saying so; a `DrawCommand` for
+glyph runs; and `crisol-text-gpu` (glyphon) to draw them. The rendering half — getting glyphs
+onto the GPU — is what remains.
 
 ## Open questions
 
@@ -259,10 +280,11 @@ Appended to `DECISIONS.md` in full; summarised here.
    layer is a *public API*, not an internal detail.
 3. Suggested order:
    a. ~~`crisol-html`~~ — done.
-   b. `crisol-text`: `cosmic-text` shaping behind an API that exposes shaped runs, cluster
-      boundaries, `point_to_cursor`, `cursor_to_point`, selection rectangles and line box
-      geometry. Design the API before the implementation; §2.5 is the requirement, and it
-      must not assume LTR even though bidi can be deferred to M8.
-   c. `crisol-text-gpu`: `glyphon` for the atlas and the draw.
-   d. Wire text measurement into `measure_leaf` in `crisol-layout`, which currently returns
-      a zero size for every text node and has a test saying so.
+   b. ~~`crisol-text`~~ — done.
+   c. Wire text measurement into `measure_leaf` in `crisol-layout`. It needs a `FontSystem`
+      and a `TextStyle` projected from `ComputedStyle`, and the resulting `TextLayout` has to
+      be stored per node — another `NodeMap`, the same shape as the style map — so paint can
+      read it without reshaping.
+   d. A `DrawCommand` for glyph runs, then `crisol-text-gpu`: `glyphon` for the atlas and the
+      draw. Watch the tile-GPU constraint (D-09) — glyphon wants its own render pass by
+      default, and the engine draws everything in one.

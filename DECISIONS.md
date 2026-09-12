@@ -568,3 +568,57 @@ correct slope instead of at forty-five degrees.
 instance count for every bordered box while making rounded corners a special case at each
 join.
 
+---
+
+## D-28 — Text positions are byte offsets, and cursors carry affinity
+
+**Status:** Accepted (M4) · **Affects:** M4, M5, M6, M16
+
+ROADMAP §2.5 makes the text layer a public API rather than an internal detail, so the
+vocabulary it uses is a long-lived commitment. Two choices in it are load-bearing.
+
+**Positions are byte offsets into the source string**, always on a `char` boundary.
+
+- **Rejected — `char` counts.** Indexing a `String` by `char` is O(n), and every caller
+  already holds the bytes.
+- **Rejected — UTF-16 offsets.** What the DOM uses, and what M16 will have to convert to.
+  Doing it now would make every Rust-side caller pay for a conversion that only JavaScript
+  needs, at the one boundary where it is cheap to do instead.
+
+**A cursor is an offset plus an [`Affinity`].** One byte offset can be two places on screen:
+at a soft wrap it is both the end of one line and the start of the next, and at a direction
+change in bidirectional text it is both the end of one run and the start of another. Affinity
+is how a caller says which. Dropping it is why so many editors put the caret in the wrong
+place at the end of a wrapped line, and it cannot be added later without changing every
+signature that mentions a position.
+
+**`Direction` is on every run from the first version**, even though bidirectional layout is
+deferred to M8 (ROADMAP §M4 permits deferring it, but requires that the API not assume LTR).
+An API that assumes left-to-right cannot be extended to one that does not, because every
+caller will have baked the assumption into its own arithmetic by then. A test asserts that
+Arabic is *reported* as RTL today, even though laying it out correctly is M8's work.
+
+**A cluster is a byte range, not an offset.** The mapping is not one to one in either
+direction: `é` as `e` plus a combining accent is two characters and one glyph, a ligature is
+several characters and one glyph, and an emoji with a skin-tone modifier is several
+characters and several glyphs that must not be split. Callers step by cluster, so one press
+of an arrow key moves past a whole grapheme rather than leaving the text visibly broken.
+
+## D-29 — Tests assert relations, not pixel positions
+
+**Status:** Accepted (M4) · **Affects:** M4 onwards
+
+Text tests run against whatever fonts the machine has, and those differ between a developer's
+laptop and a CI runner. A test that pins an advance width to two decimal places tests the
+font, not the engine, and fails for the wrong reason on a machine that happens to have a
+different one.
+
+So the text suite asserts *relations*: glyph positions increase monotonically, clusters tile
+the string with no gaps, a cursor round-trips through a point, selection rectangles line up
+with the lines they cover, hit testing anywhere along a line always lands on a cluster
+boundary. Those hold for any font.
+
+`CRISOL_REQUIRE_FONTS=1` turns a machine with no fonts from a skip into a failure, the same
+way `CRISOL_REQUIRE_GPU` does for the renderer. A suite where everything silently skipped is
+indistinguishable from one where everything passed.
+
