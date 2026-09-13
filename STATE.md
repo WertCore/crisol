@@ -701,7 +701,22 @@ Three decisions in it worth stating:
   of its own, and the last motion before a release is not guaranteed to arrive, so the drop
   hit-tests where it says it happened.
 
-**What this does not do, and it is the larger point.** `EventSystem` has no consumers outside
+**Now wired into the example, both paths.** The scripted run drives a pointer and a drag
+through `EventSystem` and asserts across the seam; the live window routes `PointerMoved`
+through it so `:hover` matches, and translates winit's `DragEntered`, `DragPosition`,
+`DragDropped` and `DragLeft` into the engine's own. Dropping on a row selects it, which is the
+visible proof that a drop reaches a *node* rather than the window, and the row under a drag
+carries a `drop-target` class while it is there.
+
+`DragDropped` carries no position, so the drop is told where it happened from the last
+`DragPosition` — the example keeps it for exactly that reason. A `DragEntered` without a
+position is ignored rather than guessed at; the `DragPosition` along in a moment will say.
+
+Worth being exact about coverage: the dispatch itself is asserted on all three platforms in
+CI, and the live window methods are compile-checked only, because they need a real surface and
+a real drag. What is tested is the part that could be silently wrong.
+
+**The gap this closed, and what remains of it.** `EventSystem` had no consumers outside
 its own tests. The todo example uses `hit_test`, `scroll_at` and `scroll_from` directly and
 never registers a listener; `apply_state` — the call that writes `:hover`, `:focus` and
 `:active` onto elements — is called only from the events crate's tests. No example styles any

@@ -81,6 +81,11 @@ const CSS: &str = "
         padding-left: 8px; padding-right: 8px;
     }
     li.selected { background-color: rgb(34, 40, 49) }
+    /* The reason `apply_state` exists. Nothing in this example styled an interaction
+       pseudo-class until the event system was wired up, which is how a `:hover` that never
+       reached the cascade went unnoticed since M5. */
+    li.todo:hover { background-color: rgb(28, 33, 41) }
+    li.todo.drop-target { background-color: rgb(50, 62, 44) }
     li.done .label { color: rgb(106, 115, 125) }
     .mark { cursor: cell; display: block; width: 30px; color: rgb(152, 195, 121) }
     .label { display: block; flex-grow: 1 }
@@ -740,6 +745,12 @@ impl App {
 
 struct State {
     pointer: Point,
+    /// Input goes through this rather than around it, which is what makes `:hover` work and
+    /// what a drop is routed by.
+    events: EventSystem,
+    /// The last position a drag reported. `DragDropped` carries none of its own, so the drop
+    /// has to be told where it happened, and this is the only thing that knows.
+    drag: Option<Point>,
     /// What the window is currently showing, so a mouse move that changes nothing does not
     /// talk to the window server sixty times a second.
     cursor: Option<cursor_icon::CursorIcon>,
@@ -776,6 +787,8 @@ impl State {
 
         Self {
             pointer: Point::ZERO,
+            events: EventSystem::new(),
+            drag: None,
             cursor: Some(cursor_icon::CursorIcon::Default),
             surface,
             renderer,
@@ -823,6 +836,91 @@ impl State {
     ///
     /// `cursor` is inherited, so the value on the text inside a row is the row's — without
     /// that the pointer would flicker back to an arrow as it crossed each label.
+    /// Routes the pointer through the event system so `:hover` is matched against something
+    /// true. Returns whether anything changed, which is whether a frame is worth drawing.
+    fn hover(&mut self) -> bool {
+        self.events
+            .pointer_moved(&self.tree, pointer_at(self.pointer), &());
+        self.events.apply_state(&mut self.tree) > 0
+    }
+
+    /// Moves a drag to a position reported by the platform, in physical pixels.
+    fn drag_to(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        let scale = self.surface.scale_factor();
+        let at = Point::new(position.x as f32 / scale, position.y as f32 / scale);
+        self.drag = Some(at);
+        let drag = DragEvent {
+            position: at,
+            modifiers: Modifiers::default(),
+        };
+        let over = self.events.drag_moved(&self.tree, drag, &());
+        self.mark_drop_target(over);
+    }
+
+    /// Drops on whatever the drag was last over.
+    ///
+    /// The payload is not here. winit hands dragged data over asynchronously by
+    /// `DataTransferId`, so an application that wants the file asks for it separately; this
+    /// example only needs to show that the drop found the right row.
+    fn drop_it(&mut self) {
+        let Some(at) = self.drag.take() else {
+            return;
+        };
+        let drag = DragEvent {
+            position: at,
+            modifiers: Modifiers::default(),
+        };
+        if let Some(node) = self.events.drag_dropped(&self.tree, drag, &()) {
+            // Selecting the row is the visible proof that the drop landed on a particular
+            // one rather than on the window. `list`'s children are the visible rows in
+            // order, which is exactly what `selected` indexes.
+            if let Some(row) = self.row_of(node) {
+                if let Some(index) = self.tree.children(self.app.list).position(|id| id == row) {
+                    self.runtime.set(self.app.selected, index);
+                    let mut dom = Dom::new(&mut self.tree);
+                    self.runtime.flush(&mut dom);
+                }
+            }
+        }
+        self.mark_drop_target(None);
+    }
+
+    /// Ends a drag that left without dropping.
+    fn drag_cancelled(&mut self) {
+        self.drag = None;
+        self.events.drag_left(DragEvent {
+            position: Point::ZERO,
+            modifiers: Modifiers::default(),
+        });
+        self.mark_drop_target(None);
+    }
+
+    /// Puts `drop-target` on the row under the drag and takes it off every other.
+    fn mark_drop_target(&mut self, under: Option<NodeId>) {
+        let wanted = under.and_then(|node| self.row_of(node));
+        let rows: Vec<_> = self.tree.children(self.app.list).collect();
+        let mut dom = Dom::new(&mut self.tree);
+        for row in rows {
+            if Some(row) == wanted {
+                dom.add_class(row, "drop-target");
+            } else {
+                dom.remove_class(row, "drop-target");
+            }
+        }
+    }
+
+    /// The `li.todo` at or above `node`, if there is one.
+    fn row_of(&self, node: NodeId) -> Option<NodeId> {
+        let mut at = Some(node);
+        while let Some(id) = at {
+            if self.tree.parent(id) == Some(self.app.list) {
+                return Some(id);
+            }
+            at = self.tree.parent(id);
+        }
+        None
+    }
+
     fn update_cursor(&mut self) {
         let icon = hit_test(&self.tree, self.pointer)
             .and_then(|hit| {
@@ -977,6 +1075,34 @@ impl ApplicationHandler for Shell {
                 let scale = state.surface.scale_factor();
                 state.pointer = Point::new(position.x as f32 / scale, position.y as f32 / scale);
                 state.update_cursor();
+                if state.hover() {
+                    state.surface.window().request_redraw();
+                }
+            }
+            // ---- drag and drop ---------------------------------------------------------
+            //
+            // winit 0.31 reports a drag's position (D-51); 0.30 did not, which is why this
+            // could not be written before. `DragEntered` may or may not carry one depending
+            // on the platform, `DragPosition` always does, and `DragDropped` never does —
+            // so the drop is told where it happened from whatever the last two recorded.
+            WindowEvent::DragEntered {
+                position: Some(position),
+                ..
+            } => {
+                state.drag_to(position);
+                state.surface.window().request_redraw();
+            }
+            WindowEvent::DragPosition { position, .. } => {
+                state.drag_to(position);
+                state.surface.window().request_redraw();
+            }
+            WindowEvent::DragDropped { .. } => {
+                state.drop_it();
+                state.surface.window().request_redraw();
+            }
+            WindowEvent::DragLeft { .. } => {
+                state.drag_cancelled();
+                state.surface.window().request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // A trackpad on macOS has already been through the system's own momentum by
