@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M9 — GC and value representation (in progress: `Value` and shapes done)
+**Current milestone:** M9 — GC and value representation. **Acceptance met**; see below for what the ASAN half of it does and does not mean.
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 601 tests passing
+**Totals:** 620 tests passing
 
 ## Open questions
 
@@ -1182,8 +1182,44 @@ Lookup walks the chain: O(properties), and §3.4 already says the speed comes fr
 monomorphic cache in the IR rather than from making this O(1). A flat map per shape would be
 O(n²) in memory across a transition chain, for objects that are mostly small.
 
-**Still to do for M9:** the mark-sweep collector, the shadow stack for Rust-held roots,
-`GcRef<T>`, and the stress mode that collects on every allocation. **Accept:** a cyclic object graph whose roots are dropped is
+### The collector, and §M9's acceptance
+
+`crisol-gc` is a precise mark-sweep collector with a shadow stack, a scope-guard rooting API
+and a stress mode (D-55).
+
+**§M9's acceptance — "a cyclic object graph, drops all roots, and the collector reclaims it" —
+passes.** `a_cycle_whose_roots_are_dropped_is_reclaimed` builds `a → b → a`, drops the scope,
+and both are swept. That test matters more than it looks: a collector that leaks cycles passes
+everything else here, because refcounting would too.
+
+**Rooting is a scope guard because §M9 asks for the API to be hard to misuse.** There is no way
+to get a `Rooted` without a `Scope`, and a `Rooted` borrows its scope, so the mistake is a
+compile error rather than something the collector finds later. Dropping is the only way to
+unroot — there is no `pop` to forget.
+
+**A `GcRef` is a slot and a generation, not an address**, so a handle whose object was
+collected reads nothing even after the slot is reused (D-17's argument, where it is worth
+more). 32 + 16 bits, because 48 is what a `Value` carries (D-53); a handle that did not fit
+would box every object reference in the language.
+
+Three guards were checked by breaking them: dropping the generation check fails the stale-handle
+test, a sweep that frees nothing fails both cycle tests, and a scope guard that forgets to
+unroot fails six.
+
+**About the ASAN half of the acceptance.** It asks for "stress mode runs the full suite with
+zero use-after-free under ASAN". **That clause is vacuous under this design rather than
+satisfied by it** — there is no `unsafe` in `crisol-gc` or `crisol-value`, so a use-after-free
+in the sense ASAN detects is not expressible; a stale handle is a detected error instead.
+Stronger than asked, and worth stating plainly, because "ASAN was clean" would imply a check
+that did not happen.
+
+It is also not permanent. It holds *because* objects sit in a slab behind checked handles. At
+M13, compiled code will want to dereference directly — most of the point of compiling — and
+then the checks stop being free and ASAN starts having something to look at. Re-open it when
+there is generated code to measure.
+
+**M9 is therefore complete** apart from that caveat being understood: value representation,
+shapes, collector, shadow stack, `GcRef`, stress mode. **Accept:** a cyclic object graph whose roots are dropped is
 reclaimed, and the full suite runs under stress mode with zero use-after-free under ASAN.
 
 §3.1 is the risk and it is a design risk rather than an implementation one: every host function
@@ -1195,9 +1231,11 @@ Prefer a scope guard over manual push/pop.
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A is complete (M0–M8). M9 is under way: `Value` and the shape system are done, the
-   collector is not.** Next is the mark-sweep collector, the shadow stack, `GcRef<T>` and
-   stress mode; §M9's acceptance needs all of them. The rooting API is the part to get right
+2. **Track A is complete (M0–M8). M9 is complete too** — value representation, shapes,
+   collector, shadow stack, `GcRef`, stress mode, and its acceptance. Next is **M10 — frontend
+   and module graph**, or M11's IR; §M9 said to do the GC before the IR and that is now done.
+   Read D-55's last section first: the collector's safety rests on objects sitting behind
+   checked handles, and M13 is where that assumption comes due. The rooting API is the part to get right
    rather than the collector — see §3.1 and the M9 section above.
    - **Track A's remaining gaps**, which are filed rather than buried:
      [#20](https://github.com/WertCore/crisol/issues/20) a paint-only style change still costs

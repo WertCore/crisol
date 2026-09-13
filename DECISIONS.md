@@ -1422,3 +1422,59 @@ rather than a slow one.
 early. The requirements differ as well: `Atom::lowercase` exists because HTML names are
 case-insensitive, and applying it to a JavaScript property name would be a bug — `obj.X` and
 `obj.x` are different properties. There is a test named after that.
+
+---
+
+## D-55 — Objects live in a slab behind checked handles, not behind raw pointers
+
+**Status:** Accepted (M9) · **Affects:** M9, M13, §3.1
+
+ROADMAP §3.1 names the GC/FFI boundary as M9's risk: Rust code holding a JS value must not
+hide it from the collector, and getting it wrong gives use-after-free bugs that appear only
+under memory pressure — "the worst possible failure mode to debug". Two decisions follow from
+taking that seriously rather than agreeing with it.
+
+**A `GcRef` is a slot index and a generation, not an address.** Reading through a handle whose
+object has been collected fails its liveness check and returns `None`, even when the slot has
+since been reused. That is `crisol-tree`'s `NodeId` argument (D-17) applied to a collector,
+where it is worth more: a stale node handle is a bug, a stale object handle is the exact
+failure §3.1 describes. Checked by freeing an object, allocating into its slot, and asserting
+the old handle reads nothing.
+
+Thirty-two bits of slot and sixteen of generation, because 48 is what a `Value` carries (D-53).
+A handle that did not fit would have to be boxed and every object reference in the language
+would cost an indirection. When the generation cannot advance the slot is **retired rather than
+reused** — that leaks one slot per 65,536 reuses, against an ABA bug that reads one object
+through another's handle.
+
+**Rooting is a scope guard, because §M9 says to make it hard to misuse and prefers one to
+manual push/pop.** There is no way to obtain a `Rooted` without a `Scope`, and a `Rooted`
+borrows its scope, so the mistake is a compile error rather than something the collector
+discovers later. Dropping is the only way to unroot; there is no `pop` to forget.
+
+`alloc` and `collect` therefore take `&self` and the heap uses interior mutability. They have
+to: a guard that restored the root stack on drop while allocation held `&mut self` would make
+two live scopes impossible, and nested scopes are the ordinary shape of a call stack.
+
+**Marking is precise.** An object's outgoing references are exactly the slot values that carry
+an address, so nothing is retained because an integer happened to look like a pointer. There
+is a test that puts a handle's bits into a slot *as a number* and asserts the target is still
+collected.
+
+### What this costs, and when it comes due
+
+**The acceptance's ASAN clause is vacuous under this design rather than satisfied by it.**
+There is no `unsafe` in `crisol-gc` or `crisol-value`, so a use-after-free in the sense ASAN
+detects is not expressible. That is stronger than the acceptance asks for and it is worth
+saying plainly, because "we ran ASAN and it was clean" would imply a check that did not
+happen.
+
+It is also not free and not permanent. It holds *because* objects sit in a slab behind checked
+handles. At M13 compiled code will want to dereference objects directly — that is most of the
+point of compiling — and at that moment the bounds and generation checks stop being free, the
+representation has to grow a raw-pointer path, and ASAN starts having something to look at.
+The right time to re-open this is when there is generated code to measure, not now.
+
+**Also not decided:** generational or incremental collection. Mark-sweep stops the world and
+walks everything live, which is fine for a heap that has not been measured yet and is the
+first thing to revisit if pause times matter. §M9 asks for mark-sweep and that is what this is.
