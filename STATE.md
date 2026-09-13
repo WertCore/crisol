@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** Track A is complete. Next is M9 — GC and value representation.
+**Current milestone:** M9 — GC and value representation (in progress: `Value` done)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 568 tests passing
+**Totals:** 586 tests passing
 
 ## Open questions
 
@@ -1136,17 +1136,48 @@ Appended to `DECISIONS.md` in full; summarised here.
 
 ---
 
+## M9 — GC and value representation
+
+### `Value`: numbers unboxed, everything else in the NaNs
+
+`crisol-value` holds a JavaScript value in one `u64` (D-53). Numbers are stored as themselves
+and everything else hides in the 2^52 NaN patterns JavaScript cannot observe, because the
+double *is* JavaScript's only number type and so is the hot path by definition.
+
+The subtle part is not the layout, it is **NaN canonicalisation**. A NaN carrying an arbitrary
+payload can have the tag bits set, and without rewriting it on the way in it reads back as an
+object whose address is the mantissa — §3.1's "use-after-free that appears only under memory
+pressure", which is the failure mode M9 exists to design out. Checked by removing the rewrite
+and watching the hostile NaN come back as an `Object`.
+
+Two smaller things worth carrying forward:
+
+- **`kind()` is total over all 2^64 patterns**, because `from_bits` is reachable from generated
+  code and a value no safe constructor produces must not be able to abort a program.
+- **Derived equality is `Object.is`, not `===`.** `Object.is(NaN, NaN)` is true and bitwise
+  equality agrees *because* of the canonicalisation; `Object.is(0, -0)` is false and bitwise
+  equality agrees because the sign bit differs. `===` disagrees with both. There is a test
+  named after this so it is found by reading rather than by debugging.
+
+**Still to do for M9:** the hidden-class/shape system with §3.2's `is_exotic` bit, the
+mark-sweep collector, the shadow stack for Rust-held roots, `GcRef<T>`, and the stress mode
+that collects on every allocation. **Accept:** a cyclic object graph whose roots are dropped is
+reclaimed, and the full suite runs under stress mode with zero use-after-free under ASAN.
+
+§3.1 is the risk and it is a design risk rather than an implementation one: every host function
+that touches a JS value participates in rooting, so the rooting API has to be hard to misuse.
+Prefer a scope guard over manual push/pop.
+
+---
+
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A is complete (M0–M8), acceptance included.** The roadmap calls it independently
-   useful and shippable on its own, so there are two honest directions and they are not
-   ordered by the roadmap:
-   - **Start M9 — GC and value representation**, which begins Track B. §M9 says to do it
-     *before* the IR because it constrains the calling convention, the IR and the ABI, and
-     §3.1 flags rooting as the risk: every host function touching a JS value participates, so
-     the rooting API has to be hard to misuse — prefer a scope guard over manual push/pop.
-   - **Or close out Track A's own gaps first**, which are filed rather than buried:
+2. **Track A is complete (M0–M8). M9 is under way: `Value` is done, the shape system and the
+   collector are not.** Continue with the shape system (§3.2's `is_exotic` bit) or the
+   mark-sweep collector; §M9's acceptance needs both. The rooting API is the part to get right
+   rather than the collector — see §3.1 and the M9 section above.
+   - **Track A's remaining gaps**, which are filed rather than buried:
      [#20](https://github.com/WertCore/crisol/issues/20) a paint-only style change still costs
      a relayout (the unfinished half of D-45, and the one with a written test for when it is
      fixed), [#16](https://github.com/WertCore/crisol/issues/16) nested rounded clips, and

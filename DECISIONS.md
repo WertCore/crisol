@@ -1320,3 +1320,58 @@ than this. They are also a dependency on someone else's opinion about what a cri
 is, at the exact milestone where that question is being answered, and `tauri-bundler` in
 particular carries a WebView-shaped worldview that is the thing this engine exists to avoid.
 Revisit at M21 when there is a real release process to serve.
+
+---
+
+## D-53 — Numbers are unboxed and everything else hides in the NaNs
+
+**Status:** Accepted (M9) · **Affects:** M9, M11, M13, M16
+
+ROADMAP §M9 says NaN-boxing on 64-bit and this records which way round it was done, because
+the arrangement is not the obvious one and it is hard to change later: `Value` is the calling
+convention as much as it is a type, so the IR (M11) and codegen (M13) are both built on this
+byte layout.
+
+**Numbers are stored as themselves; tagged values live in the space doubles do not use.** A
+double has 2^52 NaN bit patterns and JavaScript can observe exactly one of them, so all but one
+are free. The alternative — tag the pointers and box the doubles — costs an allocation and an
+indirection on every arithmetic result. JavaScript's only number type *is* the double, so that
+is the hot path by definition, and making it the slow one in order to keep pointer handling
+tidy is the wrong way round.
+
+**The tag reserves one mantissa bit beyond the quiet bit.** `TAG_BASE` is `0x7FFC…`, not
+`0x7FF8…`. That extra bit is what leaves the canonical quiet NaN — the pattern every FPU
+produces — on the *number* side of the line, so arithmetic that overflows into NaN needs no
+handling at the point it happens. Reserving only the quiet bit would have made every NaN the
+hardware produces look like a tagged value with payload zero.
+
+**NaN is canonicalised on the way in, and this is the load-bearing safety property.** A NaN
+carrying an arbitrary payload — which bit manipulation or a foreign producer can hand over,
+even though arithmetic will not — can have the tag bits set. Without the rewrite it comes back
+as an `Object` whose address is the mantissa, and the first thing that dereferences it crashes
+a long way from the cause. That is exactly §3.1's "use-after-free bugs that appear only under
+memory pressure", which is the failure mode M9 exists to design out. The rewrite costs one
+predictable branch, and JavaScript cannot tell two NaNs apart, so nothing is lost.
+
+Checked by removing it: `a_nan_with_the_tag_bits_set_is_still_a_number` fails, and the hostile
+NaN is read back as an object.
+
+**48 bits of address, refused rather than truncated.** Every platform this engine targets gives
+user space a 48-bit virtual address, so a heap pointer fits exactly. `Address::new` returns
+`None` above that instead of masking, because a truncated pointer is *wrong* rather than
+obviously invalid and the crash lands somewhere else entirely.
+
+**`kind()` is total over all 2^64 patterns.** `from_bits` is reachable from generated code, so
+a pattern no safe constructor produces must not be able to abort the program. An unrecognised
+singleton payload reads as `undefined` rather than panicking.
+
+**A consequence worth knowing before someone reaches for `==`:** derived equality on `Value` is
+JavaScript's `Object.is`, not `===`. `Object.is(NaN, NaN)` is true and bitwise equality agrees
+*because* of the canonicalisation above; `Object.is(0, -0)` is false and bitwise equality agrees
+because the sign bit differs. `===` disagrees with both. There is a test named after this so it
+is discovered by reading rather than by debugging.
+
+**Not decided here:** small-integer unboxing. Storing int32s in their own tag saves the
+double↔int conversion in loops, and it also adds a second numeric representation that every
+arithmetic site has to handle. Worth measuring against real code at M20 rather than assuming
+now; nothing in this layout precludes it, since two tag slots are still free.
