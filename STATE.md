@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M9 — GC and value representation. **Acceptance met**; see below for what the ASAN half of it does and does not mean.
+**Current milestone:** M10 — frontend and module graph (in progress: the graph is done; `oxc` is not)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 620 tests passing
+**Totals:** 634 tests passing
 
 ## Open questions
 
@@ -1228,14 +1228,54 @@ Prefer a scope guard over manual push/pop.
 
 ---
 
+## M10 — frontend and module graph
+
+### The module graph, and why it is here before the parser
+
+`crisol-frontend` holds the graph: specifiers, edges, evaluation order, cycle detection
+(D-56). It knows nothing about `oxc`, deliberately — what a graph *is*, and what a cycle in one
+means, is decided by the ES module specification rather than by whichever crate read the
+source, and split this way the ordering rules are tested against hand-built graphs where a
+cycle takes three lines.
+
+**A cycle is ordered, not rejected.** `react` and `react-dom` have shipped cycles for years;
+a graph that refused one would refuse to build most real programs, which is §3.3's failure mode
+exactly. `cycles()` reports them so a consumer can warn or explain a temporal-dead-zone error,
+but nothing refuses to proceed. Reporting filters out components of one that are not
+self-referential — without that, every acyclic module is reported and the report is useless.
+
+Both walks are iterative because the input is somebody's `node_modules` and its depth is not
+this code's to bound. There is a 100,000-deep chain in the tests.
+
+### What M10 still needs, and what stands in the way
+
+`oxc` for parsing JS/TS/JSX, `oxc_resolver` for `package.json` exports and CJS interop, and the
+acceptance: *"resolves and parses a real `node_modules` tree containing React, producing a
+complete module graph with no unresolved imports."*
+
+Two practical obstacles, recorded so the next session does not rediscover them:
+
+- **`oxc` is a large new dependency tree** and this machine's disk is the binding constraint —
+  the five-step gate already wants ~2.5 GiB against a resting ~1 GiB free. Adding oxc and a
+  React `node_modules` on top needs headroom that has to be made first.
+- **`npm` here is aliased to `pmg npm`, which does not work in this shell** (see the sessions'
+  notes on the PMG proxy). Fetching a real React tree needs that fixed or a vendored fixture
+  committed instead.
+
+Neither is a code problem and neither is solved by trying harder at the wrong moment.
+
+---
+
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A is complete (M0–M8). M9 is complete too** — value representation, shapes,
-   collector, shadow stack, `GcRef`, stress mode, and its acceptance. Next is **M10 — frontend
-   and module graph**, or M11's IR; §M9 said to do the GC before the IR and that is now done.
-   Read D-55's last section first: the collector's safety rests on objects sitting behind
-   checked handles, and M13 is where that assumption comes due. The rooting API is the part to get right
+2. **Track A (M0–M8) and M9 are complete. M10 is under way: the module graph is done, `oxc`
+   is not.** Before starting the parser work, read the obstacles in the M10 section above —
+   `oxc` is a large dependency tree against a disk that is already the binding constraint, and
+   the acceptance needs a real React `node_modules` that this shell's broken `npm` cannot
+   fetch. Make the headroom first, or vendor a fixture. Also read D-55's last section: the
+   collector's safety rests on objects sitting behind checked handles, and M13 is where that
+   assumption comes due. The rooting API is the part to get right
    rather than the collector — see §3.1 and the M9 section above.
    - **Track A's remaining gaps**, which are filed rather than buried:
      [#20](https://github.com/WertCore/crisol/issues/20) a paint-only style change still costs
