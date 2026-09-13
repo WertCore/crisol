@@ -52,6 +52,14 @@ pub struct StyleRule {
 /// A parsed stylesheet.
 #[derive(Debug)]
 pub struct Stylesheet {
+    /// Whether any selector in here uses `+` or `~`.
+    ///
+    /// Invalidation reads this. A state or attribute change on a node can affect its
+    /// following siblings *only* through those two combinators (D-38), so a sheet without
+    /// them makes the sibling half of that walk provably dead work — and on a long list it
+    /// is the expensive half. Computed once at parse rather than asked per invalidation,
+    /// because it is a property of the sheet and the sheet does not change.
+    pub uses_sibling_combinators: bool,
     /// The rules, in source order.
     pub rules: Vec<StyleRule>,
     /// Where these rules came from.
@@ -119,11 +127,16 @@ impl Stylesheet {
             rules: Vec::new(),
             origin,
             warnings: Vec::new(),
+            uses_sibling_combinators: false,
         };
         let mut source_order = 0;
         for rule in &parsed.rules.0 {
             sheet.collect(rule, &mut source_order);
         }
+        sheet.uses_sibling_combinators = sheet
+            .rules
+            .iter()
+            .any(|rule| selectors_use_sibling_combinators(&rule.selectors));
         Ok(sheet)
     }
 
@@ -226,6 +239,30 @@ impl Stylesheet {
     fn warn(&mut self, line: u32, message: String) {
         self.warnings.push(Warning { message, line });
     }
+}
+
+/// Whether any selector in `list` can reach across a sibling boundary.
+///
+/// Walks the components in match order and looks for the two combinators that do it. `:is()`
+/// and `:where()` hold nested selector lists, so those are walked too — a `+` inside one is
+/// still a `+`, and missing it would make the invalidation narrower than the dialect allows,
+/// which is the one direction that turns a performance change into a correctness bug.
+fn selectors_use_sibling_combinators(list: &SelectorList) -> bool {
+    use selectors::parser::{Combinator, Component};
+
+    fn selector_does(selector: &crate::selector::Selector) -> bool {
+        selector
+            .iter_raw_match_order()
+            .any(|component| match component {
+                Component::Combinator(Combinator::NextSibling | Combinator::LaterSibling) => true,
+                Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
+                    list.slice().iter().any(selector_does)
+                }
+                _ => false,
+            })
+    }
+
+    list.slice().iter().any(selector_does)
 }
 
 /// Parses the body of a `style` attribute: a declaration list, with no selector or braces.

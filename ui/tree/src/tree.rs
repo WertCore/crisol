@@ -78,6 +78,14 @@ pub struct Tree {
     free: Vec<u32>,
     root: Option<NodeId>,
     stats: TreeStats,
+    /// Whether any loaded stylesheet can match across a sibling boundary — see
+    /// [`Self::set_sibling_selectors`].
+    ///
+    /// `None` means no style pass has said yet, which is treated exactly like `Some(true)`.
+    /// An `Option` rather than a `bool` so that `Default` lands on "unknown" instead of on
+    /// "there are none": the narrow answer is the one that can be wrong, and it should never
+    /// be reached by forgetting to set something.
+    sibling_selectors: Option<bool>,
 }
 
 impl Tree {
@@ -771,11 +779,28 @@ impl Tree {
     pub fn mark_selector_state_changed(&mut self, id: NodeId) {
         self.mark_subtree_dirty(id, DirtyFlags::STYLE);
 
+        // The sibling half is skipped only when a style pass has positively said no rule can
+        // reach across a sibling boundary. Unknown is treated as yes: this walk being too
+        // wide costs time, and being too narrow drops a rule that should have applied.
+        if self.sibling_selectors == Some(false) {
+            return;
+        }
         let mut sibling = self.next_sibling(id);
         while let Some(node) = sibling {
             self.mark_subtree_dirty(node, DirtyFlags::STYLE);
             sibling = self.next_sibling(node);
         }
+    }
+
+    /// Tells the tree whether any loaded stylesheet uses `+` or `~`.
+    ///
+    /// Called by the style engine, which is the only thing that knows. Invalidation is
+    /// conservative in the shape the selector dialect guarantees (D-38), and this narrows
+    /// *which* dialect: a sheet with no sibling combinator cannot make a node's change
+    /// affect its following siblings, so walking them is provably dead work — and on a long
+    /// list it is the expensive part, because each marked sibling marks the rest of the list.
+    pub fn set_sibling_selectors(&mut self, used: bool) {
+        self.sibling_selectors = Some(used);
     }
 
     /// Marks `id` and everything beneath it.

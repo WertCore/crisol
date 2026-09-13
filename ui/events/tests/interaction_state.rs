@@ -117,29 +117,28 @@ fn hovering_does_not_restyle_the_whole_document() {
     );
 }
 
-#[test]
-fn crossing_rows_pays_the_sibling_combinator_and_this_is_what_it_costs() {
-    // Not a regression and not an accident: D-38 invalidates a state change conservatively —
-    // the node, its descendants, and its *following siblings*, because `.row:hover + .row`
-    // is expressible. Marking row 1 therefore marks rows 2..n, and marking row 2 marks
-    // 3..n, so crossing one boundary in a long list touches most of the list.
-    //
-    // Before `apply_state` marked anything this cost nothing, because `:hover` never
-    // applied at all. Making it correct is what makes the price visible, and the price is
-    // worth writing down: a hover-heavy list pays it on every row boundary the pointer
-    // crosses, which is the one input that happens continuously.
-    //
-    // The obvious way out is not to fix the invalidation but to narrow it: if no rule in
-    // any loaded stylesheet uses `+` or `~`, the sibling half is pure waste and the engine
-    // knows its own stylesheets. Left alone until something needs it — this test is the
-    // baseline it would be measured against.
+/// A 200-row list, and the two rows the pointer crosses between.
+fn rows_and_engine(css: &str) -> (crisol_html::Document, StyleEngine) {
     let rows: String = (0..200)
         .map(|i| format!("<li class=row><span>{i}</span></li>"))
         .collect();
-    let mut document = crisol_html::parse(&format!("<body><ul>{rows}</ul></body>"));
-    let css = ".row { width: 100px; height: 20px } .row:hover { color: red }";
+    let document = crisol_html::parse(&format!("<body><ul>{rows}</ul></body>"));
     let mut engine = StyleEngine::new();
     engine.add_stylesheet(Stylesheet::parse(css).unwrap());
+    (document, engine)
+}
+
+#[test]
+fn crossing_rows_restyles_only_the_rows_that_changed() {
+    // D-38 invalidates a state change to the node, its descendants and its *following
+    // siblings*, because `.row:hover + .row` is expressible. When no rule in the sheet
+    // actually expresses it, that last part is provably dead work — and it is the expensive
+    // part, because each marked row marks the rest of the list.
+    //
+    // This sheet has no `+` or `~`, so the engine tells the tree so and the walk stops at
+    // the two rows that really changed. It was 400 of 604 before the narrowing.
+    let (mut document, mut engine) =
+        rows_and_engine(".row { width: 100px; height: 20px } .row:hover { color: red }");
     let (mut styles, _) = engine.restyle_incremental(&mut document.tree, &StyleMap::default());
     layout(
         &mut document.tree,
@@ -160,10 +159,67 @@ fn crossing_rows_pays_the_sibling_combinator_and_this_is_what_it_costs() {
     events.apply_state(&mut document.tree);
     let (_, stats) = engine.restyle_incremental(&mut document.tree, &styles);
 
-    let total = document.tree.len();
-    assert!(
-        stats.elements > total / 4,
-        "measured at 400 of 604 when written; if this has dropped, the invalidation was \
-         narrowed and the comment above needs revisiting rather than the number"
+    assert_eq!(
+        stats.elements, 4,
+        "the row left and the row entered, each with its span — and nothing else"
+    );
+}
+
+#[test]
+fn a_sheet_that_uses_a_sibling_combinator_still_gets_the_wide_walk() {
+    // The guard on the optimisation: narrowing is sound only while nothing can match across
+    // a sibling boundary, so a sheet that can must go back to paying for it. Asserted by the
+    // rule *working* rather than by counting elements — cost is the means, the rule applying
+    // is what would actually be broken.
+    //
+    // The isolation matters and the first version of this test did not have it. Entering the
+    // document hovers the whole chain up to `html`, and marking `html` dirties everything —
+    // so a sibling rule appears to work even with the sibling walk disabled entirely. The
+    // move below is the *second* one: `html` and `body` keep their bit and are not re-marked,
+    // so row 2 can only be reached by walking siblings from row 1.
+    let (mut document, mut engine) =
+        rows_and_engine(".row { width: 100px; height: 20px } .row:hover + .row { color: red }");
+    let (mut styles, _) = engine.restyle_incremental(&mut document.tree, &StyleMap::default());
+    layout(
+        &mut document.tree,
+        &styles,
+        &mut FontSystem::empty(),
+        Size {
+            width: 200.0,
+            height: 4200.0,
+        },
+    );
+
+    let rows: Vec<_> = {
+        let list = document
+            .tree
+            .children(document.tree.root().unwrap())
+            .flat_map(|body| document.tree.children(body))
+            .next()
+            .expect("the ul");
+        document.tree.children(list).collect()
+    };
+
+    let mut events = EventSystem::new();
+    // First move: settles the ancestors, so they are not re-marked by the next one.
+    events.pointer_moved(&document.tree, pointer_at(Point::new(5.0, 10.0)), &());
+    events.apply_state(&mut document.tree);
+    styles = engine.restyle_incremental(&mut document.tree, &styles).0;
+    assert_eq!(styles.get(rows[1]).unwrap().color, RED, "row 0 hovered");
+
+    // Second move, row 0 -> row 1. Only those two change state.
+    events.pointer_moved(&document.tree, pointer_at(Point::new(5.0, 30.0)), &());
+    events.apply_state(&mut document.tree);
+    styles = engine.restyle_incremental(&mut document.tree, &styles).0;
+
+    assert_eq!(
+        styles.get(rows[2]).unwrap().color,
+        RED,
+        "row 1 is hovered, so `+` must colour row 2 — reachable only by walking siblings"
+    );
+    assert_ne!(
+        styles.get(rows[1]).unwrap().color,
+        RED,
+        "and row 1 must have stopped being the one after the hovered row"
     );
 }

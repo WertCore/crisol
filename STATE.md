@@ -746,9 +746,27 @@ marks the rest of the list. It cost nothing before only because `:hover` never w
 re-marked — so this is a per-boundary cost rather than a per-move one, and there is a test
 pinning both numbers.
 
-The way out, when something needs it, is to narrow the invalidation rather than repair it: if
-no rule in any loaded stylesheet uses `+` or `~`, the sibling half is pure waste, and the
-engine knows its own stylesheets.
+**Narrowed, and it was worth 100x.** If no rule in any loaded stylesheet uses `+` or `~`, a
+node's change cannot reach its following siblings, so walking them is provably dead work.
+`Stylesheet` computes that once at parse, the engine tells the tree on every restyle, and
+`mark_selector_state_changed` skips the sibling walk when the answer is a positive no.
+Crossing a row boundary in the 200-row list went from **400 of 604 elements to 4** — the row
+left and the row entered, each with its span.
+
+The flag is `Option<bool>` rather than `bool` so that `Default` lands on *unknown*, which is
+treated as yes. The narrow answer is the one that can be wrong, and it should not be reachable
+by forgetting to set something. `:is()`, `:where()` and `:not()` are walked into, because a
+`+` inside one is still a `+`.
+
+`set_attribute` gets the same win for free, since it marks through the same call.
+
+**The guard on it needed two attempts, which is the part worth remembering.** The first test
+asserted that `.row:hover + .row` still worked, and it passed with the sibling walk disabled
+entirely. Entering the document hovers the chain up to `html`, and marking `html` dirties
+everything — so the sibling rule appeared to work for a reason that had nothing to do with
+siblings. The real test moves the pointer a *second* time, between two rows, when the
+ancestors keep their bit and are not re-marked: row 2 is then reachable only by walking from
+row 1. That version fails when the walk is disabled, which is the only reason to believe it.
 
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB

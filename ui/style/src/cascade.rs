@@ -170,6 +170,16 @@ impl StyleEngine {
         tree: &mut Tree,
         previous: &StyleMap,
     ) -> (StyleMap, StyleStats) {
+        // The engine is the only thing that knows what its sheets can express, and the tree
+        // is where invalidation happens. Said here because this runs before any input does,
+        // so every mark after the first frame gets the narrow answer; marks before it are
+        // conservative, which is correct and costs one pass.
+        tree.set_sibling_selectors(
+            self.stylesheets
+                .iter()
+                .any(|sheet| sheet.uses_sibling_combinators),
+        );
+
         let mut styles = StyleMap::with_capacity(tree.len());
         let mut stats = StyleStats::default();
         let Some(root) = tree.root() else {
