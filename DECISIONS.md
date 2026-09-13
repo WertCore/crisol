@@ -1375,3 +1375,50 @@ is discovered by reading rather than by debugging.
 double↔int conversion in loops, and it also adds a second numeric representation that every
 arithmetic site has to handle. Worth measuring against real code at M20 rather than assuming
 now; nothing in this layout precludes it, since two tag slots are still free.
+
+---
+
+## D-54 — Shapes are a tree of remembered transitions, and lookup walks it
+
+**Status:** Accepted (M9) · **Affects:** M9, M11, M13, §3.2, §3.4
+
+An object carries a `ShapeId` and a flat slot array, never its own property names. Objects
+built the same way share a shape, so the names are stored once for all of them — the same
+argument as the style interner (D-21) applied to a different kind of repetition.
+
+**Adding a property transitions to another shape, and the transition is remembered.** So
+`{}` → `.x` → `.y` is walked once and reused forever: the second `{x: 1, y: 2}` a program
+evaluates compares no names at all. Checked by removing the reuse — three tests fail, including
+one that builds the same object a hundred times and asserts the table did not grow.
+
+**Order is part of a shape's identity**, so `{x, y}` and `{y, x}` are different shapes. Not an
+implementation artefact: JavaScript specifies insertion order for string keys and `Object.keys`
+has to produce it.
+
+**Assigning to a property the shape already has is not a transition.** Without that,
+`for (…) obj.x = i` grows the tree once per iteration — a memory leak shaped like a hidden
+class. It has its own test because it is the kind of thing that looks correct and is not.
+
+**Lookup walks the chain to the root: O(properties).** The alternative is a flat map per shape,
+which is O(1) to read and O(n²) in memory across a transition chain, for objects that are
+mostly small. ROADMAP §3.4 already says where the speed comes from instead — "shape-based
+lookup with a per-site monomorphic cache" — so the walk happens once per *call site* rather
+than once per access, and §3.4 is equally explicit that "the generic path being the common
+path in v1" is the expected budget. The cache belongs to the IR (M11). What belongs here is a
+lookup whose answer is stable enough to cache, which is why `ShapeId` is dense and `Copy`.
+
+A property table for wide shapes is the known next step if measurement asks for it. It is not
+done speculatively.
+
+**Two roots, and exoticness propagates.** §3.2's resolution is that shapes carry an `is_exotic`
+bit and the fast path branches on it once, so programs that never construct a `Proxy` pay one
+predictable branch rather than a check per access. Every transition inherits the bit — checked
+by breaking it, because a `Proxy` that quietly became an ordinary object after one property
+assignment would let the fast path specialise something it must not, and that is a wrong answer
+rather than a slow one.
+
+**`PropertyKey` is deliberately not `crisol_tree::Atom`.** The tracks do not converge until M16
+(§4), and a runtime crate reaching into the UI tree for a string type would couple them years
+early. The requirements differ as well: `Atom::lowercase` exists because HTML names are
+case-insensitive, and applying it to a JavaScript property name would be a bug — `obj.X` and
+`obj.x` are different properties. There is a test named after that.

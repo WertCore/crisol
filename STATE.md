@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M9 — GC and value representation (in progress: `Value` done)
+**Current milestone:** M9 — GC and value representation (in progress: `Value` and shapes done)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 586 tests passing
+**Totals:** 601 tests passing
 
 ## Open questions
 
@@ -1159,9 +1159,31 @@ Two smaller things worth carrying forward:
   equality agrees because the sign bit differs. `===` disagrees with both. There is a test
   named after this so it is found by reading rather than by debugging.
 
-**Still to do for M9:** the hidden-class/shape system with §3.2's `is_exotic` bit, the
-mark-sweep collector, the shadow stack for Rust-held roots, `GcRef<T>`, and the stress mode
-that collects on every allocation. **Accept:** a cyclic object graph whose roots are dropped is
+### Shapes: a tree of remembered transitions
+
+An object carries a `ShapeId` and a flat slot array, never its own property names (D-54).
+Adding a property transitions to another shape and the transition is remembered, so the second
+`{x: 1, y: 2}` a program evaluates compares no names at all. Checked by removing the reuse and
+watching a hundred identical objects grow the table.
+
+Three things in it are easy to get wrong and each has a test named after it:
+
+- **Assigning to a property that already exists is not a transition.** Otherwise
+  `for (…) obj.x = i` grows the tree once per iteration — a memory leak shaped like a hidden
+  class.
+- **Exoticness propagates through every transition.** A `Proxy` that quietly became an
+  ordinary object after one assignment would let the fast path specialise something it must
+  not, which is a wrong answer rather than a slow one.
+- **Property keys are case-sensitive**, unlike `crisol_tree::Atom`, which lowercases because
+  HTML names are case-insensitive. `obj.X` and `obj.x` are different properties. `PropertyKey`
+  is a separate type for that reason and because the tracks do not converge until M16.
+
+Lookup walks the chain: O(properties), and §3.4 already says the speed comes from a per-site
+monomorphic cache in the IR rather than from making this O(1). A flat map per shape would be
+O(n²) in memory across a transition chain, for objects that are mostly small.
+
+**Still to do for M9:** the mark-sweep collector, the shadow stack for Rust-held roots,
+`GcRef<T>`, and the stress mode that collects on every allocation. **Accept:** a cyclic object graph whose roots are dropped is
 reclaimed, and the full suite runs under stress mode with zero use-after-free under ASAN.
 
 §3.1 is the risk and it is a design risk rather than an implementation one: every host function
@@ -1173,9 +1195,9 @@ Prefer a scope guard over manual push/pop.
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A is complete (M0–M8). M9 is under way: `Value` is done, the shape system and the
-   collector are not.** Continue with the shape system (§3.2's `is_exotic` bit) or the
-   mark-sweep collector; §M9's acceptance needs both. The rooting API is the part to get right
+2. **Track A is complete (M0–M8). M9 is under way: `Value` and the shape system are done, the
+   collector is not.** Next is the mark-sweep collector, the shadow stack, `GcRef<T>` and
+   stress mode; §M9's acceptance needs all of them. The rooting API is the part to get right
    rather than the collector — see §3.1 and the M9 section above.
    - **Track A's remaining gaps**, which are filed rather than buried:
      [#20](https://github.com/WertCore/crisol/issues/20) a paint-only style change still costs
