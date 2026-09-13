@@ -455,6 +455,78 @@ fn headless() {
 
     println!("  checked: 27 todos, filter all, edit committed, draft empty");
 
+    // ---- the menu's two actions ------------------------------------------------------
+    //
+    // The bar itself is macOS/Windows only and needs a window, so it cannot be driven from
+    // here. The pair of actions behind it can be, which is why they live on `App` rather
+    // than on the window's `State` — otherwise they would be the one interaction path in
+    // this example that CI never executes on any platform.
+    //
+    // Counts are taken from the list rather than written down, so that editing the script
+    // above cannot quietly turn these into assertions about the wrong thing.
+    {
+        let mut dom = Dom::new(&mut tree);
+        let label_of = |todo: &Todo| runtime.peek(todo.label).unwrap_or_default();
+        let base = runtime.peek(app.todos).expect("todos").len();
+
+        // An empty draft still adds something.
+        assert_eq!(
+            runtime.peek(app.draft).as_deref(),
+            Some(""),
+            "the script left the draft empty"
+        );
+        app.add_draft(&runtime, &mut dom);
+        let added = runtime.peek(app.todos).expect("todos");
+        assert_eq!(added.len(), base + 1, "an empty draft adds the placeholder");
+        assert_eq!(
+            label_of(added.last().expect("the new row")),
+            "a new todo",
+            "and the placeholder is what `add` would otherwise have dropped"
+        );
+
+        // A draft with something in it is used verbatim, and is cleared behind itself so
+        // that the next invocation does not repeat it.
+        runtime.set(app.draft, "from the menu".to_owned());
+        app.add_draft(&runtime, &mut dom);
+        let added = runtime.peek(app.todos).expect("todos");
+        assert_eq!(added.len(), base + 2);
+        assert_eq!(
+            label_of(added.last().expect("the new row")),
+            "from the menu"
+        );
+        assert_eq!(
+            runtime.peek(app.draft).as_deref(),
+            Some(""),
+            "the draft is cleared, or the next add repeats it"
+        );
+
+        // Clearing takes every completed row and leaves the rest. How many the script
+        // already left ticked is deliberately not assumed.
+        for todo in added.iter().take(2) {
+            runtime.set(todo.done, true);
+        }
+        runtime.flush(&mut dom);
+        let before = runtime.peek(app.todos).expect("todos");
+        let done = before
+            .iter()
+            .filter(|todo| runtime.peek(todo.done).unwrap_or_default())
+            .count();
+        assert!(done >= 2, "two rows were just ticked");
+        app.clear_done(&runtime, &mut dom);
+        let left = runtime.peek(app.todos).expect("todos");
+        assert_eq!(
+            left.len(),
+            before.len() - done,
+            "every completed row went, and only those"
+        );
+        assert!(
+            left.iter()
+                .all(|todo| !runtime.peek(todo.done).unwrap_or_default()),
+            "nothing completed is left behind"
+        );
+        println!("  menu: added a placeholder and a draft, then cleared {done} completed");
+    }
+
     // The acceptance figure, taken here rather than sampled from outside.
     //
     // This point in the run is a stated one: the whole scripted sequence has happened, the
@@ -724,6 +796,35 @@ impl App {
         runtime.flush(dom);
         runtime.dispose(todo.scope, dom);
         self.clamp_selection(runtime, dom);
+    }
+
+    /// Adds whatever is in the draft, or a placeholder when the draft is empty.
+    ///
+    /// The placeholder is the point: `add` ignores an empty label, so without it the menu
+    /// item would do nothing whenever the draft happened to be empty, which reads as broken
+    /// rather than as deliberate.
+    fn add_draft(&self, runtime: &Runtime, dom: &mut Dom<'_>) {
+        let draft = runtime.peek(self.draft).unwrap_or_default();
+        let label = if draft.trim().is_empty() {
+            "a new todo".to_owned()
+        } else {
+            draft
+        };
+        self.add(runtime, label);
+        runtime.set(self.draft, String::new());
+        runtime.flush(dom);
+    }
+
+    /// Removes every completed todo.
+    fn clear_done(&self, runtime: &Runtime, dom: &mut Dom<'_>) {
+        let todos = runtime.peek(self.todos).unwrap_or_default();
+        let done: Vec<_> = todos
+            .into_iter()
+            .filter(|todo| runtime.peek(todo.done).unwrap_or_default())
+            .collect();
+        for todo in done {
+            self.remove(runtime, dom, todo);
+        }
     }
 
     fn clamp_selection(&self, runtime: &Runtime, dom: &mut Dom<'_>) {
@@ -1032,31 +1133,17 @@ impl State {
     /// Adds whatever is in the draft, or a placeholder when it is empty.
     ///
     /// Reached from the menu rather than the keyboard, which is the whole point of having
-    /// one: the same application state, a second way in.
+    /// one: the same application state, a second way in. The work is `App`'s so that the
+    /// headless run can exercise it, since the menu itself cannot be driven without a window.
     fn menu_add(&mut self) {
-        let draft = self.runtime.peek(self.app.draft).unwrap_or_default();
-        let label = if draft.trim().is_empty() {
-            "a new todo".to_owned()
-        } else {
-            draft
-        };
-        self.app.add(&self.runtime, label);
-        self.runtime.set(self.app.draft, String::new());
         let mut dom = Dom::new(&mut self.tree);
-        self.runtime.flush(&mut dom);
+        self.app.add_draft(&self.runtime, &mut dom);
     }
 
     /// Removes every completed todo.
     fn menu_clear_done(&mut self) {
-        let todos = self.runtime.peek(self.app.todos).unwrap_or_default();
-        let done: Vec<_> = todos
-            .into_iter()
-            .filter(|todo| self.runtime.peek(todo.done).unwrap_or_default())
-            .collect();
-        for todo in done {
-            let mut dom = Dom::new(&mut self.tree);
-            self.app.remove(&self.runtime, &mut dom, todo);
-        }
+        let mut dom = Dom::new(&mut self.tree);
+        self.app.clear_done(&self.runtime, &mut dom);
     }
 
     fn update_cursor(&mut self) {
