@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M8 — platform polish (in progress: scrolling done)
+**Current milestone:** M8 — platform polish (in progress: scrolling, chrome and menus done)
 **Last finished:** M7 — reactive API and component model
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -831,9 +831,43 @@ measure compiled without the optional `mach2` behind it. Every test passed — t
 `--all-features` — and the only thing that noticed was `cargo doc` without them. Worth
 remembering that the feature matrix is part of the gate and not a formality.
 
-**Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
-AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
-response in it, measured on all three platforms.
+### A native menu bar, and the two platforms that have one
+
+`muda` drives it, as a dev-dependency of the example for the same reason `winit` is one: the
+umbrella's `Cargo.toml` says nothing above the renderer should need a windowing crate, and a
+menu bar is shell rather than document.
+
+macOS and Windows only. On Linux `muda` drives GTK, which this engine does not otherwise
+depend on and will not acquire for a menu bar — `winit` speaks X11 and Wayland directly, and
+Linux applications conventionally put their menus inside the window, which crisol can already
+draw. `default-features = false` drops GTK and libxdo and leaves `muda` its noop backend, so
+the dev-dependency still compiles there without needing a `[target.'cfg(...)']` section.
+
+Two things about it are not obvious:
+
+- **The menu attaches after the window, not before.** On macOS it hangs off the
+  `NSApplication`, which `winit` has only finished creating by the time `resumed` runs; on
+  Windows it hangs off the window itself. Building it in `main` is too early on both.
+- **Menu clicks are not window events.** `muda` posts them to its own channel, so
+  `about_to_wait` drains it once per turn of the loop. That is compatible with
+  `ControlFlow::Wait` because the click is itself a native event and wakes the loop — nothing
+  here polls, and nothing needs `ControlFlow::Poll`.
+
+**The actions live on `App`, not on the window's `State`,** which is the part worth keeping.
+The bar cannot be driven without a window, so a menu action written as a method on `State`
+would have been the one interaction path in this example that CI never executes on any
+platform. A layer down, the headless run exercises both — and both guards were checked by
+injecting the regression and watching them fail rather than by observing that they pass:
+removing the empty-draft placeholder trips *an empty draft adds the placeholder* (27 against
+28), and dropping `clear_done`'s filter trips *every completed row went, and only those* (0
+against 27).
+
+A menu bar that will not build is a warning rather than a failure. The application is entirely
+usable from the keyboard without it.
+
+**Still to do for M8:** drag and drop, packaging (.app, .msi, AppImage) — and then the
+acceptance proper: an API-client-shaped application with a 5MB response in it, measured on all
+three platforms.
 
 **One thing measured and left alone.** In the todo example, moving the selection runs one
 effect per row: every row asks "am I the selected one?" and so subscribes to the shared
@@ -842,7 +876,7 @@ but it is linear. That is what this way of modelling a selection costs, not a li
 engine — a list long enough to care would remember the previous row and toggle exactly two.
 Said out loud in a comment rather than quietly shipped.
 
-**Totals:** 506 tests passing
+**Totals:** 546 tests passing
 
 ## Open questions
 
