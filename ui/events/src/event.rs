@@ -59,6 +59,24 @@ pub struct PointerEvent {
     pub modifiers: Modifiers,
 }
 
+/// A drag passing over the window, or the drop that ends it.
+///
+/// Deliberately not a [`PointerEvent`]: an OS drag is not the window's pointer. It has no
+/// button, and no pointer id that means anything here — the gesture belongs to the drag
+/// session, which the window is only a spectator to until the drop lands.
+///
+/// It does not carry the dragged data either. The platform hands that over asynchronously
+/// and by reference, so what the application fetches, and when, is its business; this says
+/// only that something is over a node and where. Correlating a drop with its payload is the
+/// application's job.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DragEvent {
+    /// Position in the layout's coordinate space, in logical pixels.
+    pub position: Point,
+    /// Modifier keys held at the time, which is what picks copy from move.
+    pub modifiers: Modifiers,
+}
+
 /// A key going down or up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyEvent {
@@ -188,6 +206,14 @@ pub enum Event {
     Focus,
     /// A node lost focus.
     Blur,
+    /// A drag entered a node's box.
+    DragEnter(DragEvent),
+    /// A drag moved over a node.
+    DragOver(DragEvent),
+    /// A drag left a node's box, or the drag was cancelled.
+    DragLeave(DragEvent),
+    /// A drag was released over a node.
+    Drop(DragEvent),
 }
 
 impl Event {
@@ -205,6 +231,27 @@ impl Event {
         }
     }
 
+    /// The drag this event came from, if any.
+    #[must_use]
+    pub fn drag(&self) -> Option<&DragEvent> {
+        match self {
+            Self::DragEnter(d) | Self::DragOver(d) | Self::DragLeave(d) | Self::Drop(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Where this event happened, whichever family it belongs to.
+    #[must_use]
+    pub fn position(&self) -> Option<Point> {
+        match self {
+            Self::Wheel { position, .. } => Some(*position),
+            _ => self
+                .pointer()
+                .map(|pointer| pointer.position)
+                .or_else(|| self.drag().map(|drag| drag.position)),
+        }
+    }
+
     /// Whether this event propagates through the tree at all.
     ///
     /// Enter and leave do not: they are delivered to exactly the nodes they concern, which
@@ -214,7 +261,12 @@ impl Event {
     pub fn bubbles(&self) -> bool {
         !matches!(
             self,
-            Self::PointerEnter(_) | Self::PointerLeave(_) | Self::Focus | Self::Blur
+            Self::PointerEnter(_)
+                | Self::PointerLeave(_)
+                | Self::DragEnter(_)
+                | Self::DragLeave(_)
+                | Self::Focus
+                | Self::Blur
         )
     }
 }

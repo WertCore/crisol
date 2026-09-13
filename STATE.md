@@ -680,6 +680,39 @@ none.
 Drag and drop itself is not built yet — this is the dependency that makes it possible, and the
 engine-side events are the next piece.
 
+### Drag events, and the dispatch layer nothing calls
+
+With winit 0.31 in (D-51), a drag carries a position, so it can be hit-tested to a node like
+any other input. `crisol-events` grows `DragEnter`, `DragOver`, `DragLeave` and `Drop`, and
+`EventSystem` grows `drag_moved`, `drag_dropped` and `drag_left` beside the pointer's.
+
+Three decisions in it worth stating:
+
+- **A drag keeps its own chain.** `dragged` sits next to `hovered` rather than reusing it,
+  because on every platform the OS owns the cursor for the duration of a drag. If a drag set
+  `:hover`, a file passing over a button would light it up as though a click were coming, and
+  nothing would turn it off. There is a test for exactly that, and it was checked by injecting
+  the regression and watching it fail.
+- **`DragEvent` is not a `PointerEvent`.** No button, no pointer id that means anything here.
+  It carries a position and modifiers, and *not* the dragged data — the platform hands that
+  over asynchronously and by reference, so correlating a drop with its payload is the
+  application's job, not the engine's.
+- **A drop retargets rather than trusting the last move.** `DragDropped` carries no position
+  of its own, and the last motion before a release is not guaranteed to arrive, so the drop
+  hit-tests where it says it happened.
+
+**What this does not do, and it is the larger point.** `EventSystem` has no consumers outside
+its own tests. The todo example uses `hit_test`, `scroll_at` and `scroll_from` directly and
+never registers a listener; `apply_state` — the call that writes `:hover`, `:focus` and
+`:active` onto elements — is called only from the events crate's tests. No example styles any
+of those pseudo-classes, so nothing is visibly broken, but the whole capture/bubble and
+interaction-state layer is built, tested and integrated nowhere.
+
+The drag events are consistent with that rather than an exception to it: they sit beside the
+pointer events, equally covered by unit tests and equally unwired. Wiring `EventSystem` into
+an application is one piece of work that covers all of it, and it is worth doing before the
+acceptance rather than as part of it.
+
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
 response in it, measured on all three platforms.

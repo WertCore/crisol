@@ -3,7 +3,7 @@
 use crisol_display_list::Point;
 use crisol_tree::{ElementState, NodeId, NodeMap, Tree};
 
-use crate::event::{Dispatch, Event, Outcome, Phase, PointerEvent};
+use crate::event::{Dispatch, DragEvent, Event, Outcome, Phase, PointerEvent};
 use crate::hit::{TextLookup, hit_test_with_text, path_to};
 
 /// Something that wants to see events.
@@ -52,6 +52,10 @@ pub struct EventSystem {
     /// Nodes currently under a pointer, deepest last. Kept as the whole chain rather than
     /// the deepest node so that `:hover` works on an ancestor too, which is what CSS means.
     hovered: Vec<NodeId>,
+    /// Nodes currently under a drag, deepest last. Separate from `hovered` because a drag is
+    /// not the window's pointer: on every platform the OS owns the cursor for the duration,
+    /// so the two chains can disagree and `:hover` must not follow a drag around.
+    dragged: Vec<NodeId>,
     focused: Option<NodeId>,
     pressed: Option<NodeId>,
 }
@@ -60,6 +64,7 @@ impl std::fmt::Debug for EventSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventSystem")
             .field("hovered", &self.hovered.len())
+            .field("dragged", &self.dragged.len())
             .field("focused", &self.focused)
             .field("pressed", &self.pressed)
             .finish_non_exhaustive()
@@ -235,6 +240,103 @@ impl EventSystem {
         self.hovered.last().copied()
     }
 
+    /// Moves a drag over the tree, dispatching enter, leave and over.
+    ///
+    /// The same shape as [`Self::pointer_moved`] and for the same reasons: leave is offered
+    /// deepest first so a child is seen to lose the drag before its parent does, enter
+    /// shallowest first on the way back in. `over` then goes to the deepest node and bubbles,
+    /// which is what a listener uses to say "yes, drop here".
+    ///
+    /// Returns the node under the drag.
+    pub fn drag_moved(
+        &mut self,
+        tree: &Tree,
+        drag: DragEvent,
+        text: &impl TextLookup,
+    ) -> Option<NodeId> {
+        let path = self.retarget_drag(tree, drag, text);
+        let target = path.last().copied();
+        if let Some(node) = target {
+            let over = Event::DragOver(drag);
+            self.dispatch(tree, node, &over);
+        }
+        self.dragged = path;
+        target
+    }
+
+    /// Drops a drag on whatever is under it, then forgets the drag.
+    ///
+    /// Returns the node the drop landed on. The dragged data is not here: the platform hands
+    /// that over separately and asynchronously, so correlating the two is the caller's job.
+    pub fn drag_dropped(
+        &mut self,
+        tree: &Tree,
+        drag: DragEvent,
+        text: &impl TextLookup,
+    ) -> Option<NodeId> {
+        // Retargeted first, because a drop can arrive at a position no `over` was reported
+        // for — the last motion before a release is not guaranteed to reach us.
+        let path = self.retarget_drag(tree, drag, text);
+        let target = path.last().copied();
+        if let Some(node) = target {
+            let drop = Event::Drop(drag);
+            self.dispatch(tree, node, &drop);
+        }
+        self.drag_left(drag);
+        target
+    }
+
+    /// Ends a drag without a drop, telling everything under it that it left.
+    ///
+    /// Takes no tree: the chain to unwind is the one already recorded, and re-deriving it
+    /// from a hit test would be wrong anyway — a cancelled drag is nowhere by then.
+    pub fn drag_left(&mut self, drag: DragEvent) {
+        let leave = Event::DragLeave(drag);
+        for node in std::mem::take(&mut self.dragged).into_iter().rev() {
+            let mut flight = Dispatch::new(&leave, node);
+            let mut ignored = Outcome::default();
+            self.offer(node, Phase::Target, &mut flight, &mut ignored);
+        }
+    }
+
+    /// The enter/leave half of a drag move, shared by moving and dropping.
+    fn retarget_drag(
+        &mut self,
+        tree: &Tree,
+        drag: DragEvent,
+        text: &impl TextLookup,
+    ) -> Vec<NodeId> {
+        let hit = hit_test_with_text(tree, drag.position, text);
+        let path = hit.map_or_else(Vec::new, |hit| path_to(tree, hit.node));
+
+        let left: Vec<_> = self
+            .dragged
+            .iter()
+            .rev()
+            .copied()
+            .filter(|node| !path.contains(node))
+            .collect();
+        let entered: Vec<_> = path
+            .iter()
+            .copied()
+            .filter(|node| !self.dragged.contains(node))
+            .collect();
+
+        let leave = Event::DragLeave(drag);
+        for node in left {
+            let mut flight = Dispatch::new(&leave, node);
+            let mut ignored = Outcome::default();
+            self.offer(node, Phase::Target, &mut flight, &mut ignored);
+        }
+        let enter = Event::DragEnter(drag);
+        for node in entered {
+            let mut flight = Dispatch::new(&enter, node);
+            let mut ignored = Outcome::default();
+            self.offer(node, Phase::Target, &mut flight, &mut ignored);
+        }
+        path
+    }
+
     /// Records a pointer going down on a node.
     pub fn pointer_pressed(&mut self, node: NodeId) {
         self.pressed = Some(node);
@@ -266,6 +368,7 @@ impl EventSystem {
     /// `:hover` matching something that is not there.
     pub fn forget_dead(&mut self, tree: &Tree) {
         self.hovered.retain(|node| tree.is_alive(*node));
+        self.dragged.retain(|node| tree.is_alive(*node));
         self.focused = self.focused.filter(|node| tree.is_alive(*node));
         self.pressed = self.pressed.filter(|node| tree.is_alive(*node));
     }
