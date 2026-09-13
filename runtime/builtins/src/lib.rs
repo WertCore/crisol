@@ -11,9 +11,11 @@ mod collections;
 mod convert;
 mod descriptor;
 mod error;
+mod iterator;
 mod json;
 mod object;
 mod promise;
+mod proxy;
 mod symbol;
 
 pub use array::{JsArray, MAX_LENGTH, array_index};
@@ -23,7 +25,9 @@ pub use convert::{
 };
 pub use descriptor::{Entry, PartialDescriptor, Property, Rejected, validate_and_apply};
 pub use error::{ErrorKind, JsError};
+pub use iterator::{Step, StepIterator, collect, read_step, take};
 pub use json::{Json, ParseError, parse, stringify};
 pub use object::{Got, ObjectId, OrdinaryObject, Realm, Setting};
 pub use promise::{Agent, Outcome, PromiseId, Reaction, State};
+pub use proxy::{Proxy, ProxyError, Target, Trap};
 pub use symbol::{SymbolId, Symbols, WellKnown};
