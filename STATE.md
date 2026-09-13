@@ -986,7 +986,34 @@ claim about *this* engine, but a user running a windowed build pays for a swapch
 driver on top. `todo` is the windowed path and is
 measured separately; a windowed apiclient is a follow-up rather than a gap in the claim.
 
-**Totals:** 559 tests passing
+### A paint-only change no longer costs a relayout (issue #20)
+
+The unfinished half of D-45. `restyle_incremental` marked `LAYOUT` on any computed-style
+difference, so toggling `.done` on a todo row — where the rule is
+`li.done span.label { color: … }` — relaid the row out in order to change a colour.
+
+`ComputedStyle::layout_eq` now says whether two styles would lay out identically, and the pass
+marks `PAINT` alone when they would. The todo benchmark's `toggle` step: **8 layout
+invalidations to 4**.
+
+**The issue predicted 0, and 4 is the right answer.** The remaining four are not the row. They
+are the footer count being rewritten in the same step — a *text* change, not a style one —
+whose ancestor chain is `text` → `p.count` → `body` → `html`, exactly four. That is a real
+relayout and it should stay. Worth saying because "we predicted 0 and got 4" reads like a
+partial fix, and checking which four it was is the difference between a fix and a plausible
+number.
+
+**Both directions are pinned, and both were checked by breaking them.**
+`ui/style/tests/paint_only.rs` asserts that a colour change repaints *and* that width, font
+size and `overflow` still relay out. Reverting the fix fails only the colour test; making
+`layout_eq` return `true` for everything fails the other three. A fix that simply stopped
+marking `LAYOUT` would pass the first test and fail the second three, which is why the pair
+exists rather than the first alone.
+
+The cost worry in the issue turned out not to apply: the field comparison does not replace the
+pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
+
+**Totals:** 564 tests passing
 
 ## Open questions
 
