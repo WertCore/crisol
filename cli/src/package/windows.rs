@@ -42,6 +42,13 @@ pub fn build(options: &Options) -> Result<Produced, Error> {
 
 /// Compiles the `.wxs` with whichever WiX is installed.
 fn seal(options: &Options, stage: &Path, source: &Path) -> Result<Produced, Error> {
+    // Asked not to, so the source is the answer rather than a fallback.
+    if !options.seal {
+        return Ok(Produced {
+            artifact: source.to_path_buf(),
+            missing_tool: None,
+        });
+    }
     let msi = options.out.join(format!("{}.msi", options.name));
     // WiX 4 and 5 ship a single `wix` driver; WiX 3 ships `candle` and `light`. Both are
     // still in wide use, so both are accepted rather than picking one and calling the other

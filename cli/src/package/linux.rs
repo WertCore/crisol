@@ -50,6 +50,13 @@ pub fn build(options: &Options) -> Result<Produced, Error> {
 
 /// Runs `appimagetool` over the AppDir when it is on `PATH`.
 fn seal(options: &Options, dir: &Path) -> Result<Produced, Error> {
+    // Asked not to, so the AppDir is the answer rather than a fallback.
+    if !options.seal {
+        return Ok(Produced {
+            artifact: dir.to_path_buf(),
+            missing_tool: None,
+        });
+    }
     if !tool_exists("appimagetool") {
         return Ok(Produced {
             artifact: dir.to_path_buf(),

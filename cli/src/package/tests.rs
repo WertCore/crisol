@@ -1,8 +1,13 @@
 //! Tests for the packager.
 //!
 //! Every bundle layout is built here, for all three platforms, whatever the host is — that is
-//! the point of keeping the container step separate. What cannot be tested here is
-//! `appimagetool` and WiX, which is why neither is allowed to be load-bearing.
+//! the point of keeping the container step separate.
+//!
+//! **Every case sets `seal: false`,** so nothing here runs `appimagetool` or WiX. That is not
+//! squeamishness about subprocesses: a test that seals when the tool happens to be installed
+//! and stages when it does not is a test of the runner. CI found that the hard way — the
+//! GitHub Windows image ships WiX, so the one case that reached the sealing path passed on
+//! this laptop, where WiX is absent, and failed there.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,6 +57,7 @@ fn options(temp: &Temp, target: Platform) -> Options {
         icon: None,
         manufacturer: None,
         upgrade_code: None,
+        seal: false,
     }
 }
 
@@ -222,11 +228,9 @@ fn an_appdir_carries_its_launcher_and_both_desktop_entries() {
     let opts = options(&temp, Platform::Linux);
     let produced = build(&opts).expect("an AppDir");
 
-    // Without appimagetool the AppDir itself is the artifact, and that is reported.
     let dir = opts.out.join("Todo.AppDir");
-    if produced.missing_tool.is_some() {
-        assert_eq!(produced.artifact, dir);
-    }
+    assert_eq!(produced.artifact, dir);
+    assert!(produced.missing_tool.is_none());
 
     assert!(dir.join("usr").join("bin").join("todo").is_file());
     assert!(dir.join("com.example.todo.desktop").is_file());
@@ -260,11 +264,15 @@ fn a_wxs_names_the_staged_file_relatively() {
     let produced = build(&opts).expect("a wxs");
 
     let stage = opts.out.join("Todo.msi-stage");
-    // Without WiX the source is the artifact, and that has to be said rather than implied.
-    if let Some(tool) = &produced.missing_tool {
-        assert!(tool.contains("wix"), "the missing tool should be named");
-        assert_eq!(produced.artifact, stage.join("Todo.wxs"));
-    }
+    assert_eq!(
+        produced.artifact,
+        stage.join("Todo.wxs"),
+        "staging was asked for, so the source is the artifact"
+    );
+    assert!(
+        produced.missing_tool.is_none(),
+        "nothing is missing when nothing was going to be run"
+    );
     assert!(
         stage.join("todo").is_file(),
         "the payload is staged beside the source"

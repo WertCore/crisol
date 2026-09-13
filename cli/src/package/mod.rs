@@ -96,6 +96,14 @@ pub struct Options {
     /// MSI `UpgradeCode`. Required for Windows, and deliberately not invented — see
     /// [`Error::MissingUpgradeCode`].
     pub upgrade_code: Option<String>,
+    /// Whether to run the platform tool that turns the layout into a single file.
+    ///
+    /// Off is a real mode, not just a test affordance: the layout is the documented input to
+    /// `appimagetool` and WiX, and a pipeline that runs those itself wants the input without
+    /// this tool guessing at their arguments. It is also the only way these can be tested,
+    /// because *whether the tool is installed* is not something a test may depend on — one
+    /// that seals when it finds WiX and stages when it does not is testing the runner.
+    pub seal: bool,
 }
 
 /// The command line's arguments, before defaults are worked out.
@@ -136,6 +144,9 @@ pub struct Request {
     /// MSI UpgradeCode GUID. Required when targeting Windows, and never invented.
     #[arg(long, value_name = "GUID")]
     pub upgrade_code: Option<String>,
+    /// Produce the layout but do not run appimagetool or WiX over it.
+    #[arg(long)]
+    pub stage_only: bool,
 }
 
 impl Request {
@@ -171,6 +182,7 @@ impl Request {
             icon: self.icon,
             manufacturer: self.manufacturer,
             upgrade_code: self.upgrade_code,
+            seal: !self.stage_only,
         })
     }
 }
