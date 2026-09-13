@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M12 — runtime library (in progress: the object model; the builtins are not)
+**Current milestone:** M12 — runtime library (in progress: object model, Promise, Map/Set, JSON, Array)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 707 tests passing (705 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 745 tests passing (743 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1410,6 +1410,30 @@ parity, because parity is a claim this has not earned.
 **Still to do for M12:** `Object`, `Array`, `String`, `Number`, `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
 `JSON`, and then `Proxy`/`Reflect` on top of the model above.
+### `Map`, `Set`, and the third equality
+
+`Map` keys use **SameValueZero**, which agrees with neither `===` nor `Object.is` (D-62):
+`NaN` equals `NaN` *and* `0` equals `-0`. `Value`'s derived equality is `Object.is` — right for
+descriptors, wrong here — so keys go through a wrapper that folds `-0` into `0`. NaN needs no
+handling because M9 canonicalised it, the second time that decision has paid for itself.
+
+Entries live in a `Vec` with tombstones, not only a hash map, because the spec is specific about
+mutation during iteration: an entry deleted before the iterator reaches it is not visited, and
+one added during iteration is. Both fall out of positions; neither falls out of a `HashMap`.
+
+### JSON
+
+Strict in, exact out (D-63). Eighteen pieces of JavaScript-literal syntax that JSON does not
+allow have a test, because being lenient turns a clear error at the boundary into corrupt data
+further in. Surrogate pairs are joined — without it an emoji becomes two question marks
+downstream with nothing at the failure point to say why — and lone surrogates are refused.
+
+Out: `NaN` and the infinities become `null`, `-0` becomes `0` (**a round trip loses the sign**),
+`/` is not escaped, and objects keep insertion order so a round trip does not rewrite a
+document.
+
+`Symbol`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators, and then
+`Proxy`/`Reflect` on top of the model above.
 The acceptance is a test262 subset at >80%, which needs the suite fetched the way M10's React
 tree is.
 

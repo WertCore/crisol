@@ -6,10 +6,14 @@
 
 #![doc(html_root_url = "https://docs.rs/crisol-builtins/0.0.0")]
 
+mod collections;
 mod descriptor;
+mod json;
 mod object;
 mod promise;
 
+pub use collections::{JsMap, JsSet};
 pub use descriptor::{Entry, PartialDescriptor, Property, Rejected, validate_and_apply};
+pub use json::{Json, ParseError, parse, stringify};
 pub use object::{Got, ObjectId, OrdinaryObject, Realm, Setting};
 pub use promise::{Agent, Outcome, PromiseId, Reaction, State};
