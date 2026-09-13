@@ -87,6 +87,17 @@ impl FontSystem {
         self.inner.db().len()
     }
 
+    /// Whether the database has a face in this family, matched case-insensitively, as CSS
+    /// matches font family names.
+    #[must_use]
+    pub fn has_family(&self, name: &str) -> bool {
+        self.inner.db().faces().any(|face| {
+            face.families
+                .iter()
+                .any(|(family, _)| family.eq_ignore_ascii_case(name))
+        })
+    }
+
     /// True when there are no fonts at all, and every shaping attempt will produce nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -179,8 +190,9 @@ pub fn shape(
         } else {
             cosmic_text::Style::Normal
         });
-    if let Some(first) = style.families.first() {
-        attrs = attrs.family(Family::Name(first));
+    let chosen = resolve_family(fonts, &style.families);
+    if let Some(family) = chosen.as_ref().map(Chosen::as_family) {
+        attrs = attrs.family(family);
     }
     // `Shaping::Advanced` is the one that handles the cases M4's acceptance names: CJK,
     // emoji, ligatures and combining marks. `Basic` is faster and wrong for all of them.
@@ -188,6 +200,62 @@ pub fn shape(
     buffer.shape_until_scroll(&mut fonts.inner, false);
 
     collect(fonts, buffer, text, style, width)
+}
+
+/// The family the cascade's list resolved to.
+///
+/// Owned rather than borrowed from `style.families` so that resolving can read the font
+/// database, which `shape` holds mutably a moment later.
+enum Chosen {
+    /// A named family the database actually has.
+    Named(String),
+    /// One of CSS's five generics, which always resolve.
+    Generic(Family<'static>),
+}
+
+impl Chosen {
+    fn as_family(&self) -> Family<'_> {
+        match self {
+            Self::Named(name) => Family::Name(name),
+            Self::Generic(family) => *family,
+        }
+    }
+}
+
+/// Walks a CSS `font-family` list and returns the first entry that can actually be used.
+///
+/// Two things were wrong with taking `families.first()` and calling it a name.
+///
+/// A generic is not a font name. `font-family: sans-serif` reached the shaper as
+/// `Family::Name("sans-serif")`, which asks the database for a font *called* "sans-serif" —
+/// there is no such font, so it fell through to cosmic-text's default. That default happens
+/// to be sans-serif, which is why nobody noticed, and it is not why the answer was right.
+///
+/// And a fallback list is a list. `font-family: "Inter", monospace` tried only Inter, so a
+/// machine without it rendered proportional text where the author had asked for monospace and
+/// named a fallback that would have delivered it. That one is visible, and it is exactly the
+/// case a JSON viewer hits.
+fn resolve_family(fonts: &FontSystem, families: &[String]) -> Option<Chosen> {
+    for family in families {
+        let name = family.as_str();
+        // The five generics always resolve: cosmic-text maps each to whatever the platform
+        // considers that category.
+        let generic = match name {
+            "serif" => Some(Family::Serif),
+            "sans-serif" => Some(Family::SansSerif),
+            "monospace" => Some(Family::Monospace),
+            "cursive" => Some(Family::Cursive),
+            "fantasy" => Some(Family::Fantasy),
+            _ => None,
+        };
+        if let Some(generic) = generic {
+            return Some(Chosen::Generic(generic));
+        }
+        if fonts.has_family(name) {
+            return Some(Chosen::Named(name.to_owned()));
+        }
+    }
+    None
 }
 
 /// Walks cosmic-text's output into ours.
@@ -365,5 +433,64 @@ fn line_byte_range(
         0..0
     } else {
         start..end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Chosen, FontSystem, resolve_family};
+    use cosmic_text::Family;
+
+    fn resolve(families: &[&str]) -> Option<Chosen> {
+        let names: Vec<String> = families.iter().map(|s| (*s).to_owned()).collect();
+        // Empty on purpose: a database with no faces makes every *named* family unavailable,
+        // which is the branch that matters here and the only one that is the same on every
+        // machine. Generics must still resolve.
+        resolve_family(&FontSystem::empty(), &names)
+    }
+
+    #[test]
+    fn a_generic_resolves_to_a_generic_not_to_a_font_called_that() {
+        // The bug this replaced: `sans-serif` was handed over as `Family::Name("sans-serif")`,
+        // asking the database for a font by that name. There is none, so it fell through to
+        // cosmic-text's default — which is sans-serif, so the output was right for a reason
+        // that would not survive `monospace`.
+        for (css, want) in [
+            ("serif", Family::Serif),
+            ("sans-serif", Family::SansSerif),
+            ("monospace", Family::Monospace),
+            ("cursive", Family::Cursive),
+            ("fantasy", Family::Fantasy),
+        ] {
+            match resolve(&[css]) {
+                Some(Chosen::Generic(got)) => assert_eq!(got, want, "{css}"),
+                other => panic!("{css} resolved to {:?}", other.is_some()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_font_falls_through_to_the_next_entry() {
+        // `font-family: "Inter", monospace` on a machine without Inter has to reach
+        // monospace. Before, it stopped at Inter and rendered whatever the default was,
+        // which is proportional — visibly wrong in the one place a fallback list is most
+        // often written.
+        match resolve(&["Inter", "monospace"]) {
+            Some(Chosen::Generic(got)) => assert_eq!(got, Family::Monospace),
+            other => panic!("resolved to {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn a_list_of_only_missing_fonts_resolves_to_nothing() {
+        // Nothing rather than a guess: the shaper then sets no family at all and lets
+        // cosmic-text pick, which is the same behaviour as before for this case.
+        assert!(resolve(&["No Such Font", "Nor This One"]).is_none());
+        assert!(resolve(&[]).is_none());
+    }
+
+    #[test]
+    fn an_empty_font_system_has_no_families() {
+        assert!(!FontSystem::empty().has_family("anything at all"));
     }
 }

@@ -768,6 +768,39 @@ siblings. The real test moves the pointer a *second* time, between two rows, whe
 ancestors keep their bit and are not re-marked: row 2 is then reachable only by walking from
 row 1. That version fails when the walk is disabled, which is the only reason to believe it.
 
+### Font family resolution, and what "consistent across platforms" actually means
+
+crisol draws its own everything — cascade, layout, paint, renderer — so a box is the same box
+on all three platforms. Text was the exception, and not for the reason it looked like.
+
+**`font-family` took only its first entry, and treated a generic as a name.** The shaper did
+`families.first()` and handed it over as `Family::Name`, so:
+
+- `font-family: sans-serif` asked the database for a font *called* "sans-serif". There is
+  none, so it fell through to cosmic-text's default — which is sans-serif, so the output was
+  right for a reason that would not survive the next line.
+- `font-family: "Inter", monospace` tried Inter and stopped. A machine without it rendered
+  **proportional** text where the author asked for monospace and named a fallback that would
+  have delivered it. That is visible, and it is exactly what a JSON viewer asks for.
+
+Now the list is walked: the five generics always resolve, a named family is used when the
+database actually has it, and an entry that is neither is skipped rather than ending the
+search. A list of only missing fonts resolves to nothing and lets cosmic-text pick, which is
+what happened before for that case.
+
+**No font is bundled, and the user-agent stylesheet gains no rule.** D-25's bar is that a rule
+must describe something true of *this engine*, and `:root { font-family: sans-serif }` would
+describe nothing: with no family declared the resolver already yields nothing and cosmic-text
+already picks sans-serif. A rule that changes no output has not earned its place.
+
+Which leaves the honest answer to "will it look identical everywhere": **the layout will, the
+glyphs will not, until an application says which font it wants.** System fonts differ, so
+`sans-serif` is Helvetica here and DejaVu there, and those have different metrics. An
+application that needs identical pixels loads its own face with `FontSystem::load` and names
+it in CSS — which now works, because naming it no longer discards the fallback behind it.
+That is an application decision with a binary-size cost, so the engine offers it rather than
+imposing it.
+
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
 response in it, measured on all three platforms.
