@@ -1017,9 +1017,28 @@ The implication now happens where the answer is known. `restyle_incremental` com
 node's recomputed style against the previous pass and marks `LAYOUT` only where they differ,
 which interning (D-21) makes a pointer comparison. The same append now invalidates **8**.
 
-**Still conservative in one direction:** any style change marks `LAYOUT`, including one that
-only alters a colour. Splitting `ComputedStyle` into layout-affecting and paint-only fields
-would tighten that further; it is not done, and is tracked rather than assumed.
+**The remaining direction, closed (issue #20).** Any style change used to mark `LAYOUT`,
+including one that only altered a colour, so toggling `.done` on a todo row relaid the row out
+to change its text colour. `ComputedStyle::layout_eq` now answers whether two styles would lay
+out identically, and the pass marks `PAINT` alone when they would. The todo benchmark's
+`toggle` step went from **8** layout invalidations to **4** — and the 4 that remain are not the
+row, they are the footer count being rewritten in the same step, which is a text change and a
+genuine relayout.
+
+Two things about how it is written, both deliberate:
+
+- **The comparison is asked only where the pointers already differ.** The worry when this was
+  filed was that a field comparison would cost more than the pointer comparison it replaced.
+  It does not replace it: the pointer comparison still decides *whether* anything changed, and
+  only then is the field comparison asked *what kind* of change it was. So its cost is bounded
+  by the number of nodes that genuinely restyled — normally small — and what it saves on each
+  is a relayout. The precomputed per-group hash the issue suggested is not needed.
+- **`layout_eq` copies the paint-only fields across and compares whole structs**, rather than
+  listing the layout-affecting fields to compare. The two spellings agree today and fail in
+  opposite directions later: under this one, a field added to `ComputedStyle` and forgotten is
+  treated as layout-affecting, costing a relayout nobody needed. Under the other, the same
+  omission skips a relayout that *was* needed and leaves a box at a stale size. A performance
+  bug is recoverable; a wrong picture is not.
 
 **How it was found:** not by reading the flag code, which looks obviously right, but because
 M7's acceptance counts nodes laid out and the number came back three orders of magnitude too
