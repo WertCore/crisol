@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M10 — frontend and module graph. **Acceptance met** (a real React tree resolves and parses with nothing unresolved).
+**Current milestone:** M11 — IR (in progress: the IR, lattice and verifier are done; lowering is not)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 636 tests passing (634 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 663 tests passing (661 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1289,11 +1289,48 @@ browser-conditioned resolve is a different graph.
 
 ---
 
+## M11 — IR
+
+### The IR, the lattice, and the verifier
+
+`crisol-ir` holds SSA with block parameters, a shallow type lattice, and a verifier (D-58).
+Three choices worth carrying forward:
+
+**Terminators are a field, not an `Op` variant.** A block holds a `Vec<Op>` and exactly one
+`Terminator`, so "one terminator, at the end" is a shape that cannot be written down rather than
+a rule anyone enforces. The best way to reject a class of malformed graph is to make it
+unrepresentable; the verifier is for what a type cannot say.
+
+**Safepoints are mandatory on anything that can collect, and refused on anything that cannot.**
+§M11 is firm that the IR must carry them "or the GC integration in M13 will not work". The
+second direction matters as much as the first: a safepoint on a `Const` means whoever built the
+graph did not know which operations collect, and the ones they *missed* are the dangerous half.
+`PropertyLoad` counts — a getter is a call, and on an exotic shape (D-54) the lookup itself runs
+user code.
+
+**The lattice is shallow on purpose,** and its laws are tested as laws — join commutative,
+associative, idempotent, an upper bound of both operands, agreeing with the subtype relation —
+over every pair and triple. A lattice that is only *mostly* a lattice gives an analysis whose
+answer depends on pass order, and that surfaces as a miscompilation weeks later rather than as a
+failing test. Two different object shapes join to `Object(None)`: still an object, which one no
+longer known, because picking one is how a field is read from the wrong offset.
+
+Three guards checked by breaking them: dropping the dominance check fails the cross-branch test,
+allowing a missing safepoint fails two, and the dump's expected text is pinned so a format change
+has to be agreed to in a diff.
+
+**Still to do for M11:** lowering from the oxc AST, and the acceptance — "IR text dump for a set
+of 30 representative programs is stable and reviewable". The dump and the verifier are both in
+place for it; what is missing is the thing that produces IR from source.
+
+---
+
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A (M0–M8), M9 and M10 are complete**, acceptances included. Next is **M11 — the
-   IR**. Read D-55's last section first: the collector's safety rests on objects sitting behind
+2. **Track A (M0–M8), M9 and M10 are complete**, acceptances included. **M11 is under way:
+   the IR, lattice and verifier are done; lowering from the oxc AST is not**, and the
+   acceptance needs it. Read D-55's last section first: the collector's safety rests on objects sitting behind
    checked handles, and M13 is where that assumption comes due. D-54's per-site monomorphic
    cache is M11's job and is what makes shape lookup fast. The rooting API is the part to get right
    rather than the collector — see §3.1 and the M9 section above.

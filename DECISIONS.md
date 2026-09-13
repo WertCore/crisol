@@ -1566,3 +1566,48 @@ in fifteen seconds. The acceptance was called unreachable because `npm` is alias
 `pmg` wrapper; a real React tree was already on the machine, and the npm behind the alias runs
 fine when invoked directly. Neither claim survived thirty seconds of checking, and both were
 written into `STATE.md` as facts first.
+## D-58 — Terminators are a field, safepoints are mandatory, and the lattice is shallow
+
+**Status:** Accepted (M11) · **Affects:** M11, M12, M13, §3.1
+
+Three decisions in the IR, each of which is about what the *next* milestone will be able to
+rely on.
+
+**Terminators are a separate type from operations, so a block holds a `Vec<Op>` and exactly one
+`Terminator`.** "Every block ends with one terminator, and none appears in the middle" is then
+not a rule the verifier enforces — it is a shape that cannot be written down. §M11's acceptance
+asks for a verifier that "rejects malformed graphs", and the best way to reject a class of
+malformed graph is to make it unrepresentable, leaving the verifier for what a type cannot say.
+
+**Safepoints are mandatory on anything that can collect, and the verifier rejects both
+directions.** §M11 is unusually firm — "the IR must represent safepoints explicitly or the GC
+integration in M13 will not work" — so a missing one is refused rather than inferred later. The
+*other* direction is refused too: a safepoint on a `Const` means whoever built the graph did not
+know which operations collect, and the ones they missed are the dangerous half. Both were
+checked by removing the check and watching the tests fail.
+
+`PropertyLoad` counts as able to collect. A getter is a call, and on an exotic shape (D-54) the
+lookup itself runs user code. Treating it as safe would be right for the common case and wrong
+for the one that matters, which is the wrong way round when the failure mode is §3.1's
+use-after-free under memory pressure.
+
+**SSA uses block parameters rather than phi nodes.** They are equivalent, Cranelift takes block
+parameters (§4 names it as the backend), and they make the verifier's job concrete: an edge
+passes arguments, so argument count and type can be checked per edge instead of a phi's operands
+being checked against an implicit predecessor order.
+
+**The type lattice is deliberately shallow.** `Never ⊑ {Undefined, Null, Bool, Number, String,
+Object(shape?)} ⊑ Unknown`, and that is all. A richer lattice infers more and gives the analysis
+more places to be subtly wrong in a way that produces *faster incorrect code*. This one answers
+the question codegen actually asks — "can I skip the check?" — and says `Unknown` whenever it
+cannot be sure, which is safe and merely slow.
+
+`Object` carries an optional shape because that is where specialisation comes from: a property
+access on `Object(Some(s))` resolves to a slot at compile time. Joining two different shapes
+forgets both, because the alternative is picking one, which is how a field gets read from the
+wrong offset.
+
+The laws are tested as laws — join commutative, associative, idempotent, an upper bound of both
+operands, and agreeing with the subtype relation — over every pair and triple of types. A
+lattice that is only *mostly* a lattice yields an analysis whose answer depends on the order
+passes ran in, and that surfaces as a miscompilation weeks later rather than as a failing test.
