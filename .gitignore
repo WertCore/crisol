@@ -1,4 +1,6 @@
 /target
+# `crisol package` writes here by default.
+/dist
 **/*.rs.bk
 *.pdb
 
