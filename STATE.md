@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 745 tests passing (743 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 761 tests passing (759 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1407,7 +1407,22 @@ A LIFO queue fails it, a fulfil-always pass-through fails the rejection test, an
 microtask here where a real engine charges two. The tests assert relative order, not tick
 parity, because parity is a claim this has not earned.
 
-**Still to do for M12:** `Object`, `Array`, `String`, `Number`, `Boolean`,
+### `Array`: holes, and a truncation that can stop halfway
+
+Everything unusual about an array comes from `length` being tied to the indices that exist
+(D-64). Two rules are easy to get wrong by being reasonable.
+
+**A hole is not a property holding `undefined`.** `[, 1]` and `[undefined, 1]` both read
+`undefined` at index 0, and only the second answers `0 in a`. The iterating methods disagree
+about which they mean — `forEach` skips holes, `map` preserves them — so `has` is a separate
+question from `get` rather than making each caller guess which kind of nothing it found.
+
+**`ArraySetLength` stops at the first element it cannot delete**, leaving `length` one above it
+and reporting failure. Treating it as atomic is wrong in both directions at once: it refuses a
+change the spec allows, *and* discards elements the spec protects. Checked by making it atomic
+and watching the test fail.
+
+**Still to do for M12:** `Object`, `String`, `Number`, `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
 `JSON`, and then `Proxy`/`Reflect` on top of the model above.
 ### `Map`, `Set`, and the third equality

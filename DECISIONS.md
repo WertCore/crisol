@@ -1813,3 +1813,35 @@ other implementation for no benefit.
 **Objects keep insertion order**, in a `Vec` rather than a `BTreeMap`. Sorting keys would
 quietly rewrite every document that round-tripped through, which is the kind of change that
 shows up as a spurious diff in someone else's repository.
+
+---
+
+## D-64 — A hole is not `undefined`, and truncation can fail halfway
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+Everything unusual about an array comes from `length` being tied to the indices that exist:
+writing an index at or beyond it raises it, writing a smaller one deletes the elements above.
+Two consequences are worth writing down because both are easy to get wrong *by being
+reasonable*.
+
+**A hole is not a property holding `undefined`.** `[, 1]` and `[undefined, 1]` both read
+`undefined` at index 0, and only the second answers `0 in a` with true. Every iterating method
+has to decide which it means and they do not all agree — `forEach` skips holes, `map` preserves
+them, `Array.from` fills them. So `has` is a separate question from `get` here, rather than
+`get` returning `undefined` and leaving each caller to guess which kind of nothing it found.
+
+**`ArraySetLength` deletes from the top down and stops at the first element it cannot delete**,
+leaving `length` one above it and reporting failure. Freezing one element makes `a.length = 0`
+shrink the array only as far as that element — a *partial* success.
+
+An implementation that treated truncation as atomic would be wrong in both directions at once:
+it would refuse a change the spec allows (when the obstruction is above what was asked for) and
+discard elements the spec protects (if it deleted first and checked after). Checked by making it
+atomic and watching the test fail.
+
+Smaller ones that follow from the same place: `delete` leaves a hole and does **not** shorten
+the array, which is the whole difference between `delete` and `pop`; a non-writable `length`
+stops `push` as well as assignment past the end, because growing *is* writing `length`; and
+`2^32 - 1` is a valid length but not a valid index, so `a[4294967295] = x` creates an ordinary
+string-keyed property rather than an element.
