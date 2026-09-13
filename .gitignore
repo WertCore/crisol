@@ -7,5 +7,6 @@
 # Render snapshot failures are written next to the expected image.
 tests/render-snapshots/**/*.actual.png
 tests/layout-snapshots/**/*.actual.json
+tests/ir-snapshots/**/*.actual
 
 .DS_Store

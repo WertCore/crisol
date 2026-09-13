@@ -12,6 +12,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-ir.workspace = true
+crisol-value.workspace = true
 oxc_allocator.workspace = true
 oxc_ast.workspace = true
 oxc_ast_visit.workspace = true

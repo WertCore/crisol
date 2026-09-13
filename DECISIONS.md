@@ -1611,3 +1611,50 @@ The laws are tested as laws — join commutative, associative, idempotent, an up
 operands, and agreeing with the subtype relation — over every pair and triple of types. A
 lattice that is only *mostly* a lattice yields an analysis whose answer depends on the order
 passes ran in, and that surfaces as a miscompilation weeks later rather than as a failing test.
+
+---
+
+## D-59 — Locals lower to slots; SSA construction is a separate pass
+
+**Status:** Accepted (M11) · **Affects:** M11, M12
+
+A `let` becomes a numbered slot and reading it is a `Load`, so a control-flow merge needs **no
+block parameters at all**: both arms of an `if` wrote the same slot and the code after reads it.
+Promoting slots to SSA values — the `mem2reg` every compiler has — is a separate pass and
+belongs with the other optimisations (M12).
+
+The alternative is constructing SSA during lowering, which means implementing Braun-style
+incremental φ insertion *while also* getting the AST walk right, and then debugging the two
+together when a value comes out wrong. Split, each half is checkable alone: this one emits IR
+the verifier accepts, and the promotion pass is a graph-to-graph transformation with an obvious
+before and after.
+
+The IR's block parameters are therefore unused by lowering today. They are not speculative —
+they are what the promotion pass will write, and having them in the IR first is why that pass
+can be written without changing the IR underneath it.
+
+**An unsupported construct is recorded, never guessed.** §3.3 says rejecting a construct in code
+the developer did not write is the failure mode to avoid — but a *compiler* that silently emits
+`undefined` for syntax it did not understand is worse than one that refuses, because the result
+is a program that runs and is wrong. So lowering always produces a function, everything it did
+not understand lands in `Lowered::unsupported`, and `Lowered::is_faithful` exists because
+checking a `Vec` is empty is easy to forget and a method named after the question is not.
+
+`unfaithful_programs_are_reported_not_guessed` takes twelve constructs the lowering does not
+handle and asserts each is *named*. The corpus is what works; that test is what does not, and
+the two are checked against each other rather than against a claim in a comment.
+
+**An object literal's value is typed `Object(None)`, not `Object(Some(root))`, and the
+difference is soundness rather than precision.** A type in SSA is fixed for the value's whole
+life, but an object's shape changes as properties are added — so typing the result
+`object#root` after two `PropertyStore`s claims the object is still empty, and a pass trusting
+that would resolve `.a` to no slot at all. `Object(None)` says the one thing that stays true.
+
+Recovering the precise shape needs either shape transitions modelled in the IR or types attached
+to program points rather than to values. Both are M12's, and both beat guessing now. This was
+caught by reading the first generated snapshot rather than by a test, which is the argument for
+the snapshot being reviewed rather than merely regenerated.
+
+**The corpus is representative of what lowers**, not of JavaScript. It has no arithmetic, no
+functions and no `for` loops, because those do not lower yet. Saying "thirty representative
+programs" without saying that would be the more flattering sentence and the less true one.
