@@ -1286,6 +1286,16 @@ format the target asked for and says so.
 **Signing and notarisation are not here.** Both need credentials and Apple's own tooling, and
 an unsigned `.app` is still the correct input to `codesign`. Shipping to other people is M21.
 
+**Sealing is a switch, not a consequence of what is installed.** The first version ran
+`appimagetool` or WiX whenever it found one and staged when it did not, which reads as
+helpful and is actually a test that cannot hold still: it passed here, where WiX is absent,
+and failed on CI, where the GitHub Windows image ships it. *Whether a tool is installed* is
+not something a test may branch on — a suite that does is testing the runner. `--stage-only`
+makes the choice explicit, every test takes it, and the sealing path is a subprocess call
+that is deliberately outside the tested surface. It is also a mode worth having on its own:
+a pipeline that runs those tools itself wants their input without this one guessing at their
+arguments.
+
 **Rejected: cargo-bundle or tauri-bundler.** Both would have worked and both are more complete
 than this. They are also a dependency on someone else's opinion about what a crisol application
 is, at the exact milestone where that question is being answered, and `tauri-bundler` in

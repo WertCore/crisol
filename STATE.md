@@ -895,6 +895,13 @@ entry's `Exec` resolves to the staged binary, that `AppRun` carries its executab
 that the `.wxs` names its payload relatively rather than by a path that only exists here. The
 bundled executable was then run out of `Contents/MacOS` and answered.
 
+**A test may not branch on what is installed.** The sealing step first ran whenever the tool
+happened to be on `PATH`. That passed here, where WiX is absent, and failed on CI, where the
+GitHub Windows image ships it — the one test that reached the sealing path invoked WiX for
+real and got exit 204. The lesson generalises past packaging: a suite whose behaviour depends
+on the machine is a suite that tests the machine. `--stage-only` makes it a decision, every
+test takes it, and the subprocess call sits outside the tested surface on purpose.
+
 **Two things that fail silently and so are refused at package time.** An MSI `UpgradeCode` is
 never invented: it has to be identical across every version ever shipped or the second release
 installs beside the first rather than replacing it, which works perfectly once and then never
