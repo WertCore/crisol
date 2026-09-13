@@ -5,5 +5,7 @@
 #![doc(html_root_url = "https://docs.rs/crisol-frontend/0.0.0")]
 
 mod graph;
+mod loader;
 
 pub use graph::{ModuleGraph, ModuleId};
+pub use loader::{Loader, Request, Unresolved};
