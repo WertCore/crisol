@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M11 — IR. **Acceptance met** (forty programs lower, verify, and dump to a reviewed snapshot).
+**Current milestone:** M12 — runtime library (in progress: the object model; the builtins are not)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1357,13 +1357,56 @@ closures, `for`, arrays, and the rest of the unsupported list.
 
 ---
 
+## M12 — runtime library
+
+### The object model, first, because everything stands on it
+
+`crisol-builtins` has `ValidateAndApplyPropertyDescriptor` and the ordinary internal methods
+(D-60). `Object.defineProperty`, `Object.freeze`, getters, `Proxy` and `Reflect` are all
+restatements of these, so they come before any of them.
+
+Written out rather than simplified, because every rule that looks redundant is load-bearing:
+**freezing needs two bits** (non-configurable but writable still accepts a new value); a frozen
+property may be re-set to the value it already has **by SameValue**, so `NaN`→`NaN` is allowed
+and `0`→`-0` is not — which is the payoff for canonicalising NaN back at M9, since `Value`'s
+derived equality *is* `Object.is` (D-53) and this is one comparison rather than a special case.
+
+**`[[Set]]` consults the prototype chain before deciding where to write.** `Object.freeze(proto)`
+stops `child.x = 1` from creating an own property on the child. Surprising, correct, and
+invisible until someone freezes a prototype.
+
+**`Object.keys` order is observable:** array indices first and ascending, then strings in
+insertion order, and only *canonical* decimals count — `"01"`, `"1.0"` and `"-0"` are ordinary
+string keys.
+
+Three rules checked by breaking them: dropping SameValue fails two tests, making `[[Set]]` local
+fails the frozen-prototype one, and leaving integer keys unsorted fails the ordering one.
+
+**Two of these tests failed when first written, and were the tests being wrong.** Both used
+`PartialDescriptor::value()` meaning "an ordinary property" — but it defaults every attribute to
+`false`, which is exactly what `Object.defineProperty` does and emphatically not what assignment
+does. The asymmetry proving itself on its own author is the reason it has a test.
+
+**Still to do for M12:** all of it, really — `Object`, `Array`, `String`, `Number`, `Boolean`,
+`Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
+`Promise` with a microtask queue, `JSON`, and then `Proxy`/`Reflect` on top of the model above.
+The acceptance is a test262 subset at >80%, which needs the suite fetched the way M10's React
+tree is.
+
+**The join with shapes is the piece to do next.** `Shapes` (D-54) is the fast path, a data
+property in a slot; this is the general path. Real engines keep both and spill from one to the
+other, and *when an object leaves the fast path* is the decision §3.2's "one predictable branch"
+rests on. It deserves its own diff.
+
+---
+
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A (M0–M8), M9, M10 and M11 are complete**, acceptances included. Next is **M12 —
-   the runtime library**, which is also where `mem2reg` (D-59) and shape-precise object types
-   belong. M11's lowering covers a subset: arithmetic, functions and `for` are in the
-   unsupported list rather than missing silently. Read D-55's last section first: the collector's safety rests on objects sitting behind
+2. **Track A (M0–M8), M9, M10 and M11 are complete**, acceptances included. **M12 is under
+   way: the object model is done, the builtins are not.** The next piece is the join between
+   `Shapes` (fast path) and the descriptor table (general path) — see the M12 section. M12 also
+   owns `mem2reg` (D-59) and shape-precise object types. Read D-55's last section first: the collector's safety rests on objects sitting behind
    checked handles, and M13 is where that assumption comes due. D-54's per-site monomorphic
    cache is M11's job and is what makes shape lookup fast. The rooting API is the part to get right
    rather than the collector — see §3.1 and the M9 section above.
@@ -1377,8 +1420,14 @@ closures, `for`, arrays, and the rest of the unsupported list.
      screen reader, so they cannot be closed from here at all.
 3. Whichever comes first, run **the whole gate** before pushing — `fmt`, `clippy --workspace
    --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, both
-   headless examples, and `cargo doc --workspace --no-deps`. Two of five is how PR #25 failed
-   on formatting alone.
+   headless examples, and **`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`**. Two
+   of five is how PR #25 failed on formatting alone.
+
+   **The `RUSTDOCFLAGS` part is not decoration.** CI sets it and a bare `cargo doc` does not,
+   so a broken intra-doc link is a warning locally and a failure there — a whole session's
+   worth of doc runs were weaker than CI's before anyone noticed. The same applies to the test
+   step: CI sets `CRISOL_REQUIRE_GPU`, `CRISOL_REQUIRE_FONTS` and `CRISOL_REQUIRE_NODE_MODULES`,
+   and without them the tests that need those things *skip*.
 4. For anything platform-shaped, add `cargo clippy --workspace --all-targets --all-features
    --target x86_64-unknown-linux-gnu` and `--target x86_64-pc-windows-msvc`. Neither needs a
    linker, both are ~400 MB, and together they caught two Windows/Linux-only failures before

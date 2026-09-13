@@ -1658,3 +1658,56 @@ the snapshot being reviewed rather than merely regenerated.
 **The corpus is representative of what lowers**, not of JavaScript. It has no arithmetic, no
 functions and no `for` loops, because those do not lower yet. Saying "thirty representative
 programs" without saying that would be the more flattering sentence and the less true one.
+
+---
+
+## D-60 — The object model follows the specification's shape, including its asymmetries
+
+**Status:** Accepted (M12) · **Affects:** M12, M13, §3.2
+
+`ValidateAndApplyPropertyDescriptor` (ECMA-262 10.1.6.3) is written out rather than
+simplified, because every rule in it that looks redundant is load-bearing:
+
+- A **non-configurable** property can still have its value changed if it is also **writable**.
+  Freezing needs both bits, and an implementation that treats `configurable: false` as "frozen"
+  rejects legal programs.
+- A frozen property may be "changed" to the value it already has, by **SameValue** — so `NaN`
+  to `NaN` is allowed and `0` to `-0` is not. `Value`'s derived equality *is* `Object.is`
+  (D-53), so this is one comparison rather than a special case, which is the payoff for having
+  canonicalised NaN back at M9.
+- Writability goes true → false and never back, on a non-configurable property.
+- Changing a data property into an accessor, or back, needs `configurable` — in both
+  directions.
+- A descriptor asking for nothing is allowed on anything, including a frozen property on a
+  non-extensible object. Asking for no change is not a change.
+
+Each is a line in the spec and a test. The code's shape follows the specification's on purpose:
+when the two disagree, the diff should be obvious rather than requiring someone to re-derive
+the rule.
+
+**`[[Set]]` consults the prototype chain before deciding where to write**, which is the rule
+most likely to be "simplified" away. `Object.freeze(proto)` stops `child.x = 1` from creating
+an own property on the child — surprising, correct, and invisible until someone freezes a
+prototype. Checked by making `[[Set]]` local and watching the test fail.
+
+**`[[OwnPropertyKeys]]` puts array indices first, ascending, then strings in insertion order.**
+`Object.keys({b: 1, 2: 2, a: 3, 1: 4})` is `["1", "2", "b", "a"]`, and code that renders a
+keyed list depends on it. Only *canonical* decimals count: `"01"`, `"1.0"` and `"-0"` are
+ordinary string keys, and moving them into the numeric group would reorder `Object.keys` in a
+way no engine does.
+
+**Getters are returned, not called.** `[[Get]]` on an accessor has to call a function and
+nothing in this crate can call one, so it hands back `Got::Getter` and the caller performs the
+call. Pretending otherwise would mean inventing a calling convention here, in the crate least
+equipped to own one.
+
+### What this is not yet joined to
+
+[`crisol_value::Shapes`] is the fast path — a data property in a slot, resolved at compile time
+(D-54). This is the general path, where a property can be an accessor, non-enumerable or
+frozen. Real engines keep both and spill from the first to the second when a property stops
+being ordinary.
+
+Marrying them is the next piece of work and deliberately not done here: the join decides when
+an object leaves the fast path, which is the decision §3.2's "one predictable branch" rests on,
+and it deserves its own diff rather than arriving underneath a descriptor implementation.
