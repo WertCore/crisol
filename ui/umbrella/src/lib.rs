@@ -25,6 +25,8 @@ pub use crisol_tree as tree;
 #[cfg(feature = "render")]
 pub use crisol_render_wgpu as render;
 
+pub mod chrome;
+
 #[cfg(feature = "measure")]
 pub mod measure;
 

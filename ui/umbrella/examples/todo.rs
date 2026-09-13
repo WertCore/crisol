@@ -22,6 +22,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crisol_ui::chrome::{ResizeEdge, resize_edge};
 use crisol_ui::css::stylesheet::Stylesheet;
 use crisol_ui::display_list::{Color, DisplayList, Point};
 use crisol_ui::dom::Dom;
@@ -114,6 +115,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Without it a machine with no fonts renders an empty window and reports success, which is
 /// indistinguishable from working.
+/// How far in from an edge counts as the resize band, in logical pixels.
+const RESIZE_BORDER: f32 = 6.0;
+
+/// Maps the engine's edge vocabulary to winit's.
+///
+/// `crisol-ui` names its own directions rather than depending on a windowing crate — nothing
+/// above the renderer does (see its `Cargo.toml`). This is the rename that costs, written
+/// once by the application that needed it.
+fn to_winit(edge: ResizeEdge) -> winit::window::ResizeDirection {
+    use winit::window::ResizeDirection as D;
+    match edge {
+        ResizeEdge::North => D::North,
+        ResizeEdge::NorthEast => D::NorthEast,
+        ResizeEdge::East => D::East,
+        ResizeEdge::SouthEast => D::SouthEast,
+        ResizeEdge::South => D::South,
+        ResizeEdge::SouthWest => D::SouthWest,
+        ResizeEdge::West => D::West,
+        ResizeEdge::NorthWest => D::NorthWest,
+    }
+}
+
+/// The pointer shape for an edge, which winit already knows.
+fn resize_cursor(edge: ResizeEdge) -> cursor_icon::CursorIcon {
+    to_winit(edge).into()
+}
+
 fn fonts() -> FontSystem {
     let fonts = FontSystem::new();
     if fonts.is_empty() {
@@ -921,7 +949,51 @@ impl State {
         None
     }
 
+    /// Handles a press that might be on the window's own chrome rather than its content.
+    ///
+    /// An edge starts a resize, the title starts a move, and anything else is left alone for
+    /// the application to treat as a click. Order matters: the edge band overlaps the title
+    /// at the top corners, and a corner that moved the window instead of resizing it would
+    /// be the more surprising of the two.
+    fn press(&mut self, at: Point) {
+        if let Some(edge) = resize_edge(at, self.surface.logical_size(), RESIZE_BORDER) {
+            let _ = self.surface.window().drag_resize_window(to_winit(edge));
+            return;
+        }
+        if self.over_title(at) {
+            let _ = self.surface.window().drag_window();
+        }
+    }
+
+    /// Whether `at` is over the heading, which is this application's title bar.
+    ///
+    /// Which element counts is the application's to decide — the engine knows where the
+    /// boxes are, not which of them the user thinks of as somewhere to grab the window by.
+    fn over_title(&self, at: Point) -> bool {
+        let Some(hit) = hit_test(&self.tree, at) else {
+            return false;
+        };
+        let mut node = Some(hit.node);
+        while let Some(id) = node {
+            if self.tree.node(id).kind.tag() == Some("h1") {
+                return true;
+            }
+            node = self.tree.parent(id);
+        }
+        false
+    }
+
     fn update_cursor(&mut self) {
+        // An edge wins over whatever the cascade says, because the resize is what a press
+        // there would actually do, and a cursor that disagrees with that is a lie.
+        if let Some(edge) = resize_edge(self.pointer, self.surface.logical_size(), RESIZE_BORDER) {
+            let icon = resize_cursor(edge);
+            if self.cursor != Some(icon) {
+                self.cursor = Some(icon);
+                self.surface.window().set_cursor(icon.into());
+            }
+            return;
+        }
         let icon = hit_test(&self.tree, self.pointer)
             .and_then(|hit| {
                 let over_text = self
@@ -1030,6 +1102,11 @@ impl ApplicationHandler for Shell {
                 .create_window(
                     WindowAttributes::default()
                         .with_title("Crisol — M7: signals, effects, components")
+                        // M8's window chrome: no system title bar, so what the window shows
+                        // is what the engine drew, the same on all three platforms. The cost
+                        // is that moving and resizing become the application's problem —
+                        // handled in `PointerButton` below.
+                        .with_decorations(false)
                         .with_surface_size(winit::dpi::LogicalSize::new(600.0, 460.0)),
                 )
                 .expect("could not create a window"),
@@ -1103,6 +1180,15 @@ impl ApplicationHandler for Shell {
             WindowEvent::DragLeft { .. } => {
                 state.drag_cancelled();
                 state.surface.window().request_redraw();
+            }
+            WindowEvent::PointerButton {
+                state: ElementState::Pressed,
+                position,
+                ..
+            } => {
+                let scale = state.surface.scale_factor();
+                let at = Point::new(position.x as f32 / scale, position.y as f32 / scale);
+                state.press(at);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // A trackpad on macOS has already been through the system's own momentum by

@@ -801,6 +801,36 @@ it in CSS — which now works, because naming it no longer discards the fallback
 That is an application decision with a binary-size cost, so the engine offers it rather than
 imposing it.
 
+### Window chrome the application draws
+
+The window is borderless now — `decorations(false)` — so what it shows is what the engine
+drew, on all three platforms. That is the one part of the window crisol did not otherwise
+control, and it is where the consistency question above actually bites: a system title bar
+looks like its system no matter what the document does.
+
+What it costs is the two things the system title bar was doing.
+
+**Moving** is the application's, because only it knows which of its elements is a title bar.
+The example hit-tests its own `h1` and calls `drag_window`.
+
+**Resizing** is geometry, identical everywhere, so it is in the engine:
+`crisol_ui::chrome::resize_edge` answers which edge or corner a point is in. Corners beat the
+edges they are made of, the band sits inside the window rather than straddling its boundary,
+and a window narrower than two borders splits the difference so both edges stay reachable —
+without that last one a window shrunk to nothing could never be grown back, which is a
+permanent failure rather than an awkward one.
+
+It names its own eight directions rather than winit's, the same way `platform_cursor` returns
+a `cursor-icon` type: the umbrella's `Cargo.toml` says plainly that nothing above the renderer
+should need `winit`, and a resize direction is not a reason to break that. The application
+writes the rename once.
+
+**A cfg I moved by accident, and what caught it.** Adding `pub mod chrome` next to
+`pub mod measure` put chrome under `#[cfg(feature = "measure")]` and left measure ungated, so
+measure compiled without the optional `mach2` behind it. Every test passed — they run with
+`--all-features` — and the only thing that noticed was `cargo doc` without them. Worth
+remembering that the feature matrix is part of the gate and not a formality.
+
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
 response in it, measured on all three platforms.
