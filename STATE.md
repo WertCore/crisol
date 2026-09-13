@@ -1,7 +1,7 @@
 # Crisol — State
 
-**Current milestone:** M8 — platform polish (every deliverable done; the acceptance is what remains)
-**Last finished:** M7 — reactive API and component model
+**Current milestone:** Track A is complete. Next is M9 — GC and value representation.
+**Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -345,7 +345,11 @@ magnitude too large that found it (D-45).
 
 ---
 
-## In progress
+## M8 — platform polish, and its acceptance
+
+Complete, acceptance included. Kept here rather than folded into **Done** above because the
+acceptance is §7's first kill criterion and the reasoning behind the number should stay
+where it can be read.
 
 **M8 — platform polish.** Scrolling, momentum and scrollbars are done; the rest of the
 deliverable is not.
@@ -919,6 +923,53 @@ signal. The DOM layer absorbs the writes, so the cost is closure calls rather th
 but it is linear. That is what this way of modelling a selection costs, not a limit of the
 engine — a list long enough to care would remember the previous row and toggle exactly two.
 Said out loud in a comment rather than quietly shipped.
+
+### The acceptance, and the number the product claim rests on
+
+`ui/umbrella/examples/apiclient.rs` is the application §M8 asks for: a sidebar of saved
+requests, a URL bar, a status line, and a response pane holding what the selected request
+returned. Selecting another request swaps the response and returns the pane to the top, which
+is the interaction that makes it an application rather than a layout.
+
+**With a 5 MB JSON response loaded — 240,884 lines — it measures 10.4–10.7 MiB**, the spread
+being run-to-run variation rather than a difference between profiles: debug and release land in
+the same place, because what dominates is the response text and neither profile changes that.
+The budget is 60 MB, so it lands with a factor of about 5.6 to spare, and §7's first kill
+criterion does not fire.
+
+| | |
+|---|---|
+| response | 5.0 MB, 240,884 lines |
+| nodes in the tree | **118** |
+| laid out, first frame | 147 |
+| scrollbar extent | 4,335,248 px against the 4,335,248 px it should be |
+| a scroll frame | 1.71 ms release, 2.38 ms debug |
+| **memory** | **10.4–10.7 MiB (phys_footprint)**, against 60 MB |
+
+118 nodes for 240,884 lines is the whole argument. One element per line is 481,768 nodes and
+3,678 MiB (D-47), which is not a tuning problem. The pane builds only the ~47 lines in view
+plus overscan, and two spacers stand in for the rest — and *that the extent is right* is
+asserted rather than assumed, because a pane that is cheap by scrolling to the wrong place is
+not a pane. That guard was checked by breaking the bottom spacer and watching it fail: 182 px
+against 4,335,248.
+
+**The body is held once**, as one `String` plus a `Vec<u32>` of line starts, rather than as
+240,884 separate `String`s. The per-`String` header alone would be ~5.8 MB — a tenth of the
+budget spent on bookkeeping nobody can see. Most of the 10.5 MiB is the response text itself,
+which is the application's data rather than the engine's, and that is the shape the number
+should have.
+
+**CI gates it on all three platforms** at 60 MiB, writing the reading into the job summary.
+The extraction was checked against real output rather than assumed, and the gate was checked
+in both directions — 59.9 passes, 60.1 fails — because a budget that cannot fail is not a
+budget. The ceiling is written in the workflow rather than carried in the matrix, because
+unlike the idle-memory step above it is §M8's number and not a per-platform observation.
+
+**What this does not cover.** The reading is headless: no window, no GPU device, so it is the
+engine's and the application's rather than the driver's. That is the right number for a
+claim about *this* engine and it is comparable across three platforms, but a user running a
+windowed build pays for a swapchain and a driver on top. `todo` is the windowed path and is
+measured separately; a windowed apiclient is a follow-up rather than a gap in the claim.
 
 **Totals:** 559 tests passing
 
