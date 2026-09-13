@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 564 tests passing
+**Totals:** 568 tests passing
 
 ## Open questions
 
@@ -1028,7 +1028,13 @@ it is trackable rather than buried in a document nobody greps. Current ones:
 - **M1's "window opens on all three platforms" is verified on macOS only** — issue
   [#15](https://github.com/WertCore/crisol/issues/15). Everything short of the window is
   covered offscreen on all three in CI, so what is untested is specifically the `winit`
-  surface and swapchain path.
+  surface and swapchain path. **One piece of it is now testable and tested:** the decision
+  `WindowSurface::resize` makes is split into `reconfigure_to`, so the two cases that only a
+  real window produces — Windows reporting `0x0` while minimised, and a resize event for the
+  size already configured — are pinned on all three platforms. That is the failure mode that
+  would have been a *panic* rather than a cosmetic artefact. What still needs a human is
+  everything visual: artefacts on resize, dragging between displays of different densities,
+  and whether a scale-factor change is picked up. The issue stays open for those.
 - **A full `cargo test --workspace --all-features` fits, but the development machine rarely
   has room for it.** It ran repeatedly on 2026-09-13 (559 tests); what it needs is about
   2 GiB free, and the resting state of that disk is nearer 1 GiB. So the failure mode is a
