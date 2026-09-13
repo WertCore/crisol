@@ -1002,11 +1002,13 @@ it is trackable rather than buried in a document nobody greps. Current ones:
   [#15](https://github.com/WertCore/crisol/issues/15). Everything short of the window is
   covered offscreen on all three in CI, so what is untested is specifically the `winit`
   surface and swapchain path.
-- **A full `cargo test --workspace` no longer fits on the development machine's disk.**
-  wgpu, naga and lightningcss together overflow it. Local runs go in two halves — the
-  graphics crates and everything else — and CI runs the whole thing. Nothing about the code
-  requires this; it is a note so the next session does not rediscover it as a mysterious
-  linker failure.
+- **A full `cargo test --workspace --all-features` fits, but the development machine rarely
+  has room for it.** It ran repeatedly on 2026-09-13 (559 tests); what it needs is about
+  2 GiB free, and the resting state of that disk is nearer 1 GiB. So the failure mode is a
+  `No space left on device` in the middle of a link, not a code problem — `cargo clean` and
+  retry rather than splitting the run. The whole five-step gate from a clean `target/` wants
+  ~2.5 GiB. Note that `cargo clean --doc` reclaims almost nothing (~12 MiB): the doc step's
+  real cost is rebuilding dependencies at *default* features, not rustdoc output.
 - **`DisplayList` has no transform command.** Rounded clipping landed (D-26); transforms did
   not, and are not in any milestone's property subset yet.
 - **Per-corner inner border radii are approximated.** The shader shrinks a corner's inner
@@ -1104,18 +1106,27 @@ Appended to `DECISIONS.md` in full; summarised here.
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. Start M5. Read §M5's note first: accessibility belongs *here*, not in year three, because
-   it constrains the tree, the focus model and the event system, and retrofitting means
-   restructuring. Touch is designed in now too (§3.6), even though mobile ships at M22. Text is the one milestone the roadmap explicitly
-   says to over-budget for, and it is the core competency rather than a checkbox: the text
-   layer is a *public API*, not an internal detail.
-3. Suggested order, because each step makes the next testable:
-   a. Hit testing in `crisol-events`: a point to a node, respecting clips. `crisol-text`
-      already resolves a point *within* a text block to a cursor, so the two compose into
-      "which character did the user click" as soon as the first exists.
-   b. The event model: capture/bubble over the tree, with touch and pointer cancellation in
-      the vocabulary from the start rather than added for M22.
-   c. Focus: order, keyboard navigation, and the `ElementState` bits that M3 put on the node
-      and nothing has written yet — `:hover`, `:focus`, `:focus-within`, `:active` are all
-      matched by the cascade already and all currently always false.
-   d. IME preedit, then the `accesskit` bridge.
+2. **Track A is complete (M0–M8), acceptance included.** The roadmap calls it independently
+   useful and shippable on its own, so there are two honest directions and they are not
+   ordered by the roadmap:
+   - **Start M9 — GC and value representation**, which begins Track B. §M9 says to do it
+     *before* the IR because it constrains the calling convention, the IR and the ABI, and
+     §3.1 flags rooting as the risk: every host function touching a JS value participates, so
+     the rooting API has to be hard to misuse — prefer a scope guard over manual push/pop.
+   - **Or close out Track A's own gaps first**, which are filed rather than buried:
+     [#20](https://github.com/WertCore/crisol/issues/20) a paint-only style change still costs
+     a relayout (the unfinished half of D-45, and the one with a written test for when it is
+     fixed), [#16](https://github.com/WertCore/crisol/issues/16) nested rounded clips, and
+     [#15](https://github.com/WertCore/crisol/issues/15) opening a window by hand on Windows
+     and Linux. [#13](https://github.com/WertCore/crisol/issues/13) and
+     [#14](https://github.com/WertCore/crisol/issues/14) need a human at a keyboard and a
+     screen reader, so they cannot be closed from here at all.
+3. Whichever comes first, run **the whole gate** before pushing — `fmt`, `clippy --workspace
+   --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, both
+   headless examples, and `cargo doc --workspace --no-deps`. Two of five is how PR #25 failed
+   on formatting alone.
+4. For anything platform-shaped, add `cargo clippy --workspace --all-targets --all-features
+   --target x86_64-unknown-linux-gnu` and `--target x86_64-pc-windows-msvc`. Neither needs a
+   linker, both are ~400 MB, and together they caught two Windows/Linux-only failures before
+   CI did. They are **not** a substitute for CI: clippy type-checks, so anything that only
+   appears when a test *runs* is invisible to it.
