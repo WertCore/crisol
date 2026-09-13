@@ -542,6 +542,29 @@ response.
 Layout is the whale, not the `Node` the memory measurement was worrying about earlier. Whatever
 the virtualised pane looks like, what it must avoid building is laid-out and shaped text.
 
+### Building only the window, which does fit
+
+The same 240,884 lines with only the ~49 in view built, and two spacers standing in for the
+rest so the scrollbar is the size it would be if they had been built:
+
+| | one element per line | only the window |
+|---|---|---|
+| nodes | 481,768 | **103** |
+| memory | 3,671 MiB | **2.2 MiB** |
+| layout | ~43 min, extrapolated | **15 ms** |
+
+The scroll extent comes out at 4,335,212 px against the 4,335,212 px it should be, which is
+checked rather than assumed — a cheap pane that scrolls to the wrong place is not a pane. So
+the approach fits the budget with two orders of magnitude to spare, and the acceptance is
+reachable.
+
+**What it needs that does not exist.** The spacer heights are baked into the stylesheet,
+which a real pane cannot do: both heights change on every scroll frame. There is no inline
+`style` attribute and no per-node style override, so today the only way to move a spacer is
+to reparse a stylesheet per frame. Closing that is a prerequisite for the acceptance app, and
+the cheapest form of it is probably a per-node length override rather than a full inline-style
+parser — the pane needs exactly two numbers, not a CSS dialect.
+
 **A process per measurement, because the first version of this was wrong.** Measuring every
 size in one process produced two numbers that disagreed sixfold — ~13 KB per line as a
 difference of totals, ~2.6 KB as a difference of stages. Freeing a 670 MiB tree does not return

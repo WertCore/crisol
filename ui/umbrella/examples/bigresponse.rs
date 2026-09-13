@@ -28,6 +28,9 @@ const CSS: &str = "
     .line { display: block; white-space: pre }
 ";
 
+/// Must agree with `line-height` in `CSS`: the spacers are sized in multiples of it.
+const LINE_HEIGHT: f32 = 18.0;
+
 /// The viewport an API client's response pane might have.
 const VIEWPORT: Size = Size {
     width: 900.0,
@@ -40,8 +43,11 @@ fn main() {
         // Child: one configuration, one process, one reading.
         Some(at) => {
             let count: usize = args[at + 1].parse().expect("--lines takes a number");
-            let stages = args.iter().any(|a| a == "--stages");
-            child(count, stages);
+            if args.iter().any(|a| a == "--window") {
+                child_window(count);
+            } else {
+                child(count, args.iter().any(|a| a == "--stages"));
+            }
         }
         None => parent(),
     }
@@ -111,17 +117,38 @@ fn parent() {
         );
     }
 
+    // The same response, built the way it would have to be built.
+    if let Some(fields) = run_child(&exe, &["--lines", &lines.to_string(), "--window"]) {
+        let (mib, nodes, ms) = (fields[0], fields[1], fields[2]);
+        let (visible, scroll_max, want) = (fields[3], fields[4], fields[5]);
+        println!("\nthe same {lines} lines, building only the {visible:.0} in view:");
+        println!("  {nodes:.0} nodes, {mib:.1} MiB, laid out in {ms:.1} ms");
+        let correct = (scroll_max - want).abs() < 1.0;
+        println!(
+            "  scrollbar spans {scroll_max:.0} px against the {want:.0} px it should — {}",
+            if correct {
+                "the extent is right"
+            } else {
+                "WRONG, the spacers do not stand in"
+            },
+        );
+        println!(
+            "\n  Built with the spacer heights baked into the stylesheet, which a real pane\n  \
+             cannot do: both change on every scroll frame. There is no inline `style`\n  \
+             attribute and no per-node style override, so today the only way to move a\n  \
+             spacer is to reparse a stylesheet per frame. That is the gap between this\n  \
+             measurement and a response pane."
+        );
+    }
+
     if let Some((count, mib)) = previous {
         let per_line = mib * 1024.0 * 1024.0 / count as f64;
         println!(
-            "\nAt {per_line:.0} bytes a line, {lines} lines is about {:.0} MiB, against a 60 MB \
-             budget.",
+            "\nAt {per_line:.0} bytes a line, {lines} lines is about {:.0} MiB against a 60 MB \
+             budget: one\nelement per line does not fit, and not by a margin any tuning \
+             closes. Building only the\nwindow does fit, and scrolls to the right place while \
+             doing it.\n",
             per_line * lines as f64 / (1024.0 * 1024.0),
-        );
-        println!(
-            "One element per line does not fit, and not by a margin any tuning closes. A \
-             response pane\nhas to build nodes for the lines in view rather than for the \
-             response.\n"
         );
     }
 }
@@ -196,6 +223,98 @@ fn child(count: usize, stages: bool) {
     } else {
         println!("MEASURED {:.6} {nodes} {layout_ms:.3}", mib(after_layout));
     }
+    drop((tree, styles, fonts, cache, engine, payload));
+}
+
+/// The same response, built the way a response pane would have to build it.
+///
+/// Only the lines in view become nodes. The scroll extent comes from two spacers, one above
+/// the window and one below, whose heights stand in for the lines that were not built — so
+/// the scrollbar is the size it would be if all of them had been. That the extent is right is
+/// checked here rather than assumed: a cheap pane that scrolls to the wrong place is not a
+/// pane.
+///
+/// The spacer heights are baked into the stylesheet because there is nowhere else to put
+/// them. See the note this prints.
+fn child_window(total: usize) {
+    let payload = pretty_json(5 * 1024 * 1024);
+    let lines: Vec<&str> = payload.lines().collect();
+    let total = total.min(lines.len());
+
+    // A window big enough to cover the viewport, plus overscan so a scroll does not show
+    // blank rows before the next build catches up.
+    let visible = (VIEWPORT.height / LINE_HEIGHT).ceil() as usize + 10;
+    let visible = visible.min(total);
+    // Park the window in the middle, where both spacers are non-zero.
+    let first = (total - visible) / 2;
+    let above = first as f32 * LINE_HEIGHT;
+    let below = (total - first - visible) as f32 * LINE_HEIGHT;
+
+    let css = format!(
+        "{CSS}
+        .pane  {{ display: block; overflow: scroll; width: {}px; height: {}px }}
+        .above {{ display: block; height: {above}px }}
+        .below {{ display: block; height: {below}px }}",
+        VIEWPORT.width, VIEWPORT.height,
+    );
+
+    let Some(base) = crisol_ui::measure::current() else {
+        return;
+    };
+    let base = base.bytes;
+
+    let mut tree = Tree::new();
+    let pane;
+    {
+        let mut dom = Dom::new(&mut tree);
+        let root = dom.create_element("html");
+        dom.set_root(root);
+        let body = dom.create_element("body");
+        dom.append_child(root, body).expect("body under html");
+        pane = dom.create_element("div");
+        dom.set_attribute(pane, "class", "pane");
+        dom.append_child(body, pane).expect("pane under body");
+
+        let spacer = dom.create_element("div");
+        dom.set_attribute(spacer, "class", "above");
+        dom.append_child(pane, spacer).expect("spacer under pane");
+        for line in &lines[first..first + visible] {
+            let element = dom.create_element("div");
+            dom.set_attribute(element, "class", "line");
+            let text = dom.create_text(line);
+            dom.append_child(element, text).expect("text under div");
+            dom.append_child(pane, element).expect("line under pane");
+        }
+        let spacer = dom.create_element("div");
+        dom.set_attribute(spacer, "class", "below");
+        dom.append_child(pane, spacer).expect("spacer under pane");
+    }
+
+    let mut engine = StyleEngine::new();
+    engine.add_stylesheet(Stylesheet::parse(&css).expect("the generated stylesheet"));
+    let styles = engine
+        .restyle_incremental(&mut tree, &StyleMap::default())
+        .0;
+
+    let mut fonts = FontSystem::new();
+    let mut cache = LayoutCache::new();
+    let started = std::time::Instant::now();
+    {
+        let mut context = LayoutContext::new(&mut tree, &styles, &mut fonts, &mut cache);
+        context.run(VIEWPORT);
+    }
+    let layout_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    let after = reading();
+    let nodes = tree.len();
+    // What the scrollbar would be: the whole response, less the part on screen.
+    let scroll_max = tree.scroll_max(pane).height;
+    let want = total as f32 * LINE_HEIGHT - VIEWPORT.height;
+
+    println!(
+        "MEASURED {:.6} {nodes} {layout_ms:.3} {visible} {scroll_max:.1} {want:.1}",
+        mib(after - base),
+    );
     drop((tree, styles, fonts, cache, engine, payload));
 }
 
