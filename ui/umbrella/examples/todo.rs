@@ -1135,12 +1135,17 @@ impl State {
     /// Reached from the menu rather than the keyboard, which is the whole point of having
     /// one: the same application state, a second way in. The work is `App`'s so that the
     /// headless run can exercise it, since the menu itself cannot be driven without a window.
+    ///
+    /// Gated with its caller: where there is no menu bar there is nothing to call this, and
+    /// the example is built with `-D warnings`.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn menu_add(&mut self) {
         let mut dom = Dom::new(&mut self.tree);
         self.app.add_draft(&self.runtime, &mut dom);
     }
 
     /// Removes every completed todo.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn menu_clear_done(&mut self) {
         let mut dom = Dom::new(&mut self.tree);
         self.app.clear_done(&self.runtime, &mut dom);
@@ -1293,8 +1298,10 @@ impl ApplicationHandler for Shell {
                         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
                         if let Ok(handle) = surface.window().window_handle() {
                             if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                                // Safe in the sense the signature asks for: the handle comes
-                                // from the window we just made and outlives this call.
+                                // SAFETY: the handle comes from the window created just
+                                // above, which `State` owns for as long as the application
+                                // runs. It therefore outlives both this call and the menu
+                                // hung on it, which is what `init_for_hwnd` requires.
                                 let _ = unsafe { bar.init_for_hwnd(win32.hwnd.get()) };
                             }
                         }

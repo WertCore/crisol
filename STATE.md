@@ -865,6 +865,14 @@ against 27).
 A menu bar that will not build is a warning rather than a failure. The application is entirely
 usable from the keyboard without it.
 
+**Two things only CI could catch, and it caught both.** Under `-D warnings` a `cfg` on the
+caller is not enough — the callee has to carry the same one, or it is dead code on every other
+platform, which is how `menu_add`/`menu_clear_done` failed Linux. And `undocumented_unsafe_blocks`
+wants the literal `SAFETY:` marker: `init_for_hwnd`'s block had a comment explaining exactly
+why it was sound and still failed Windows for not spelling it that way. Neither is reachable
+from a macOS build, but both are reachable from `cargo clippy --target`, which needs no linker
+and is now worth running for the two other desktop triples before pushing anything platform-shaped.
+
 **Still to do for M8:** drag and drop, packaging (.app, .msi, AppImage) — and then the
 acceptance proper: an API-client-shaped application with a 5MB response in it, measured on all
 three platforms.
