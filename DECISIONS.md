@@ -1915,3 +1915,68 @@ which is why `new Error()` and `new Error("")` differ from `new Error("x")` in `
 `Error.prototype.toString` joins the two with `": "` **only when both halves exist**: a message
 with no name is just the message, and a name with no message has no trailing colon. That detail
 is in every stack trace anyone has ever read.
+
+---
+
+## D-68 — A `Proxy`'s traps are the easy half; the invariants are the point
+
+**Status:** Accepted (M12) · **Affects:** M12, M13, §3.2
+
+§3.2 makes `Proxy` a named product risk — it cannot be rejected if the ecosystem is a goal,
+because Vue 3's reactivity, MobX, Immer, Valtio and Solid stores all depend on it. That
+decision is about *cost*: shapes carry an `is_exotic` bit (D-54) so the fast path branches once.
+This is about *correctness*, which is a separate and larger problem.
+
+**A trap is a function call. What makes `Proxy` safe to have in a language is that the spec
+checks the trap's answer against the target and throws when they disagree.** Without those
+checks a proxy could report that a frozen property holds a different value than it does, and
+every piece of code that reasoned about `Object.freeze` — including the engine's own optimiser —
+would be reasoning about a lie.
+
+So the invariant checks are the content, and each has a test that builds a *lying* trap and
+asserts the lie is refused:
+
+| trap | may not |
+|---|---|
+| `get` | report a non-configurable, non-writable property as anything but its value |
+| `set` | claim success when that property's value would change |
+| `has` | report a non-configurable own property as absent |
+| `deleteProperty` | claim to have deleted a non-configurable property |
+| `getOwnPropertyDescriptor` | report `undefined` for a non-configurable property |
+| `ownKeys` | omit a non-configurable key, or invent one on a non-extensible target |
+| `isExtensible` | disagree with the target **at all** |
+
+That last row has *no latitude*, unlike the property traps where a proxy may invent properties
+freely. `Object.isExtensible` is how code decides whether a shape can still change, so a proxy
+that lied about it would invalidate that reasoning everywhere.
+
+**An implementation with the traps and without the checks passes every test that uses a proxy
+and fails only the ones that try to break one** — which is the direction real code exercises
+after someone has already shipped a bug. Checked by removing the `get` check and watching its
+test fail.
+
+**Revocation is checked before the handler**, because revocation exists precisely to detach the
+handler; consulting it first would defeat the mechanism. A revoked proxy with a lying trap
+reports *revoked*, not *invalid*, and there is a test for that ordering.
+
+## D-69 — `done` is coerced, and leaving a loop early closes the iterator
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+`IteratorComplete` calls `ToBoolean` on `result.done`. So `{ done: 0 }` is **not** finished and
+`{ done: "false" }` **is** — `"false"` is a non-empty string and therefore truthy (D-65). An
+implementation comparing `done === true` loops forever on the first; one comparing `done == true`
+disagrees somewhere else again. Checked by replacing the coercion with a comparison.
+
+**The final result's `value` is a return value, not an element.** `for…of` and spread discard
+it; `yield*` is the one place it is visible. Collecting has to stop *at* the done step rather
+than after it.
+
+**Leaving a loop early calls the iterator's `return`.** That is how a generator's `finally` runs
+and how whatever the iterator was holding gets released. Skipping it leaks, and the leak is
+invisible because the happy path — running to exhaustion — never exercises it. Exhaustion is
+*not* early exit and must not close; there are tests for both directions.
+
+**A finished iterator stays finished.** Once a done step has come out, later calls report done
+again even if the underlying sequence has more. Without it an exhausted iterator asked again
+would restart, and the protocol has no way to notice.
