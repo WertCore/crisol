@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M10 — frontend and module graph (in progress: the graph is done; `oxc` is not)
+**Current milestone:** M10 — frontend and module graph. **Acceptance met** (a real React tree resolves and parses with nothing unresolved).
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 634 tests passing
+**Totals:** 636 tests passing (634 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1247,35 +1247,55 @@ self-referential — without that, every acyclic module is reported and the repo
 Both walks are iterative because the input is somebody's `node_modules` and its depth is not
 this code's to bound. There is a 100,000-deep chain in the tests.
 
-### What M10 still needs, and what stands in the way
+### Resolving and parsing a real tree — §M10's acceptance
 
-`oxc` for parsing JS/TS/JSX, `oxc_resolver` for `package.json` exports and CJS interop, and the
-acceptance: *"resolves and parses a real `node_modules` tree containing React, producing a
-complete module graph with no unresolved imports."*
+`Loader` wraps `oxc_resolver` and `oxc_parser`: resolve a specifier, parse the file, collect
+what it asks for, repeat. **§M10's acceptance passes** — `react-dom/client` resolved from a
+real npm-installed tree, every specifier resolved, nothing unresolved.
 
-Two practical obstacles, recorded so the next session does not rediscover them:
+**Both module systems, because a real tree has both.** React 19 is CommonJS from top to
+bottom; its entry is `module.exports = require('./cjs/react.production.js')`. ESM requests come
+from the parser's `ModuleRecord` (the specification's `[[RequestedModules]]`), which does not
+and should not contain `require` — that is a function call, not syntax. So `require()` is found
+by an **exhaustive AST visit**, and the choice of "exhaustive" over "match the shapes we
+expected" is the important one: a loader that understood only `import` would walk React and
+find *no edges at all*, then report a complete graph with no unresolved imports. **It would
+pass the acceptance by doing nothing.** A missing edge makes "no unresolved imports" easier to
+satisfy, not harder, and getting that backwards is how this milestone would be passed without
+being done.
 
-- **`oxc` is a large new dependency tree** and this machine's disk is the binding constraint —
-  the five-step gate already wants ~2.5 GiB against a resting ~1 GiB free. Adding oxc and a
-  React `node_modules` on top needs headroom that has to be made first.
-- **`npm` here is aliased to `pmg npm`, which does not work in this shell** (see the sessions'
-  notes on the PMG proxy). Fetching a real React tree needs that fixed or a vendored fixture
-  committed instead.
+**A real tree, not a fixture.** What makes it an acceptance is `exports` maps, conditions, CJS
+entry points and a dependency in another package, laid out the way npm lays them out. CI
+installs React 19.2.8 rather than vendoring it, pinned so a React release cannot turn a green
+branch red without a commit, and `CRISOL_REQUIRE_NODE_MODULES` makes an absent tree a failure
+rather than a skip — the same arrangement as `CRISOL_REQUIRE_GPU`, for the reason the workflow
+already states.
 
-Neither is a code problem and neither is solved by trying harder at the wrong moment.
+**§3.5 is visible in the graph.** `if (process.env.NODE_ENV === 'production') require(A) else
+require(B)` puts *both* bundles in it. That is correct for a graph, which records what could be
+imported; eliminating one is an optimisation pass's job (M12) and §3.5's actual subject. The
+test asserts both are there so the day one disappears is a failure rather than a smaller number
+nobody looked at.
+
+**Two things assumed and then checked, one of which was wrong.** `oxc` was written off as too
+large for this disk — it is 292 MB of `target` and builds in fifteen seconds. And the acceptance
+was written off as needing an npm that does not work in this shell — a real React tree was
+already on the machine, and the npm behind the broken `pmg` alias runs fine when invoked
+directly. Both were assumptions stated as blockers without being measured.
+
+**Still to do for M10:** TypeScript and JSX go through the same parser and are untested here;
+`oxc_resolver` is configured with one set of conditions (`node`, `require`, `default`) and a
+browser-conditioned resolve is a different graph.
 
 ---
 
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A (M0–M8) and M9 are complete. M10 is under way: the module graph is done, `oxc`
-   is not.** Before starting the parser work, read the obstacles in the M10 section above —
-   `oxc` is a large dependency tree against a disk that is already the binding constraint, and
-   the acceptance needs a real React `node_modules` that this shell's broken `npm` cannot
-   fetch. Make the headroom first, or vendor a fixture. Also read D-55's last section: the
-   collector's safety rests on objects sitting behind checked handles, and M13 is where that
-   assumption comes due. The rooting API is the part to get right
+2. **Track A (M0–M8), M9 and M10 are complete**, acceptances included. Next is **M11 — the
+   IR**. Read D-55's last section first: the collector's safety rests on objects sitting behind
+   checked handles, and M13 is where that assumption comes due. D-54's per-site monomorphic
+   cache is M11's job and is what makes shape lookup fast. The rooting API is the part to get right
    rather than the collector — see §3.1 and the M9 section above.
    - **Track A's remaining gaps**, which are filed rather than buried:
      [#20](https://github.com/WertCore/crisol/issues/20) a paint-only style change still costs

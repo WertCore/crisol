@@ -1515,3 +1515,54 @@ tests for that reason.
 import records of one module. Evaluation visits the module once regardless, but source order
 decides evaluation order, so a graph that sorted or deduplicated edges would produce an order
 the specification does not.
+
+---
+
+## D-57 — `require` is found by an exhaustive visit, not by matching the shapes we expected
+
+**Status:** Accepted (M10) · **Affects:** M10, M12, §3.5
+
+§M10's acceptance is "resolves and parses a real `node_modules` tree containing React,
+producing a complete module graph with no unresolved imports". React 19 is CommonJS from top to
+bottom — its entry is `module.exports = require('./cjs/react.production.js')` — so every edge in
+that graph comes from a `require` call rather than from `import` syntax.
+
+**A loader that understood only ESM would pass this acceptance by doing nothing.** It would walk
+React, find no edges at all, and report a complete graph with no unresolved imports. That is the
+trap in the acceptance's wording: *a missing edge makes "no unresolved imports" easier to
+satisfy, not harder*. Any incompleteness in finding requests is therefore invisible to the very
+test that is supposed to catch it.
+
+So `require()` is found with `oxc_ast_visit`'s visitor, which walks every node, rather than by a
+hand-rolled walk over the statement and expression shapes CJS "usually" takes. React's entry
+puts its requires inside an `if`; its bundles put them inside functions; `require(require(x))` is
+legal. A walker covering the cases someone thought of would miss edges silently, and silence is
+exactly what this acceptance cannot detect.
+
+ESM requests come from the parser's `ModuleRecord` — the specification's `[[RequestedModules]]`
+— which is exactly right for `import` and `export … from` and correctly does *not* contain
+`require`. The two sets are merged by source position, because `requested_modules` is a map and
+its iteration order is not source order, and source order is what decides evaluation order.
+
+**The tree is installed, not vendored.** What makes this an acceptance is `exports` maps,
+conditions, CJS entry points and a dependency living in another package, laid out the way npm
+lays them out. A committed fixture would satisfy the sentence and test nothing. CI installs a
+**pinned** React so that a React release cannot turn a green branch red without a commit, and
+`CRISOL_REQUIRE_NODE_MODULES` makes an absent tree a failure rather than a skip — the same
+arrangement as `CRISOL_REQUIRE_GPU`, for the reason the workflow already gives.
+
+**Both `NODE_ENV` branches stay in the graph.** `if (process.env.NODE_ENV === 'production')
+require(A) else require(B)` contributes two edges. That is correct for a graph, which records
+what *could* be imported; §3.5's concern — that the dev build's invariant machinery must not
+reach a release binary — is an optimisation pass's job at M12, and it needs both branches to be
+present in order to remove one. The test asserts both are there, so the day one disappears is a
+failure rather than a smaller number nobody looked at.
+
+### A note on how this decision was nearly not made
+
+Both of this milestone's supposed blockers were asserted without measurement and both were
+wrong. `oxc` was called too large for this machine's disk; it is 292 MB of `target` and builds
+in fifteen seconds. The acceptance was called unreachable because `npm` is aliased to a broken
+`pmg` wrapper; a real React tree was already on the machine, and the npm behind the alias runs
+fine when invoked directly. Neither claim survived thirty seconds of checking, and both were
+written into `STATE.md` as facts first.

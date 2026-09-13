@@ -62,6 +62,24 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # §M10's acceptance is "a real `node_modules` tree containing React", and *real* is the
+      # load-bearing word: what makes it an acceptance is `exports` maps, conditions, CJS entry
+      # points and a dependency in another package, laid out the way npm actually lays them
+      # out. A committed fixture would satisfy the sentence and test nothing.
+      #
+      # Installed rather than vendored for the same reason, and pinned rather than floating so
+      # that a React release cannot turn a green branch red without a commit.
+      - name: Fetch a real React tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/react-tree"
+          mkdir -p "$root"
+          cd "$root"
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund --loglevel=error react@19.2.8 react-dom@19.2.8
+          echo "CRISOL_NODE_MODULES_ROOT=$root" >> "$GITHUB_ENV"
+
       - name: Test
         run: cargo test --workspace --all-features
         env:
@@ -71,6 +89,9 @@ jobs:
           # rasteriser and its fonts from the package installed above.
           CRISOL_REQUIRE_GPU: 1
           CRISOL_REQUIRE_FONTS: 1
+          # Same argument, for the same reason: the step above fetched the tree, so an absent
+          # one here is a broken workflow rather than a machine without npm.
+          CRISOL_REQUIRE_NODE_MODULES: 1
 
       # `cargo test` builds examples but never runs them, so the interaction paths — key
       # handling, selection, the edit/commit cycle — would compile on three platforms and be
