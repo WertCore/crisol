@@ -1845,3 +1845,73 @@ the array, which is the whole difference between `delete` and `pop`; a non-writa
 stops `push` as well as assignment past the end, because growing *is* writing `length`; and
 `2^32 - 1` is a valid length but not a valid index, so `a[4294967295] = x` creates an ordinary
 string-keyed property rather than an element.
+
+---
+
+## D-65 — The coercions are written from the grammar, not from a parser that is nearly right
+
+**Status:** Accepted (M12) · **Affects:** M12, M13
+
+`ToBoolean`, `ToNumber` and `ToString` are short and have an unusually high density of
+surprises. Three are worth recording because getting them wrong is *easy* and *silent*.
+
+**The falsy list is closed.** `undefined`, `null`, `false`, `±0`, `NaN`, `""`. Nothing else.
+`Boolean("0")` and `Boolean("false")` are both true, and an implementation that "helpfully"
+added `"0"` would break every truthiness check on a string in the ecosystem.
+
+**`ToNumber` is not `parseInt`.** `Number("10abc")` is `NaN`; `parseInt("10abc")` is `10`.
+Reaching for the lenient one because it usually works turns malformed input into a plausible
+number, which is worse than a failure. `Number("")` is `0` — that is why `+[]` is `0` — and
+`Number("   ")` is `0` too.
+
+**Rust's `f64` parser is close to the grammar and not the same as it**, so the differences are
+excluded explicitly rather than hoped over: `"inf"`, `"infinity"` and `"nan"` are Rust literals
+and not JavaScript ones, `"1_000"` uses a separator that `ToNumber` does not allow, and a lone
+`"."`, `"+"` or `"-"` is neither. Each has a test. Delegating to a parser that is *nearly* right
+is the kind of shortcut that shows up years later as one engine disagreeing with the others.
+
+**`String(-0)` is `"0"`.** The sign is observable through `Object.is` and not through text —
+the mirror image of the `Map` key rule (D-62), and the reason those two cannot share one
+comparison. The changeover to exponential form is exactly at `1e21` and below `1e-6`, both
+specified rather than float-printing accidents, and the exponent always carries its sign
+(`1e+21`, not Rust's `1e21`).
+
+## D-66 — Well-known symbols are shared without being registered
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+Three kinds of symbol behave differently in ways that are easy to conflate:
+
+| | equal to another with the same description? | in the registry? |
+|---|---|---|
+| `Symbol("x")` | no | no |
+| `Symbol.for("x")` | yes | yes |
+| `Symbol.iterator` | there is only one | **no** |
+
+The third row is the trap. Well-known symbols are shared across every realm, which *looks* like
+registry behaviour — but `Symbol.keyFor(Symbol.iterator)` is `undefined`. Putting them in the
+registry would make `Symbol.for("Symbol.iterator")` hand back the real one, which is exactly the
+collision the registry's separate namespace exists to prevent. There is a test that asks for
+that key and asserts it gets an impostor.
+
+Also recorded because it is routinely conflated: `Symbol()` has **no** description while
+`Symbol("")` has an empty one, and `description` reports `undefined` for the first.
+
+## D-67 — Every error kind inherits from `Error`, and `name` lives on the prototype
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+`TypeError.prototype`'s prototype **is** `Error.prototype`. That is what makes
+`new TypeError() instanceof Error` true and what makes `catch (e) { if (e instanceof Error) }`
+catch all of them. An implementation that gave each kind an independent prototype would pass
+every test that constructs one and fail every real catch block in the wild — a failure that
+only appears in someone else's code.
+
+`name` comes from the prototype rather than the instance, which is observable:
+`Object.keys(new TypeError("x"))` does not contain `"name"`, and `err.name = "Mine"` shadows
+rather than replaces. `message` is the opposite — an own property, and only when non-empty,
+which is why `new Error()` and `new Error("")` differ from `new Error("x")` in `Object.keys`.
+
+`Error.prototype.toString` joins the two with `": "` **only when both halves exist**: a message
+with no name is just the message, and a name with no message has no trailing colon. That detail
+is in every stack trace anyone has ever read.
