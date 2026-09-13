@@ -79,3 +79,9 @@ required-features = ["render"]
 [[example]]
 name = "bigresponse"
 required-features = ["measure"]
+
+# M8's acceptance. `measure` rather than `render`: it is headless, so the reading is the
+# engine's and the application's rather than the GPU driver's.
+[[example]]
+name = "apiclient"
+required-features = ["measure"]
