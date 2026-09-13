@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M12 — runtime library (in progress: object model, Promise, Map/Set, JSON, Array, coercions, Symbol, Error)
+**Current milestone:** M12 — runtime library (in progress: object model, Promise, collections, JSON, Array, coercions, Symbol, Error, Proxy, iterators)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 795 tests passing (793 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 813 tests passing (811 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1442,6 +1442,23 @@ all of them; an independent prototype per kind would pass every construction tes
 real catch block. `name` lives on the prototype and `message` is an own property only when
 non-empty, and `toString` joins them only when both exist.
 
+### `Proxy` invariants, and the iterator protocol
+
+**A proxy's traps are the easy half** (D-68). What makes `Proxy` safe to have in a language is
+that the spec checks each trap's answer against the target and throws on specific disagreements
+— without them, a proxy could report a frozen property as holding a different value, and
+everything that reasoned about `Object.freeze`, including the optimiser, would be reasoning
+about a lie. Every invariant has a test that builds a *lying* trap and asserts refusal.
+`isExtensible` has **no latitude at all**, unlike the property traps where invention is allowed.
+
+An implementation with the traps and without the checks passes every test that *uses* a proxy
+and fails only the ones that try to break one. Revocation is checked before the handler, because
+detaching the handler is what revocation is for.
+
+**`done` is coerced, not compared** (D-69): `{ done: 0 }` is not finished and
+`{ done: "false" }` is. Leaving a loop early closes the iterator — that is how a generator's
+`finally` runs — while running to exhaustion does not, and both directions have tests.
+
 **Still to do for M12:** `Object` statics, `String`, `Number`, `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
 `JSON`, and then `Proxy`/`Reflect` on top of the model above.
@@ -1467,8 +1484,7 @@ Out: `NaN` and the infinities become `null`, `-0` becomes `0` (**a round trip lo
 `/` is not escaped, and objects keep insertion order so a round trip does not rewrite a
 document.
 
-`Date`, `RegExp` via `regress`, iterators, and then `Proxy`/`Reflect` on top of the model
-above.
+`Date`, and `RegExp` via `regress`.
 The acceptance is a test262 subset at >80%, which needs the suite fetched the way M10's React
 tree is.
 
