@@ -119,6 +119,38 @@ jobs:
           PLATFORM: ${{ matrix.name }}
           BUDGET_MIB: ${{ matrix.budget_mib }}
 
+      # M8's acceptance, and so §7's first kill criterion. Separate from the step above
+      # because it is a different claim: that one is the engine idling, this one is an
+      # application with a 5 MB JSON response loaded, and the 60 MB ceiling is ROADMAP
+      # §M8's number rather than a per-platform observation — so it is written here rather
+      # than carried in the matrix.
+      - name: Measure the acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(cargo run -p crisol-ui --example apiclient --features measure -- --headless)
+          echo "$output"
+          # Anchored on a digit after "ACCEPTANCE: " for the same reason as the step above:
+          # this script's own text is echoed into the log, and a looser pattern finds the
+          # instrument rather than the measurement.
+          reading=$(grep -oE 'ACCEPTANCE: [0-9.]+ MiB \([A-Za-z_]+\)' <<<"$output" \
+            | head -1 | sed 's/.*ACCEPTANCE: //' || true)
+          echo "**$PLATFORM** acceptance, 5 MB response loaded: ${reading:-no reading}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$reading" ]; then
+            echo "::error::No acceptance reading in the apiclient run's output."
+            exit 1
+          fi
+          mib=${reading%% *}
+          if awk -v m="$mib" -v b="$ACCEPTANCE_MIB" 'BEGIN { exit !(m > b) }'; then
+            echo "::error::Acceptance $reading is over the ${ACCEPTANCE_MIB} MiB budget. ROADMAP §7's first kill criterion says re-evaluate rather than tune."
+            exit 1
+          fi
+          echo "$reading is within the ${ACCEPTANCE_MIB} MiB acceptance budget."
+        env:
+          CRISOL_REQUIRE_FONTS: 1
+          PLATFORM: ${{ matrix.name }}
+          ACCEPTANCE_MIB: 60
+
       - name: Docs
         run: cargo doc --workspace --no-deps
         env:
