@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M12 — runtime library (in progress: object model, Promise, Map/Set, JSON, Array)
+**Current milestone:** M12 — runtime library (in progress: object model, Promise, Map/Set, JSON, Array, coercions, Symbol, Error)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 761 tests passing (759 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 795 tests passing (793 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1422,7 +1422,27 @@ and reporting failure. Treating it as atomic is wrong in both directions at once
 change the spec allows, *and* discards elements the spec protects. Checked by making it atomic
 and watching the test fail.
 
-**Still to do for M12:** `Object`, `String`, `Number`, `Boolean`,
+### Coercions, `Symbol`, and the `Error` hierarchy
+
+**The coercions are written from the grammar** (D-65), because Rust's `f64` parser is close to
+it and not the same: `"inf"`, `"nan"` and `"1_000"` are Rust literals that `ToNumber` rejects,
+and each has a test. `Number` is not `parseInt` — `Number("10abc")` is `NaN` where `parseInt`
+gives `10`, and reaching for the lenient one turns malformed input into a plausible number.
+The falsy list is closed, so `Boolean("0")` is true. `String(-0)` is `"0"`: the sign is
+observable through `Object.is` and not through text, which is the mirror of the `Map` rule and
+why the two cannot share a comparison.
+
+**Well-known symbols are shared without being registered** (D-66).
+`Symbol.keyFor(Symbol.iterator)` is `undefined`, and a test asks the registry for that key and
+asserts it gets an impostor — putting them in the registry would let `Symbol.for` reach the real
+one, which is the collision the separate namespace exists to prevent.
+
+**Every error kind inherits from `Error`** (D-67), which is what makes `instanceof Error` catch
+all of them; an independent prototype per kind would pass every construction test and fail every
+real catch block. `name` lives on the prototype and `message` is an own property only when
+non-empty, and `toString` joins them only when both exist.
+
+**Still to do for M12:** `Object` statics, `String`, `Number`, `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
 `JSON`, and then `Proxy`/`Reflect` on top of the model above.
 ### `Map`, `Set`, and the third equality
@@ -1447,8 +1467,8 @@ Out: `NaN` and the infinities become `null`, `-0` becomes `0` (**a round trip lo
 `/` is not escaped, and objects keep insertion order so a round trip does not rewrite a
 document.
 
-`Symbol`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators, and then
-`Proxy`/`Reflect` on top of the model above.
+`Date`, `RegExp` via `regress`, iterators, and then `Proxy`/`Reflect` on top of the model
+above.
 The acceptance is a test262 subset at >80%, which needs the suite fetched the way M10's React
 tree is.
 
