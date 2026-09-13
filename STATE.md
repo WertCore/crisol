@@ -601,6 +601,33 @@ holding an earlier one's pages, and which way that skewed a number depended on w
 being subtracted. Isolated, the two methods now agree to within 1% (15,821 and 15,850), and
 that agreement is the only reason to believe either.
 
+### Drag and drop: winit throws the position away
+
+Checked before designing anything, because the engine dispatches events to nodes by
+hit-testing a point, and a drop with no point has no target.
+
+winit 0.30's `WindowEvent::DroppedFile(PathBuf)` and `HoveredFile(PathBuf)` carry **a path and
+nothing else** — one event per file, with no position and no grouping. It is not a platform
+limit. Every backend has the coordinate and discards it:
+
+- **macOS** (`window_delegate.rs`) reads the pasteboard out of the `NSDraggingInfo` `sender`
+  and ignores its `draggingLocation`. `draggingUpdated:` is not implemented at all, so there
+  is no drag-over stream either — only entered, exited and dropped.
+- **Windows** (`drop_handler.rs`) calls `DragQueryFileW` and never `DragQueryPoint`, and
+  ignores the `pt` that `IDropTarget::DragOver` is handed.
+
+So on winit 0.30, **node-targeted drag and drop is not implementable** and neither is
+drop-target highlighting, which needs the drag-over stream. Tracking the last `CursorMoved`
+does not rescue it: during an OS drag session the pointer belongs to the drag, not the window.
+
+What *is* implementable is a window-level drop — "these files were dropped on this app" —
+which needs no target and is the case an API client actually wants: drop a `.json` or `.har`
+on the window to load it. That covers the acceptance app's need without pretending to a
+precision the platform layer is not delivering.
+
+Getting the targeted version means patching winit. That is a dependency decision rather than
+an engine one, so it is recorded here and not taken unilaterally.
+
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
 response in it, measured on all three platforms.
