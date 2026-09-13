@@ -111,10 +111,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The font system, honouring the same `CRISOL_REQUIRE_FONTS` the tests use.
+/// The application's native menu bar, on the platforms that have one.
 ///
-/// Without it a machine with no fonts renders an empty window and reports success, which is
-/// indistinguishable from working.
+/// Native on purpose, and the one part of this example that is *meant* to look different on
+/// each platform. Everything else here is drawn by the engine so that it does not — but a
+/// menu bar belongs to the desktop rather than to the document, and a hand-drawn one is
+/// immediately wrong: on macOS it lives at the top of the screen rather than in the window,
+/// it carries the application menu, and it answers to the system's own keyboard handling.
+///
+/// Linux has no entry here. muda drives GTK there, which this engine does not otherwise
+/// depend on and will not acquire for a menu bar — winit speaks X11 and Wayland directly.
+/// Linux applications conventionally put their menus inside the window, which crisol can
+/// already draw.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod menu {
+    use muda::{Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+
+    /// Ids the event loop matches on. Strings because that is what muda carries.
+    pub const ADD: &str = "todo.add";
+    pub const CLEAR_DONE: &str = "todo.clear-done";
+
+    /// Builds the bar. Held by the caller: dropping a `Menu` unhooks it.
+    pub fn build() -> muda::Result<Menu> {
+        let bar = Menu::new();
+
+        // macOS insists the first submenu is the application menu, and puts the application
+        // name on it whatever this says. Quit has to be the predefined item rather than an
+        // ordinary one, or the system does not treat it as quitting.
+        let app = Submenu::new("Crisol", true);
+        app.append_items(&[
+            &PredefinedMenuItem::about(None, None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(None),
+        ])?;
+
+        let todo = Submenu::new("&Todo", true);
+        todo.append_items(&[
+            &MenuItem::with_id(MenuId::new(ADD), "&Add a todo", true, None),
+            &PredefinedMenuItem::separator(),
+            &MenuItem::with_id(MenuId::new(CLEAR_DONE), "&Clear completed", true, None),
+        ])?;
+
+        bar.append_items(&[&app, &todo])?;
+        Ok(bar)
+    }
+}
+
 /// How far in from an edge counts as the resize band, in logical pixels.
 const RESIZE_BORDER: f32 = 6.0;
 
@@ -142,6 +184,10 @@ fn resize_cursor(edge: ResizeEdge) -> cursor_icon::CursorIcon {
     to_winit(edge).into()
 }
 
+/// The font system, honouring the same `CRISOL_REQUIRE_FONTS` the tests use.
+///
+/// Without it a machine with no fonts renders an empty window and reports success, which is
+/// indistinguishable from working.
 fn fonts() -> FontSystem {
     let fonts = FontSystem::new();
     if fonts.is_empty() {
@@ -983,6 +1029,36 @@ impl State {
         false
     }
 
+    /// Adds whatever is in the draft, or a placeholder when it is empty.
+    ///
+    /// Reached from the menu rather than the keyboard, which is the whole point of having
+    /// one: the same application state, a second way in.
+    fn menu_add(&mut self) {
+        let draft = self.runtime.peek(self.app.draft).unwrap_or_default();
+        let label = if draft.trim().is_empty() {
+            "a new todo".to_owned()
+        } else {
+            draft
+        };
+        self.app.add(&self.runtime, label);
+        self.runtime.set(self.app.draft, String::new());
+        let mut dom = Dom::new(&mut self.tree);
+        self.runtime.flush(&mut dom);
+    }
+
+    /// Removes every completed todo.
+    fn menu_clear_done(&mut self) {
+        let todos = self.runtime.peek(self.app.todos).unwrap_or_default();
+        let done: Vec<_> = todos
+            .into_iter()
+            .filter(|todo| self.runtime.peek(todo.done).unwrap_or_default())
+            .collect();
+        for todo in done {
+            let mut dom = Dom::new(&mut self.tree);
+            self.app.remove(&self.runtime, &mut dom, todo);
+        }
+    }
+
     fn update_cursor(&mut self) {
         // An edge wins over whatever the cascade says, because the resize is what a press
         // there would actually do, and a cursor that disagrees with that is a lie.
@@ -1090,6 +1166,9 @@ impl State {
 #[derive(Default)]
 struct Shell {
     state: Option<State>,
+    /// Held, not just built. Dropping a `Menu` takes it back off the application.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    menu: Option<muda::Menu>,
 }
 
 impl ApplicationHandler for Shell {
@@ -1112,7 +1191,54 @@ impl ApplicationHandler for Shell {
                 .expect("could not create a window"),
         );
         let surface = WindowSurface::new(window).expect("could not create a surface");
+
+        // After the window, deliberately. On macOS the menu attaches to the `NSApplication`,
+        // which winit has only finished creating by the time this callback runs; on Windows
+        // it attaches to the window itself and so needs one to exist.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            match menu::build() {
+                Ok(bar) => {
+                    #[cfg(target_os = "macos")]
+                    bar.init_for_nsapp();
+                    #[cfg(target_os = "windows")]
+                    {
+                        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        if let Ok(handle) = surface.window().window_handle() {
+                            if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                                // Safe in the sense the signature asks for: the handle comes
+                                // from the window we just made and outlives this call.
+                                let _ = unsafe { bar.init_for_hwnd(win32.hwnd.get()) };
+                            }
+                        }
+                    }
+                    self.menu = Some(bar);
+                }
+                // A menu bar that will not build is not a reason to refuse to start. The
+                // application is entirely usable from the keyboard without it.
+                Err(error) => eprintln!("warning: no native menu ({error})"),
+            }
+        }
+
         self.state = Some(State::new(surface));
+    }
+
+    /// Menu clicks do not arrive as window events — muda posts them to its own channel, so
+    /// they are drained here, once per turn of the loop.
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+            let Some(state) = self.state.as_mut() else {
+                continue;
+            };
+            match event.id().as_ref() {
+                menu::ADD => state.menu_add(),
+                menu::CLEAR_DONE => state.menu_clear_done(),
+                _ => continue,
+            }
+            state.surface.window().request_redraw();
+        }
+        let _ = event_loop;
     }
 
     fn window_event(

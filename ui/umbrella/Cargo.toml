@@ -58,6 +58,11 @@ windows-sys = { workspace = true, optional = true, features = [
 # nothing above the renderer should need them.
 wgpu.workspace = true
 winit.workspace = true
+# Native menus for the example, and a dev-dependency for the same reason winit is one:
+# nothing above the renderer should need a windowing crate, and a menu bar is shell rather
+# than document. `default-features = false` drops GTK and libxdo, which are Linux-only and
+# which this engine does not otherwise pull in.
+muda = { version = "0.20", default-features = false }
 
 [[example]]
 name = "tree"
