@@ -1478,3 +1478,40 @@ The right time to re-open this is when there is generated code to measure, not n
 **Also not decided:** generational or incremental collection. Mark-sweep stops the world and
 walks everything live, which is fine for a heap that has not been measured yet and is the
 first thing to revisit if pause times matter. §M9 asks for mark-sweep and that is what this is.
+
+---
+
+## D-56 — A cycle in the module graph is ordered, not rejected
+
+**Status:** Accepted (M10) · **Affects:** M10, M13, M17
+
+The easy mistake is to treat a module graph the way a build system treats a dependency graph,
+where a cycle is an error to report and refuse. In ES modules a cycle is **specified
+behaviour**: the modules are instantiated together, evaluated in depth-first post-order, and a
+binding read before its module has evaluated is a `ReferenceError` from the temporal dead zone
+rather than a link failure. `react` and `react-dom` have shipped cycles for years, so a graph
+that refused one would refuse to build most real programs — and §3.3 is explicit that rejecting
+constructs in code the developer did not write is the failure mode to avoid.
+
+So `evaluation_order` cannot fail. `cycles()` reports which modules are in one, because a
+consumer may want to warn or may want to explain a temporal-dead-zone error by pointing at one,
+but nothing refuses to proceed. Reporting is deliberately *not* "every strongly connected
+component": a component of one is a cycle only if the module imports itself, and without that
+filter every acyclic module is reported and the report is useless. There is a test for exactly
+that, and it fails when the filter is removed.
+
+**The graph does not know about the parser.** §M10 wants `oxc` for parsing and `oxc_resolver`
+for resolution, and both will feed this — but what a graph *is*, and what a cycle in one means,
+is decided by the specification rather than by whichever crate read the source. Split, the
+ordering rules are tested against hand-built graphs where a cycle takes three lines, instead of
+against a `node_modules` tree where reproducing one is an afternoon.
+
+**Both walks are iterative.** The input is somebody's dependency tree and its depth is not this
+code's to bound; a recursive post-order walk turns a deep graph into a stack overflow, arriving
+from a user's `node_modules` rather than from anything here. A 100,000-deep chain is in the
+tests for that reason.
+
+**Import records are kept, not merged.** `import {a} from "./m"; import {b} from "./m"` is two
+import records of one module. Evaluation visits the module once regardless, but source order
+decides evaluation order, so a graph that sorted or deduplicated edges would produce an order
+the specification does not.
