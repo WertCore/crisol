@@ -304,14 +304,19 @@ against what the incremental passes produced, so a missed invalidation cannot pa
 **Measured against M16's minimum surface**, since §M7 asks for this to be designed for that
 consumer. `crisol-dom` has `createElement`, `createTextNode`, `appendChild`, `insertBefore`,
 `removeChild`, `replaceChild`, `nodeType`, `parentNode`, `firstChild`, `nextSibling`,
-`setAttribute`, `removeAttribute` and `classList`. Three things are missing and each is real
-work rather than a wrapper:
+`setAttribute`, `removeAttribute`, `classList` and the `style` attribute. Two things are
+missing and each is real work rather than a wrapper:
 
 - **`createElementNS`** — the tree has no namespace concept at all.
-- **`style`, the CSSOM subset** — there is nowhere to put an inline style; it needs storage on
-  `ElementData` and a slot in the cascade above author rules.
 - **`addEventListener`** — `crisol-events` already dispatches with real capture and bubble and
   has `preventDefault`/`stopPropagation` (M5), but nothing registers listeners.
+
+**`style` landed** (D-50), ahead of the other two because the virtualised response view could
+not be built without it: a pane moves two spacers every scroll frame, and reparsing a
+stylesheet to do that is not a frame budget. It is stored as text on `ElementData` and parsed
+by the cascade at `Origin::Inline`, above author rules. What is *not* there yet is the CSSOM
+object — `element.style.height = "4px"` needs a JS-side wrapper over `setAttribute`; the
+engine side of it is done.
 
 M16's batching note — *mark dirty, run one style/layout/paint pass per frame, never relayout
 per `appendChild`* — is already how this works: nothing touches the tree between flushes, so a
@@ -554,24 +559,28 @@ rest so the scrollbar is the size it would be if they had been built:
 | | one element per line | only the window |
 |---|---|---|
 | nodes | 481,768 | **103** |
-| memory | 3,671 MiB | **2.2 MiB** |
-| layout | ~43 min, extrapolated | **15 ms** |
+| memory | 3,678 MiB | **2.4 MiB** |
+| first frame | ~43 min, extrapolated | **15 ms** |
+| a scroll frame | — | **1.9 ms** |
 
 The scroll extent comes out at 4,335,212 px against the 4,335,212 px it should be, which is
 checked rather than assumed — a cheap pane that scrolls to the wrong place is not a pane. So
 the approach fits the budget with two orders of magnitude to spare, and the acceptance is
 reachable.
 
-**What it needs that does not exist.** The spacer heights are baked into the stylesheet,
-which a real pane cannot do: both heights change on every scroll frame. Today the only way to
-move a spacer is to reparse a stylesheet per frame.
+**What it needed, and now has.** The first version baked the spacer heights into the
+stylesheet, which a real pane cannot do: both change on every scroll frame, and the only way
+to move one was to reparse a stylesheet. That was the **`style`, the CSSOM subset** gap listed
+under the DOM API above — recorded as one of three missing pieces, but blocking rather than
+merely missing, because the one design that fits the budget could not be built without it.
 
-This is the **`style`, the CSSOM subset** gap already listed under the DOM API above — *there
-is nowhere to put an inline style; it needs storage on `ElementData` and a slot in the cascade
-above author rules*. It was recorded as one of three missing DOM pieces; what the measurement
-adds is that it is not merely missing but **blocking**, because the acceptance cannot be built
-without it, and that the pane's demand on it is small and known: one `height`, on two nodes,
-per frame. Whatever else the CSSOM subset grows to cover, that much has to work.
+It is implemented (D-50), and the example now scrolls the pane the way a pane does: **1.9 ms a
+frame**, 12% of a 60 Hz budget in a debug build, writing two `style` attributes and the rows'
+text and reparsing nothing. So the acceptance is not just affordable in memory, it is
+affordable per frame.
+
+The remaining piece is the CSSOM *object* — `element.style.height = "4px"` — which is a JS-side
+wrapper over `setAttribute` rather than engine work.
 
 **A process per measurement, because the first version of this was wrong.** Measuring every
 size in one process produced two numbers that disagreed sixfold — ~13 KB per line as a

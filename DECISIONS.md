@@ -1075,8 +1075,8 @@ of the cost and `Node` is 6%, so the section below — that this is not a reason
 `Node` — is righter than it knew: shrinking `Node` to nothing at all would leave 94% of the
 bill. What a virtualised pane must avoid building is **laid-out and shaped text**.
 
-The window was measured too, and it holds: 103 nodes, **2.2 MiB**, laid out in 15 ms, against
-3,671 MiB projected for the whole response. Most of that 2.2 MiB is the font system rather
+The window was measured too, and it holds: 103 nodes, **2.4 MiB**, first frame 15 ms and
+**1.9 ms** a frame to scroll (D-50), against 3,678 MiB projected for the whole response. Most of that 2.2 MiB is the font system rather
 than the nodes, so it stays flat as the window grows. The scroll extent was checked rather
 than assumed — 4,335,212 px against the 4,335,212 px it should be — because a pane that is
 cheap by scrolling to the wrong place would otherwise pass as a good memory number.
@@ -1161,3 +1161,38 @@ number, because it still gets quoted.
 while deliberately reading the wrong field, because its tolerance had a 4 MiB floor and the
 test process weighs 1.7 MiB. Any tolerance expressed as an absolute floor needs checking
 against the smallest case it will ever see, not the largest.
+
+## D-50 — An inline style is an origin, and it is stored as text
+
+**Status:** Accepted (M8) · **Affects:** M8, M16
+
+A virtualised response view (D-47) moves two spacers every scroll frame. Without somewhere to
+put a per-element length, the only way to do that was to reparse a stylesheet per frame, which
+made the one design that fits the memory budget unbuildable. So the CSSOM `style` gap stopped
+being one of three missing DOM pieces and became the thing in the way.
+
+**It is its own cascade origin, not a very specific selector.** `Origin::Inline` sorts above
+`Origin::Author`, so an inline declaration beats `#id` without carrying a specificity that
+could be out-argued by a longer selector. `important` still sorts above origin, so
+`!important` in a stylesheet beats a normal inline declaration and loses to an important one —
+which is the CSS rule, and falls out of the existing `Precedence` ordering rather than needing
+a special case.
+
+**Stored as text on `ElementData`, parsed by the cascade.** The parsed form would be the
+obvious choice and it is not available: `Property` is lightningcss's, `crisol-css` depends on
+`crisol-tree`, and storing parsed declarations on an element would either invert that or pull
+a CSS grammar into the tree crate. `Option<Box<str>>` costs a pointer on elements that have no
+inline style — `Node` went from 328 to 344 bytes, against the 400-byte budget
+`ui/tree/tests/sizes.rs` holds — and only elements that do have one pay to parse it, only when
+they are restyled.
+
+Parsing per restyle sounds like the cost this was meant to avoid, and the measurement says it
+is not: scrolling a 240,884-line response costs **1.9 ms a frame**, 12% of a 60 Hz budget, in
+a debug build. Two declarations is not a stylesheet. If it ever does show up, the cache goes
+beside the string rather than replacing it.
+
+**`attribute()` has to answer for it.** `style` lives in its own field like `id` and `class`,
+and all three are invisible to a caller that looks in the attribute list. Forgetting the
+accessor would not just break `getAttribute("style")`: `set_attribute`'s no-op check reads
+back through it, so every write would look like a change and mark the node dirty forever.
+`rewriting_a_style_to_the_same_text_costs_nothing` is the test that fails if it goes missing.

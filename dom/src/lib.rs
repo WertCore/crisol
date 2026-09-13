@@ -238,6 +238,7 @@ impl<'a> Dom<'a> {
         match name {
             "id" => data.id = Some(value.into()),
             "class" => data.set_class(value),
+            "style" => data.style = Some(value.into()),
             _ => match data
                 .attributes
                 .iter_mut()
@@ -263,6 +264,7 @@ impl<'a> Dom<'a> {
         };
         let had = match name {
             "id" => data.id.take().is_some(),
+            "style" => data.style.take().is_some(),
             "class" => {
                 let had = !data.classes.is_empty();
                 data.classes.clear();

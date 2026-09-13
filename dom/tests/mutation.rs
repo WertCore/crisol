@@ -183,3 +183,54 @@ fn mutating_through_a_stale_handle_fails_rather_than_corrupting() {
     assert!(!dom.set_attribute(a, "class", "x"));
     assert_eq!(dom.node_type(a), None);
 }
+
+// ---- the `style` attribute ------------------------------------------------------------
+
+#[test]
+fn a_style_write_round_trips_through_get_attribute() {
+    // Stored in its own field rather than the attribute list, so the generic accessor has to
+    // know about it or `getAttribute("style")` answers `None` for something that is there.
+    let (mut tree, [_, a, ..]) = fixture();
+    let mut dom = Dom::new(&mut tree);
+    assert!(dom.set_attribute(a, "style", "color: red"));
+
+    let data = tree.element(a).unwrap();
+    assert_eq!(data.attribute("style").as_deref(), Some("color: red"));
+    assert!(data.has_attribute("style"));
+}
+
+#[test]
+fn rewriting_a_style_to_the_same_text_costs_nothing() {
+    // The no-op check reads back through `attribute`, so this only holds because `style`
+    // answers there. It is the test that would fail if the accessor were forgotten.
+    let (mut tree, [_, a, ..]) = fixture();
+    let mut dom = Dom::new(&mut tree);
+    assert!(dom.set_attribute(a, "style", "color: red"));
+    tree.clear_all_dirty();
+
+    let mut dom = Dom::new(&mut tree);
+    assert!(!dom.set_attribute(a, "style", "color: red"));
+    assert_eq!(dom.stats().no_ops, 1);
+    assert!(!tree.dirty(a).contains(DirtyFlags::STYLE));
+}
+
+#[test]
+fn a_style_write_marks_the_node_for_restyle() {
+    let (mut tree, [_, a, ..]) = fixture();
+    let mut dom = Dom::new(&mut tree);
+    assert!(dom.set_attribute(a, "style", "color: red"));
+    assert!(tree.dirty(a).contains(DirtyFlags::STYLE));
+}
+
+#[test]
+fn removing_a_style_takes_it_off_the_element() {
+    let (mut tree, [_, a, ..]) = fixture();
+    let mut dom = Dom::new(&mut tree);
+    assert!(dom.set_attribute(a, "style", "color: red"));
+    assert!(dom.remove_attribute(a, "style"));
+
+    assert!(tree.element(a).unwrap().style.is_none());
+    assert!(!tree.element(a).unwrap().has_attribute("style"));
+    let mut dom = Dom::new(&mut tree);
+    assert!(!dom.remove_attribute(a, "style"), "gone stays gone");
+}

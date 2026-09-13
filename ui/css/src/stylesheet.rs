@@ -25,6 +25,13 @@ pub enum Origin {
     UserAgent,
     /// The application's stylesheets.
     Author,
+    /// A `style` attribute. Beats any author rule, however specific.
+    ///
+    /// Last in the enum because the cascade sorts on the derived `Ord`: an inline
+    /// declaration outranks an author one without having to carry a specificity that could
+    /// be out-argued. That is the CSS rule too — inline style is its own origin, not a
+    /// very specific selector.
+    Inline,
 }
 
 /// One `selector { declarations }` rule.
@@ -219,6 +226,24 @@ impl Stylesheet {
     fn warn(&mut self, line: u32, message: String) {
         self.warnings.push(Warning { message, line });
     }
+}
+
+/// Parses the body of a `style` attribute: a declaration list, with no selector or braces.
+///
+/// Returns an empty list for anything it cannot parse, on the same reasoning as the
+/// stylesheet's warnings — one bad declaration must not cost the element the rest of them.
+/// lightningcss already recovers per declaration inside the block, so this only discards the
+/// whole thing when the attribute is not a declaration list at all.
+///
+/// Parsing lives here, rather than the parsed form living on the element, because
+/// `crisol-css` depends on `crisol-tree` and not the other way round. The element stores the
+/// string it was given; the cascade turns it into declarations when it needs them.
+#[must_use]
+pub fn parse_inline_style(source: &str) -> Vec<(Property<'static>, bool)> {
+    lightningcss::declaration::DeclarationBlock::parse_string(source, ParserOptions::default())
+        .as_ref()
+        .map(flatten)
+        .unwrap_or_default()
 }
 
 /// Flattens a declaration block to longhands, `!important` declarations last.

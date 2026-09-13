@@ -358,3 +358,83 @@ fn a_tree_with_no_root_styles_nothing() {
     assert!(styles.is_empty());
     assert_eq!(stats.elements, 0);
 }
+
+// ---- inline styles -------------------------------------------------------------------
+
+/// `body_and_paragraph`, with a `style` attribute on the paragraph.
+fn with_inline(style: &str) -> (Tree, NodeId) {
+    let (mut tree, _, p) = body_and_paragraph();
+    tree.element_mut(p).unwrap().style = Some(style.into());
+    (tree, p)
+}
+
+#[test]
+fn an_inline_style_applies() {
+    let (tree, p) = with_inline("color: red");
+    assert_eq!(style_of(&tree, "", p).color, RED);
+}
+
+#[test]
+fn an_inline_style_beats_a_more_specific_rule() {
+    // `#first` is the most specific thing an author can write at this element, and it still
+    // loses: inline is a different origin, not a higher specificity.
+    let (tree, p) = with_inline("color: blue");
+    assert_eq!(style_of(&tree, "#first { color: red }", p).color, BLUE);
+}
+
+#[test]
+fn an_important_rule_beats_a_normal_inline_style() {
+    // The one direction an author can win, and the reason `important` sorts above `origin`.
+    let (tree, p) = with_inline("color: blue");
+    assert_eq!(style_of(&tree, "p { color: red !important }", p).color, RED);
+}
+
+#[test]
+fn an_important_inline_style_beats_an_important_rule() {
+    let (tree, p) = with_inline("color: blue !important");
+    assert_eq!(
+        style_of(&tree, "p { color: red !important }", p).color,
+        BLUE
+    );
+}
+
+#[test]
+fn a_later_inline_declaration_beats_an_earlier_one() {
+    let (tree, p) = with_inline("color: red; color: blue");
+    assert_eq!(style_of(&tree, "", p).color, BLUE);
+}
+
+#[test]
+fn an_inline_shorthand_expands_like_any_other() {
+    // Shorthands are flattened to longhands before the cascade sees them, so an inline
+    // `margin` has to reach all four edges exactly as a stylesheet's does. Asserted against
+    // the stylesheet spelling rather than a literal `Px`, which is the same relation the
+    // test is actually about (D-29).
+    let (inline, p) = with_inline("margin: 4px");
+    let (sheet, _, q) = body_and_paragraph();
+    let inline = style_of(&inline, "", p);
+    let sheet = style_of(&sheet, "p { margin: 4px }", q);
+    assert_eq!(inline.margin, sheet.margin);
+    assert_ne!(inline.margin.top, ComputedStyle::default().margin.top);
+}
+
+#[test]
+fn a_malformed_declaration_does_not_cost_the_others() {
+    // CSS error recovery is a feature (see `Stylesheet`'s warnings): one bad declaration
+    // must not throw away the element's whole style attribute.
+    let (tree, p) = with_inline("color: red; width: ¯\\_(ツ)_/¯");
+    assert_eq!(style_of(&tree, "", p).color, RED);
+}
+
+#[test]
+fn an_inline_style_inherits_to_children() {
+    let (mut tree, body, p) = body_and_paragraph();
+    tree.element_mut(body).unwrap().style = Some("color: red".into());
+    assert_eq!(style_of(&tree, "", p).color, RED);
+}
+
+#[test]
+fn an_element_without_one_is_unaffected() {
+    let (tree, _, p) = body_and_paragraph();
+    assert_eq!(style_of(&tree, "p { color: red }", p).color, RED);
+}

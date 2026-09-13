@@ -119,10 +119,10 @@ fn parent() {
 
     // The same response, built the way it would have to be built.
     if let Some(fields) = run_child(&exe, &["--lines", &lines.to_string(), "--window"]) {
-        let (mib, nodes, ms) = (fields[0], fields[1], fields[2]);
-        let (visible, scroll_max, want) = (fields[3], fields[4], fields[5]);
+        let (mib, nodes, build_ms) = (fields[0], fields[1], fields[2]);
+        let (visible, scroll_max, want, scroll_ms) = (fields[3], fields[4], fields[5], fields[6]);
         println!("\nthe same {lines} lines, building only the {visible:.0} in view:");
-        println!("  {nodes:.0} nodes, {mib:.1} MiB, laid out in {ms:.1} ms");
+        println!("  {nodes:.0} nodes, {mib:.1} MiB, first frame {build_ms:.1} ms");
         let correct = (scroll_max - want).abs() < 1.0;
         println!(
             "  scrollbar spans {scroll_max:.0} px against the {want:.0} px it should — {}",
@@ -133,12 +133,10 @@ fn parent() {
             },
         );
         println!(
-            "\n  Built with the spacer heights baked into the stylesheet, which a real pane\n  \
-             cannot do: both change on every scroll frame. There is no inline `style`\n  \
-             attribute and no per-node style override, so today the only way to move a\n  \
-             spacer is to reparse a stylesheet per frame. That is the gap between this\n  \
-             measurement and a response pane."
+            "  scrolling it costs {scroll_ms:.2} ms a frame — {} of a 16.7 ms budget,",
+            format_args!("{:.0}%", scroll_ms / 16.7 * 100.0),
         );
+        println!("  writing two `style` attributes and the rows' text, reparsing no stylesheet.");
     }
 
     if let Some((count, mib)) = previous {
@@ -243,18 +241,13 @@ fn child_window(total: usize) {
 
     // A window big enough to cover the viewport, plus overscan so a scroll does not show
     // blank rows before the next build catches up.
-    let visible = (VIEWPORT.height / LINE_HEIGHT).ceil() as usize + 10;
-    let visible = visible.min(total);
-    // Park the window in the middle, where both spacers are non-zero.
-    let first = (total - visible) / 2;
-    let above = first as f32 * LINE_HEIGHT;
-    let below = (total - first - visible) as f32 * LINE_HEIGHT;
+    let visible = ((VIEWPORT.height / LINE_HEIGHT).ceil() as usize + 10).min(total);
+    let last_first = total - visible;
 
     let css = format!(
         "{CSS}
-        .pane  {{ display: block; overflow: scroll; width: {}px; height: {}px }}
-        .above {{ display: block; height: {above}px }}
-        .below {{ display: block; height: {below}px }}",
+        .pane   {{ display: block; overflow: scroll; width: {}px; height: {}px }}
+        .spacer {{ display: block }}",
         VIEWPORT.width, VIEWPORT.height,
     );
 
@@ -265,6 +258,9 @@ fn child_window(total: usize) {
 
     let mut tree = Tree::new();
     let pane;
+    let above;
+    let below;
+    let mut rows = Vec::with_capacity(visible);
     {
         let mut dom = Dom::new(&mut tree);
         let root = dom.create_element("html");
@@ -275,47 +271,77 @@ fn child_window(total: usize) {
         dom.set_attribute(pane, "class", "pane");
         dom.append_child(body, pane).expect("pane under body");
 
-        let spacer = dom.create_element("div");
-        dom.set_attribute(spacer, "class", "above");
-        dom.append_child(pane, spacer).expect("spacer under pane");
-        for line in &lines[first..first + visible] {
+        above = spacer(&mut dom, pane);
+        for _ in 0..visible {
             let element = dom.create_element("div");
             dom.set_attribute(element, "class", "line");
-            let text = dom.create_text(line);
+            let text = dom.create_text("");
             dom.append_child(element, text).expect("text under div");
             dom.append_child(pane, element).expect("line under pane");
+            rows.push(text);
         }
-        let spacer = dom.create_element("div");
-        dom.set_attribute(spacer, "class", "below");
-        dom.append_child(pane, spacer).expect("spacer under pane");
+        below = spacer(&mut dom, pane);
     }
 
     let mut engine = StyleEngine::new();
     engine.add_stylesheet(Stylesheet::parse(&css).expect("the generated stylesheet"));
-    let styles = engine
-        .restyle_incremental(&mut tree, &StyleMap::default())
-        .0;
-
     let mut fonts = FontSystem::new();
     let mut cache = LayoutCache::new();
-    let started = std::time::Instant::now();
-    {
-        let mut context = LayoutContext::new(&mut tree, &styles, &mut fonts, &mut cache);
-        context.run(VIEWPORT);
+    let mut styles = StyleMap::default();
+
+    // Frame zero, and then a scroll. The window is moved by writing two `style` attributes
+    // and the rows' text — no stylesheet is reparsed, which is the whole point of the
+    // exercise and was not possible before the inline-style support this measures.
+    let mut frames = Vec::new();
+    for step in 0..=SCROLL_STEPS {
+        let first = last_first * step / SCROLL_STEPS;
+        let started = std::time::Instant::now();
+        {
+            let mut dom = Dom::new(&mut tree);
+            dom.set_attribute(above, "style", &height(first as f32 * LINE_HEIGHT));
+            let after = (total - first - visible) as f32 * LINE_HEIGHT;
+            dom.set_attribute(below, "style", &height(after));
+            for (row, line) in rows.iter().zip(&lines[first..first + visible]) {
+                dom.set_text(*row, line);
+            }
+        }
+        styles = engine.restyle_incremental(&mut tree, &styles).0;
+        {
+            let mut context = LayoutContext::new(&mut tree, &styles, &mut fonts, &mut cache);
+            context.run(VIEWPORT);
+        }
+        frames.push(started.elapsed().as_secs_f64() * 1000.0);
     }
-    let layout_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let after = reading();
     let nodes = tree.len();
-    // What the scrollbar would be: the whole response, less the part on screen.
+    let build_ms = frames[0];
+    // The first frame builds everything; a scroll is what the pane does forever after.
+    let scroll_ms = frames[1..].iter().sum::<f64>() / (frames.len() - 1) as f64;
     let scroll_max = tree.scroll_max(pane).height;
     let want = total as f32 * LINE_HEIGHT - VIEWPORT.height;
 
     println!(
-        "MEASURED {:.6} {nodes} {layout_ms:.3} {visible} {scroll_max:.1} {want:.1}",
+        "MEASURED {:.6} {nodes} {build_ms:.3} {visible} {scroll_max:.1} {want:.1} {scroll_ms:.4}",
         mib(after - base),
     );
     drop((tree, styles, fonts, cache, engine, payload));
+}
+
+/// How many times the window is moved, to average a scroll frame over something.
+const SCROLL_STEPS: usize = 20;
+
+/// A spacer standing in for lines that were never built.
+fn spacer(dom: &mut Dom<'_>, pane: crisol_ui::tree::NodeId) -> crisol_ui::tree::NodeId {
+    let node = dom.create_element("div");
+    dom.set_attribute(node, "class", "spacer");
+    dom.append_child(pane, node).expect("spacer under pane");
+    node
+}
+
+/// The one declaration a virtualised pane needs to write per frame, twice.
+fn height(px: f32) -> String {
+    format!("height: {px}px")
 }
 
 fn reading() -> u64 {

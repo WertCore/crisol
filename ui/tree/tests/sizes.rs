@@ -3,6 +3,12 @@
 //! M8's acceptance is an RSS number, which makes the size of a `Node` a tracked figure
 //! rather than an implementation detail. A field added without noticing costs a megabyte
 //! every three thousand nodes.
+//!
+//! **Arena is not the memory story, and the figure below should not be read as one.** A node
+//! that is styled, laid out and shaped costs about **16 KB** once taffy's box tree and its
+//! shaped text are counted (`ui/umbrella/examples/bigresponse.rs`); the arena is roughly 6% of
+//! that. D-47 sized a response from this number alone and came out 24x low. What this test
+//! guards is drift in a field nobody costed — not the budget.
 
 use std::mem::size_of;
 
@@ -11,8 +17,8 @@ use crisol_tree::{Atom, Attribute, BoxStyle, ElementData, Node, NodeId, NodeKind
 /// What a node may grow to before somebody has to justify it.
 ///
 /// Not a tight bound — a bound that has to move on every change teaches nothing. This one
-/// is roughly 20% of headroom over the measured 328 bytes, so it catches a field nobody
-/// costed rather than ordinary drift.
+/// leaves headroom over the measured size (328 bytes when it was set; 344 since the `style`
+/// attribute's slot, D-50), so it catches a field nobody costed rather than ordinary drift.
 const BUDGET: usize = 400;
 
 #[test]
@@ -20,7 +26,8 @@ fn a_node_stays_within_its_memory_budget() {
     let node = size_of::<Node>();
     println!(
         "\n  Node {node}  =  NodeKind {} + BoxStyle {} + links {} + geometry {} + flags\n\
-           \x20 100k nodes: {:.1} MB of arena\n",
+           \x20 100k nodes: {:.1} MB of arena, which is about 6% of what they cost once\n\
+           \x20 styled, laid out and shaped — see examples/bigresponse.rs\n",
         size_of::<NodeKind>(),
         size_of::<BoxStyle>(),
         5 * size_of::<Option<NodeId>>(),

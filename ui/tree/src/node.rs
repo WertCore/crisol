@@ -101,6 +101,14 @@ pub struct ElementData {
     pub classes: Vec<Atom>,
     /// Everything else, in document order.
     pub attributes: Vec<Attribute>,
+    /// The `style` attribute's text, if it has one.
+    ///
+    /// Boxed and optional because almost no element has one: `Option<Box<str>>` costs a
+    /// pointer's worth of `Node` for the elements that do not, and `Node` is a tracked
+    /// figure (`tests/sizes.rs`). Stored as text rather than parsed declarations because
+    /// parsing them needs `crisol-css`, which depends on this crate — the cascade parses it
+    /// on the way past.
+    pub style: Option<Box<str>>,
     /// Interaction state the matcher reads for `:hover`, `:focus` and friends.
     ///
     /// Nothing sets these before M5, when there is an event loop to set them from. They
@@ -121,8 +129,8 @@ impl ElementData {
 
     /// The value of an attribute, by name.
     ///
-    /// Answers for `id` and `class` too, so a caller that does not care where they are
-    /// stored does not have to know. `class` is the only one that can allocate, and only
+    /// Answers for `id`, `class` and `style` too, so a caller that does not care where they
+    /// are stored does not have to know. `class` is the only one that can allocate, and only
     /// when an element has two or more classes and someone asks for the joined string —
     /// which is `[class="a b"]`, a rare selector. Presence tests go through
     /// [`Self::has_attribute`] and never allocate.
@@ -130,6 +138,9 @@ impl ElementData {
     pub fn attribute(&self, name: &str) -> Option<Cow<'_, str>> {
         match name {
             "id" => return self.id.as_ref().map(|id| Cow::Borrowed(id.as_str())),
+            "style" => {
+                return self.style.as_deref().map(Cow::Borrowed);
+            }
             "class" => {
                 return match self.classes.as_slice() {
                     [] => None,
@@ -155,6 +166,7 @@ impl ElementData {
     pub fn has_attribute(&self, name: &str) -> bool {
         match name {
             "id" => self.id.is_some(),
+            "style" => self.style.is_some(),
             "class" => !self.classes.is_empty(),
             _ => self
                 .attributes

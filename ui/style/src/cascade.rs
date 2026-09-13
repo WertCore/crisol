@@ -252,10 +252,34 @@ impl StyleEngine {
             return self.interner.intern(style);
         };
 
+        // Parsed before `declarations`, which borrows from it. An inline `style` is parsed
+        // per restyle rather than kept in parsed form on the element: see
+        // `parse_inline_style`, and note that only elements that have one pay for it.
+        let inline = element
+            .data()
+            .style
+            .as_deref()
+            .map(crisol_css::stylesheet::parse_inline_style)
+            .unwrap_or_default();
+
         // Collect every winning declaration with its precedence, then sort. Sorting
         // declarations rather than rules is what makes `margin: 0` in a later rule lose to
         // `margin-top: 4px` in an earlier, more specific one.
         let mut declarations = Vec::new();
+
+        // Its own origin, so no author rule out-specifies it. Specificity and source order
+        // are zero because the origin has already decided the question.
+        for (property, important) in &inline {
+            declarations.push((
+                Precedence {
+                    important: *important,
+                    origin: Origin::Inline,
+                    specificity: 0,
+                    source_order: 0,
+                },
+                property,
+            ));
+        }
         for sheet in &self.stylesheets {
             for rule in &sheet.rules {
                 stats.rules_tested += 1;
