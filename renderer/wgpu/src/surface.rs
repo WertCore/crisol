@@ -176,15 +176,12 @@ impl WindowSurface {
     /// configuring a zero-sized surface is a validation error. The size before minimising
     /// is kept so that restoring the window does not need a second resize event.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+        let current = (self.config.width, self.config.height);
+        if let Some((width, height)) = reconfigure_to(current, (width, height)) {
+            self.config.width = width;
+            self.config.height = height;
+            self.surface.configure(&self.gpu.device, &self.config);
         }
-        if self.config.width == width && self.config.height == height {
-            return;
-        }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.gpu.device, &self.config);
     }
 
     /// Reconfigures with the window's current size. Call after a scale factor change, which
@@ -242,4 +239,59 @@ fn choose_format(capabilities: &wgpu::SurfaceCapabilities) -> Option<wgpu::Textu
         .find(|format| format.is_srgb())
         .or_else(|| capabilities.formats.first().map(|f| f.add_srgb_suffix()))
         .or_else(|| capabilities.formats.first().copied())
+}
+
+/// The size to reconfigure a swapchain to, or `None` to leave it alone.
+///
+/// Split out of [`WindowSurface::resize`] because both of its `None` cases are reachable only
+/// through a real window doing something — minimising on Windows, or delivering a resize event
+/// for the size it already has — and a CI runner has no window at all. The logic is three
+/// lines and correct; what it did not have was anything that would notice if it stopped being.
+/// Issue #15, whose remaining half needs a human at a machine.
+fn reconfigure_to(current: (u32, u32), requested: (u32, u32)) -> Option<(u32, u32)> {
+    let (width, height) = requested;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if current == requested {
+        return None;
+    }
+    Some(requested)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconfigure_to;
+
+    #[test]
+    fn a_new_size_reconfigures() {
+        assert_eq!(reconfigure_to((800, 600), (1024, 768)), Some((1024, 768)));
+    }
+
+    #[test]
+    fn the_size_it_already_has_does_not() {
+        assert_eq!(
+            reconfigure_to((800, 600), (800, 600)),
+            None,
+            "a resize event for the current size should not rebuild the swapchain"
+        );
+    }
+
+    #[test]
+    fn a_minimised_window_is_ignored_rather_than_clamped() {
+        // Windows reports 0x0 while minimised. Configuring that is a validation error, and
+        // clamping it to 1x1 would be worse than ignoring it: the window would come back
+        // from the taskbar at 1x1 until a second resize event arrived to undo it.
+        assert_eq!(reconfigure_to((800, 600), (0, 0)), None);
+        assert_eq!(reconfigure_to((800, 600), (0, 600)), None, "zero width");
+        assert_eq!(reconfigure_to((800, 600), (800, 0)), None, "zero height");
+    }
+
+    #[test]
+    fn a_window_restored_to_its_previous_size_needs_no_reconfigure() {
+        // The whole reason the pre-minimise size is kept: minimise then restore is
+        // `(0,0)` then `(800,600)`, and the second is the size already configured.
+        assert_eq!(reconfigure_to((800, 600), (0, 0)), None);
+        assert_eq!(reconfigure_to((800, 600), (800, 600)), None);
+    }
 }
