@@ -959,7 +959,22 @@ budget spent on bookkeeping nobody can see. Most of the 10.5 MiB is the response
 which is the application's data rather than the engine's, and that is the shape the number
 should have.
 
-**CI gates it on all three platforms** at 60 MiB, writing the reading into the job summary.
+**Measured on all three, and they are three different quantities.** CI gates each at 60 MiB
+and writes the reading into the job summary:
+
+| platform | reading | metric |
+|---|---|---|
+| Linux | 15.7 MiB | `VmRSS` |
+| macOS | 10.2 MiB | `phys_footprint` |
+| Windows | 8.1 MiB | `PrivateUsage` |
+
+**Do not read that as a ranking.** `Metric` in `measure.rs` already says why: `VmRSS` excludes
+anything swapped or not yet faulted in, `PrivateUsage` counts committed private bytes whether
+resident or not, and `phys_footprint` is what jetsam kills on. Windows reading lowest does not
+mean Windows is cheapest — it means three operating systems were asked three different
+questions. What the three jointly support is the only claim being made: *on every platform, by
+that platform's own accounting, this is far under 60 MB.* A three-way comparison would need one
+metric all three can produce, and none of these is that.
 The extraction was checked against real output rather than assumed, and the gate was checked
 in both directions — 59.9 passes, 60.1 fails — because a budget that cannot fail is not a
 budget. The ceiling is written in the workflow rather than carried in the matrix, because
@@ -967,8 +982,8 @@ unlike the idle-memory step above it is §M8's number and not a per-platform obs
 
 **What this does not cover.** The reading is headless: no window, no GPU device, so it is the
 engine's and the application's rather than the driver's. That is the right number for a
-claim about *this* engine and it is comparable across three platforms, but a user running a
-windowed build pays for a swapchain and a driver on top. `todo` is the windowed path and is
+claim about *this* engine, but a user running a windowed build pays for a swapchain and a
+driver on top. `todo` is the windowed path and is
 measured separately; a windowed apiclient is a follow-up rather than a gap in the claim.
 
 **Totals:** 559 tests passing
