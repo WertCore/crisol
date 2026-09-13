@@ -136,12 +136,40 @@ fn the_corpus_dump_matches_its_snapshot() {
         let actual = path.with_extension("ir.actual");
         std::fs::write(&actual, &rendered).expect("write the actual dump");
         panic!(
-            "the IR dump changed. Compare {} against {} — if the change is an improvement, \
-             replace the snapshot and the diff is the review.",
+            "the IR dump changed.\n{}\n\nWrote {}. If the change is an improvement, replace \
+             the snapshot and the diff is the review.",
+            first_difference(&expected, &rendered),
             actual.display(),
-            path.display()
         );
     }
+}
+
+/// Describes the first line that differs, for a failure nobody can open the files for.
+///
+/// CI is where this test fails and CI is where "compare these two paths" is useless advice —
+/// the files are on a machine that no longer exists by the time anyone reads the log. It also
+/// names a line-ending difference explicitly, because that one looks like every character
+/// changed and is the most likely way for this to fail for a reason that is not about the IR.
+fn first_difference(expected: &str, actual: &str) -> String {
+    if expected.replace("\r\n", "\n") == actual.replace("\r\n", "\n") {
+        return "The only difference is line endings — the snapshot was checked out with CRLF. \
+                `.gitattributes` should be pinning it to LF."
+            .to_owned();
+    }
+    for (at, (left, right)) in expected.lines().zip(actual.lines()).enumerate() {
+        if left != right {
+            return format!(
+                "first difference at line {}:\n  snapshot: {left}\n  now:      {right}",
+                at + 1
+            );
+        }
+    }
+    format!(
+        "the first {} lines match; the snapshot has {} lines and the dump has {}",
+        expected.lines().count().min(actual.lines().count()),
+        expected.lines().count(),
+        actual.lines().count()
+    )
 }
 
 #[test]

@@ -1,0 +1,7 @@
+# Snapshots are compared byte for byte, so they must not be rewritten on checkout.
+#
+# Without this, git's EOL conversion hands a Windows checkout CRLF while the test renders LF,
+# and the comparison fails on one platform for a reason that has nothing to do with the IR.
+# That is exactly what happened on PR #51: every content test passed and only the byte-exact
+# one failed, on the only runner that converts.
+tests/ir-snapshots/*.ir text eol=lf
