@@ -625,8 +625,26 @@ which needs no target and is the case an API client actually wants: drop a `.jso
 on the window to load it. That covers the acceptance app's need without pretending to a
 precision the platform layer is not delivering.
 
-Getting the targeted version means patching winit. That is a dependency decision rather than
-an engine one, so it is recorded here and not taken unilaterally.
+**winit 0.31 fixes all of this, so none of that is the answer.** Checked before writing a
+patch, and the patch would have been wasted work. 0.31.0-beta.3 (4 Sep 2026) replaces the
+whole thing with a real drag-and-drop subsystem, split across `winit-core` and per-platform
+crates:
+
+- `DragEntered { id, position: Option<_> }`, and **`DragPosition { id, position, proposed_action }`**
+  — the drag-over stream, with a position that is not optional.
+- `DragDropped`, `DragLeft`, `DataTransferReceived` — data is fetched asynchronously by id and
+  arrives typed, rather than as a `PathBuf` per file.
+- `OutgoingDragDropped` / `OutgoingDragCanceled`, so an app can be a drag *source* too.
+
+And the backends implement it rather than merely declaring it, which is the thing 0.30 taught
+to check: `winit-appkit` now reads `sender.draggingLocation()` and implements
+`draggingUpdated:`, and `winit-win32` carries a full `IDropTarget` with drag-state tracking.
+
+So the open question is not "fork or upstream PR" but **when to take the 0.31 upgrade**. It is
+a pre-release, and the upgrade is a large breaking change — the crate split, renamed events, a
+different application handler, and a DnD model that fetches typed data by id instead of
+handing over paths. That is a dependency decision rather than an engine one, so it is recorded
+here and not taken unilaterally.
 
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
