@@ -1753,3 +1753,63 @@ changes.
 so adoption costs one extra microtask here where a real engine charges two. The tests assert the
 *relative* order that follows from adoption being asynchronous at all, not a tick count — an
 assertion of parity would be a claim this implementation has not earned.
+
+---
+
+## D-62 — Three equalities, and `Map` uses the one that is neither of the others
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+| | `NaN` vs `NaN` | `0` vs `-0` |
+|---|---|---|
+| `===` (strict) | different | same |
+| `Object.is` (SameValue) | same | different |
+| **`Map`/`Set` (SameValueZero)** | **same** | **same** |
+
+`Value`'s derived equality is `Object.is` (D-53). That is exactly right for property
+descriptors, where the spec asks for SameValue (D-60), and **wrong for `Map` keys**. Using it
+would give a map with two entries that print identically and neither of which `get(0)` reliably
+finds — a bug that survives every casual test, because nobody writes `-0` on purpose. It arrives
+from arithmetic.
+
+So map keys go through a wrapper that folds `-0` into `0`. NaN needs no handling because M9
+canonicalises it on the way into a `Value`, which is the second time that decision has paid for
+itself. Checked by removing the fold: three tests fail.
+
+**Entries live in a `Vec` with tombstones, not only in a hash map.** Insertion order is
+observable, and the spec is specific about mutation during iteration: an entry deleted before
+the iterator reaches it is *not* visited, and one added during iteration *is*. A `Vec` of
+positions gives both; a `HashMap` alone gives neither. It is also why an iterator over a `Map`
+whose body keeps adding will not terminate — specified, not an oversight.
+
+Re-setting an existing key keeps its **position and its original key**: a `Map` used as an LRU
+by re-setting would not work, and `map.keys()` after `set(-0, …)` on a `0`-keyed map still
+reports `0`.
+
+## D-63 — JSON is strict on the way in and exact on the way out
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+JSON looks like a JavaScript literal and is not. Trailing commas, comments, single quotes,
+unquoted keys, leading `+`, leading zeros, hexadecimal, `NaN` and `Infinity` are all rejected,
+because accepting any of them makes `JSON.parse` succeed on input every other parser refuses —
+which turns a clear error at the boundary into corrupt data further in. Eighteen of them have a
+test.
+
+**Surrogate pairs are joined.** `😀` is one character, not two. Without joining, both
+halves become replacement characters and an emoji turns into two question marks somewhere
+downstream, with nothing at the point of failure to say why. Lone surrogates are refused rather
+than passed through.
+
+**A raw control character inside a string is an error**, not the character: a literal newline
+between the quotes is malformed JSON even though it is obvious what was meant.
+
+On the way out: `NaN` and the infinities become `null`, because JSON cannot write them and
+emitting `NaN` would produce output no other parser accepts. `-0` becomes `0`, so **a round trip
+loses the sign** — specified, and a real information loss worth knowing rather than discovering.
+`/` is deliberately *not* escaped; it is legal either way and escaping it differs from every
+other implementation for no benefit.
+
+**Objects keep insertion order**, in a `Vec` rather than a `BTreeMap`. Sorting keys would
+quietly rewrite every document that round-tripped through, which is the kind of change that
+shows up as a spurious diff in someone else's repository.

@@ -257,7 +257,7 @@ survives.
 atlas persists across frames and is trimmed (D-30), and `ImageStore` holds uploads until
 removed. Nothing new was needed.
 
-**Totals:** 398 tests passing
+**Totals:** 745 tests passing (743 without a `node_modules` tree: the two acceptance cases skip)
 
 ### M7 — reactive API and component model
 
@@ -1407,9 +1407,31 @@ A LIFO queue fails it, a fulfil-always pass-through fails the rejection test, an
 microtask here where a real engine charges two. The tests assert relative order, not tick
 parity, because parity is a claim this has not earned.
 
+### `Map`, `Set`, and the third equality
+
+`Map` keys use **SameValueZero**, which agrees with neither `===` nor `Object.is` (D-62):
+`NaN` equals `NaN` *and* `0` equals `-0`. `Value`'s derived equality is `Object.is` — right for
+descriptors, wrong here — so keys go through a wrapper that folds `-0` into `0`. NaN needs no
+handling because M9 canonicalised it, the second time that decision has paid for itself.
+
+Entries live in a `Vec` with tombstones, not only a hash map, because the spec is specific about
+mutation during iteration: an entry deleted before the iterator reaches it is not visited, and
+one added during iteration is. Both fall out of positions; neither falls out of a `HashMap`.
+
+### JSON
+
+Strict in, exact out (D-63). Eighteen pieces of JavaScript-literal syntax that JSON does not
+allow have a test, because being lenient turns a clear error at the boundary into corrupt data
+further in. Surrogate pairs are joined — without it an emoji becomes two question marks
+downstream with nothing at the failure point to say why — and lone surrogates are refused.
+
+Out: `NaN` and the infinities become `null`, `-0` becomes `0` (**a round trip loses the sign**),
+`/` is not escaped, and objects keep insertion order so a round trip does not rewrite a
+document.
+
 **Still to do for M12:** `Object`, `Array`, `String`, `Number`, `Boolean`,
-`Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
-`JSON`, and then `Proxy`/`Reflect` on top of the model above.
+`Symbol`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators, and then
+`Proxy`/`Reflect` on top of the model above.
 The acceptance is a test262 subset at >80%, which needs the suite fetched the way M10's React
 tree is.
 
