@@ -492,6 +492,9 @@ version = "0.0.0"
 [[package]]
 name = "crisol-builtins"
 version = "0.0.0"
+dependencies = [
+ "crisol-value",
+]
 
 [[package]]
 name = "crisol-codegen"
