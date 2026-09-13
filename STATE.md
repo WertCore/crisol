@@ -493,6 +493,17 @@ first frame. That is not a theoretical worry: it is what produced the contradict
 multi-window work, where a one-window build at four times the window area read *lower* than the
 same build at one times.
 
+**Read on all three platforms, in the job summary.** CI already ran the headless example with
+`--features measure` on macOS, Linux and Windows — that is where the acceptance figure comes
+from, since no one machine has all three. The number only reached the log, though, and a figure
+that takes opening three logs and scrolling to find is not the defensible one the ROADMAP asks
+for. Each job now puts its reading in its own summary.
+
+Not gated on a ceiling yet, deliberately. The macOS figure is known and the other two are not,
+and picking a bound before seeing the numbers it bounds is exactly how D-49's tolerance came to
+be wider than the thing it was checking. The bound goes in once there are three numbers to set
+it from.
+
 **And it was worse than noise.** Instrumenting the windows example showed the reading was never
 taken after a frame at all — the print never fired, because the windows were never asked to
 redraw and `ControlFlow::Wait` never volunteered. Every external figure taken there described a

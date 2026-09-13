@@ -67,9 +67,32 @@ jobs:
         # `measure` is added here and nowhere else: it is off by default because an embedder
         # has no use for it, but this is the run that produces the acceptance figure, and CI
         # is the only place all three platforms are available.
-        run: cargo run -p crisol-ui --example todo --features measure -- --headless
+        #
+        # The reading goes to the job summary rather than only to the log. M8's acceptance is
+        # a memory number the product claim rests on, and a number nobody can find without
+        # opening three logs and scrolling is not a defensible one.
+        #
+        # Deliberately not gated on a ceiling yet: the macOS figure is known and the other two
+        # are not, and a bound picked before seeing the numbers it bounds is how D-49's
+        # tolerance came to be wider than the thing it was checking. Watch these, then set it.
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(cargo run -p crisol-ui --example todo --features measure -- --headless)
+          echo "$output"
+          # `|| true` because `pipefail` would otherwise turn a missing line into a failed
+          # step, and the run itself is what this step exists to check. A reading that does
+          # not appear should say so in the summary rather than look like a broken build.
+          reading=$(grep -F 'memory after the scripted run' <<<"$output" | sed 's/.*run: //' || true)
+          # One job, one summary, so this is a line rather than a row in a table that
+          # would have no header to render against.
+          echo "**$PLATFORM** idle memory: ${reading:-no reading}" >> "$GITHUB_STEP_SUMMARY"
         env:
           CRISOL_REQUIRE_FONTS: 1
+          # Through the environment rather than interpolated into the script. These values
+          # are the workflow's own literals today, so this is hygiene rather than a fix —
+          # it is what keeps the step safe if the matrix ever grows a computed entry.
+          PLATFORM: ${{ matrix.name }}
 
       - name: Docs
         run: cargo doc --workspace --no-deps
