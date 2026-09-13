@@ -1064,6 +1064,23 @@ Virtualised, the same response is a window of roughly a thousand nodes — 328 K
 budget goes almost entirely to the parsed JSON, which is the application's data rather than
 the engine's.
 
+**Measured afterwards, and the estimate above was low by 24×.**
+`ui/umbrella/examples/bigresponse.rs` builds it: 100,002 nodes is **762 MiB**, not 31 MB. The
+arithmetic was right and the accounting was not — "before styles, taffy's per-node cache, or
+shaped text" waves at 95% of the cost. Per line of a 240,884-line response: dom **1,017**
+bytes, style **15**, layout **14,818**.
+
+That sharpens the conclusion rather than changing it, and it moves the target. Layout is 93%
+of the cost and `Node` is 6%, so the section below — that this is not a reason to shrink
+`Node` — is righter than it knew: shrinking `Node` to nothing at all would leave 94% of the
+bill. What a virtualised pane must avoid building is **laid-out and shaped text**.
+
+The window was measured too, and it holds: 103 nodes, **2.2 MiB**, laid out in 15 ms, against
+3,671 MiB projected for the whole response. Most of that 2.2 MiB is the font system rather
+than the nodes, so it stays flat as the window grows. The scroll extent was checked rather
+than assumed — 4,335,212 px against the 4,335,212 px it should be — because a pane that is
+cheap by scrolling to the wrong place would otherwise pass as a good memory number.
+
 So the acceptance is a statement about the *application*, not only the engine, and the engine's
 job is to make a virtualised list cheap: M6's incremental relayout and M7's keyed reconciler
 already do, and M8's scrolling is what drives it.

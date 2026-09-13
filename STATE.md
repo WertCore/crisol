@@ -413,6 +413,10 @@ cost about 8.5 MB over an empty GPU window.
 the engine: 5MB of JSON expanded one node per token is ~100k nodes and 31 MB of arena on its
 own. `ui/tree/tests/sizes.rs` keeps `Node` (328 bytes) a tracked figure so that does not drift.
 
+*Measured later, and that 31 MB was low by 24× — the real figure for 100k nodes is 762 MiB,
+because arena is 6% of what a node costs once it is styled, laid out and shaped. It makes the
+conclusion stronger and the target different; see "What a 5 MB response costs" below.*
+
 ### Cursor shapes
 
 The CSS `cursor` property, every keyword of it. Lives on `ComputedStyle` rather than
@@ -559,11 +563,15 @@ the approach fits the budget with two orders of magnitude to spare, and the acce
 reachable.
 
 **What it needs that does not exist.** The spacer heights are baked into the stylesheet,
-which a real pane cannot do: both heights change on every scroll frame. There is no inline
-`style` attribute and no per-node style override, so today the only way to move a spacer is
-to reparse a stylesheet per frame. Closing that is a prerequisite for the acceptance app, and
-the cheapest form of it is probably a per-node length override rather than a full inline-style
-parser — the pane needs exactly two numbers, not a CSS dialect.
+which a real pane cannot do: both heights change on every scroll frame. Today the only way to
+move a spacer is to reparse a stylesheet per frame.
+
+This is the **`style`, the CSSOM subset** gap already listed under the DOM API above — *there
+is nowhere to put an inline style; it needs storage on `ElementData` and a slot in the cascade
+above author rules*. It was recorded as one of three missing DOM pieces; what the measurement
+adds is that it is not merely missing but **blocking**, because the acceptance cannot be built
+without it, and that the pane's demand on it is small and known: one `height`, on two nodes,
+per frame. Whatever else the CSSOM subset grows to cover, that much has to work.
 
 **A process per measurement, because the first version of this was wrong.** Measuring every
 size in one process produced two numbers that disagreed sixfold — ~13 KB per line as a
