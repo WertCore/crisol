@@ -20,7 +20,7 @@ const MILESTONES: &[(&str, &str, bool)] = &[
     ("M4", "HTML and text", true),
     ("M5", "events, focus, input, accessibility", true),
     ("M6", "incremental everything", true),
-    ("M7", "reactive API and component model", false),
+    ("M7", "reactive API and component model", true),
     ("M8", "platform polish", false),
     ("M9", "GC and value representation", false),
     ("M10", "frontend and module graph", false),
