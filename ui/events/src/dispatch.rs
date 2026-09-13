@@ -385,6 +385,9 @@ impl EventSystem {
     /// a restyle is needed at all.
     pub fn apply_state(&self, tree: &mut Tree) -> usize {
         let mut changed = 0;
+        // Collected rather than marked in place: marking borrows the tree mutably and the
+        // write loop is already holding an element borrow.
+        let mut touched = Vec::new();
         let hovered: Vec<_> = self.hovered.clone();
         let focus_path = self
             .focused
@@ -426,8 +429,21 @@ impl EventSystem {
             let updated = (data.state & !interaction) | target;
             if updated != data.state {
                 data.state = updated;
+                touched.push(node);
                 changed += 1;
             }
+        }
+
+        // Writing the bit is not enough: the cascade reads it, and an incremental restyle
+        // only revisits what is marked. Without this a `:hover` rule never applies — the
+        // element's state says hovered, the computed style is whatever it was before, and
+        // nothing anywhere reports an error.
+        //
+        // Same invalidation an attribute write uses (D-38), for the same reason: `:hover`
+        // can be matched through a descendant or a sibling combinator, so the node alone is
+        // not the blast radius.
+        for node in touched {
+            tree.mark_selector_state_changed(node);
         }
         changed
     }

@@ -709,9 +709,31 @@ of those pseudo-classes, so nothing is visibly broken, but the whole capture/bub
 interaction-state layer is built, tested and integrated nowhere.
 
 The drag events are consistent with that rather than an exception to it: they sit beside the
-pointer events, equally covered by unit tests and equally unwired. Wiring `EventSystem` into
-an application is one piece of work that covers all of it, and it is worth doing before the
-acceptance rather than as part of it.
+pointer events, equally covered by unit tests and equally unwired.
+
+**Wiring it up found a bug that had been there since M5.** `apply_state` wrote the `:hover`,
+`:focus` and `:active` bits onto elements and never marked anything dirty, so an incremental
+restyle skipped the very nodes whose state had just changed. An application following the
+method's own instructions — *call this after handling input and before restyling* — would get
+an element whose state says hovered, a computed style that says otherwise, and no error
+anywhere. It is fixed with the same invalidation an attribute write uses (D-38), because
+`:hover` can be matched through a descendant or a sibling combinator.
+
+The reason it survived is worth more than the fix. Every existing test called `apply_state`
+and then read `data.state` back — asserting on one side of the seam, never across it. The new
+test restyles and checks the computed colour, which is the only version of the question that
+could have failed.
+
+**And the fix exposes a price.** Crossing one row boundary in a 200-row list restyles **400 of
+604 elements**, because D-38 marks a changed node's following siblings and each marked row
+marks the rest of the list. It cost nothing before only because `:hover` never worked. Moving
+*within* an already-hovered row is still free — the chain does not change, so nothing is
+re-marked — so this is a per-boundary cost rather than a per-move one, and there is a test
+pinning both numbers.
+
+The way out, when something needs it, is to narrow the invalidation rather than repair it: if
+no rule in any loaded stylesheet uses `+` or `~`, the sibling half is pure waste, and the
+engine knows its own stylesheets.
 
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB

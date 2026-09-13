@@ -25,7 +25,9 @@ use std::sync::Arc;
 use crisol_ui::css::stylesheet::Stylesheet;
 use crisol_ui::display_list::{Color, DisplayList, Point};
 use crisol_ui::dom::Dom;
-use crisol_ui::events::{hit_test, scroll_at, scroll_from};
+use crisol_ui::events::{
+    DragEvent, EventSystem, Modifiers, hit_test, pointer_at, scroll_at, scroll_from,
+};
 use crisol_ui::layout::{LayoutCache, LayoutContext, ShapedText};
 use crisol_ui::paint::{PaintOptions, paint};
 use crisol_ui::platform_cursor;
@@ -285,6 +287,51 @@ fn headless() {
         Some(cursor_icon::CursorIcon::Pointer)
     );
     println!("  pointer over a row label: {icon:?}");
+
+    // ---- dispatch: what a pointer leaves behind, and what a drag must not ------------
+    //
+    // `EventSystem` is the layer an application drives input through, and until now nothing
+    // outside its own unit tests did. Exercising it here puts the interaction-state pipeline
+    // on all three platforms in CI: `:hover` is matched by the cascade against bits that
+    // `apply_state` writes, so a break in it is invisible until something reads them.
+    //
+    // `ElementState` is qualified because winit exports that name too, and the two mean
+    // entirely different things.
+    let mut events = EventSystem::new();
+    events.pointer_moved(&tree, pointer_at(at), &());
+    let touched = events.apply_state(&mut tree);
+    assert!(touched > 0, "the pointer should have marked its chain");
+    let hovered = |tree: &Tree, node| {
+        tree.element(node)
+            .is_some_and(|data| data.state.contains(crisol_ui::tree::ElementState::HOVER))
+    };
+    assert!(hovered(&tree, label), "the label under the pointer");
+    assert!(
+        hovered(&tree, row),
+        "and its row, because :hover is a chain"
+    );
+
+    // A drag over the very same point. It must land on the same node and must *not* leave
+    // the row looking hovered: the OS owns the cursor while a drag is in flight, so a file
+    // passing over a button is not a finger about to press it, and nothing would ever turn
+    // that highlight off again.
+    let mut events = EventSystem::new();
+    let drag = DragEvent {
+        position: at,
+        modifiers: Modifiers::default(),
+    };
+    events.drag_moved(&tree, drag, &());
+    events.apply_state(&mut tree);
+    assert!(
+        !hovered(&tree, row),
+        "a drag is not a pointer, and must not leave :hover behind"
+    );
+    assert_eq!(
+        events.drag_dropped(&tree, drag, &()),
+        Some(text),
+        "the drop lands on the node under it"
+    );
+    println!("  hover set on the row, and a drag over it left none");
 
     // Printed numbers are not a check. What the script should have left behind:
     let labels = runtime.peek(app.todos).expect("todos");
