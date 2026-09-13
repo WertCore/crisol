@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M11 — IR (in progress: the IR, lattice and verifier are done; lowering is not)
+**Current milestone:** M11 — IR. **Acceptance met** (forty programs lower, verify, and dump to a reviewed snapshot).
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 663 tests passing (661 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 669 tests passing (667 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1319,18 +1319,51 @@ Three guards checked by breaking them: dropping the dominance check fails the cr
 allowing a missing safepoint fails two, and the dump's expected text is pinned so a format change
 has to be agreed to in a diff.
 
-**Still to do for M11:** lowering from the oxc AST, and the acceptance — "IR text dump for a set
-of 30 representative programs is stable and reviewable". The dump and the verifier are both in
-place for it; what is missing is the thing that produces IR from source.
+### Lowering, and §M11's acceptance
+
+`lower()` walks the oxc AST and emits IR (D-59). **§M11's acceptance passes**: forty programs
+lower, every one verifies, and the dump goes into one snapshot file.
+
+**Locals become slots, so a merge needs no block parameters.** Both arms of an `if` write the
+same slot and the code after reads it. `mem2reg` — promoting slots to SSA values — is a
+separate pass and belongs with the other optimisations (M12). Constructing SSA *during*
+lowering means debugging Braun-style φ insertion and the AST walk at the same time; split, each
+half is checkable alone.
+
+**An unsupported construct is recorded, never guessed.** §3.3 says rejecting constructs the
+developer did not write is the failure mode to avoid, but a compiler that silently emits
+`undefined` for syntax it did not read is worse, because the program runs and is wrong. So
+lowering always produces a function and everything it missed is in `unsupported`.
+`is_faithful()` exists because checking a `Vec` is empty is easy to forget.
+
+**One snapshot file, not forty.** A change to the IR or the dump format then shows up as a
+single diff covering every program, which is what makes it reviewable — forty files each
+changing by two lines is forty times the reading for the same information.
+
+**Reading the first snapshot found a soundness bug that no test had.** An object literal was
+typed `object#root`, the *empty* shape, after its properties were stored into it — so a pass
+trusting that type would resolve `.a` to no slot. It is `Object(None)` now: an object, shape
+unknown, which is the one thing that stays true when a value's type is fixed for its whole life
+and the object's shape is not. That is the argument for snapshots being *read* rather than
+regenerated.
+
+**The corpus is representative of what lowers**, not of JavaScript — no arithmetic, no
+functions, no `for` loops, because those do not lower yet. Twelve of them are in
+`unfaithful_programs_are_reported_not_guessed`, which asserts each is named rather than
+silently mistranslated, so the two lists are checked against each other.
+
+**Still to do for M11 in spirit, though the acceptance is met:** arithmetic, functions and
+closures, `for`, arrays, and the rest of the unsupported list.
 
 ---
 
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
-2. **Track A (M0–M8), M9 and M10 are complete**, acceptances included. **M11 is under way:
-   the IR, lattice and verifier are done; lowering from the oxc AST is not**, and the
-   acceptance needs it. Read D-55's last section first: the collector's safety rests on objects sitting behind
+2. **Track A (M0–M8), M9, M10 and M11 are complete**, acceptances included. Next is **M12 —
+   the runtime library**, which is also where `mem2reg` (D-59) and shape-precise object types
+   belong. M11's lowering covers a subset: arithmetic, functions and `for` are in the
+   unsupported list rather than missing silently. Read D-55's last section first: the collector's safety rests on objects sitting behind
    checked handles, and M13 is where that assumption comes due. D-54's per-site monomorphic
    cache is M11's job and is what makes shape lookup fast. The rooting API is the part to get right
    rather than the collector — see §3.1 and the M9 section above.

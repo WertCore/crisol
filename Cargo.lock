@@ -545,6 +545,8 @@ dependencies = [
 name = "crisol-frontend"
 version = "0.0.0"
 dependencies = [
+ "crisol-ir",
+ "crisol-value",
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",

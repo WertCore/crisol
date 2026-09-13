@@ -6,6 +6,8 @@
 
 mod graph;
 mod loader;
+mod lower;
 
 pub use graph::{ModuleGraph, ModuleId};
 pub use loader::{Loader, Request, Unresolved};
+pub use lower::{Lowered, ParseFailed, Unsupported, lower};

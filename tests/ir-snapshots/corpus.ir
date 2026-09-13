@@ -1,0 +1,605 @@
+=== empty ===
+--- source
+
+--- ir
+function empty {
+bb0:  ; entry
+    return
+}
+
+=== number ===
+--- source
+let x = 1;
+--- ir
+function number {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    return
+}
+
+=== negative-is-not-arithmetic-here ===
+--- source
+let x = 0;
+--- ir
+function negative-is-not-arithmetic-here {
+bb0:  ; entry
+    v0: number = const 0.0
+    store $0, v0
+    return
+}
+
+=== float ===
+--- source
+let x = 1.5;
+--- ir
+function float {
+bb0:  ; entry
+    v0: number = const 1.5
+    store $0, v0
+    return
+}
+
+=== string ===
+--- source
+let s = "hello";
+--- ir
+function string {
+bb0:  ; entry
+    v0: string = const "hello"
+    store $0, v0
+    return
+}
+
+=== string-with-quotes ===
+--- source
+let s = "a \"b\" c";
+--- ir
+function string-with-quotes {
+bb0:  ; entry
+    v0: string = const "a \"b\" c"
+    store $0, v0
+    return
+}
+
+=== bool ===
+--- source
+let t = true; let f = false;
+--- ir
+function bool {
+bb0:  ; entry
+    v0: bool = const true
+    store $0, v0
+    v1: bool = const false
+    store $1, v1
+    return
+}
+
+=== null ===
+--- source
+let n = null;
+--- ir
+function null {
+bb0:  ; entry
+    v0: null = const null
+    store $0, v0
+    return
+}
+
+=== undefined ===
+--- source
+let u = undefined;
+--- ir
+function undefined {
+bb0:  ; entry
+    v0: undefined = const undefined
+    store $0, v0
+    return
+}
+
+=== declaration-without-init ===
+--- source
+let x;
+--- ir
+function declaration-without-init {
+bb0:  ; entry
+    v0: undefined = const undefined
+    store $0, v0
+    return
+}
+
+=== two-declarations ===
+--- source
+let a = 1; let b = 2;
+--- ir
+function two-declarations {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    return
+}
+
+=== read-a-variable ===
+--- source
+let a = 1; let b = a;
+--- ir
+function read-a-variable {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    store $1, v1
+    return
+}
+
+=== assign ===
+--- source
+let a = 1; a = 2;
+--- ir
+function assign {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $0, v1
+    return
+}
+
+=== assign-is-an-expression ===
+--- source
+let a = 1; let b = (a = 2);
+--- ir
+function assign-is-an-expression {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $0, v1
+    store $1, v1
+    return
+}
+
+=== strict-equal ===
+--- source
+let a = 1; let b = 2; let c = a === b;
+--- ir
+function strict-equal {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: bool = eq v2, v3
+    store $2, v4
+    return
+}
+
+=== strict-not-equal ===
+--- source
+let a = 1; let b = 2; let c = a !== b;
+--- ir
+function strict-not-equal {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: bool = ne v2, v3
+    store $2, v4
+    return
+}
+
+=== less ===
+--- source
+let a = 1; let b = 2; let c = a < b;
+--- ir
+function less {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: bool = lt v2, v3
+    store $2, v4
+    return
+}
+
+=== less-equal ===
+--- source
+let a = 1; let b = 2; let c = a <= b;
+--- ir
+function less-equal {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: bool = le v2, v3
+    store $2, v4
+    return
+}
+
+=== greater ===
+--- source
+let a = 1; let b = 2; let c = a > b;
+--- ir
+function greater {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: bool = gt v2, v3
+    store $2, v4
+    return
+}
+
+=== greater-equal ===
+--- source
+let a = 1; let b = 2; let c = a >= b;
+--- ir
+function greater-equal {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: bool = ge v2, v3
+    store $2, v4
+    return
+}
+
+=== return-nothing ===
+--- source
+return;
+--- ir
+function return-nothing {
+bb0:  ; entry
+    return
+}
+
+=== return-a-value ===
+--- source
+let a = 1; return a;
+--- ir
+function return-a-value {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    return v1
+}
+
+=== dead-code-after-return ===
+--- source
+return; let a = 1;
+--- ir
+function dead-code-after-return {
+bb0:  ; entry
+    return
+}
+
+=== throw ===
+--- source
+let e = "boom"; throw e;
+--- ir
+function throw {
+bb0:  ; entry
+    v0: string = const "boom"
+    store $0, v0
+    v1: unknown = load $0
+    throw v1
+}
+
+=== if-without-else ===
+--- source
+let a = 1; if (a === 1) { a = 2; }
+--- ir
+function if-without-else {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    v2: number = const 1.0
+    v3: bool = eq v1, v2
+    branch v3 -> bb1, bb2
+bb1:
+    v4: number = const 2.0
+    store $0, v4
+    jump bb3
+bb2:
+    jump bb3
+bb3:
+    return
+}
+
+=== if-else ===
+--- source
+let a = 1; if (a === 1) { a = 2; } else { a = 3; }
+--- ir
+function if-else {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    v2: number = const 1.0
+    v3: bool = eq v1, v2
+    branch v3 -> bb1, bb2
+bb1:
+    v4: number = const 2.0
+    store $0, v4
+    jump bb3
+bb2:
+    v5: number = const 3.0
+    store $0, v5
+    jump bb3
+bb3:
+    return
+}
+
+=== nested-if ===
+--- source
+let a = 1; if (a === 1) { if (a === 1) { a = 2; } else { a = 3; } }
+--- ir
+function nested-if {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    v2: number = const 1.0
+    v3: bool = eq v1, v2
+    branch v3 -> bb1, bb2
+bb1:
+    v4: unknown = load $0
+    v5: number = const 1.0
+    v6: bool = eq v4, v5
+    branch v6 -> bb4, bb5
+bb2:
+    jump bb3
+bb3:
+    return
+bb4:
+    v7: number = const 2.0
+    store $0, v7
+    jump bb6
+bb5:
+    v8: number = const 3.0
+    store $0, v8
+    jump bb6
+bb6:
+    jump bb3
+}
+
+=== if-with-return ===
+--- source
+let a = 1; if (a === 1) { return a; } a = 2;
+--- ir
+function if-with-return {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    v2: number = const 1.0
+    v3: bool = eq v1, v2
+    branch v3 -> bb1, bb2
+bb1:
+    v4: unknown = load $0
+    return v4
+bb2:
+    jump bb3
+bb3:
+    v5: number = const 2.0
+    store $0, v5
+    return
+}
+
+=== while ===
+--- source
+let a = 1; while (a < 10) { a = 10; }
+--- ir
+function while {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    jump bb1
+bb1:
+    v1: unknown = load $0
+    v2: number = const 10.0
+    v3: bool = lt v1, v2
+    branch v3 -> bb2, bb3
+bb2:
+    v4: number = const 10.0
+    store $0, v4
+    jump bb1
+bb3:
+    return
+}
+
+=== while-with-if ===
+--- source
+let a = 1; while (a < 10) { if (a === 1) { a = 10; } }
+--- ir
+function while-with-if {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    jump bb1
+bb1:
+    v1: unknown = load $0
+    v2: number = const 10.0
+    v3: bool = lt v1, v2
+    branch v3 -> bb2, bb3
+bb2:
+    v4: unknown = load $0
+    v5: number = const 1.0
+    v6: bool = eq v4, v5
+    branch v6 -> bb4, bb5
+bb3:
+    return
+bb4:
+    v7: number = const 10.0
+    store $0, v7
+    jump bb6
+bb5:
+    jump bb6
+bb6:
+    jump bb1
+}
+
+=== empty-object ===
+--- source
+let o = {};
+--- ir
+function empty-object {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    store $0, v0
+    return
+}
+
+=== object-with-properties ===
+--- source
+let o = { a: 1, b: "two" };
+--- ir
+function object-with-properties {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: number = const 1.0
+    set v0."a" = v1  ; safepoint []
+    v2: string = const "two"
+    set v0."b" = v2  ; safepoint []
+    store $0, v0
+    return
+}
+
+=== object-with-string-key ===
+--- source
+let o = { "a b": 1 };
+--- ir
+function object-with-string-key {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: number = const 1.0
+    set v0."a b" = v1  ; safepoint []
+    store $0, v0
+    return
+}
+
+=== property-read ===
+--- source
+let o = { a: 1 }; let v = o.a;
+--- ir
+function property-read {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: number = const 1.0
+    set v0."a" = v1  ; safepoint []
+    store $0, v0
+    v2: unknown = load $0
+    v3: unknown = get v2."a"  ; safepoint []
+    store $1, v3
+    return
+}
+
+=== property-chain ===
+--- source
+let o = { a: 1 }; let v = o.a.b;
+--- ir
+function property-chain {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: number = const 1.0
+    set v0."a" = v1  ; safepoint []
+    store $0, v0
+    v2: unknown = load $0
+    v3: unknown = get v2."a"  ; safepoint []
+    v4: unknown = get v3."b"  ; safepoint []
+    store $1, v4
+    return
+}
+
+=== call-no-args ===
+--- source
+let f = null; let v = f();
+--- ir
+function call-no-args {
+bb0:  ; entry
+    v0: null = const null
+    store $0, v0
+    v1: unknown = load $0
+    v2: unknown = call v1()  ; safepoint []
+    store $1, v2
+    return
+}
+
+=== call-with-args ===
+--- source
+let f = null; let a = 1; let v = f(a, a);
+--- ir
+function call-with-args {
+bb0:  ; entry
+    v0: null = const null
+    store $0, v0
+    v1: number = const 1.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: unknown = load $1
+    v5: unknown = call v2(v3, v4)  ; safepoint []
+    store $2, v5
+    return
+}
+
+=== call-a-method ===
+--- source
+let o = { a: 1 }; let v = o.a();
+--- ir
+function call-a-method {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: number = const 1.0
+    set v0."a" = v1  ; safepoint []
+    store $0, v0
+    v2: unknown = load $0
+    v3: unknown = get v2."a"  ; safepoint []
+    v4: unknown = call v3()  ; safepoint []
+    store $1, v4
+    return
+}
+
+=== block-scope ===
+--- source
+let a = 1; { a = 2; }
+--- ir
+function block-scope {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $0, v1
+    return
+}
+
+=== empty-statement ===
+--- source
+;
+--- ir
+function empty-statement {
+bb0:  ; entry
+    return
+}
+
