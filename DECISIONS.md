@@ -1711,3 +1711,45 @@ being ordinary.
 Marrying them is the next piece of work and deliberately not done here: the join decides when
 an object leaves the fast path, which is the decision §3.2's "one predictable branch" rests on,
 and it deserves its own diff rather than arriving underneath a descriptor implementation.
+
+---
+
+## D-61 — The microtask queue is FIFO, drains to empty, and `then` is never synchronous
+
+**Status:** Accepted (M12) · **Affects:** M12, M15
+
+§M12 singles `Promise` out: *"job queue ordering must match spec or async code misbehaves in
+ways that look like race conditions."* Nothing here is concurrent — every job runs to completion
+on one thread — so the bugs look like races only because the order is observable and the code
+depending on it never says so. Three rules carry that:
+
+**`then` always queues, even on a settled promise.** `Promise.resolve(1).then(f)` does not call
+`f` before `then` returns. Code that relied on the synchronous case would work until the promise
+happened to be pending, which is exactly the intermittent failure §M12 describes.
+
+**The queue is FIFO and drains to empty, including jobs queued by jobs.** That is what makes two
+chains interleave step by step — `a1, b1, a2, b2`, not `a1, a2, b1, b2` — and a queue that ran
+one chain to completion first would change the behaviour of every `await`-heavy program. It is
+also why an endless `.then` chain starves the event loop rather than yielding: specified, not an
+oversight.
+
+**A missing handler passes the settlement through *as it was*.** A rejection arriving at
+`.then(onFulfilled)` must continue as a rejection. Forwarding it as a fulfilment means
+`p.then(onFulfilled).catch(handler)` never reaches the `catch`, and the program carries on with
+an `Error` where it expected data — a wrong answer rather than a crash. This was written wrong
+first time and caught by reading it back before the tests existed.
+
+All three were checked by breaking them: a LIFO queue fails the interleaving test, a
+fulfil-always pass-through fails the rejection-forwarding test, and a synchronous `then` fails
+five.
+
+**Reactions are Rust closures, and the queue really runs them.** Elsewhere in this crate a thing
+that would need to call a JavaScript function hands it back instead ([`Got::Getter`]) — but here
+*ordering is the entire content*, so returning jobs uncalled would leave nothing to test. When
+the interpreter lands, a job becomes "call this function" and none of the ordering above
+changes.
+
+**Not modelled yet:** the spec's `NewPromiseResolveThenableJob` adds a tick that this does not,
+so adoption costs one extra microtask here where a real engine charges two. The tests assert the
+*relative* order that follows from adoption being asynchronous at all, not a tick count — an
+assertion of parity would be a claim this implementation has not earned.

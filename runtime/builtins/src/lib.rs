@@ -8,6 +8,8 @@
 
 mod descriptor;
 mod object;
+mod promise;
 
 pub use descriptor::{Entry, PartialDescriptor, Property, Rejected, validate_and_apply};
 pub use object::{Got, ObjectId, OrdinaryObject, Realm, Setting};
+pub use promise::{Agent, Outcome, PromiseId, Reaction, State};

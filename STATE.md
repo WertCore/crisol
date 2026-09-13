@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 669 tests passing (667 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 707 tests passing (705 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1387,9 +1387,29 @@ fails the frozen-prototype one, and leaving integer keys unsorted fails the orde
 `false`, which is exactly what `Object.defineProperty` does and emphatically not what assignment
 does. The asymmetry proving itself on its own author is the reason it has a test.
 
-**Still to do for M12:** all of it, really — `Object`, `Array`, `String`, `Number`, `Boolean`,
+### Promise, and the ordering that looks like a race
+
+`Agent` holds every promise and one FIFO microtask queue (D-61). §M12 singles this out, and the
+three rules that carry it are: **`then` always queues** even on a settled promise; **the queue
+drains to empty**, including jobs queued by jobs; and **a missing handler passes the settlement
+through as it was** — a rejection arriving at `.then(onFulfilled)` continues as a rejection.
+
+That last one was written wrong first time. Forwarding a rejection as a *fulfilment* means
+`p.then(onFulfilled).catch(handler)` never reaches the catch and the program carries on with an
+`Error` where it expected data — a wrong answer rather than a crash. Caught by reading it back
+before the tests existed.
+
+The canonical check is that two chains interleave `a1, b1, a2, b2` rather than `a1, a2, b1, b2`.
+A LIFO queue fails it, a fulfil-always pass-through fails the rejection test, and a synchronous
+`then` fails five — all checked by breaking them.
+
+**Not modelled:** the spec's `NewPromiseResolveThenableJob` tick, so adoption costs one extra
+microtask here where a real engine charges two. The tests assert relative order, not tick
+parity, because parity is a claim this has not earned.
+
+**Still to do for M12:** `Object`, `Array`, `String`, `Number`, `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
-`Promise` with a microtask queue, `JSON`, and then `Proxy`/`Reflect` on top of the model above.
+`JSON`, and then `Proxy`/`Reflect` on top of the model above.
 The acceptance is a test262 subset at >80%, which needs the suite fetched the way M10's React
 tree is.
 
