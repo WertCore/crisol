@@ -405,7 +405,7 @@ fn a_todo_app_adds_removes_filters_and_edits_without_rebuilding_the_tree() {
     assert_eq!(dom_view.children(app.list)[..ITEMS], before[..]);
 
     // ---- toggle, which the filter does read ----------------------------------------------
-    let (_, dom, list, _) = step(
+    let (_, dom, list, layout) = step(
         &runtime,
         &mut tree,
         &mut frame,
@@ -440,6 +440,19 @@ fn a_todo_app_adds_removes_filters_and_edits_without_rebuilding_the_tree() {
         runtime.stats().effects_run,
         2,
         "exactly two: this row's class binding and the footer count"
+    );
+    // Issue #20. This was 8: ticking a row toggles `.done`, which matches
+    // `li.done span.label { color: … }`, and *any* computed-style difference used to mark
+    // `LAYOUT` — so the row and its ancestors relaid out to change a colour.
+    //
+    // The 4 that remain are not the row. They are the footer count being rewritten in the
+    // same step, which is a text change rather than a style one: `text` -> `p.count` ->
+    // `body` -> `html`, an ancestor chain of exactly four. That is a real layout change and
+    // it should stay. `ui/style/tests/paint_only.rs` is where the colour-versus-size
+    // distinction is pinned directly; this number is the end-to-end consequence of it.
+    assert_eq!(
+        layout.caches_invalidated, 4,
+        "a colour-only change must not relay out the row it applies to"
     );
 
     // ---- filter ------------------------------------------------------------------------
