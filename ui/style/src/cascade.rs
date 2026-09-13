@@ -46,6 +46,16 @@ pub struct StyleStats {
     /// The number M6's acceptance is about: after one text edit in a large document, this
     /// should be nearly every element.
     pub reused: usize,
+    /// Elements whose style changed in a way that moves or resizes their box, so they were
+    /// marked `LAYOUT`.
+    pub relaid_out: usize,
+    /// Elements whose style changed only in how the box is drawn, so they were marked
+    /// `PAINT` and spared a relayout.
+    ///
+    /// The pair is the point rather than either number alone: a change that is genuinely
+    /// paint-only should move the count from `relaid_out` to here, and a fix that simply
+    /// stopped marking things would show up as both falling.
+    pub repainted: usize,
 }
 
 /// Holds the stylesheets and computes styles for a tree.
@@ -231,8 +241,22 @@ impl StyleEngine {
             // stops a structural insert from relaying out every sibling: adding one row to
             // a list marks all of them for restyle, because `:nth-child` could have moved,
             // but almost none of them actually compute to a different style.
+            //
+            // And *did* change is still not the same as *changed the box*. A style that
+            // differs only in colour repaints; it does not relay out. The field comparison
+            // that answers this is a real one rather than a pointer comparison, but it is
+            // asked only where the pointers already differ — so its cost is bounded by the
+            // number of nodes that genuinely restyled, and what it saves on each is a
+            // relayout. See `ComputedStyle::layout_eq` for why it is spelled the way it is.
             if changed {
-                tree.mark_dirty(id, DirtyFlags::LAYOUT);
+                let paint_only = previous.get(id).is_some_and(|old| old.layout_eq(&computed));
+                if paint_only {
+                    tree.mark_dirty(id, DirtyFlags::PAINT);
+                    stats.repainted += 1;
+                } else {
+                    tree.mark_dirty(id, DirtyFlags::LAYOUT);
+                    stats.relaid_out += 1;
+                }
             }
 
             let mut child = tree.get(id).and_then(crisol_tree::Node::last_child);

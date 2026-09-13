@@ -160,6 +160,37 @@ impl Default for ComputedStyle {
 }
 
 impl ComputedStyle {
+    /// Whether these two styles would lay out identically.
+    ///
+    /// True when they differ only in properties that change how a box is *drawn* and not
+    /// where it is or how big it is — so the caller can mark `PAINT` and leave `LAYOUT`
+    /// alone. Toggling `.done` on a todo row, where the rule is
+    /// `li.done span.label { color: … }`, should not relay out the row.
+    ///
+    /// **Written as "overwrite the paint-only fields, then compare everything" rather than
+    /// as a list of layout fields to compare, and that is the whole point.** The two spellings
+    /// behave identically today and fail in opposite directions tomorrow: a field added to
+    /// `ComputedStyle` and forgotten here is treated as layout-affecting, which costs a
+    /// relayout nobody needed. Under the other spelling the same omission would skip a
+    /// relayout that *was* needed, and the result is a box that silently keeps a stale size.
+    /// One is a performance bug; the other is a wrong picture.
+    ///
+    /// The clone is a memcpy plus one `Arc` bump on `font_family`, and it is paid only for
+    /// nodes whose style actually changed — the caller asks this question inside a branch
+    /// that already knows the two styles differ.
+    #[must_use]
+    pub fn layout_eq(&self, other: &Self) -> bool {
+        let mut probe = self.clone();
+        probe.color = other.color;
+        probe.background_color = other.background_color;
+        probe.border_color = other.border_color;
+        probe.border_radius = other.border_radius;
+        probe.opacity = other.opacity;
+        probe.cursor = other.cursor;
+        probe.visibility = other.visibility;
+        probe == *other
+    }
+
     /// The style a child starts from before its own declarations are applied.
     ///
     /// Inherited properties carry down; everything else resets to its initial value. Which
