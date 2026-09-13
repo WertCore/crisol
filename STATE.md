@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M12 — runtime library (in progress: the object model; the builtins are not)
+**Current milestone:** M12 — runtime library (in progress: object model, Promise, Map/Set, JSON, Array)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -257,7 +257,7 @@ survives.
 atlas persists across frames and is trimmed (D-30), and `ImageStore` holds uploads until
 removed. Nothing new was needed.
 
-**Totals:** 745 tests passing (743 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 398 tests passing
 
 ### M7 — reactive API and component model
 
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 707 tests passing (705 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 745 tests passing (743 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1407,6 +1407,9 @@ A LIFO queue fails it, a fulfil-always pass-through fails the rejection test, an
 microtask here where a real engine charges two. The tests assert relative order, not tick
 parity, because parity is a claim this has not earned.
 
+**Still to do for M12:** `Object`, `Array`, `String`, `Number`, `Boolean`,
+`Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
+`JSON`, and then `Proxy`/`Reflect` on top of the model above.
 ### `Map`, `Set`, and the third equality
 
 `Map` keys use **SameValueZero**, which agrees with neither `===` nor `Object.is` (D-62):
@@ -1429,7 +1432,6 @@ Out: `NaN` and the infinities become `null`, `-0` becomes `0` (**a round trip lo
 `/` is not escaped, and objects keep insertion order so a round trip does not rewrite a
 document.
 
-**Still to do for M12:** `Object`, `Array`, `String`, `Number`, `Boolean`,
 `Symbol`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators, and then
 `Proxy`/`Reflect` on top of the model above.
 The acceptance is a test262 subset at >80%, which needs the suite fetched the way M10's React
