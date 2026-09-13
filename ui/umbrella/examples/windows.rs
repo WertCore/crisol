@@ -34,7 +34,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 
 const CSS: &str = "
     body { display: flex; flex-direction: column; padding-top: 24px; padding-left: 24px;
@@ -48,7 +48,7 @@ const CSS: &str = "
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut Shell::default())?;
+    event_loop.run_app(Shell::default())?;
     Ok(())
 }
 
@@ -188,15 +188,15 @@ struct Shell {
 }
 
 impl Shell {
-    fn open(&mut self, event_loop: &ActiveEventLoop) {
+    fn open(&mut self, event_loop: &dyn ActiveEventLoop) {
         self.opened += 1;
         let title = format!("crisol — window {}", self.opened);
-        let window = Arc::new(
+        let window = Arc::from(
             event_loop
                 .create_window(
-                    Window::default_attributes()
+                    WindowAttributes::default()
                         .with_title(&title)
-                        .with_inner_size(winit::dpi::LogicalSize::new(420.0, 260.0)),
+                        .with_surface_size(winit::dpi::LogicalSize::new(420.0, 260.0)),
                 )
                 .expect("could not create a window"),
         );
@@ -250,7 +250,7 @@ impl Shell {
 }
 
 impl ApplicationHandler for Shell {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if !self.windows.is_empty() {
             return;
         }
@@ -264,7 +264,7 @@ impl ApplicationHandler for Shell {
         self.open(event_loop);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 self.windows.remove(&id);
@@ -272,7 +272,7 @@ impl ApplicationHandler for Shell {
                     event_loop.exit();
                 }
             }
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 if let Some(document) = self.windows.get_mut(&id) {
                     document.surface.resize(size.width, size.height);
                     document.surface.window().request_redraw();
@@ -288,7 +288,7 @@ impl ApplicationHandler for Shell {
                 match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Character("n") => self.open(event_loop),
-                    Key::Named(NamedKey::Space) => {
+                    Key::Character(" ") => {
                         if let Some(document) = self.windows.get_mut(&id) {
                             document.bump();
                             document.surface.window().request_redraw();

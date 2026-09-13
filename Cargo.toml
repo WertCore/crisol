@@ -82,7 +82,7 @@ wgpu = "30"
 # `android-game-activity` is not optional decoration: `android-activity` refuses to
 # compile unless exactly one entrypoint model is chosen. See DECISIONS D-16. The feature is
 # inert off Android, where the dependency is not in the graph at all.
-winit = { version = "0.30.13", features = ["android-game-activity"] }
+winit = { version = "0.31.0-beta.3", features = ["android-game-activity"] }
 pollster = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
 bitflags = "2"

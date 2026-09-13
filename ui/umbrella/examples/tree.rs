@@ -17,12 +17,12 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::default())?;
+    event_loop.run_app(App::default())?;
     Ok(())
 }
 
@@ -38,16 +38,16 @@ struct State {
 }
 
 impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
-        let window = Arc::new(
+        let window = Arc::from(
             event_loop
                 .create_window(
-                    Window::default_attributes()
+                    WindowAttributes::default()
                         .with_title("Crisol — M2: tree, paint, display list")
-                        .with_inner_size(winit::dpi::LogicalSize::new(480.0, 360.0)),
+                        .with_surface_size(winit::dpi::LogicalSize::new(480.0, 360.0)),
                 )
                 .expect("could not create a window"),
         );
@@ -60,13 +60,18 @@ impl ApplicationHandler for App {
         });
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 state.surface.resize(size.width, size.height);
                 state.surface.window().request_redraw();
             }
@@ -76,7 +81,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key.as_ref() {
-                    Key::Named(NamedKey::Space) => state.document.remove_a_card(),
+                    Key::Character(" ") => state.document.remove_a_card(),
                     Key::Character("r") => state.document.rebuild(),
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     _ => return,

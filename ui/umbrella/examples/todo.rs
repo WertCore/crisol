@@ -41,7 +41,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 
 const CSS: &str = "
     body {
@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut Shell::default())?;
+    event_loop.run_app(Shell::default())?;
     Ok(())
 }
 
@@ -150,10 +150,7 @@ fn headless() {
 
     let typing = |word: &str| -> Vec<Key> {
         word.chars()
-            .map(|character| match character {
-                ' ' => Key::Named(NamedKey::Space),
-                other => Key::Character(other.to_string().into()),
-            })
+            .map(|character| Key::Character(character.to_string().into()))
             .collect()
     };
 
@@ -681,9 +678,8 @@ impl App {
                 runtime.set(self.filter, next);
                 self.clamp_selection(runtime, dom);
             }
-            Key::Named(NamedKey::Space) => {
-                runtime.update(self.draft, |draft| draft.push(' '));
-            }
+            // No arm for space: it arrives as `Key::Character(" ")` now, and the arm
+            // below already appends it.
             Key::Character(typed) => {
                 runtime.update(self.draft, |draft| draft.push_str(typed));
             }
@@ -800,7 +796,7 @@ impl State {
         self.cursor = shape;
         match shape {
             Some(shape) => {
-                self.surface.window().set_cursor(shape);
+                self.surface.window().set_cursor(shape.into());
                 self.surface.window().set_cursor_visible(true);
             }
             // `cursor: none` is not a shape to fall back from — the pointer goes away.
@@ -880,16 +876,16 @@ struct Shell {
 }
 
 impl ApplicationHandler for Shell {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
-        let window = Arc::new(
+        let window = Arc::from(
             event_loop
                 .create_window(
-                    Window::default_attributes()
+                    WindowAttributes::default()
                         .with_title("Crisol — M7: signals, effects, components")
-                        .with_inner_size(winit::dpi::LogicalSize::new(600.0, 460.0)),
+                        .with_surface_size(winit::dpi::LogicalSize::new(600.0, 460.0)),
                 )
                 .expect("could not create a window"),
         );
@@ -897,13 +893,18 @@ impl ApplicationHandler for Shell {
         self.state = Some(State::new(surface));
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 state.surface.resize(size.width, size.height);
                 // The viewport changed, so every box has to be measured against it again.
                 state.tree.mark_subtree_dirty(
@@ -925,7 +926,7 @@ impl ApplicationHandler for Shell {
                     state.surface.window().request_redraw();
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::PointerMoved { position, .. } => {
                 let scale = state.surface.scale_factor();
                 state.pointer = Point::new(position.x as f32 / scale, position.y as f32 / scale);
                 state.update_cursor();
@@ -939,6 +940,11 @@ impl ApplicationHandler for Shell {
                     MouseScrollDelta::PixelDelta(position) => {
                         Point::new(-position.x as f32, -position.y as f32)
                     }
+                    // `MouseScrollDelta` is `#[non_exhaustive]` as of winit 0.31. A kind this
+                    // build does not know how to read is not a scroll of zero — it is a scroll
+                    // of unknown size, and inventing a distance for it would be worse than
+                    // ignoring it.
+                    _ => return,
                 };
                 if state.scroll(delta) {
                     state.surface.window().request_redraw();

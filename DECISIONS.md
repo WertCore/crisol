@@ -1196,3 +1196,43 @@ and all three are invisible to a caller that looks in the attribute list. Forget
 accessor would not just break `getAttribute("style")`: `set_attribute`'s no-op check reads
 back through it, so every write would look like a change and mark the node dirty forever.
 `rewriting_a_style_to_the_same_text_costs_nothing` is the test that fails if it goes missing.
+
+## D-51 — winit 0.31, pre-release, taken now
+
+**Status:** Accepted (M8) · **Affects:** M8, M22
+
+M8 lists drag and drop. winit 0.30 cannot do it: `DroppedFile` carries a path and no position,
+every backend has the coordinate and discards it, and macOS never implements `draggingUpdated:`
+so there is no drag-over stream to highlight a target with. The engine dispatches events to
+nodes by hit-testing a point, so a drop with no point has no target.
+
+0.31.0-beta.3 replaces file drops with a real subsystem — `DragPosition` carrying a
+non-optional position, typed data fetched asynchronously by id, and outgoing drags so an app
+can be a source as well as a target. The backends implement it rather than declaring it:
+`winit-appkit` reads `draggingLocation` and implements `draggingUpdated:`, `winit-win32`
+carries a full `IDropTarget`.
+
+**Taken as a pre-release, deliberately.** The alternative was a fork, which would have been
+work thrown away the moment 0.31 shipped, or waiting, which blocks an M8 deliverable on a
+schedule nobody here controls. crisol is unreleased and has no downstream to break, so the
+usual argument against a beta dependency — *you inflict it on your consumers* — does not
+apply yet. It has to stop applying before 1.0, which is the condition on this decision rather
+than a footnote to it.
+
+**What the upgrade cost**, so the next beta bump is estimated from evidence rather than hope:
+35 errors across four examples and one library, all mechanical. `Window` became a trait, so
+`Arc<Window>` is `Arc<dyn Window>` and `create_window` hands back a `Box<dyn Window>`.
+`inner_size` became `surface_size`, `Resized` became `SurfaceResized`, `CursorMoved` became
+`PointerMoved`, `resumed` became `can_create_surfaces`, `run_app` takes the handler by value,
+and `set_cursor` takes a `Cursor` rather than a `CursorIcon`.
+
+**Two of those had a wrong answer that compiles.** `inner_size`'s rename is suggested by the
+compiler as `outer_size`, which is a different measurement — it includes decorations, and
+taking the hint would have sized every surface wrong with no error anywhere. And
+`MouseScrollDelta` is now `#[non_exhaustive]`: the arm added for it returns rather than
+scrolling zero, because a delta this build cannot read is a scroll of unknown size and
+inventing a distance for it is worse than ignoring it.
+
+`NamedKey::Space` is gone, which is a correction rather than a loss — `keyboard-types` follows
+the spec, where space is a character. The two arms that special-cased it were deleted outright
+because the `Key::Character` arms beside them already did the same work.

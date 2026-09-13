@@ -16,7 +16,7 @@ use crate::gpu::{Gpu, GpuError, SharedGpu};
 /// A window, its surface, and the configuration they were last agreed on.
 #[derive(Debug)]
 pub struct WindowSurface {
-    window: Arc<Window>,
+    window: Arc<dyn Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     /// Shared, because a second window must not mean a second device.
@@ -44,7 +44,7 @@ pub enum AcquiredFrame {
 impl WindowSurface {
     /// Creates a surface for `window` and acquires a device that can present to it.
     ///
-    /// Takes `Arc<Window>` because the surface borrows the window handle for as long as it
+    /// Takes `Arc<dyn Window>` because the surface borrows the window handle for as long as it
     /// lives, and sharing ownership is the only way to promise that without a lifetime
     /// escaping into every type that touches the renderer.
     ///
@@ -52,7 +52,7 @@ impl WindowSurface {
     ///
     /// Returns [`GpuError`] when the surface cannot be created, no adapter can present to
     /// it, or the surface exposes no format we can render to.
-    pub fn new(window: Arc<Window>) -> Result<Self, GpuError> {
+    pub fn new(window: Arc<dyn Window>) -> Result<Self, GpuError> {
         let instance = wgpu::Instance::new(crate::gpu::instance_descriptor());
         let surface = instance.create_surface(Arc::clone(&window))?;
         let gpu = SharedGpu::new(Gpu::for_surface(instance, &surface)?);
@@ -74,20 +74,20 @@ impl WindowSurface {
     ///
     /// Returns [`GpuError`] when the surface cannot be created or exposes no format we can
     /// render to.
-    pub fn with_gpu(gpu: SharedGpu, window: Arc<Window>) -> Result<Self, GpuError> {
+    pub fn with_gpu(gpu: SharedGpu, window: Arc<dyn Window>) -> Result<Self, GpuError> {
         let surface = gpu.instance.create_surface(Arc::clone(&window))?;
         Self::configure(window, surface, gpu)
     }
 
     fn configure(
-        window: Arc<Window>,
+        window: Arc<dyn Window>,
         surface: wgpu::Surface<'static>,
         gpu: SharedGpu,
     ) -> Result<Self, GpuError> {
         let capabilities = surface.get_capabilities(&gpu.adapter);
         let format = choose_format(&capabilities).ok_or(GpuError::NoSurfaceFormat)?;
 
-        let size = window.inner_size();
+        let size = window.surface_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -116,7 +116,7 @@ impl WindowSurface {
 
     /// The window.
     #[must_use]
-    pub fn window(&self) -> &Arc<Window> {
+    pub fn window(&self) -> &Arc<dyn Window> {
         &self.window
     }
 
@@ -190,7 +190,7 @@ impl WindowSurface {
     /// Reconfigures with the window's current size. Call after a scale factor change, which
     /// arrives without a resize event on some platforms.
     pub fn refresh(&mut self) {
-        let size = self.window.inner_size();
+        let size = self.window.surface_size();
         self.config.width = size.width.max(1);
         self.config.height = size.height.max(1);
         self.surface.configure(&self.gpu.device, &self.config);

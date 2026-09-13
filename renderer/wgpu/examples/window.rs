@@ -20,7 +20,7 @@ use crisol_render_wgpu::{AcquiredFrame, FrameTarget, Renderer, WindowSurface};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{WindowAttributes, WindowId};
 
 const CHECKERBOARD: ImageId = ImageId(1);
 
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait rather than poll: this scene is static, so redrawing continuously would burn a
     // core for nothing. A real application drives this from the animation scheduler.
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::default())?;
+    event_loop.run_app(App::default())?;
     Ok(())
 }
 
@@ -44,17 +44,17 @@ struct State {
 }
 
 impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         // `resumed` fires again after an Android-style suspend, so recreating state that
         // already exists would leak a window.
         if self.state.is_some() {
             return;
         }
 
-        let attributes = Window::default_attributes()
+        let attributes = WindowAttributes::default()
             .with_title("Crisol — M1")
-            .with_inner_size(winit::dpi::LogicalSize::new(640.0, 400.0));
-        let window = Arc::new(
+            .with_surface_size(winit::dpi::LogicalSize::new(640.0, 400.0));
+        let window = Arc::from(
             event_loop
                 .create_window(attributes)
                 .expect("could not create a window"),
@@ -82,14 +82,19 @@ impl ApplicationHandler for App {
         self.state = Some(State { surface, renderer });
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 state.surface.resize(size.width, size.height);
                 state.surface.window().request_redraw();
             }

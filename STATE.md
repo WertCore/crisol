@@ -640,11 +640,21 @@ And the backends implement it rather than merely declaring it, which is the thin
 to check: `winit-appkit` now reads `sender.draggingLocation()` and implements
 `draggingUpdated:`, and `winit-win32` carries a full `IDropTarget` with drag-state tracking.
 
-So the open question is not "fork or upstream PR" but **when to take the 0.31 upgrade**. It is
-a pre-release, and the upgrade is a large breaking change — the crate split, renamed events, a
-different application handler, and a DnD model that fetches typed data by id instead of
-handing over paths. That is a dependency decision rather than an engine one, so it is recorded
-here and not taken unilaterally.
+**The upgrade is taken** (D-51). crisol is unreleased, so a pre-release dependency costs
+nothing downstream, and the alternative was a fork that 0.31 would have made pointless. The
+migration was 35 mechanical errors: `Window` is a trait now, `inner_size` is `surface_size`,
+`Resized` is `SurfaceResized`, `CursorMoved` is `PointerMoved`, `resumed` is
+`can_create_surfaces`, `run_app` takes its handler by value, and `set_cursor` takes a `Cursor`.
+
+Two of those had a wrong answer that compiles, which is the part worth remembering. The
+compiler suggests `outer_size` for `inner_size` — a different measurement that includes
+decorations, and taking the hint would have sized every surface wrong silently. And
+`MouseScrollDelta` is `#[non_exhaustive]` now, so an unknown delta returns rather than
+scrolling zero: a kind this build cannot read is a scroll of unknown size, not a scroll of
+none.
+
+Drag and drop itself is not built yet — this is the dependency that makes it possible, and the
+engine-side events are the next piece.
 
 **Still to do for M8:** native menus, drag and drop, window chrome, packaging (.app, .msi,
 AppImage) — and then the acceptance proper: an API-client-shaped application with a 5MB
