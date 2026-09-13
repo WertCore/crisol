@@ -1236,3 +1236,58 @@ inventing a distance for it is worse than ignoring it.
 `NamedKey::Space` is gone, which is a correction rather than a loss — `keyboard-types` follows
 the spec, where space is a character. The two arms that special-cased it were deleted outright
 because the `Key::Character` arms beside them already did the same work.
+
+---
+
+## D-52 — The bundle layout is built anywhere; only the container is host-gated
+
+**Status:** Accepted (M8) · **Affects:** M8, M21, M22
+
+M8 lists packaging as `.app`, `.msi` and `AppImage`. The obvious shape is three host-only
+code paths, each compiled and tested on its own runner. That shape is how a packager ends up
+broken on two platforms out of three: the macOS path is the one the author runs, and the other
+two are exercised only when someone tries to ship.
+
+So the split is not by host but by **what actually needs one**. A `.app` is a directory with a
+plist in it. An AppDir is a directory with a shell script in it. A `.wxs` is XML. None of those
+need the platform they target, and all three are therefore built, and tested, on every runner.
+What genuinely needs a host is the container step — `appimagetool` wants FUSE and a Linux
+kernel, WiX wants Windows — and that step runs when the tool is on `PATH` and reports itself
+missing when it is not, with the layout left in place because the layout *is* that tool's
+documented input.
+
+The result is that the 13 tests covering this run identically on all three CI platforms, and
+the part that can only run in one place is the part that is a subprocess call.
+
+**`crisol package` takes a binary, not a project.** `crisol build` is M13, so until it exists
+there is nothing to compile from. The input is a Rust application built against `crisol-ui`,
+which is exactly what §M8's acceptance describes — "built entirely in Rust". When `build`
+lands, its output is handed to the same command; nothing here knows which of the two made the
+executable, which is why it takes a path.
+
+**The `UpgradeCode` is never invented.** An MSI's `UpgradeCode` must be byte-identical across
+every version an application ever ships, or Windows installs the new version *beside* the old
+one instead of replacing it. A generated one would work perfectly on the first release and
+fail on the second, which is the worst possible time to find out. It is required, and refusing
+is a one-line error rather than a silent future defect.
+
+**An MSI version is checked against what the installer can hold**, not against a style rule.
+Windows Installer packs `ProductVersion` into 32 bits: major and minor are bytes, build is
+16 bits, and a fourth field is ignored entirely when comparing. So `1.2.3.4` and `1.2.3.5` are
+the same release as far as upgrades are concerned, and `1.2.65536` wraps. All of these build,
+install, and then fail to upgrade. Rejecting them at package time is the only place it is
+cheap.
+
+**Icons are copied, not converted.** The three platforms want `.icns`, `.png` and `.ico`, and
+they disagree about sizes and colour profiles in ways a generic conversion gets wrong. A
+packager that re-encodes images is a packager that owns an image pipeline; this one takes the
+format the target asked for and says so.
+
+**Signing and notarisation are not here.** Both need credentials and Apple's own tooling, and
+an unsigned `.app` is still the correct input to `codesign`. Shipping to other people is M21.
+
+**Rejected: cargo-bundle or tauri-bundler.** Both would have worked and both are more complete
+than this. They are also a dependency on someone else's opinion about what a crisol application
+is, at the exact milestone where that question is being answered, and `tauri-bundler` in
+particular carries a WebView-shaped worldview that is the thing this engine exists to avoid.
+Revisit at M21 when there is a real release process to serve.

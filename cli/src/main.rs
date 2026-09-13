@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod doctor;
+mod package;
 
 /// Exit code for a command that is real but not implemented yet.
 ///
@@ -30,6 +31,14 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// Only Windows trips this: `PathBuf` is 32 bytes there rather than 24, which is enough to
+// push `Package` over the threshold. Boxing it would fight clap's derive, and the cost the
+// lint is about — carrying the widest variant everywhere — is not paid here, because a
+// command is parsed once, matched once, and dropped.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "parsed once, matched once, then dropped"
+)]
 enum Command {
     /// Compile a project to a native binary.
     Build {
@@ -55,12 +64,13 @@ enum Command {
         #[arg(default_value = ".")]
         path: std::path::PathBuf,
     },
-    /// Produce a distributable artifact.
-    Package {
-        /// Project directory.
-        #[arg(default_value = ".")]
-        path: std::path::PathBuf,
-    },
+    /// Wrap a built binary into the artifact its platform expects.
+    ///
+    /// Takes an executable rather than a project: `crisol build` is M13, and until it
+    /// exists the input is a Rust application built against `crisol-ui`, which is what
+    /// ROADMAP §M8's acceptance describes. The same command takes `build`'s output later.
+    Package(package::Request),
+
     /// Report what this machine and this build of crisol can do.
     Doctor,
 }
@@ -75,7 +85,36 @@ fn main() -> ExitCode {
         Command::Dev { .. } => unimplemented("dev", "M17", "React on the dev-mode interpreter"),
         Command::Run { .. } => unimplemented("run", "M16", "the DOM host API"),
         Command::Check { .. } => unimplemented("check", "M10", "the frontend and module graph"),
-        Command::Package { .. } => unimplemented("package", "M8", "platform packaging"),
+        Command::Package(request) => package(request),
+    }
+}
+
+/// Runs `crisol package` and reports what came of it.
+fn package(request: package::Request) -> ExitCode {
+    let options = match request.resolve() {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("crisol package: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match package::build(&options) {
+        Ok(produced) => {
+            println!("{}", produced.artifact.display());
+            if let Some(tool) = produced.missing_tool {
+                // Loud, and on stderr, because the caller asked for a sealed artifact and
+                // got the thing that goes into one. Still a success: the layout is complete
+                // and correct, and it is the documented input to the tool that is missing.
+                eprintln!();
+                eprintln!("note: {tool} is not on PATH, so the layout above was not sealed.");
+                eprintln!("      It is complete, and is what that tool takes as input.");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("crisol package: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

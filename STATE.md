@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M8 — platform polish (in progress: scrolling, chrome and menus done)
+**Current milestone:** M8 — platform polish (every deliverable done; the acceptance is what remains)
 **Last finished:** M7 — reactive API and component model
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -873,9 +873,38 @@ why it was sound and still failed Windows for not spelling it that way. Neither 
 from a macOS build, but both are reachable from `cargo clippy --target`, which needs no linker
 and is now worth running for the two other desktop triples before pushing anything platform-shaped.
 
-**Still to do for M8:** drag and drop, packaging (.app, .msi, AppImage) — and then the
-acceptance proper: an API-client-shaped application with a 5MB response in it, measured on all
-three platforms.
+### Packaging, split by what needs a host rather than by host
+
+`crisol package` wraps a built executable into `.app`, `AppDir`/`.AppImage` or `.wxs`/`.msi`
+(D-52). It takes a binary rather than a project because `crisol build` is M13; the input today
+is a Rust application built against `crisol-ui`, which is what §M8's acceptance describes, and
+the same command takes `build`'s output when there is one.
+
+**The layout is built on any host and only the container step is gated.** A `.app` is a
+directory, an AppDir is a directory, a `.wxs` is XML — none of them need the platform they
+target. So all three are produced everywhere and the 13 tests covering them run identically on
+all three CI runners; only `appimagetool` and WiX are host-bound, and when they are absent the
+layout is left in place and reported, because the layout *is* their documented input. Built
+the other way — one host-only path each — the two platforms the author does not sit in front
+of are the two that quietly rot.
+
+Verified beyond the crate's own assertions: all three artifacts were generated from macOS and
+re-read with parsers that are not this code — `plistlib`, `configparser` and `ElementTree` —
+checking that `CFBundleExecutable` names a file that exists and is executable, that the desktop
+entry's `Exec` resolves to the staged binary, that `AppRun` carries its executable bit, and
+that the `.wxs` names its payload relatively rather than by a path that only exists here. The
+bundled executable was then run out of `Contents/MacOS` and answered.
+
+**Two things that fail silently and so are refused at package time.** An MSI `UpgradeCode` is
+never invented: it has to be identical across every version ever shipped or the second release
+installs beside the first rather than replacing it, which works perfectly once and then never
+again. And an MSI `ProductVersion` is packed into 32 bits — major and minor are bytes, build is
+16 bits, the fourth field is ignored when comparing — so `1.2.3.4`, `1.2.3.5` and `1.2.65536`
+all build, install, and then fail to upgrade.
+
+**Still to do for M8:** nothing in the deliverable list. What remains is the acceptance
+proper — an API-client-shaped application with a 5MB response in it, measured on all three
+platforms — and that is the §7 kill criterion rather than a checkbox.
 
 **One thing measured and left alone.** In the todo example, moving the selection runs one
 effect per row: every row asks "am I the selected one?" and so subscribes to the shared
@@ -884,7 +913,7 @@ but it is linear. That is what this way of modelling a selection costs, not a li
 engine — a list long enough to care would remember the previous row and toggle exactly two.
 Said out loud in a comment rather than quietly shipped.
 
-**Totals:** 546 tests passing
+**Totals:** 559 tests passing
 
 ## Open questions
 
