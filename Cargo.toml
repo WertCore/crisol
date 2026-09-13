@@ -89,6 +89,17 @@ bitflags = "2"
 raw-window-handle = "0.6"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+
+# The JavaScript front end. Pinned to 0.91 rather than the current 0.149 because the newer
+# line needs Rust 1.96 and this workspace's MSRV is 1.87 — Track A is meant to be embeddable,
+# so a parser dependency in Track B is not a reason to raise the floor for everybody.
+# `oxc_ast_visit` must stay on the same version as `oxc_ast`.
+oxc_allocator = "0.91.0"
+oxc_ast = "0.91.0"
+oxc_ast_visit = "0.91.0"
+oxc_parser = "0.91.0"
+oxc_span = "0.91.0"
+oxc_resolver = "11.13.1"
 # lightningcss owns the CSS grammar; `selectors` owns matching. They agree on
 # cssparser 0.37, so there is exactly one tokenizer in the graph. See DECISIONS D-20.
 lightningcss = { version = "1.0.0-alpha.72", default-features = false, features = ["into_owned"] }
