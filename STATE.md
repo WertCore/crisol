@@ -499,10 +499,34 @@ from, since no one machine has all three. The number only reached the log, thoug
 that takes opening three logs and scrolling to find is not the defensible one the ROADMAP asks
 for. Each job now puts its reading in its own summary.
 
-Not gated on a ceiling yet, deliberately. The macOS figure is known and the other two are not,
-and picking a bound before seeing the numbers it bounds is exactly how D-49's tolerance came to
-be wider than the thing it was checking. The bound goes in once there are three numbers to set
-it from.
+**Three numbers, and they are not the same quantity.** Taken 13 Sep 2026 from one run of the
+identical headless script:
+
+| platform | reading | metric |
+|---|---|---|
+| macOS (arm64) | 4.6 MiB | `phys_footprint` |
+| Linux (x86_64) | 13.5 MiB | `VmRSS` |
+| Windows (x86_64) | 3.4 MiB | `PrivateUsage` |
+
+Linux reads about three times macOS for the same work and is not three times worse: `VmRSS`
+counts shared pages that `phys_footprint` discounts and `PrivateUsage` excludes outright. This
+is D-46 showing up as an operational fact rather than a definition — **§M8's "< 60MB RSS" does
+not name one measurement**, and the acceptance has to state which metric it means on each
+platform or the claim is three different claims wearing one number.
+
+The ceiling is now set, per platform, at roughly twice each observed figure — enough to catch a
+regression that doubles the floor, loose enough to survive runner variance. One sample is a
+weak basis for a tight bound, so it is deliberately generous and should tighten once there are
+enough runs to know the spread. Setting it *after* the readings rather than before is the whole
+point: a bound guessed ahead of its data is how D-49's tolerance came to be wider than the
+thing it was checking.
+
+**The gate fails when the reading is missing, not just when it is too big.** Otherwise deleting
+the measurement would silently disable the check — a guard that cannot fail, which is the
+failure mode this repo keeps rediscovering. Worth one more note: a plain substring search for
+the reading matches the workflow's *own script text*, which the runner echoes into the same
+log, so the grep is anchored on a digit. The first attempt at collecting these numbers found
+the instrument instead of the measurement.
 
 **And it was worse than noise.** Instrumenting the windows example showed the reading was never
 taken after a frame at all — the print never fired, because the windows were never asked to

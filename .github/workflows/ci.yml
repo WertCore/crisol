@@ -17,12 +17,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `budget_mib` is per platform because the three do not measure the same quantity.
+          # macOS reports `phys_footprint`, Linux `VmRSS`, Windows `PrivateUsage` — VmRSS
+          # counts shared pages the other two discount, which is why Linux reads about three
+          # times macOS for the identical run and why one shared ceiling would be meaningless.
+          #
+          # Each is roughly 2x the reading observed on 13 Sep 2026, which catches a regression
+          # that doubles the floor while leaving room for runner variance. One sample is a
+          # weak basis for a tight bound, so this is deliberately loose; tighten it when there
+          # are enough runs to know the spread.
           - name: macOS (arm64)
             os: macos-latest
+            budget_mib: 10 # observed 4.6 (phys_footprint)
           - name: Linux (x86_64)
             os: ubuntu-latest
+            budget_mib: 28 # observed 13.5 (VmRSS)
           - name: Windows (x86_64)
             os: windows-latest
+            budget_mib: 8 # observed 3.4 (PrivateUsage)
     steps:
       - uses: actions/checkout@v4
 
@@ -72,27 +84,40 @@ jobs:
         # a memory number the product claim rests on, and a number nobody can find without
         # opening three logs and scrolling is not a defensible one.
         #
-        # Deliberately not gated on a ceiling yet: the macOS figure is known and the other two
-        # are not, and a bound picked before seeing the numbers it bounds is how D-49's
-        # tolerance came to be wider than the thing it was checking. Watch these, then set it.
+        # Gated on a per-platform ceiling, set from the readings these three jobs produced
+        # rather than guessed ahead of them — see `budget_mib` in the matrix for why one
+        # shared number would not mean anything.
         shell: bash
         run: |
           set -euo pipefail
           output=$(cargo run -p crisol-ui --example todo --features measure -- --headless)
           echo "$output"
-          # `|| true` because `pipefail` would otherwise turn a missing line into a failed
-          # step, and the run itself is what this step exists to check. A reading that does
-          # not appear should say so in the summary rather than look like a broken build.
-          reading=$(grep -F 'memory after the scripted run' <<<"$output" | sed 's/.*run: //' || true)
+          # Anchored on a digit after "run: ". A plain substring search also matches this
+          # script's own text, which the runner echoes into the same log — the grep finds
+          # the instrument instead of the measurement.
+          reading=$(grep -oE 'memory after the scripted run: [0-9.]+ MiB \([A-Za-z_]+\)' <<<"$output" \
+            | head -1 | sed 's/.*run: //' || true)
           # One job, one summary, so this is a line rather than a row in a table that
           # would have no header to render against.
           echo "**$PLATFORM** idle memory: ${reading:-no reading}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$reading" ]; then
+            echo "::error::No memory reading in the headless run's output."
+            exit 1
+          fi
+          mib=${reading%% *}
+          # `awk` rather than `[ ]`, which cannot compare decimals.
+          if awk -v m="$mib" -v b="$BUDGET_MIB" 'BEGIN { exit !(m > b) }'; then
+            echo "::error::Idle memory $reading is over the ${BUDGET_MIB} MiB budget for $PLATFORM."
+            exit 1
+          fi
+          echo "$reading is within the ${BUDGET_MIB} MiB budget for $PLATFORM."
         env:
           CRISOL_REQUIRE_FONTS: 1
           # Through the environment rather than interpolated into the script. These values
           # are the workflow's own literals today, so this is hygiene rather than a fix —
           # it is what keeps the step safe if the matrix ever grows a computed entry.
           PLATFORM: ${{ matrix.name }}
+          BUDGET_MIB: ${{ matrix.budget_mib }}
 
       - name: Docs
         run: cargo doc --workspace --no-deps
