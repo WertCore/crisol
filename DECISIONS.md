@@ -1980,3 +1980,51 @@ invisible because the happy path — running to exhaustion — never exercises i
 **A finished iterator stays finished.** Once a done step has come out, later calls report done
 again even if the underlying sequence has more. Without it an exhausted iterator asked again
 would restart, and the protocol has no way to notice.
+
+---
+
+## D-70 — `isFrozen` is vacuously true, and `seal` differs from `freeze` by one bit
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+`Object.isFrozen(Object.preventExtensions({}))` is **true**. Freeze was never called; the object
+simply has no properties that could change and cannot gain any, so every condition in the
+definition holds over an empty set. `isSealed` is the same.
+
+This matters because code branches on `isFrozen` to decide whether it may mutate, and will take
+the frozen path for an object nobody froze. An implementation that "corrected" it by tracking a
+`frozen` flag would be more intuitive and would disagree with every engine. Checked by making
+`isFrozen` demand at least one property and watching the test fail.
+
+**`seal` and `freeze` differ by exactly one bit.** `seal` makes every own property
+non-configurable and stops extensions; `freeze` does that *and* makes data properties
+non-writable. **A sealed object's values can still change — only its shape is fixed.**
+Conflating them gives either an object that reports sealed and silently accepts writes, or one
+that rejects writes nobody asked it to reject. Checked by making `seal` also clear `writable`.
+
+An accessor has no `writable` attribute, so freezing must not ask for one on it — and an
+accessor does not prevent an object from being frozen.
+
+## D-71 — `Number.isNaN` and the global `isNaN` are different functions
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+| | `"NaN"` | `"1"` | `undefined` | `true` |
+|---|---|---|---|---|
+| `Number.isNaN` | `false` | `false` | `false` | `false` |
+| global `isNaN` | **`true`** | `false` | **`true`** | `false` |
+| `Number.isFinite` | `false` | **`false`** | `false` | **`false`** |
+| global `isFinite` | `false` | **`true`** | `false` | **`true`** |
+
+The globals coerce with `ToNumber` first; the `Number` ones do not. Reaching for whichever
+happens to be in scope is how a string that looks numeric passes a guard meant to reject it —
+`isFinite("1")` is `true`. Both are implemented, next to each other, so the difference is
+visible at the point where someone picks one.
+
+`Number.isInteger(5.0)` is **true**: every JavaScript number is a double, so `5` *is* `5.0` and
+there is no separate integer type for this to distinguish.
+
+`Number.isSafeInteger` stops at `2^53 - 1` because beyond it the representable doubles are
+further apart than 1 — `2^53` and `2^53 + 1` are the same value. There is a test asserting that
+collision directly, because the boundary means nothing without it. It is also why APIs with
+64-bit ids send them as strings.
