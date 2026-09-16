@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 813 tests passing (811 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 825 tests passing (823 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1459,7 +1459,23 @@ detaching the handler is what revocation is for.
 `{ done: "false" }` is. Leaving a loop early closes the iterator — that is how a generator's
 `finally` runs — while running to exhaustion does not, and both directions have tests.
 
-**Still to do for M12:** `Object` statics, `String`, `Number`, `Boolean`,
+### `Object` and `Number` statics
+
+**`Object.isFrozen(Object.preventExtensions({}))` is true** (D-70) — every condition holds over
+an empty set of properties. Code branching on `isFrozen` to decide whether it may mutate takes
+the frozen path for an object nobody froze, and "correcting" that with a `frozen` flag would be
+more intuitive and disagree with every engine.
+
+**`seal` and `freeze` differ by one bit:** a sealed object's values can still change, only its
+shape is fixed. Both rules checked by breaking them.
+
+**`Number.isNaN` and the global `isNaN` are different functions** (D-71) — the global coerces
+first, so `isFinite("1")` is true and `Number.isFinite("1")` is false. Both are implemented next
+to each other so the difference is visible where someone picks one. `isSafeInteger`'s boundary
+has a test asserting the actual collision (`2^53` and `2^53 + 1` are one double), because the
+boundary means nothing without it.
+
+**Still to do for M12:** `String`, `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
 `JSON`, and then `Proxy`/`Reflect` on top of the model above.
 ### `Map`, `Set`, and the third equality

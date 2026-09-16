@@ -16,6 +16,7 @@ mod json;
 mod object;
 mod promise;
 mod proxy;
+mod statics;
 mod symbol;
 
 pub use array::{JsArray, MAX_LENGTH, array_index};
@@ -30,4 +31,9 @@ pub use json::{Json, ParseError, parse, stringify};
 pub use object::{Got, ObjectId, OrdinaryObject, Realm, Setting};
 pub use promise::{Agent, Outcome, PromiseId, Reaction, State};
 pub use proxy::{Proxy, ProxyError, Target, Trap};
+pub use statics::{
+    MAX_SAFE_INTEGER, assign, entries, freeze, from_entries, global_is_finite, global_is_nan,
+    is_frozen, is_integer, is_safe_integer, is_sealed, keys, number_is_finite, number_is_nan,
+    own_property_names, seal, values,
+};
 pub use symbol::{SymbolId, Symbols, WellKnown};
