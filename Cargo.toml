@@ -100,6 +100,11 @@ oxc_ast_visit = "0.91.0"
 oxc_parser = "0.91.0"
 oxc_span = "0.91.0"
 oxc_resolver = "11.13.1"
+
+# JavaScript-compatible regular expressions. §M12 names it explicitly, because Rust's `regex`
+# deliberately omits backreferences and lookaround — which real code uses, so a "close enough"
+# engine would reject patterns that work everywhere else.
+regress = "0.10"
 # lightningcss owns the CSS grammar; `selectors` owns matching. They agree on
 # cssparser 0.37, so there is exactly one tokenizer in the graph. See DECISIONS D-20.
 lightningcss = { version = "1.0.0-alpha.72", default-features = false, features = ["into_owned"] }

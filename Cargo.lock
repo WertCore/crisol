@@ -494,6 +494,7 @@ name = "crisol-builtins"
 version = "0.0.0"
 dependencies = [
  "crisol-value",
+ "regress",
 ]
 
 [[package]]
@@ -2646,6 +2647,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "regress"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2057b2325e68a893284d1538021ab90279adac1139957ca2a74426c6f118fb48"
+dependencies = [
+ "hashbrown 0.16.1",
+ "memchr",
 ]
 
 [[package]]

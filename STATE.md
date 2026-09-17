@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 861 tests passing (859 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 882 tests passing (880 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1506,6 +1506,19 @@ Months wrap and days are 1-based while months are 0-based — specified, and del
 **UTC only.** Local-time accessors need the host's zone and its historical transition table
 (M15). Guessing would produce a date that is right in one timezone and silently wrong in the
 rest — the worst outcome, because it works for whoever wrote it.
+
+### `RegExp`
+
+Over `regress` (D-74), which §M12 names because Rust's `regex` omits **backreferences and
+lookaround** and real code uses both. What `regress` does not supply is the **mutable cursor**:
+`const r = /a/g; r.test("a")` gives true, then false, then true.
+
+Three rules carry it, all mutation-tested: **`test` is `exec` with the result discarded** (a
+stateless `test` would disagree with `exec` on the same object — breaking it fails four tests);
+**a failed match resets `lastIndex`**, which is what makes repeated calls alternate; and **`y`
+anchors at `lastIndex` while `g` searches from it**. Without either flag `lastIndex` is inert.
+
+An empty match advances by one *character*, or `/(?:)/g` never terminates.
 
 **Still to do for M12:** `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
