@@ -2065,3 +2065,42 @@ BOM otherwise leaves an invisible character on the front of its first field.
 
 Three of these were checked by breaking them: making `slice` swap, dropping U+FEFF from the
 whitespace set, and making `to_rust` lossy each fail their tests.
+
+---
+
+## D-73 — `Invalid Date` is a state, not an error, and pre-epoch arithmetic must floor
+
+**Status:** Accepted (M12) · **Affects:** M12, M15
+
+A `Date` is one number: milliseconds since the epoch. Three rules about that number carry most
+of the correctness.
+
+**`TimeClip` invalidates rather than clamps.** The time value must be an integer with magnitude
+at most `8.64e15`; anything else becomes `NaN` and the date is permanently invalid. Clamping
+would let a date **silently become a different date**, which is worse than an obviously broken
+one. It must run on every construction and mutation, and `-0` is normalised so two dates either
+side of the epoch do not compare unequal through a sign nobody can see.
+
+**`day_from_time` floors; `time_within_day` uses `rem_euclid`.** Truncating puts
+1969-12-31T23:00Z in day 0 rather than day -1, and a plain remainder gives it an hour of `-1`.
+Both look correct for every date anyone tests by hand, and are wrong for everything before 1970.
+
+**The epoch was a Thursday**, so the weekday offset is 4. Getting that constant wrong shifts
+every weekday in the program by a fixed amount, which looks like a timezone bug and is not.
+
+All three were checked by breaking them.
+
+**Months wrap and days are 1-based while months are 0-based.** `new Date(2020, 12, 1)` is
+January 2021 and `new Date(2020, 0, 0)` is 31 December 2019 — both specified, both used
+deliberately, since `new Date(y, m + 1, 0)` is the idiomatic last day of month `m`. The
+0-based/1-based inconsistency is in the language; normalising it here would make every ported
+program wrong by one month.
+
+**Only UTC.** Local-time accessors need the host's zone *and* its historical transition table,
+which is M15's to supply. Implementing them against a guess would produce a date that is right
+in one timezone and silently wrong in the rest — the worst available outcome, because it works
+for whoever wrote it.
+
+`toISOString` returns `None` for an invalid date rather than a string, because it **throws** a
+`RangeError` where `toString` returns `"Invalid Date"` — two methods on the same object with
+different failure modes, and the caller has to pick.

@@ -9,6 +9,7 @@
 mod array;
 mod collections;
 mod convert;
+mod date;
 mod descriptor;
 mod error;
 mod iterator;
@@ -24,6 +25,11 @@ pub use array::{JsArray, MAX_LENGTH, array_index};
 pub use collections::{JsMap, JsSet};
 pub use convert::{
     number_to_string, string_to_boolean, string_to_number, to_boolean, to_number, to_string,
+};
+pub use date::{
+    Fields, INVALID_DATE, MAX_TIME, MS_PER_DAY, civil_from_days, day_from_time, days_from_civil,
+    days_in_month, fields, is_leap_year, make_date, make_time, time_clip, time_from_civil,
+    time_within_day, to_iso_string, week_day,
 };
 pub use descriptor::{Entry, PartialDescriptor, Property, Rejected, validate_and_apply};
 pub use error::{ErrorKind, JsError};

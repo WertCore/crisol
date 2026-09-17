@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 825 tests passing (823 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 861 tests passing (859 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1489,6 +1489,23 @@ disagree with every engine and stop `slice` composing with `indexOf`.
 `slice` and `substring` differ twice (swap, and negative handling), which is what makes
 substituting one for the other a reliable bug. `trim` removes U+FEFF, which Unicode does not
 call whitespace and the spec trims anyway.
+
+### `Date`
+
+A `Date` is one number, and three rules about it carry the correctness (D-73). **`TimeClip`
+invalidates rather than clamps** — clamping lets a date silently become a *different* date.
+**`day_from_time` floors and `time_within_day` uses `rem_euclid`** — truncating puts
+1969-12-31T23:00Z in day 0 and a plain remainder gives it an hour of −1, both of which look
+right for every date tested by hand and are wrong for everything before 1970. **The epoch was a
+Thursday**, so the weekday offset is 4; getting it wrong shifts every weekday by a constant and
+looks like a timezone bug. All three checked by breaking them.
+
+Months wrap and days are 1-based while months are 0-based — specified, and deliberate, since
+`new Date(y, m + 1, 0)` is the idiomatic last day of month `m`.
+
+**UTC only.** Local-time accessors need the host's zone and its historical transition table
+(M15). Guessing would produce a date that is right in one timezone and silently wrong in the
+rest — the worst outcome, because it works for whoever wrote it.
 
 **Still to do for M12:** `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
