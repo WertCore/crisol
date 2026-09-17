@@ -80,6 +80,32 @@ jobs:
           npm install --no-audit --no-fund --loglevel=error react@19.2.8 react-dom@19.2.8
           echo "CRISOL_NODE_MODULES_ROOT=$root" >> "$GITHUB_ENV"
 
+      # §M12's acceptance is a test262 pass rate, and the harness that will measure it has to
+      # be checked against the *real* corpus — a hand-written frontmatter parser that works on
+      # a sample and mis-reads one unusual file would quietly shrink the denominator.
+      #
+      # Linux only, and sparse. The full suite is a large checkout for a step that currently
+      # validates a parser rather than running anything, so paying for it on three platforms
+      # would be cost without a corresponding guarantee. When there is an execution engine
+      # (M13) this should widen to every platform, because a pass rate is per-target.
+      - name: Fetch the test262 subset
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/test262"
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/tc39/test262.git "$root"
+          cd "$root"
+          git sparse-checkout set harness \
+            test/built-ins/Object test/built-ins/Array test/built-ins/String \
+            test/built-ins/Number test/built-ins/Boolean test/built-ins/Symbol \
+            test/built-ins/Map test/built-ins/Set test/built-ins/Date \
+            test/built-ins/Error test/built-ins/RegExp test/built-ins/JSON \
+            test/built-ins/Promise test/built-ins/Proxy test/built-ins/Reflect
+          echo "CRISOL_TEST262_ROOT=$root" >> "$GITHUB_ENV"
+          echo "CRISOL_REQUIRE_TEST262=1" >> "$GITHUB_ENV"
+
       - name: Test
         run: cargo test --workspace --all-features
         env:

@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 896 tests passing (894 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 899 tests passing (897 without a `node_modules` tree; the test262 cases also skip without the suite)
 
 ## Open questions
 
@@ -1535,12 +1535,29 @@ would make `if (obj)` unreliable for every other object type.
 **A rejected async step ends the iteration and propagates** (D-77). Swallowing it would turn a
 failed network page into a quietly truncated list — the failure that looks like success.
 
-**Still to do for M12 — and it is the acceptance itself.** §M12 asks that *"the relevant
-test262 subset passes at >80% for implemented builtins"*, and **no test262 test has been run**.
-Everything in `crisol-builtins` is this implementation's own reading of the specification:
-good tests, mutation-checked, and *not the acceptance*. Getting there needs the suite fetched
-the way M10's React tree is, plus a harness to run it — and the Data volume is at 100%
-capacity, so the checkout does not currently fit.
+### The test262 harness, and why M12's acceptance is blocked on M13
+
+The suite is fetched and the harness is built (D-78). It discovers **12,719 cases** for the
+implemented builtins, parses every one, and reports what running them would require.
+
+**It cannot run any of them.** Every test262 test is a JavaScript program that must be executed,
+and there is no way to execute JavaScript here — `compiler/codegen` is an M13 stub and there is
+no interpreter. Checked, not assumed: the only grep hit for "execute" was `evaluation_order`.
+
+**So M12's acceptance depends on M13.** An ordering problem in the roadmap rather than the
+implementation, and worth stating: M12 is described as "large but mechanical, and the most
+parallelizable work in the project", which is true of *writing* the builtins and not of
+*demonstrating* them.
+
+**The pass rate is undefined, not 0%** — reporting "0 of 12,719 passing" would imply the tests
+ran and failed. The harness prints that distinction, because a number in a status table outlives
+the caveat beside it.
+
+The frontmatter parser is hand-written against test262's restricted YAML subset, so the parse
+test runs over **all 12,719 files** rather than a sample, and its counts were cross-checked
+against independent `grep`s — files, includes, negative and async all match exactly. CI fetches
+the subset sparsely on Linux only, with `CRISOL_REQUIRE_TEST262` so an absent suite fails rather
+than skips; all three paths verified.
 
 Two other gaps worth stating plainly rather than leaving implied:
 
