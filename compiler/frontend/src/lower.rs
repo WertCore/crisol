@@ -27,14 +27,14 @@
 use std::collections::HashMap;
 
 use crisol_ir::{
-    Block, BlockId, CompareOp, Constant, Function, Instruction, Op, Safepoint, Terminator, Type,
-    ValueId,
+    BinaryOp, Block, BlockId, CompareOp, Constant, Function, Instruction, Op, Safepoint,
+    Terminator, Type, UnaryOp, ValueId,
 };
 use crisol_value::PropertyKey;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BinaryExpression, BinaryOperator, Expression, ObjectPropertyKind, Program, PropertyKey as Key,
-    Statement,
+    BinaryExpression, BinaryOperator, Expression, LogicalExpression, LogicalOperator,
+    ObjectPropertyKind, Program, PropertyKey as Key, Statement, UnaryExpression, UnaryOperator,
 };
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
@@ -399,6 +399,27 @@ impl Lowering {
                 self.emit(Type::Unknown, Op::Call { callee, args })
             }
             Expression::ObjectExpression(object) => self.object(object),
+            Expression::UnaryExpression(unary) => self.unary(unary),
+            Expression::LogicalExpression(logical) => self.logical(logical),
+            Expression::ConditionalExpression(conditional) => self.conditional(conditional),
+            Expression::ArrayExpression(array) => {
+                let mut elements = Vec::with_capacity(array.elements.len());
+                for element in &array.elements {
+                    match element.as_expression() {
+                        Some(expression) => elements.push(self.expression(expression)),
+                        None => {
+                            // A hole in `[1, , 3]`, or a spread. Holes are not `undefined`
+                            // (D-64) and the IR has no way to say so yet, so this is recorded
+                            // rather than filled in with a value that would read the same and
+                            // answer `in` differently.
+                            self.note("array hole or spread", array.span.start);
+                            let placeholder = self.placeholder();
+                            elements.push(placeholder);
+                        }
+                    }
+                }
+                self.emit(Type::Object(None), Op::CreateArray { elements })
+            }
             Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression),
             other => {
                 self.note(expression_kind(other), 0);
@@ -415,11 +436,32 @@ impl Lowering {
             BinaryOperator::LessEqualThan => CompareOp::LessEqual,
             BinaryOperator::GreaterThan => CompareOp::Greater,
             BinaryOperator::GreaterEqualThan => CompareOp::GreaterEqual,
-            // Arithmetic is not a `Compare`, and the IR has no arithmetic op yet. Recorded
-            // rather than lowered to something that looks like it works.
+            other => return self.arithmetic(binary, other),
+        };
+        let left = self.expression(&binary.left);
+        let right = self.expression(&binary.right);
+        self.emit(Type::Bool, Op::Compare { op, left, right })
+    }
+
+    /// The operators that produce a value rather than a boolean.
+    fn arithmetic(&mut self, binary: &BinaryExpression<'_>, operator: BinaryOperator) -> ValueId {
+        let op = match operator {
+            BinaryOperator::Addition => BinaryOp::Add,
+            BinaryOperator::Subtraction => BinaryOp::Subtract,
+            BinaryOperator::Multiplication => BinaryOp::Multiply,
+            BinaryOperator::Division => BinaryOp::Divide,
+            BinaryOperator::Remainder => BinaryOp::Remainder,
+            BinaryOperator::Exponential => BinaryOp::Exponent,
+            BinaryOperator::BitwiseAnd => BinaryOp::BitAnd,
+            BinaryOperator::BitwiseOR => BinaryOp::BitOr,
+            BinaryOperator::BitwiseXOR => BinaryOp::BitXor,
+            BinaryOperator::ShiftLeft => BinaryOp::ShiftLeft,
+            BinaryOperator::ShiftRight => BinaryOp::ShiftRight,
+            BinaryOperator::ShiftRightZeroFill => BinaryOp::UnsignedShiftRight,
+            // `==`, `!=`, `in`, `instanceof` — each needs machinery this does not have yet.
             _ => {
                 self.note(
-                    &format!("binary operator {}", binary.operator.as_str()),
+                    &format!("binary operator {}", operator.as_str()),
                     binary.span.start,
                 );
                 return self.placeholder();
@@ -427,7 +469,169 @@ impl Lowering {
         };
         let left = self.expression(&binary.left);
         let right = self.expression(&binary.right);
-        self.emit(Type::Bool, Op::Compare { op, left, right })
+        // Everything except `+` coerces with `ToNumber` and produces a number. `+` may
+        // concatenate, so its result is `Unknown` unless something later proves otherwise —
+        // typing it `Number` would let codegen emit a float add for a string concatenation.
+        let ty = if op.is_always_numeric() {
+            Type::Number
+        } else {
+            Type::Unknown
+        };
+        self.emit(ty, Op::Binary { op, left, right })
+    }
+
+    fn unary(&mut self, unary: &UnaryExpression<'_>) -> ValueId {
+        let (op, ty) = match unary.operator {
+            UnaryOperator::UnaryNegation => (UnaryOp::Negate, Type::Number),
+            UnaryOperator::UnaryPlus => (UnaryOp::ToNumber, Type::Number),
+            // `!` is `ToBoolean` inverted, so it always produces a boolean and never fails.
+            UnaryOperator::LogicalNot => (UnaryOp::Not, Type::Bool),
+            UnaryOperator::BitwiseNot => (UnaryOp::BitNot, Type::Number),
+            // `typeof` produces one of a fixed set of strings, and is the only operator that
+            // does not throw on an undeclared identifier.
+            UnaryOperator::Typeof => (UnaryOp::TypeOf, Type::String),
+            UnaryOperator::Void => (UnaryOp::Void, Type::Undefined),
+            UnaryOperator::Delete => {
+                self.note("delete operator", unary.span.start);
+                return self.placeholder();
+            }
+        };
+        let operand = self.expression(&unary.argument);
+        self.emit(ty, Op::Unary { op, operand })
+    }
+
+    /// `&&`, `||` and `??`, which are **control flow rather than operators**.
+    ///
+    /// `a && b` must not evaluate `b` when `a` is falsy. Lowering them as a two-operand
+    /// instruction would evaluate both, which changes what the program *does* — a side effect
+    /// in `b` would run when the source says it must not. So each becomes a branch, and the
+    /// result travels through a slot.
+    ///
+    /// **`??` is not `||`.** It tests for `null` or `undefined`, not falsiness, so `0 ?? 1` is
+    /// `0` where `0 || 1` is `1`. Treating them alike is the bug that made `??` worth adding to
+    /// the language in the first place.
+    fn logical(&mut self, logical: &LogicalExpression<'_>) -> ValueId {
+        let slot = self.temporary();
+        let left = self.expression(&logical.left);
+        self.emit_effect(Op::Store { slot, value: left });
+
+        let right_block = self.new_block();
+        let join = self.new_block();
+
+        let condition = match logical.operator {
+            // Truthiness of the left operand decides, in opposite directions.
+            LogicalOperator::And | LogicalOperator::Or => left,
+            // Nullishness, which needs an explicit comparison rather than the value itself.
+            LogicalOperator::Coalesce => self.is_nullish(left),
+        };
+        let (then_block, else_block) = match logical.operator {
+            // `a && b`: evaluate `b` only when `a` is truthy.
+            LogicalOperator::And => (right_block, join),
+            // `a || b`: evaluate `b` only when `a` is falsy.
+            LogicalOperator::Or => (join, right_block),
+            // `a ?? b`: evaluate `b` only when `a` is nullish.
+            LogicalOperator::Coalesce => (right_block, join),
+        };
+        self.terminate(Terminator::Branch {
+            condition,
+            then_block,
+            then_args: Vec::new(),
+            else_block,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(right_block);
+        let right = self.expression(&logical.right);
+        self.emit_effect(Op::Store { slot, value: right });
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+
+        self.switch_to(join);
+        self.emit(Type::Unknown, Op::Load { slot })
+    }
+
+    /// `a === null || a === undefined`, as `??` and `?.` need it.
+    fn is_nullish(&mut self, value: ValueId) -> ValueId {
+        let null = self.emit(Type::Null, Op::Const(Constant::Null));
+        let is_null = self.emit(
+            Type::Bool,
+            Op::Compare {
+                op: CompareOp::StrictEqual,
+                left: value,
+                right: null,
+            },
+        );
+        let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+        let is_undefined = self.emit(
+            Type::Bool,
+            Op::Compare {
+                op: CompareOp::StrictEqual,
+                left: value,
+                right: undefined,
+            },
+        );
+        // A bitwise or, not a logical one: both operands are already booleans, so there is
+        // nothing to short-circuit and no side effect to skip.
+        self.emit(
+            Type::Bool,
+            Op::Binary {
+                op: BinaryOp::BitOr,
+                left: is_null,
+                right: is_undefined,
+            },
+        )
+    }
+
+    /// `test ? consequent : alternate`, which is control flow for the same reason as `&&`.
+    fn conditional(&mut self, conditional: &oxc_ast::ast::ConditionalExpression<'_>) -> ValueId {
+        let slot = self.temporary();
+        let condition = self.expression(&conditional.test);
+        let then_block = self.new_block();
+        let else_block = self.new_block();
+        let join = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition,
+            then_block,
+            then_args: Vec::new(),
+            else_block,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(then_block);
+        let consequent = self.expression(&conditional.consequent);
+        self.emit_effect(Op::Store {
+            slot,
+            value: consequent,
+        });
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+
+        self.switch_to(else_block);
+        let alternate = self.expression(&conditional.alternate);
+        self.emit_effect(Op::Store {
+            slot,
+            value: alternate,
+        });
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+
+        self.switch_to(join);
+        self.emit(Type::Unknown, Op::Load { slot })
+    }
+
+    /// A slot no source name can collide with.
+    ///
+    /// Named with a character the grammar does not allow in an identifier, so a program cannot
+    /// declare a variable that shadows a compiler temporary.
+    fn temporary(&mut self) -> u32 {
+        let name = format!(" tmp{}", self.next_slot);
+        self.slot(&name)
     }
 
     fn object(&mut self, object: &oxc_ast::ast::ObjectExpression<'_>) -> ValueId {

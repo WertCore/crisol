@@ -12,8 +12,8 @@ mod types;
 mod verify;
 
 pub use function::{
-    Block, BlockId, CompareOp, Constant, Function, FunctionId, Instruction, Op, Safepoint,
-    Terminator, ValueId,
+    BinaryOp, Block, BlockId, CompareOp, Constant, Function, FunctionId, Instruction, Op,
+    Safepoint, Terminator, UnaryOp, ValueId,
 };
 pub use types::Type;
 pub use verify::{VerifyError, verify};

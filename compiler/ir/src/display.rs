@@ -92,6 +92,8 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         }
         Op::Await { value } => write!(f, "await {value}"),
         Op::Compare { op, left, right } => write!(f, "{} {left}, {right}", CompareName(*op)),
+        Op::Binary { op, left, right } => write!(f, "{} {left}, {right}", op.symbol()),
+        Op::Unary { op, operand } => write!(f, "{} {operand}", op.symbol()),
     }
 }
 

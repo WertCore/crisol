@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M12 — runtime library (in progress: object model, Promise, collections, JSON, Array, coercions, Symbol, Error, Proxy, iterators)
+**Current milestone:** M13 — codegen (M12's surface is complete; its acceptance is blocked on M13, see below)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 899 tests passing (897 without a `node_modules` tree; the test262 cases also skip without the suite)
+**Totals:** 903 tests passing — 899 at the last full-workspace run plus 4 measured new corpus cases; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
@@ -1599,6 +1599,31 @@ tree is.
 property in a slot; this is the general path. Real engines keep both and spill from one to the
 other, and *when an object leaves the fast path* is the decision §3.2's "one predictable branch"
 rests on. It deserves its own diff.
+
+---
+
+## M13 — codegen
+
+### The IR had no arithmetic, and M13's acceptance needs it
+
+§M11's deliverable lists the IR's ops and **arithmetic is not among them** (D-79). §M13's
+acceptance needs *"arithmetic, closures, classes, and array methods"* to compile — and **all
+four were in M11's recorded `unsupported` list**. That is a gap in the plan, not the
+implementation: the roadmap reads as though M13 begins where M11 stopped, and it does not.
+
+`Op::Binary` and `Op::Unary` are now in the IR, and the lowering covers arithmetic, bitwise,
+unary, logical, conditional and array literals. **Still missing for M13's acceptance:**
+functions/closures, classes, and array *methods* — the last needs calls to resolve.
+
+**`Add` is typed `Unknown`, everything else `Number`.** `+` concatenates when either operand is
+a string, so typing it `Number` would let codegen emit a float add for a string concatenation —
+a miscompilation, not a slow path. `+` is also the only arithmetic operator that can collect,
+because `ToPrimitive` calls user code.
+
+**`&&`, `||` and `??` lower to branches** (D-80). Lowering them as instructions would evaluate
+both operands, which changes what the program *does*. `??` tests nullishness rather than
+falsiness — `0 ?? 1` is `0` — and emits explicit comparisons rather than branching on the value.
+Both mutation-tested.
 
 ---
 
