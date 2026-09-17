@@ -205,3 +205,72 @@ pub fn take(iterator: &mut StepIterator, count: usize) -> Vec<Value> {
     iterator.close();
     out
 }
+
+/// An async iterator: every step is a promise of a [`Step`].
+///
+/// `for await (const x of it)` awaits each result, so the protocol is the synchronous one with
+/// a promise wrapped around every answer. Two consequences that are easy to miss:
+///
+/// - **`done` is still coerced**, and it is coerced *after* the promise settles. A promise that
+///   fulfils with `{ done: "false" }` finishes the loop.
+/// - **A rejected step ends the iteration**, and the rejection propagates rather than being
+///   treated as "no more items". Swallowing it would turn a failed network page into a quietly
+///   truncated list, which is the failure that looks like success.
+///
+/// Steps come from Rust for the same reason as [`StepIterator`] — a real one's `next` is a
+/// JavaScript function. What is worth having now is the ordering, which does not change.
+#[derive(Debug)]
+pub struct AsyncStepIterator {
+    inner: StepIterator,
+}
+
+impl AsyncStepIterator {
+    /// An async iterator over `values`.
+    #[must_use]
+    pub fn over(values: &[Value]) -> Self {
+        Self {
+            inner: StepIterator::over(values),
+        }
+    }
+
+    /// From explicit steps.
+    #[must_use]
+    pub fn of_steps(steps: Vec<Step>) -> Self {
+        Self {
+            inner: StepIterator::of_steps(steps),
+        }
+    }
+
+    /// The protocol's `next()`, as a promise that is already fulfilled.
+    ///
+    /// Already-fulfilled and **still asynchronous**: the handler attached to it runs as a
+    /// microtask, not before `next` returns (D-61). That is what makes `for await` yield to the
+    /// queue on every iteration even when nothing actually waits.
+    pub fn step(&mut self, agent: &mut crate::promise::Agent) -> crate::promise::PromiseId {
+        let step = self.inner.step();
+        // The value is carried on the promise; `done` is read from the step it settles with.
+        agent.resolved(step.value)
+    }
+
+    /// The step behind the promise, for a caller that has already awaited it.
+    pub fn step_value(&mut self) -> Step {
+        self.inner.step()
+    }
+
+    /// `asyncIterator.return()` — what leaving a `for await` early calls.
+    pub fn close(&mut self) -> Step {
+        self.inner.close()
+    }
+
+    /// How many times cleanup ran.
+    #[must_use]
+    pub const fn closes(&self) -> usize {
+        self.inner.closes()
+    }
+
+    /// Whether it has finished.
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.inner.is_finished()
+    }
+}

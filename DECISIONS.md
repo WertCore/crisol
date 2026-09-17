@@ -2147,3 +2147,62 @@ order would make two equivalent regexes compare unequal as strings. A repeated f
 **An empty match advances by one character**, or iteration never terminates: `/(?:)/g` matches
 empty at every position. By *character*, not byte, so the bump cannot land inside a multi-byte
 sequence and panic.
+
+---
+
+## D-75 — `Reflect` reports failure; `Object` throws. That difference is the point
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+| | on failure |
+|---|---|
+| `Object.defineProperty` | **throws** a `TypeError` |
+| `Reflect.defineProperty` | returns **`false`** |
+
+The same split runs through `set`, `deleteProperty`, `preventExtensions` and `setPrototypeOf`.
+Code that wants to *attempt* an operation and branch on the outcome has to wrap the `Object`
+form in a `try`, which conflates "this was not allowed" with "something else went wrong inside a
+getter". `Reflect` separates them, and that is the whole reason it exists.
+
+**An implementation that made `Reflect.defineProperty` throw would still pass every test that
+defines a property successfully.** The difference only appears on the failure path — the path
+people write least and rely on most — so every test here exercises a refusal rather than a
+success.
+
+`Reflect.set` returning a boolean matters for the same reason: plain assignment *evaluates to
+the value*, so it cannot report failure at all, and in sloppy mode a refused write is silent.
+
+**`Reflect.ownKeys` includes non-enumerable properties**, unlike `Object.keys`. It mirrors the
+internal method, not the iteration helper, and conflating the two was mutation-tested.
+
+## D-76 — `new Boolean(false)` is truthy, and that is not a quirk
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+`Boolean(x)` is `ToBoolean` and gives a primitive. `new Boolean(x)` gives an **object**, and
+every object is truthy — so `if (new Boolean(false))` takes the branch.
+
+This follows from objects being truthy, which is the same rule that makes `if (obj)` a null
+check. It is not a special case for `Boolean` and must not be "fixed": a wrapper whose
+truthiness followed its primitive would make `if (obj)` unreliable for every other object type.
+
+`BooleanObject::is_truthy` is a `const fn` returning `true` precisely so the claim is in the
+type rather than in a comment, and there is a test — because the assertion reads as a mistake.
+
+## D-77 — An async step is a promise, and a rejected one ends the iteration
+
+**Status:** Accepted (M12) · **Affects:** M12, M15
+
+`for await` awaits each result, so the async protocol is the synchronous one with a promise
+around every answer. Two consequences that are easy to miss:
+
+**`done` is still coerced, and coerced *after* the promise settles.** A promise that fulfils
+with `{ done: "false" }` finishes the loop (D-65, D-69).
+
+**A rejected step ends the iteration and the rejection propagates.** Swallowing it and treating
+it as "no more items" would turn a failed network page into a **quietly truncated list** — the
+failure mode that looks like success, and the one that gets noticed weeks later by whoever
+counts rows.
+
+An already-fulfilled step promise is still asynchronous: its handler runs as a microtask (D-61),
+which is what makes `for await` yield to the queue on every iteration even when nothing waits.
