@@ -2104,3 +2104,46 @@ for whoever wrote it.
 `toISOString` returns `None` for an invalid date rather than a string, because it **throws** a
 `RangeError` where `toString` returns `"Invalid Date"` — two methods on the same object with
 different failure modes, and the caller has to pick.
+
+---
+
+## D-74 — `regress`, because `lastIndex` is the hard part and backreferences are non-negotiable
+
+**Status:** Accepted (M12) · **Affects:** M12
+
+§M12 names `regress` and the reason is worth stating. Rust's `regex` crate deliberately omits
+**backreferences and lookaround** to guarantee linear-time matching. JavaScript has both and
+real code uses them, so a "close enough" engine would reject patterns that work in every
+browser. The trade is that a pathological pattern can backtrack — a real denial-of-service
+surface, and it belongs in the same conversation as any other untrusted input.
+
+**What `regress` does not supply is the mutable cursor**, because it is not a JavaScript engine.
+That cursor is the single most surprising thing about `RegExp`:
+
+```js
+const r = /a/g;
+r.test("a");   // true   — lastIndex is now 1
+r.test("a");   // false  — searching from 1 finds nothing, and resets to 0
+r.test("a");   // true   — again
+```
+
+Three rules carry it, each mutation-tested:
+
+- **`test` is `exec` with the result discarded**, so it mutates exactly as much. A stateless
+  `test` would disagree with `exec` on the same object, which is worse than either behaviour on
+  its own. Breaking this fails four tests.
+- **A failed match resets `lastIndex` to zero.** That reset is what makes repeated calls
+  *alternate* rather than staying false forever.
+- **`y` anchors at `lastIndex`; `g` searches from it.** A sticky match found later in the string
+  is not a match.
+
+Without `g` or `y`, `lastIndex` is **inert** — assignable, and changes nothing. That is its own
+source of confusion and there is a test pinning it.
+
+`flags` reports in the specification's fixed order, so `/x/yg.flags` is `"gy"`. Echoing source
+order would make two equivalent regexes compare unequal as strings. A repeated flag is a
+`SyntaxError`, not something to ignore — accepting `/x/gg` lets a typo through.
+
+**An empty match advances by one character**, or iteration never terminates: `/(?:)/g` matches
+empty at every position. By *character*, not byte, so the bump cannot land inside a multi-byte
+sequence and panic.

@@ -12,4 +12,5 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+regress.workspace = true
 crisol-value.workspace = true

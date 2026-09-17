@@ -17,6 +17,7 @@ mod json;
 mod object;
 mod promise;
 mod proxy;
+mod regexp;
 mod statics;
 mod string;
 mod symbol;
@@ -38,6 +39,7 @@ pub use json::{Json, ParseError, parse, stringify};
 pub use object::{Got, ObjectId, OrdinaryObject, Realm, Setting};
 pub use promise::{Agent, Outcome, PromiseId, Reaction, State};
 pub use proxy::{Proxy, ProxyError, Target, Trap};
+pub use regexp::{Captured, Flags, JsRegExp};
 pub use statics::{
     MAX_SAFE_INTEGER, assign, entries, freeze, from_entries, global_is_finite, global_is_nan,
     is_frozen, is_integer, is_safe_integer, is_sealed, keys, number_is_finite, number_is_nan,
