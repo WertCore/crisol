@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 882 tests passing (880 without a `node_modules` tree: the two acceptance cases skip)
+**Totals:** 896 tests passing (894 without a `node_modules` tree: the two acceptance cases skip)
 
 ## Open questions
 
@@ -1520,9 +1520,38 @@ anchors at `lastIndex` while `g` searches from it**. Without either flag `lastIn
 
 An empty match advances by one *character*, or `/(?:)/g` never terminates.
 
-**Still to do for M12:** `Boolean`,
-`Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
-`JSON`, and then `Proxy`/`Reflect` on top of the model above.
+### `Reflect`, `Boolean`, and async iteration
+
+**`Reflect` reports failure where `Object` throws** (D-75) — that difference is the whole reason
+it exists. An implementation that made `Reflect.defineProperty` throw would still pass every
+test that defines a property *successfully*, so every test here exercises a **refusal**.
+`Reflect.ownKeys` includes non-enumerable properties, mirroring the internal method rather than
+the iteration helper.
+
+**`new Boolean(false)` is truthy** (D-76), because every object is — the same rule that makes
+`if (obj)` a null check. Not a quirk to fix: a wrapper whose truthiness followed its primitive
+would make `if (obj)` unreliable for every other object type.
+
+**A rejected async step ends the iteration and propagates** (D-77). Swallowing it would turn a
+failed network page into a quietly truncated list — the failure that looks like success.
+
+**Still to do for M12 — and it is the acceptance itself.** §M12 asks that *"the relevant
+test262 subset passes at >80% for implemented builtins"*, and **no test262 test has been run**.
+Everything in `crisol-builtins` is this implementation's own reading of the specification:
+good tests, mutation-checked, and *not the acceptance*. Getting there needs the suite fetched
+the way M10's React tree is, plus a harness to run it — and the Data volume is at 100%
+capacity, so the checkout does not currently fit.
+
+Two other gaps worth stating plainly rather than leaving implied:
+
+- **Nothing depends on `crisol-builtins`.** It is a correct library of specification semantics
+  that the engine does not yet call. The join to `Shapes` (fast path, D-54) and to the GC heap
+  is still ahead, and *when an object leaves the fast path* is what §3.2's "one predictable
+  branch" rests on.
+- **Several pieces stop where a function call would begin** — getters are returned uncalled,
+  `Proxy` traps are checked but not dispatched, iterator steps come from Rust. That is
+  deliberate and documented, but it means "`Proxy` is done" reads stronger than it is.
+
 ### `Map`, `Set`, and the third equality
 
 `Map` keys use **SameValueZero**, which agrees with neither `===` nor `Object.is` (D-62):
