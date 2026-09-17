@@ -2206,3 +2206,61 @@ counts rows.
 
 An already-fulfilled step promise is still asynchronous: its handler runs as a microtask (D-61),
 which is what makes `for await` yield to the queue on every iteration even when nothing waits.
+
+---
+
+## D-78 — M12's acceptance cannot be met before M13, and the harness says so in numbers
+
+**Status:** Accepted (M12) · **Affects:** M12, M13
+
+§M12's acceptance is *"the relevant `test262` subset passes at >80% for implemented builtins"*.
+**Every test262 test is a JavaScript program that must be executed**, and there is no way to
+execute JavaScript in this repository: `compiler/codegen` is a stub scheduled for M13, `opt` is
+a stub scheduled for M20, and there is no interpreter. Checked rather than assumed — the one
+grep hit for "execute" was `evaluation_order`, which orders modules.
+
+**So M12's acceptance depends on M13.** That is an ordering problem in the roadmap, not in the
+implementation, and it is worth writing down: M12 is described as "large but mechanical, and
+the most parallelizable work in the project", which is true of *writing* the builtins and not
+true of *demonstrating* them.
+
+**The pass rate is undefined, not 0%.** Reporting "0 of 12,719 passing" would imply the tests
+ran and failed, which is a different and less accurate claim than "there is no way to run them".
+The harness prints the distinction explicitly, because a number in a status table outlives the
+caveat next to it.
+
+### What the harness does do
+
+It **measures the acceptance** rather than asserting one. Over the sparse subset for the
+implemented builtins it finds:
+
+| | |
+|---|---|
+| cases | 12,719 |
+| need extra harness includes | 3,169 |
+| expect failure (`negative:`) | 192 |
+| `async` | 505 |
+| distinct features required | 99 |
+
+The frontmatter parser is hand-written against test262's restricted YAML subset — scalars, `|`
+block text, `[a, b]` flow sequences — because a general parser would accept documents the corpus
+does not contain while still needing the same amount of glue. The risk that carries is *silently
+mis-parsing something unusual*, so the parse test runs over **all 12,719 files** rather than a
+sample, and the counts were cross-checked against independent `grep`s: files, includes, negative
+and async all match exactly.
+
+`_FIXTURE.js` files are excluded. They are imported *by* tests rather than being tests, and
+counting them would inflate the denominator — the wrong direction to be wrong in for a
+percentage-based acceptance.
+
+### CI
+
+Fetched sparsely, **on Linux only**. The suite is a large checkout for a step that currently
+validates a parser rather than running anything, so paying for it on three platforms would be
+cost without a matching guarantee. When there is an execution engine this should widen to every
+platform, because a pass rate is per-target.
+
+`CRISOL_REQUIRE_TEST262` makes an absent suite a failure rather than a skip — the same
+arrangement as `CRISOL_REQUIRE_GPU` and `CRISOL_REQUIRE_NODE_MODULES`, for the same reason. All
+three paths were verified: absent-and-optional skips, absent-and-required fails,
+present-and-required runs.
