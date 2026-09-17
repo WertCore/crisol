@@ -79,6 +79,38 @@ const CORPUS: &[(&str, &str)] = &[
     ("call-a-method", "let o = { a: 1 }; let v = o.a();"),
     ("block-scope", "let a = 1; { a = 2; }"),
     ("empty-statement", ";"),
+    ("add", "let a = 1 + 2;"),
+    ("subtract", "let a = 3 - 1;"),
+    ("multiply", "let a = 2 * 3;"),
+    ("divide", "let a = 6 / 2;"),
+    ("remainder", "let a = 7 % 3;"),
+    ("exponent", "let a = 2 ** 8;"),
+    (
+        "string-concatenation-is-the-same-operator",
+        "let a = \"x\" + \"y\";",
+    ),
+    ("bitwise-and", "let a = 6 & 3;"),
+    ("bitwise-or", "let a = 6 | 3;"),
+    ("bitwise-xor", "let a = 6 ^ 3;"),
+    ("shift-left", "let a = 1 << 4;"),
+    ("shift-right", "let a = 16 >> 2;"),
+    ("unsigned-shift-right", "let a = 1 >>> 0;"),
+    ("negate", "let a = -1;"),
+    ("unary-plus", "let a = +\"1\";"),
+    ("logical-not", "let a = !true;"),
+    ("bitwise-not", "let a = ~0;"),
+    ("typeof", "let a = typeof 1;"),
+    ("void", "let a = void 0;"),
+    (
+        "logical-and-short-circuits",
+        "let a = 1; let b = false && a;",
+    ),
+    ("logical-or-short-circuits", "let a = 1; let b = true || a;"),
+    ("nullish-coalescing-is-not-or", "let a = 0; let b = a ?? 1;"),
+    ("conditional", "let a = true ? 1 : 2;"),
+    ("nested-arithmetic", "let a = 1 + 2 * 3;"),
+    ("array-literal", "let a = [1, 2, 3];"),
+    ("empty-array", "let a = [];"),
 ];
 
 fn snapshot_path() -> PathBuf {
@@ -203,18 +235,22 @@ fn unfaithful_programs_are_reported_not_guessed() {
     // dump. A compiler that silently emits `undefined` for syntax it did not read produces a
     // program that runs and is wrong, which is worse than one that refuses.
     let cases = [
-        ("let a = 1 + 2;", "binary operator +"),
         ("for (;;) { }", "for statement"),
         ("function f() { }", "function declaration"),
-        ("let a = [1];", "array literal"),
         ("let a = () => 1;", "arrow function"),
         ("let o = {}; let a = o[1];", "computed member access"),
-        ("let a = !true;", "unary expression"),
-        ("let a = true && false;", "logical expression"),
-        ("let a = true ? 1 : 2;", "conditional expression"),
         ("try { } catch (e) { }", "try statement"),
         ("let [a] = [1];", "destructuring declaration"),
         ("let o = { ...{} };", "object spread"),
+        ("let a = delete ({}).x;", "delete operator"),
+        // A hole is not `undefined` (D-64) and the IR cannot yet say so, so it is recorded
+        // rather than filled in with a value that reads the same and answers `in` differently.
+        ("let a = [1, , 3];", "array hole or spread"),
+        // `==` is not `===`: it coerces, and the coercion table needs machinery that is not
+        // here yet. Lowering it as a strict comparison would be wrong for every mixed-type
+        // operand, which is the only case anyone writes `==` for.
+        ("let a = 1 == 2;", "binary operator =="),
+        ("let a = 1 instanceof Object;", "binary operator instanceof"),
     ];
 
     for (source, expected) in cases {
@@ -251,6 +287,73 @@ fn an_object_literal_does_not_claim_a_shape_it_will_not_keep() {
         !dump.contains(": object#"),
         "and must not claim a specific shape: {dump}"
     );
+}
+
+#[test]
+fn the_short_circuiting_operators_are_lowered_as_control_flow() {
+    // `a && b` must not evaluate `b` when `a` is falsy. Lowering these as a two-operand
+    // instruction would evaluate both, which changes what the program *does* — a side effect in
+    // `b` would run when the source says it must not.
+    for source in [
+        "let a = 1; let b = false && a;",
+        "let a = 1; let b = true || a;",
+        "let a = 1; let b = null ?? a;",
+        "let a = true ? 1 : 2;",
+    ] {
+        let lowered = lower("short-circuit", source).expect("parses");
+        assert!(
+            lowered.function.blocks.len() > 1,
+            "{source:?} should branch, and lowered to a single block"
+        );
+    }
+}
+
+#[test]
+fn nullish_coalescing_tests_for_null_not_for_falsiness() {
+    // `0 ?? 1` is `0` where `0 || 1` is `1`. Treating them alike is the bug that made `??`
+    // worth adding to the language, so the lowering must compare against null and undefined
+    // rather than branching on the value itself.
+    let nullish = lower("nullish", "let a = 0; let b = a ?? 1;").expect("parses");
+    let dump = nullish.function.to_string();
+    assert!(
+        dump.contains("const null") && dump.contains("const undefined"),
+        "`??` should compare against both nullish values:\n{dump}"
+    );
+
+    let or = lower("or", "let a = 0; let b = a || 1;").expect("parses");
+    let or_dump = or.function.to_string();
+    assert!(
+        !or_dump.contains("const null"),
+        "`||` branches on truthiness and needs no null comparison:\n{or_dump}"
+    );
+}
+
+#[test]
+fn addition_is_not_typed_as_a_number() {
+    // `+` may concatenate, so typing its result `Number` would let codegen emit a float add for
+    // a string concatenation. Every other arithmetic operator coerces with `ToNumber`.
+    let add = lower("add", "let a = 1 + 2;").expect("parses");
+    assert!(
+        add.function.to_string().contains("unknown = + "),
+        "`+` is unknown until something proves otherwise:\n{}",
+        add.function
+    );
+
+    let subtract = lower("subtract", "let a = 1 - 2;").expect("parses");
+    assert!(
+        subtract.function.to_string().contains("number = - "),
+        "`-` always produces a number:\n{}",
+        subtract.function
+    );
+}
+
+#[test]
+fn a_compiler_temporary_cannot_be_shadowed_by_a_source_name() {
+    // The temporaries that carry a short-circuit result are named with a character the grammar
+    // does not allow in an identifier, so a program cannot declare one that collides.
+    let lowered = lower("collide", "let a = 1; let b = false && a;").expect("parses");
+    assert!(lowered.is_faithful());
+    assert!(lowered.function.blocks.len() > 1);
 }
 
 #[test]

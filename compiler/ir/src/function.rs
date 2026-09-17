@@ -114,6 +114,107 @@ impl Constant {
     }
 }
 
+/// Arithmetic and bitwise operators.
+///
+/// **`Add` is the odd one out and the reason this is not simply "arithmetic".** Every other
+/// operator here coerces both operands with `ToNumber` and produces a number. `+` does not: if
+/// either operand is a string after `ToPrimitive`, it concatenates. So `1 + 1` is `2` and
+/// `1 + "1"` is `"11"`, and an IR that typed `Add` as `Number` would let codegen emit a float
+/// add for a string concatenation.
+///
+/// The shift operators are also not what they look like: they coerce to **int32** (or uint32
+/// for `UnsignedShiftRight`) and back to a double, so `1 << 31` is negative and
+/// `1 << 32` is `1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    /// `+` — numeric addition **or** string concatenation.
+    Add,
+    /// `-`.
+    Subtract,
+    /// `*`.
+    Multiply,
+    /// `/`.
+    Divide,
+    /// `%` — the sign follows the *dividend*, unlike a mathematical modulo.
+    Remainder,
+    /// `**`.
+    Exponent,
+    /// `&`, on int32.
+    BitAnd,
+    /// `|`, on int32.
+    BitOr,
+    /// `^`, on int32.
+    BitXor,
+    /// `<<`, on int32.
+    ShiftLeft,
+    /// `>>`, sign-propagating, on int32.
+    ShiftRight,
+    /// `>>>`, zero-filling, on **uint32** — the one operator whose result can exceed `i32::MAX`.
+    UnsignedShiftRight,
+}
+
+impl BinaryOp {
+    /// Whether the result is always a number.
+    ///
+    /// True for everything except [`BinaryOp::Add`], which may concatenate. This is the
+    /// distinction codegen needs before it can emit a float instruction.
+    #[must_use]
+    pub const fn is_always_numeric(self) -> bool {
+        !matches!(self, Self::Add)
+    }
+
+    /// The symbol, for the text dump.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+            Self::Remainder => "%",
+            Self::Exponent => "**",
+            Self::BitAnd => "&",
+            Self::BitOr => "|",
+            Self::BitXor => "^",
+            Self::ShiftLeft => "<<",
+            Self::ShiftRight => ">>",
+            Self::UnsignedShiftRight => ">>>",
+        }
+    }
+}
+
+/// Operators taking one operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `-`.
+    Negate,
+    /// `+` — `ToNumber`, which is why `+"1"` is `1`.
+    ToNumber,
+    /// `!` — `ToBoolean` then inverted, so it never fails.
+    Not,
+    /// `~`, on int32.
+    BitNot,
+    /// `typeof` — the only operator that does **not** throw on an undeclared identifier.
+    TypeOf,
+    /// `void` — evaluates its operand and gives `undefined`.
+    Void,
+}
+
+impl UnaryOp {
+    /// The symbol, for the text dump.
+    #[must_use]
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Negate => "-",
+            Self::ToNumber => "+",
+            Self::Not => "!",
+            Self::BitNot => "~",
+            Self::TypeOf => "typeof",
+            Self::Void => "void",
+        }
+    }
+}
+
 /// How two values are compared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompareOp {
@@ -202,6 +303,22 @@ pub enum Op {
         /// Right operand.
         right: ValueId,
     },
+    /// Arithmetic or a bitwise operation.
+    Binary {
+        /// Which operator.
+        op: BinaryOp,
+        /// Left operand.
+        left: ValueId,
+        /// Right operand.
+        right: ValueId,
+    },
+    /// A one-operand operator.
+    Unary {
+        /// Which operator.
+        op: UnaryOp,
+        /// The operand.
+        operand: ValueId,
+    },
 }
 
 impl Op {
@@ -219,6 +336,9 @@ impl Op {
         matches!(
             self,
             Self::Call { .. }
+                // `+` reaches `ToPrimitive`, which calls `valueOf` or `toString` — user code,
+                // which can allocate. The other operators coerce primitives that already exist.
+                | Self::Binary { op: BinaryOp::Add, .. }
                 | Self::PropertyLoad { .. }
                 | Self::PropertyStore { .. }
                 | Self::CreateObject { .. }
@@ -243,7 +363,10 @@ impl Op {
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
             Self::CreateArray { elements } => elements.clone(),
             Self::Closure { captures, .. } => captures.clone(),
-            Self::Compare { left, right, .. } => vec![*left, *right],
+            Self::Compare { left, right, .. } | Self::Binary { left, right, .. } => {
+                vec![*left, *right]
+            }
+            Self::Unary { operand, .. } => vec![*operand],
         }
     }
 }

@@ -2264,3 +2264,57 @@ platform, because a pass rate is per-target.
 arrangement as `CRISOL_REQUIRE_GPU` and `CRISOL_REQUIRE_NODE_MODULES`, for the same reason. All
 three paths were verified: absent-and-optional skips, absent-and-required fails,
 present-and-required runs.
+## D-79 — The IR had no arithmetic, and M13's acceptance needs it
+
+**Status:** Accepted (M13) · **Affects:** M11, M13
+
+§M11's deliverable lists the IR's ops: *"Load, Store, Call, PropertyLoad, PropertyStore,
+CreateObject, CreateArray, Closure, Await, Throw, Branch, Compare"*. There is **no arithmetic
+op in that list**, and M11 was built to it.
+
+§M13's acceptance is that *"`main.ts` containing arithmetic, closures, classes, and array
+methods compiles to a standalone binary"*. **All four of those were in M11's recorded
+`unsupported` list**, and the first of them could not even be represented in the IR.
+
+That is a gap in the plan rather than the implementation, and it is worth recording because the
+plan reads as though M13 begins where M11 stopped. It does not: M13's acceptance requires
+extending M11 first.
+
+### `Add` is the odd operator
+
+Every arithmetic operator except `+` coerces both operands with `ToNumber` and produces a
+number. `+` does not — after `ToPrimitive`, a string operand concatenates. So `1 + 1` is `2` and
+`1 + "1"` is `"11"`.
+
+`Op::Binary` therefore types `Add` as **`Unknown`** and everything else as `Number`. Typing
+`Add` as `Number` would let codegen emit a float add for a string concatenation, which is a
+miscompilation rather than a slow path. `BinaryOp::is_always_numeric` exists so that decision is
+asked as a question rather than assumed, and it is mutation-tested.
+
+`+` is also the only arithmetic operator that **can collect**: `ToPrimitive` calls `valueOf` or
+`toString`, which is user code. The others coerce primitives that already exist.
+
+## D-80 — `&&`, `||` and `??` are control flow, not operators
+
+**Status:** Accepted (M13) · **Affects:** M11, M13
+
+`a && b` must not evaluate `b` when `a` is falsy. Lowering these as a two-operand instruction
+would evaluate both — which does not merely lose an optimisation, it **changes what the program
+does**: a side effect in `b` would run when the source says it must not.
+
+So each lowers to a branch, with the result travelling through a compiler temporary. The
+temporaries are named with a leading space, which the grammar does not allow in an identifier,
+so a program cannot declare a variable that shadows one.
+
+**`??` is not `||`.** It tests for `null` or `undefined`, not falsiness, so `0 ?? 1` is `0`
+where `0 || 1` is `1`. Conflating them is precisely the bug that made `??` worth adding to the
+language, and the lowering emits explicit comparisons against both nullish values rather than
+branching on the operand. Checked by making it branch on truthiness: two tests fail, including
+the corpus snapshot.
+
+The conditional operator is the same shape for the same reason.
+
+**A hole in an array literal is still recorded as unsupported.** `[1, , 3]` has a hole at index
+1, and a hole is not `undefined` (D-64) — the IR has no way to express one, so filling it with
+`undefined` would produce a value that reads the same and answers `in` differently. Recorded
+rather than guessed, per D-59.

@@ -603,3 +603,374 @@ bb0:  ; entry
     return
 }
 
+=== add ===
+--- source
+let a = 1 + 2;
+--- ir
+function add {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: number = const 2.0
+    v2: unknown = + v0, v1  ; safepoint []
+    store $0, v2
+    return
+}
+
+=== subtract ===
+--- source
+let a = 3 - 1;
+--- ir
+function subtract {
+bb0:  ; entry
+    v0: number = const 3.0
+    v1: number = const 1.0
+    v2: number = - v0, v1
+    store $0, v2
+    return
+}
+
+=== multiply ===
+--- source
+let a = 2 * 3;
+--- ir
+function multiply {
+bb0:  ; entry
+    v0: number = const 2.0
+    v1: number = const 3.0
+    v2: number = * v0, v1
+    store $0, v2
+    return
+}
+
+=== divide ===
+--- source
+let a = 6 / 2;
+--- ir
+function divide {
+bb0:  ; entry
+    v0: number = const 6.0
+    v1: number = const 2.0
+    v2: number = / v0, v1
+    store $0, v2
+    return
+}
+
+=== remainder ===
+--- source
+let a = 7 % 3;
+--- ir
+function remainder {
+bb0:  ; entry
+    v0: number = const 7.0
+    v1: number = const 3.0
+    v2: number = % v0, v1
+    store $0, v2
+    return
+}
+
+=== exponent ===
+--- source
+let a = 2 ** 8;
+--- ir
+function exponent {
+bb0:  ; entry
+    v0: number = const 2.0
+    v1: number = const 8.0
+    v2: number = ** v0, v1
+    store $0, v2
+    return
+}
+
+=== string-concatenation-is-the-same-operator ===
+--- source
+let a = "x" + "y";
+--- ir
+function string-concatenation-is-the-same-operator {
+bb0:  ; entry
+    v0: string = const "x"
+    v1: string = const "y"
+    v2: unknown = + v0, v1  ; safepoint []
+    store $0, v2
+    return
+}
+
+=== bitwise-and ===
+--- source
+let a = 6 & 3;
+--- ir
+function bitwise-and {
+bb0:  ; entry
+    v0: number = const 6.0
+    v1: number = const 3.0
+    v2: number = & v0, v1
+    store $0, v2
+    return
+}
+
+=== bitwise-or ===
+--- source
+let a = 6 | 3;
+--- ir
+function bitwise-or {
+bb0:  ; entry
+    v0: number = const 6.0
+    v1: number = const 3.0
+    v2: number = | v0, v1
+    store $0, v2
+    return
+}
+
+=== bitwise-xor ===
+--- source
+let a = 6 ^ 3;
+--- ir
+function bitwise-xor {
+bb0:  ; entry
+    v0: number = const 6.0
+    v1: number = const 3.0
+    v2: number = ^ v0, v1
+    store $0, v2
+    return
+}
+
+=== shift-left ===
+--- source
+let a = 1 << 4;
+--- ir
+function shift-left {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: number = const 4.0
+    v2: number = << v0, v1
+    store $0, v2
+    return
+}
+
+=== shift-right ===
+--- source
+let a = 16 >> 2;
+--- ir
+function shift-right {
+bb0:  ; entry
+    v0: number = const 16.0
+    v1: number = const 2.0
+    v2: number = >> v0, v1
+    store $0, v2
+    return
+}
+
+=== unsigned-shift-right ===
+--- source
+let a = 1 >>> 0;
+--- ir
+function unsigned-shift-right {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: number = const 0.0
+    v2: number = >>> v0, v1
+    store $0, v2
+    return
+}
+
+=== negate ===
+--- source
+let a = -1;
+--- ir
+function negate {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: number = - v0
+    store $0, v1
+    return
+}
+
+=== unary-plus ===
+--- source
+let a = +"1";
+--- ir
+function unary-plus {
+bb0:  ; entry
+    v0: string = const "1"
+    v1: number = + v0
+    store $0, v1
+    return
+}
+
+=== logical-not ===
+--- source
+let a = !true;
+--- ir
+function logical-not {
+bb0:  ; entry
+    v0: bool = const true
+    v1: bool = ! v0
+    store $0, v1
+    return
+}
+
+=== bitwise-not ===
+--- source
+let a = ~0;
+--- ir
+function bitwise-not {
+bb0:  ; entry
+    v0: number = const 0.0
+    v1: number = ~ v0
+    store $0, v1
+    return
+}
+
+=== typeof ===
+--- source
+let a = typeof 1;
+--- ir
+function typeof {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: string = typeof v0
+    store $0, v1
+    return
+}
+
+=== void ===
+--- source
+let a = void 0;
+--- ir
+function void {
+bb0:  ; entry
+    v0: number = const 0.0
+    v1: undefined = void v0
+    store $0, v1
+    return
+}
+
+=== logical-and-short-circuits ===
+--- source
+let a = 1; let b = false && a;
+--- ir
+function logical-and-short-circuits {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: bool = const false
+    store $1, v1
+    branch v1 -> bb1, bb2
+bb1:
+    v2: unknown = load $0
+    store $1, v2
+    jump bb2
+bb2:
+    v3: unknown = load $1
+    store $2, v3
+    return
+}
+
+=== logical-or-short-circuits ===
+--- source
+let a = 1; let b = true || a;
+--- ir
+function logical-or-short-circuits {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: bool = const true
+    store $1, v1
+    branch v1 -> bb2, bb1
+bb1:
+    v2: unknown = load $0
+    store $1, v2
+    jump bb2
+bb2:
+    v3: unknown = load $1
+    store $2, v3
+    return
+}
+
+=== nullish-coalescing-is-not-or ===
+--- source
+let a = 0; let b = a ?? 1;
+--- ir
+function nullish-coalescing-is-not-or {
+bb0:  ; entry
+    v0: number = const 0.0
+    store $0, v0
+    v1: unknown = load $0
+    store $1, v1
+    v2: null = const null
+    v3: bool = eq v1, v2
+    v4: undefined = const undefined
+    v5: bool = eq v1, v4
+    v6: bool = | v3, v5
+    branch v6 -> bb1, bb2
+bb1:
+    v7: number = const 1.0
+    store $1, v7
+    jump bb2
+bb2:
+    v8: unknown = load $1
+    store $2, v8
+    return
+}
+
+=== conditional ===
+--- source
+let a = true ? 1 : 2;
+--- ir
+function conditional {
+bb0:  ; entry
+    v0: bool = const true
+    branch v0 -> bb1, bb2
+bb1:
+    v1: number = const 1.0
+    store $0, v1
+    jump bb3
+bb2:
+    v2: number = const 2.0
+    store $0, v2
+    jump bb3
+bb3:
+    v3: unknown = load $0
+    store $1, v3
+    return
+}
+
+=== nested-arithmetic ===
+--- source
+let a = 1 + 2 * 3;
+--- ir
+function nested-arithmetic {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: number = const 2.0
+    v2: number = const 3.0
+    v3: number = * v1, v2
+    v4: unknown = + v0, v3  ; safepoint []
+    store $0, v4
+    return
+}
+
+=== array-literal ===
+--- source
+let a = [1, 2, 3];
+--- ir
+function array-literal {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: number = const 2.0
+    v2: number = const 3.0
+    v3: object = array [v0, v1, v2]  ; safepoint []
+    store $0, v3
+    return
+}
+
+=== empty-array ===
+--- source
+let a = [];
+--- ir
+function empty-array {
+bb0:  ; entry
+    v0: object = array []  ; safepoint []
+    store $0, v0
+    return
+}
+
