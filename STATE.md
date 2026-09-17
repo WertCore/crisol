@@ -1475,7 +1475,22 @@ to each other so the difference is visible where someone picks one. `isSafeInteg
 has a test asserting the actual collision (`2^53` and `2^53 + 1` are one double), because the
 boundary means nothing without it.
 
-**Still to do for M12:** `String`, `Boolean`,
+### `String` is UTF-16, and may be ill-formed
+
+`JsString` stores `Vec<u16>` (D-72). A JavaScript string may hold a **lone surrogate**, which
+Rust's `String` cannot represent — so using one would mean rejecting legal input or silently
+replacing it with U+FFFD. `to_rust` returns `None` rather than substituting; `to_rust_lossy` is
+documented as diagnostics-only.
+
+**Length counts code units, iteration yields code points.** Slicing mid-pair splits an emoji and
+yields a lone surrogate — specified, and snapping indices to code-point boundaries would both
+disagree with every engine and stop `slice` composing with `indexOf`.
+
+`slice` and `substring` differ twice (swap, and negative handling), which is what makes
+substituting one for the other a reliable bug. `trim` removes U+FEFF, which Unicode does not
+call whitespace and the spec trims anyway.
+
+**Still to do for M12:** `Boolean`,
 `Symbol`, `Map`, `Set`, `Date`, the `Error` hierarchy, `RegExp` via `regress`, iterators,
 `JSON`, and then `Proxy`/`Reflect` on top of the model above.
 ### `Map`, `Set`, and the third equality

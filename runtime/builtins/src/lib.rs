@@ -17,6 +17,7 @@ mod object;
 mod promise;
 mod proxy;
 mod statics;
+mod string;
 mod symbol;
 
 pub use array::{JsArray, MAX_LENGTH, array_index};
@@ -36,4 +37,5 @@ pub use statics::{
     is_frozen, is_integer, is_safe_integer, is_sealed, keys, number_is_finite, number_is_nan,
     own_property_names, seal, values,
 };
+pub use string::JsString;
 pub use symbol::{SymbolId, Symbols, WellKnown};

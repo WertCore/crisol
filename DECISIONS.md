@@ -2028,3 +2028,40 @@ there is no separate integer type for this to distinguish.
 further apart than 1 — `2^53` and `2^53 + 1` are the same value. There is a test asserting that
 collision directly, because the boundary means nothing without it. It is also why APIs with
 64-bit ids send them as strings.
+
+---
+
+## D-72 — A JavaScript string is UTF-16, and is not required to be well-formed
+
+**Status:** Accepted (M12) · **Affects:** M12, M13, M15
+
+`JsString` stores `Vec<u16>`, not Rust's `String`.
+
+A JavaScript string is a sequence of 16-bit code units and **may contain a lone surrogate**:
+`"\uD800"` is an ordinary one-element string. Rust's `String` cannot hold that at all, so using
+one would mean either rejecting legal input or silently replacing it with U+FFFD — corrupting
+data at the boundary and losing the ability to round-trip anything that arrived over a network.
+
+The cost is a conversion at every Rust boundary. What it buys is correctness on the cases that
+actually occur: half an emoji arriving in one chunk of a stream, a filename from a Windows API,
+a `JSON.parse` of a document written by something careless. `to_rust` returns `None` rather than
+substituting, because a lossy replacement is how text gets corrupted somewhere far from where it
+went wrong; `to_rust_lossy` exists and is documented as diagnostics-only.
+
+**Length counts code units; iteration yields code points.** `"😀".length` is 2 and
+`[..."😀"].length` is 1, and every index-taking method — `charAt`, `slice`, `indexOf`,
+`substring` — works in code units. Slicing at an odd boundary therefore splits an emoji in half
+and yields a lone surrogate. That is specified, and an implementation that "helpfully" snapped
+indices to code-point boundaries would return different strings than every engine *and* stop
+`slice` composing with `indexOf`.
+
+**`slice` and `substring` differ twice**, which is what makes substituting one for the other a
+reliable bug: `substring` **swaps** arguments that are the wrong way round and **clamps**
+negatives to zero, while `slice` returns `""` and counts negatives from the end.
+
+**`trim` removes the byte-order mark.** U+FEFF is not classified as whitespace by Unicode and
+the specification trims it anyway — the one people miss, and the reason a file beginning with a
+BOM otherwise leaves an invisible character on the front of its first field.
+
+Three of these were checked by breaking them: making `slice` swap, dropping U+FEFF from the
+whitespace set, and making `to_rust` lossy each fail their tests.
