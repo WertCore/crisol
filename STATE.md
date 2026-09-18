@@ -1724,7 +1724,15 @@ Both mutation-tested.
      and Linux. [#13](https://github.com/WertCore/crisol/issues/13) and
      [#14](https://github.com/WertCore/crisol/issues/14) need a human at a keyboard and a
      screen reader, so they cannot be closed from here at all.
-3. Whichever comes first, run **the whole gate** before pushing — `fmt`, `clippy --workspace
+3. **Add a cross-target clippy pass to the local gate.** `cargo clippy --target
+   x86_64-pc-windows-msvc` and `--target x86_64-unknown-linux-gnu` type-check `cfg`-gated code
+   without a linker, and both targets are already installed. Raising the MSRV surfaced a
+   `collapsible_if` inside a `#[cfg(target_os = "windows")]` block that a macOS run cannot see:
+   the fix went green locally and failed Windows anyway. Three CI failures earlier in this
+   project were attributed to "what local runs structurally cannot catch" — for this class that
+   was not true, only unattempted.
+
+4. Whichever comes first, run **the whole gate** before pushing — `fmt`, `clippy --workspace
    --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, both
    headless examples, and **`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`**. Two
    of five is how PR #25 failed on formatting alone.

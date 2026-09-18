@@ -2542,3 +2542,12 @@ platforms.
 The consequence to remember: **an MSRV bump can fail CI in code the change never touched**, and
 a crate-scoped local gate cannot see it. The lint fired in Track A, while every edit was in the
 compiler crates.
+
+**The second instance was inside `#[cfg(target_os = "windows")]`**, which a macOS clippy run
+structurally cannot see — the first fix went green locally and failed Windows anyway. That gap
+is closeable: `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` were already installed, and
+`cargo clippy --target <triple>` type-checks platform-gated code without needing a linker.
+
+So the local gate now includes a cross-target clippy pass for the two non-host desktop targets.
+Earlier in the project three CI failures were attributed to "what local runs structurally
+cannot catch" — for *this* class of failure that was not true, only unattempted.
