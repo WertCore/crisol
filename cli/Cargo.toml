@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+# A library as well as a binary, so the acceptance test can call the pipeline directly.
+name = "crisol"
+path = "src/lib.rs"
+
 [lints]
 workspace = true
 
@@ -16,6 +21,9 @@ name = "crisol"
 path = "src/main.rs"
 
 [dependencies]
+crisol-codegen.workspace = true
+crisol-frontend.workspace = true
+crisol-ir.workspace = true
 crisol-render-wgpu.workspace = true
 clap.workspace = true
 wgpu.workspace = true

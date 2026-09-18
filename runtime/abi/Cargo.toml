@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+# A static library as well as an rlib: the linker that produces a compiled program needs an
+# archive it can pass to `cc`, and an rlib is not one.
+crate-type = ["lib", "staticlib"]
+
 [lints]
 workspace = true
 

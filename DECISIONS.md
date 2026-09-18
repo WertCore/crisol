@@ -2722,3 +2722,49 @@ consistent: a snapshot catches what a reader notices, and misses what the IR can
 `extends` needs the prototype chain wired through the parent *and* `super` resolved inside
 methods; half of that produces a class that constructs and then fails its first inherited call.
 Static members, computed method names and non-method class elements are recorded too.
+
+---
+
+## D-89 — Source to a running binary, and what that revealed
+
+**Status:** Accepted (M13) · **Affects:** M13
+
+`crisol build` now takes a file and produces a native executable: parse, lower, verify, compile,
+link. §M13's acceptance is phrased as *"compiles to a standalone binary that runs and produces
+correct output"*, and the tests build and **run** real programs — one that only checked the
+binary existed would pass for a binary that printed nothing.
+
+**Position-independent code is not optional.** The object has to *call* the runtime helpers, and
+without `is_pic` the linker refuses with "illegal text-relocations". The failure was instructive:
+a program using only `-` linked and ran, while `2 + 3` did not — because only the latter emits a
+call. A backend tested solely on native instructions would never have found it.
+
+**The entry point is C, not Rust.** Five lines, written to a temporary file and compiled by the
+host's `cc`. A Rust `main` would drag in `std`'s runtime initialisation and make a compiled
+program's contents depend on a Rust version rather than on what was compiled. It calls the
+runtime's `crisol_print` rather than decoding the value, because the NaN-box layout is the
+runtime's business and a copy of it in generated C would be a second place for it to drift.
+
+**Build errors name the stage.** Parse, unsupported, malformed, codegen, link — because "it did
+not build" is not actionable, and the interesting part is always *which* gave up. `Unsupported`
+is deliberately separate from `Parse`: one is a mistake in the program and the other is a gap in
+the compiler, and they need different responses from whoever reads them.
+
+A program the compiler cannot fully handle is **refused**, not compiled with the gaps omitted
+(D-59). There is a test for that, because a compiler that silently drops what it did not
+understand produces a binary that runs and is wrong.
+
+### What the acceptance actually covers
+
+§M13 names four things. Measured by building and running:
+
+| | |
+|---|---|
+| arithmetic, comparisons, control flow, locals | **works end to end** |
+| closures | `Op::Closure` is not lowered |
+| classes | `Op::Construct` is not lowered |
+| array methods | `Op::CreateArray` is not lowered |
+
+**One of the four.** The pipeline is real and the coverage is not there yet, and saying
+"M13's acceptance path works" without that table would be the more flattering sentence and the
+less true one.

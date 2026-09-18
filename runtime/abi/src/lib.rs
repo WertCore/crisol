@@ -200,3 +200,40 @@ pub extern "C" fn crisol_unsigned_shift_right(left: u64, right: u64) -> u64 {
     let count = to_uint32(to_number(right)) & 31;
     from_number(f64::from(to_uint32(to_number(left)) >> count))
 }
+
+/// Prints a value the way a program's result should appear.
+///
+/// Exists so the C entry point a compiled program links against does not have to understand
+/// NaN boxing. Decoding 64 bits into a JavaScript value is this crate's job, and duplicating
+/// the tag layout in generated C would be a second place for it to drift.
+///
+/// # Safety
+///
+/// Called from the generated entry point with a NaN-boxed value.
+#[unsafe(no_mangle)]
+pub extern "C" fn crisol_print(bits: u64) {
+    let value = Value::from_bits(bits);
+    // Deliberately not `Display`: a compiled program's output is a product surface, and
+    // `Debug` would print Rust's idea of the value rather than JavaScript's.
+    match value.kind() {
+        crisol_value::Kind::Undefined => println!("undefined"),
+        crisol_value::Kind::Null => println!("null"),
+        crisol_value::Kind::Boolean => println!("{}", value.as_boolean().unwrap_or(false)),
+        crisol_value::Kind::Number => match value.as_number() {
+            Some(number) if number.is_nan() => println!("NaN"),
+            Some(number) if number.is_infinite() && number > 0.0 => println!("Infinity"),
+            Some(number) if number.is_infinite() => println!("-Infinity"),
+            // Whole numbers print without a decimal point, as JavaScript does — `1`, not `1.0`.
+            Some(number) if number.fract() == 0.0 && number.abs() < 1e21 => {
+                println!("{number:.0}");
+            }
+            Some(number) => println!("{number}"),
+            None => println!("NaN"),
+        },
+        crisol_value::Kind::String | crisol_value::Kind::Symbol | crisol_value::Kind::Object => {
+            // Reaching into the heap needs a runtime this crate does not have. Saying so beats
+            // printing a pointer that looks like a number.
+            println!("[unprintable: the heap is not wired up yet]");
+        }
+    }
+}
