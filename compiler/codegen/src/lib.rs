@@ -110,6 +110,33 @@ pub trait Backend {
     fn finish(self) -> Result<Vec<u8>, CodegenError>;
 }
 
+/// Which runtime symbol each operator calls.
+///
+/// The names are the contract with `crisol-abi`, and **nothing connects the two sides until
+/// link time** — a typo on either is silent through every compiler test. `crisol-abi::SYMBOLS`
+/// is the defining list and a test here checks this against it.
+const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
+    (BinaryOp::Add, "crisol_add"),
+    (BinaryOp::Remainder, "crisol_remainder"),
+    (BinaryOp::Exponent, "crisol_exponent"),
+    (BinaryOp::BitAnd, "crisol_bit_and"),
+    (BinaryOp::BitOr, "crisol_bit_or"),
+    (BinaryOp::BitXor, "crisol_bit_xor"),
+    (BinaryOp::ShiftLeft, "crisol_shift_left"),
+    (BinaryOp::ShiftRight, "crisol_shift_right"),
+    (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
+];
+
+/// The runtime symbols the backend emits calls to.
+///
+/// Exposed so a test can check them against what `crisol-abi` defines. The two sides are
+/// connected **only by name**, so a typo on either is silent through every compiler test and
+/// fails when someone tries to link a binary.
+#[must_use]
+pub fn helper_symbols() -> Vec<&'static str> {
+    HELPER_SYMBOLS.iter().map(|(_, symbol)| *symbol).collect()
+}
+
 /// The Cranelift backend.
 ///
 /// `Debug` reports what it is targeting and nothing else: an `ObjectModule` holds every
@@ -180,23 +207,13 @@ impl Cranelift {
         signature.params.push(AbiParam::new(types::I64));
         signature.returns.push(AbiParam::new(types::I64));
         let mut helpers = HashMap::new();
-        for (op, symbol) in [
-            (BinaryOp::Add, "crisol_add"),
-            (BinaryOp::Remainder, "crisol_remainder"),
-            (BinaryOp::Exponent, "crisol_exponent"),
-            (BinaryOp::BitAnd, "crisol_bit_and"),
-            (BinaryOp::BitOr, "crisol_bit_or"),
-            (BinaryOp::BitXor, "crisol_bit_xor"),
-            (BinaryOp::ShiftLeft, "crisol_shift_left"),
-            (BinaryOp::ShiftRight, "crisol_shift_right"),
-            (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
-        ] {
+        for (op, symbol) in HELPER_SYMBOLS {
             let id = module
                 .declare_function(symbol, Linkage::Import, &signature)
                 .map_err(|error| CodegenError::Backend {
                     message: error.to_string(),
                 })?;
-            helpers.insert(op, id);
+            helpers.insert(*op, id);
         }
 
         Ok(Self {

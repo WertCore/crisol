@@ -19,3 +19,7 @@ cranelift-frontend.workspace = true
 cranelift-module.workspace = true
 cranelift-object.workspace = true
 target-lexicon.workspace = true
+
+[dev-dependencies]
+# Only to check the symbol contract from both sides; the backend does not link the runtime.
+crisol-abi.workspace = true

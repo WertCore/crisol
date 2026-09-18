@@ -21,6 +21,7 @@ members = [
     "compiler/codegen",
     "compiler/diag",
     "runtime/gc",
+    "runtime/abi",
     "runtime/value",
     "runtime/builtins",
     "runtime/async",
@@ -70,6 +71,7 @@ crisol-opt = { path = "compiler/opt", version = "0.0.0" }
 crisol-codegen = { path = "compiler/codegen", version = "0.0.0" }
 crisol-diag = { path = "compiler/diag", version = "0.0.0" }
 crisol-gc = { path = "runtime/gc", version = "0.0.0" }
+crisol-abi = { path = "runtime/abi", version = "0.0.0" }
 crisol-value = { path = "runtime/value", version = "0.0.0" }
 crisol-builtins = { path = "runtime/builtins", version = "0.0.0" }
 crisol-async = { path = "runtime/async", version = "0.0.0" }
