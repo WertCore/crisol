@@ -435,6 +435,15 @@ impl Lowering {
                     value: closure,
                 });
             }
+            Statement::ClassDeclaration(class) => {
+                let name = class
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+                let value = self.class(class, &name);
+                let slot = self.declare(&name);
+                self.emit_effect(Op::Store { slot, value });
+            }
             Statement::EmptyStatement(_) => {}
             other => {
                 self.note(kind_of(other), 0);
@@ -467,12 +476,24 @@ impl Lowering {
             Expression::BinaryExpression(binary) => self.binary(binary),
             Expression::AssignmentExpression(assignment) => {
                 let value = self.expression(&assignment.right);
-                match assignment.left.get_identifier_name() {
-                    Some(name) => {
-                        let slot = self.slot(name);
+                // Matched on the target's *shape*, not on `get_identifier_name`: that helper
+                // reports the **property** name for `this.x`, so using it turned `this.x = x`
+                // into `x = x` — a silently wrong translation with no note, which is the one
+                // outcome the unsupported list exists to prevent.
+                match &assignment.left {
+                    oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                        let slot = self.slot(identifier.name.as_str());
                         self.emit_effect(Op::Store { slot, value });
                     }
-                    None => self.note("assignment target", assignment.span.start),
+                    oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) => {
+                        let object = self.expression(&member.object);
+                        self.emit_effect(Op::PropertyStore {
+                            object,
+                            key: PropertyKey::new(member.property.name.as_str()),
+                            value,
+                        });
+                    }
+                    _ => self.note("assignment target", assignment.span.start),
                 }
                 value
             }
@@ -565,6 +586,28 @@ impl Lowering {
                     }
                 };
                 self.close_over(id, &names)
+            }
+            Expression::NewExpression(new) => {
+                let callee = self.expression(&new.callee);
+                let mut args = Vec::with_capacity(new.arguments.len());
+                for argument in &new.arguments {
+                    match argument.as_expression() {
+                        Some(expression) => args.push(self.expression(expression)),
+                        None => {
+                            self.note("spread argument", new.span.start);
+                            let placeholder = self.placeholder();
+                            args.push(placeholder);
+                        }
+                    }
+                }
+                self.emit(Type::Object(None), Op::Construct { callee, args })
+            }
+            Expression::ClassExpression(class) => {
+                let name = class
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+                self.class(class, &name)
             }
             Expression::ThisExpression(_) => {
                 let slot = self.slot("this");
@@ -893,6 +936,103 @@ impl Lowering {
             })
             .collect();
         self.emit(Type::Object(None), Op::Closure { function, captures })
+    }
+
+    /// Lowers a class to the two objects it is made of.
+    ///
+    /// A `class` is sugar, and desugaring it here rather than inventing an IR node keeps the
+    /// object model honest: a class **is** a constructor function whose `prototype` property
+    /// holds an object carrying the methods. Every instance shares that one prototype object,
+    /// which is why methods are stored on it once rather than copied per instance — an
+    /// implementation that stored them on the instance would work until someone compared two
+    /// objects' methods for identity, or counted `Object.keys`.
+    fn class(&mut self, class: &oxc_ast::ast::Class<'_>, name: &str) -> ValueId {
+        if class.heritage.is_some() {
+            // `extends` needs the prototype chain wired through the parent *and* `super`
+            // resolved inside methods. Half of that would produce a class that constructs and
+            // then fails its first inherited call.
+            self.note("class extends", class.span.start);
+        }
+
+        let shape = crisol_value::Shapes::new().root();
+        let prototype = self.emit(Type::Object(None), Op::CreateObject { shape });
+        let mut constructor = None;
+
+        for element in &class.body.body {
+            let oxc_ast::ast::ClassElement::MethodDefinition(method) = element else {
+                self.note("class member that is not a method", class.span.start);
+                continue;
+            };
+            if method.r#static {
+                self.note("static class member", method.span.start);
+                continue;
+            }
+            let Some(key) = method.key.static_name() else {
+                self.note("computed method name", method.span.start);
+                continue;
+            };
+            let method_name = key.to_string();
+            let (id, captures) = self.lower_function(
+                &format!("{name}.{method_name}"),
+                &method.value.params,
+                method.value.body.as_deref(),
+                None,
+                true,
+            );
+            let closure = self.close_over(id, &captures);
+            if method_name == "constructor" {
+                // Remembered, **not returned**. Returning here dropped every method declared
+                // after the constructor — and `constructor` conventionally comes first, so the
+                // common ordering was the broken one.
+                constructor = Some(closure);
+                continue;
+            }
+            self.emit_effect(Op::PropertyStore {
+                object: prototype,
+                key: PropertyKey::new(&method_name),
+                value: closure,
+            });
+        }
+
+        let constructor = match constructor {
+            Some(closure) => closure,
+            None => {
+                // No explicit constructor: the class still needs one, because `new` has to
+                // call something. It does nothing.
+                let (id, captures) = self.implicit_constructor(name);
+                self.close_over(id, &captures)
+            }
+        };
+        self.emit_effect(Op::PropertyStore {
+            object: constructor,
+            key: PropertyKey::new("prototype"),
+            value: prototype,
+        });
+        constructor
+    }
+
+    /// The empty constructor a class without one still has.
+    fn implicit_constructor(&mut self, name: &str) -> (FunctionId, Vec<String>) {
+        let index = self.functions.len();
+        let mut function = Function::new(&format!("{name}.constructor"));
+        let entry = function.entry;
+        function.captures = Vec::new();
+        self.functions.push(function);
+        self.scopes.push(Scope {
+            function: index,
+            current: entry,
+            terminated: false,
+            slots: HashMap::new(),
+            next_slot: 0,
+            captures: Vec::new(),
+        });
+        self.declare("this");
+        self.terminate(Terminator::Return(None));
+        self.scopes.pop();
+        (
+            FunctionId(u32::try_from(index).expect("functions fit in u32")),
+            Vec::new(),
+        )
     }
 
     /// A slot no source name can collide with.

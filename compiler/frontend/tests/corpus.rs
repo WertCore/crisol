@@ -159,6 +159,21 @@ const CORPUS: &[(&str, &str)] = &[
         "let f = function () { return this; };",
     ),
     ("this-at-top-level", "let t = this;"),
+    (
+        "class-with-a-constructor",
+        "class C { constructor(x) { this.x = x; } }",
+    ),
+    ("class-with-a-method", "class C { m() { return 1; } }"),
+    (
+        "class-with-both",
+        "class C { constructor(x) { this.x = x; } m() { return this.x; } }",
+    ),
+    ("class-with-no-constructor-still-has-one", "class C { }"),
+    ("new-expression", "class C { } let c = new C();"),
+    (
+        "new-with-arguments",
+        "class C { constructor(x) { this.x = x; } } let c = new C(1);",
+    ),
 ];
 
 fn snapshot_path() -> PathBuf {
@@ -299,6 +314,11 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // operand, which is the only case anyone writes `==` for.
         ("let a = 1 == 2;", "binary operator =="),
         ("let a = 1 instanceof Object;", "binary operator instanceof"),
+        // `extends` needs the prototype chain wired through the parent *and* `super` resolved
+        // inside methods. Half of that produces a class that constructs and then fails its
+        // first inherited call.
+        ("class A { } class B extends A { }", "class extends"),
+        ("class C { static m() { } }", "static class member"),
     ];
 
     for (source, expected) in cases {
@@ -551,6 +571,119 @@ fn a_method_calls_object_is_evaluated_once() {
         dump.matches("call ").count(),
         2,
         "one call for `f()` and one for `.m()`:\n{dump}"
+    );
+}
+
+#[test]
+fn methods_live_on_the_prototype_not_the_instance() {
+    // A class *is* a constructor whose `prototype` property holds an object carrying the
+    // methods, and every instance shares that one object. An implementation that stored them
+    // per instance would work until someone compared two objects' methods for identity, or
+    // counted `Object.keys`.
+    let lowered = lower("class", "class C { m() { return 1; } }").expect("parses");
+    let dump = lowered.program().to_string();
+    assert!(
+        dump.contains(r#"set v0."m""#),
+        "the method goes on the prototype object:\n{dump}"
+    );
+    assert!(
+        dump.contains(r#""prototype""#),
+        "and the constructor points at it:\n{dump}"
+    );
+}
+
+#[test]
+fn a_class_without_a_constructor_still_has_one() {
+    // `new C()` has to call something. A class with no `constructor` gets an empty one rather
+    // than a missing one, or `new` would have nothing to invoke.
+    let lowered = lower("implicit", "class C { }").expect("parses");
+    assert!(
+        lowered
+            .functions
+            .iter()
+            .any(|function| function.name == "C.constructor"),
+        "an implicit constructor was not created: {:?}",
+        lowered
+            .functions
+            .iter()
+            .map(|f| &f.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn new_is_one_operation_not_a_sequence() {
+    // `new` encapsulates a rule no call site should have to remember: a constructor returning
+    // an object *replaces* the new `this`, while one returning a primitive does not. Spelling
+    // it out as allocate-then-call would put that rule at every site.
+    let lowered = lower("new", "class C { } let c = new C();").expect("parses");
+    let block = &lowered.program().blocks[0];
+    assert!(
+        block
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.op, Op::Construct { .. })),
+        "no Construct op:\n{}",
+        lowered.program()
+    );
+}
+
+#[test]
+fn a_constructor_binds_its_own_this() {
+    let lowered = lower("ctor", "class C { constructor(x) { this.x = x; } }").expect("parses");
+    let constructor = lowered
+        .functions
+        .iter()
+        .find(|function| function.name == "C.constructor")
+        .expect("the constructor");
+    assert!(
+        constructor.captures.is_empty(),
+        "a constructor is not an arrow; it binds its own `this`"
+    );
+    assert_eq!(constructor.parameters.len(), 1);
+}
+
+#[test]
+fn a_method_declared_after_the_constructor_is_not_dropped() {
+    // The first version returned as soon as it found the constructor, which dropped every
+    // method after it — and `constructor` conventionally comes first, so the *common* ordering
+    // was the broken one. Found by reading the snapshot, not by a failing test.
+    let lowered = lower(
+        "both",
+        "class C { constructor(x) { this.x = x; } m() { return this.x; } }",
+    )
+    .expect("parses");
+    let names: Vec<&str> = lowered
+        .functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    assert!(names.contains(&"C.constructor"), "{names:?}");
+    assert!(
+        names.contains(&"C.m"),
+        "the method after the constructor: {names:?}"
+    );
+}
+
+#[test]
+fn assigning_to_a_property_is_not_assigning_to_a_variable() {
+    // `this.x = x` became `x = x`, silently and with no note, because oxc's
+    // `get_identifier_name` reports the **property** name for a member target. A wrong
+    // translation with no note is the one outcome the unsupported list exists to prevent.
+    let lowered = lower("member", "let o = { }; let x = 1; o.x = x;").expect("parses");
+    let block = &lowered.program().blocks[0];
+    assert!(
+        block
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.op, Op::PropertyStore { .. })),
+        "assigning to `o.x` should be a property store:\n{}",
+        lowered.program()
+    );
+    assert!(
+        lowered.is_faithful(),
+        "and it is supported, not merely noted: {:?}",
+        lowered.unsupported
     );
 }
 
