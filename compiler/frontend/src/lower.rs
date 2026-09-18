@@ -104,9 +104,9 @@ pub fn lower(name: &str, source: &str) -> Result<Lowered, ParseFailed> {
             ..ParseOptions::default()
         })
         .parse();
-    if !parsed.errors.is_empty() {
+    if !parsed.diagnostics.is_empty() {
         return Err(ParseFailed {
-            errors: parsed.errors.iter().map(ToString::to_string).collect(),
+            errors: parsed.diagnostics.iter().map(ToString::to_string).collect(),
         });
     }
     let mut lowering = Lowering::new(name);
@@ -549,42 +549,22 @@ impl Lowering {
                 self.close_over(id, &names)
             }
             Expression::ArrowFunctionExpression(arrow) => {
-                // A concise body — `x => x + 1` — is parsed as a body holding one expression
-                // statement, which the parser flags rather than restructuring.
-                let concise = arrow.expression.then(|| {
-                    arrow
-                        .body
-                        .statements
-                        .first()
-                        .and_then(|statement| match statement {
-                            Statement::ExpressionStatement(statement) => {
-                                Some(&statement.expression)
-                            }
-                            _ => None,
-                        })
-                });
-                match concise.flatten() {
-                    Some(expression) => {
-                        let (id, names) = self.lower_function(
-                            "arrow",
-                            &arrow.params,
-                            None,
-                            Some(expression),
-                            false,
-                        );
-                        self.close_over(id, &names)
+                // A concise body — `x => x + 1` — and a block body are distinct shapes in the
+                // AST, so the distinction is read off the type rather than reconstructed from
+                // a boolean plus a guess at the single statement inside.
+                let (id, names) = match (arrow.get_expression(), arrow.get_function_body()) {
+                    (Some(expression), _) => {
+                        self.lower_function("arrow", &arrow.params, None, Some(expression), false)
                     }
-                    None => {
-                        let (id, names) = self.lower_function(
-                            "arrow",
-                            &arrow.params,
-                            Some(&arrow.body),
-                            None,
-                            false,
-                        );
-                        self.close_over(id, &names)
+                    (None, Some(body)) => {
+                        self.lower_function("arrow", &arrow.params, Some(body), None, false)
                     }
-                }
+                    (None, None) => {
+                        self.note("arrow with no body", arrow.span.start);
+                        return self.placeholder();
+                    }
+                };
+                self.close_over(id, &names)
             }
             Expression::ThisExpression(_) => {
                 let slot = self.slot("this");

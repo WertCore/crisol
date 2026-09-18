@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlags, Value as ClifValue, types};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Value as ClifValue, types};
 use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{Linkage, Module as _};
@@ -205,6 +205,7 @@ impl Backend for Cranelift {
 
         let mut context = cranelift_codegen::Context::new();
         context.func.signature = signature;
+        let frontend_config = self.module.target_config();
         let add = self
             .module
             .declare_func_in_func(self.add_helper, &mut context.func);
@@ -217,7 +218,9 @@ impl Backend for Cranelift {
             add,
         };
         lowering.lower(function)?;
-        lowering.builder.finalize();
+        // `finalize` needs the target's frontend config in this version — it is what decides
+        // pointer width for the safepoint spill slots it inserts.
+        lowering.builder.finalize(frontend_config);
 
         // Counted before `define_function` consumes the context. Read from the DFG, which is
         // where `declare_value_needs_stack_map` actually records them.
@@ -333,7 +336,7 @@ impl Lowering<'_> {
     fn as_f64(&mut self, value: ClifValue) -> ClifValue {
         self.builder
             .ins()
-            .bitcast(types::F64, MemFlags::new(), value)
+            .bitcast(types::F64, MemFlagsData::new(), value)
     }
 
     /// Re-boxes an `f64`. Also just a bitcast.
@@ -343,7 +346,7 @@ impl Lowering<'_> {
     fn box_f64(&mut self, value: ClifValue) -> ClifValue {
         self.builder
             .ins()
-            .bitcast(types::I64, MemFlags::new(), value)
+            .bitcast(types::I64, MemFlagsData::new(), value)
     }
 
     /// A boxed boolean from a Cranelift condition.

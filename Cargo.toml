@@ -33,7 +33,7 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wertcore/crisol"
 authors = ["Crisol contributors"]
@@ -94,11 +94,11 @@ clap = { version = "4", features = ["derive"] }
 # line needs Rust 1.96 and this workspace's MSRV is 1.87 — Track A is meant to be embeddable,
 # so a parser dependency in Track B is not a reason to raise the floor for everybody.
 # `oxc_ast_visit` must stay on the same version as `oxc_ast`.
-oxc_allocator = "0.91.0"
-oxc_ast = "0.91.0"
-oxc_ast_visit = "0.91.0"
-oxc_parser = "0.91.0"
-oxc_span = "0.91.0"
+oxc_allocator = "0.150"
+oxc_ast = "0.150"
+oxc_ast_visit = "0.150"
+oxc_parser = "0.150"
+oxc_span = "0.150"
 oxc_resolver = "11.13.1"
 
 # JavaScript-compatible regular expressions. §M12 names it explicitly, because Rust's `regex`
@@ -109,10 +109,10 @@ regress = "0.10"
 # §4 names Cranelift as the codegen backend, and §M13 needs stack maps at safepoints —
 # Cranelift emits them, which is the deciding feature rather than a convenience. LLVM would
 # mean a build dependency an embedder cannot vendor.
-cranelift-codegen = { version = "0.128", features = ["all-arch"] }
-cranelift-frontend = "0.128"
-cranelift-module = "0.128"
-cranelift-object = "0.128"
+cranelift-codegen = { version = "0.135", features = ["all-arch"] }
+cranelift-frontend = "0.135"
+cranelift-module = "0.135"
+cranelift-object = "0.135"
 target-lexicon = "0.13"
 # lightningcss owns the CSS grammar; `selectors` owns matching. They agree on
 # cssparser 0.37, so there is exactly one tokenizer in the graph. See DECISIONS D-20.

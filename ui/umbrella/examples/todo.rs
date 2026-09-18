@@ -1049,12 +1049,12 @@ impl State {
             // Selecting the row is the visible proof that the drop landed on a particular
             // one rather than on the window. `list`'s children are the visible rows in
             // order, which is exactly what `selected` indexes.
-            if let Some(row) = self.row_of(node) {
-                if let Some(index) = self.tree.children(self.app.list).position(|id| id == row) {
-                    self.runtime.set(self.app.selected, index);
-                    let mut dom = Dom::new(&mut self.tree);
-                    self.runtime.flush(&mut dom);
-                }
+            if let Some(row) = self.row_of(node)
+                && let Some(index) = self.tree.children(self.app.list).position(|id| id == row)
+            {
+                self.runtime.set(self.app.selected, index);
+                let mut dom = Dom::new(&mut self.tree);
+                self.runtime.flush(&mut dom);
             }
         }
         self.mark_drop_target(None);
@@ -1296,14 +1296,14 @@ impl ApplicationHandler for Shell {
                     #[cfg(target_os = "windows")]
                     {
                         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                        if let Ok(handle) = surface.window().window_handle() {
-                            if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                                // SAFETY: the handle comes from the window created just
-                                // above, which `State` owns for as long as the application
-                                // runs. It therefore outlives both this call and the menu
-                                // hung on it, which is what `init_for_hwnd` requires.
-                                let _ = unsafe { bar.init_for_hwnd(win32.hwnd.get()) };
-                            }
+                        if let Ok(handle) = surface.window().window_handle()
+                            && let RawWindowHandle::Win32(win32) = handle.as_raw()
+                        {
+                            // SAFETY: the handle comes from the window created just above,
+                            // which `State` owns for as long as the application runs. It
+                            // therefore outlives both this call and the menu hung on it,
+                            // which is what `init_for_hwnd` requires.
+                            let _ = unsafe { bar.init_for_hwnd(win32.hwnd.get()) };
                         }
                     }
                     self.menu = Some(bar);

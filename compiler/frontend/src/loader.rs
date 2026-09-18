@@ -158,12 +158,12 @@ impl Loader {
         let source_type = SourceType::from_path(path).unwrap_or_default();
         let parsed = Parser::new(&allocator, source, source_type).parse();
         self.parsed += 1;
-        if !parsed.errors.is_empty() {
+        if !parsed.diagnostics.is_empty() {
             // Recorded, not fatal: oxc recovers, and a file with a syntax error still has
             // imports worth knowing about.
             self.parse_errors.push((
                 path.to_path_buf(),
-                format!("{} syntax errors", parsed.errors.len()),
+                format!("{} syntax errors", parsed.diagnostics.len()),
             ));
         }
 
