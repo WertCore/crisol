@@ -3514,3 +3514,42 @@ empty string, which would read like a legitimate result.
 
 **Consequence:** the receiver is read with `to_text`, not a string-only accessor, because
 `String.prototype.slice.call(5)` coerces — which is exactly how test262 reaches these methods.
+
+## D-116
+
+**Property attributes live on the object, not in the shape.**
+
+Status: Accepted
+
+A production engine puts them in the shape, so every object sharing it answers without a
+lookup. This does not, for a reason specific to what attributes *are*: they do not affect
+layout. Putting them in the shape would mean rebuilding the chain whenever `defineProperty`
+changes an existing property's writability — rebuilding a description of where values live
+because something that is not where values live has changed.
+
+The cost is real and worth stating: attribute lookup is not shape-cached, so a hot property
+access that had to consult them would pay per object. Nothing does yet, because only assignment
+consults `writable` and only enumeration consults `enumerable`. An object nobody calls
+`defineProperty` on carries an empty map and pays nothing.
+
+**Assignment and `defineProperty` default to opposite ends.** `o.x = 1` creates a property that
+is writable, enumerable and configurable; `Object.defineProperty(o, "x", {})` creates one that
+is none of those. An implementation reusing the assignment default passes every test that does
+not check the difference — which is most of them, and none of the ones that matter.
+
+Three consequences, each of which was previously wrong:
+
+- **`Object.keys` and `getOwnPropertyNames` are no longer the same function.** D-110 recorded
+  that as wrong-in-general and right-then, because nothing could make a property
+  non-enumerable. Something can now.
+- **A write to a non-writable property is silently ignored**, not an error. That is sloppy mode,
+  which is the only mode there is here.
+- **`defineProperty` writes past a non-writable property** where assignment does not, because it
+  redefines rather than assigns. Sharing the write path would make a property defined
+  non-writable impossible to redefine.
+
+An absent property's descriptor is `undefined`, which is how a caller distinguishes "not there"
+from "there and not writable".
+
+**Not done: accessors.** A descriptor with `get` or `set` is ignored rather than refused, which
+is the one part of this that fails quietly. Recorded here rather than left to be found.

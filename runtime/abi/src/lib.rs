@@ -1226,7 +1226,9 @@ extern "C" fn function_apply(
 
 const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "keys", object_keys),
-    ("Object", "getOwnPropertyNames", object_keys),
+    ("Object", "getOwnPropertyNames", object_own_names),
+    ("Object", "defineProperty", object_define_property),
+    ("Object", "getOwnPropertyDescriptor", object_own_descriptor),
     ("Object", "values", object_values),
     ("Object", "create", object_create),
     ("Object", "getPrototypeOf", object_get_prototype),
@@ -1236,6 +1238,216 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Array", "isArray", array_is_array),
     ("Array", "of", array_of),
 ];
+
+/// Writes a property regardless of whether it is writable.
+///
+/// `defineProperty` redefines rather than assigns, so the check an assignment makes must not
+/// apply — otherwise a property defined non-writable could never be redefined.
+///
+/// # Safety
+///
+/// `name` must be a live string.
+unsafe fn define_ignoring_writability(handle: GcRef, name: &str, value: u64) -> u64 {
+    let key = PropertyKey::new(name);
+    with_runtime(|runtime| {
+        let Some(current) = runtime.heap.shape_of(handle) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        let (shape, slot, width) = {
+            let mut shapes = runtime.shapes.borrow_mut();
+            let shape = shapes.add(current, &key);
+            let Some(slot) = shapes.lookup(shape, &key) else {
+                return Value::UNDEFINED.to_bits();
+            };
+            (shape, slot, shapes.len(shape) as usize)
+        };
+        if shape != current {
+            runtime.heap.transition(handle, shape, width);
+        }
+        runtime
+            .heap
+            .set(handle, slot.index(), Value::from_bits(value));
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// Reads a property of `object` by name, without walking the prototype chain.
+fn own_property(object: u64, name: &str) -> Option<(u32, Value)> {
+    let handle = handle_of(object)?;
+    with_runtime(|runtime| {
+        let shape = runtime.heap.shape_of(handle)?;
+        let key = PropertyKey::new(name);
+        let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+        runtime
+            .heap
+            .get(handle, slot.index())
+            .map(|value| (slot.index(), value))
+    })
+}
+
+/// Whether a descriptor field is present and truthy.
+fn descriptor_flag(descriptor: u64, name: &str) -> Option<bool> {
+    let key = name.to_owned();
+    // SAFETY: `key` is a live Rust string.
+    let bits = unsafe { crisol_property_load(descriptor, key.as_ptr(), key.len() as u64) };
+    let value = Value::from_bits(bits);
+    // **Absent and `false` are different.** A descriptor that omits `writable` leaves an
+    // existing property's writability alone, and one that says `writable: false` clears it.
+    if value.kind() == crisol_value::Kind::Undefined {
+        return None;
+    }
+    Some(is_truthy(value))
+}
+
+/// `Object.defineProperty(target, key, descriptor)`.
+///
+/// **A defined property defaults to none of writable, enumerable or configurable**, which is
+/// the opposite of what assignment creates. That difference is the whole reason descriptors
+/// exist, and an implementation that reused the assignment default would pass every test that
+/// does not check it.
+extern "C" fn object_define_property(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        // SAFETY: as above.
+        let key = unsafe { argument(argc, argv, 1) };
+        // SAFETY: as above.
+        let descriptor = unsafe { argument(argc, argv, 2) };
+
+        let Some(handle) = handle_of(target) else {
+            return raise("cannot define a property on a non-object", "TypeError");
+        };
+        let Some(name) = to_text(key) else {
+            return raise("a property key must be a name", "TypeError");
+        };
+
+        let existing = own_property(target, &name);
+        let value_key = "value".to_owned();
+        // SAFETY: `value_key` is a live Rust string.
+        let given =
+            unsafe { crisol_property_load(descriptor, value_key.as_ptr(), value_key.len() as u64) };
+        let has_value = Value::from_bits(given).kind() != crisol_value::Kind::Undefined
+            || own_property(descriptor, "value").is_some();
+
+        // The write goes through the ordinary path so the shape transition happens there once.
+        let stored = if has_value {
+            given
+        } else {
+            existing.map_or(Value::UNDEFINED.to_bits(), |(_, value)| value.to_bits())
+        };
+        // SAFETY: `name` is a live Rust string.
+        let outcome = unsafe { define_ignoring_writability(handle, &name, stored) };
+        if Value::from_bits(outcome).is_exception() {
+            return outcome;
+        }
+
+        let Some((slot, _)) = own_property(target, &name) else {
+            return target;
+        };
+        let previous = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
+        let base = if existing.is_some() {
+            previous
+        } else {
+            crisol_value::Attributes::DEFINED
+        };
+        let attributes = crisol_value::Attributes {
+            writable: descriptor_flag(descriptor, "writable").unwrap_or(base.writable),
+            enumerable: descriptor_flag(descriptor, "enumerable").unwrap_or(base.enumerable),
+            configurable: descriptor_flag(descriptor, "configurable").unwrap_or(base.configurable),
+        };
+        with_runtime(|runtime| runtime.heap.set_attributes(handle, slot, attributes));
+        target
+    })
+}
+
+/// `Object.getOwnPropertyDescriptor(target, key)`.
+extern "C" fn object_own_descriptor(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        // SAFETY: as above.
+        let key = unsafe { argument(argc, argv, 1) };
+        let Some(name) = to_text(key) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        let Some(handle) = handle_of(target) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        // **`undefined` for an absent property**, which is how a caller tells "not there" from
+        // "there and not writable".
+        let Some((slot, value)) = own_property(target, &name) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        let attributes = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
+
+        let descriptor = crisol_create_object();
+        with_rooted(&[descriptor], || {
+            let Some(into) = handle_of(descriptor) else {
+                return;
+            };
+            with_runtime(|runtime| {
+                runtime.define(into, "value", value);
+                runtime.define(into, "writable", boolean(attributes.writable));
+                runtime.define(into, "enumerable", boolean(attributes.enumerable));
+                runtime.define(into, "configurable", boolean(attributes.configurable));
+            });
+        });
+        descriptor
+    })
+}
+
+/// A boolean as a value.
+const fn boolean(flag: bool) -> Value {
+    if flag { Value::TRUE } else { Value::FALSE }
+}
+
+/// `Object.getOwnPropertyNames` — every own property, enumerable or not.
+extern "C" fn object_own_names(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        names_as_array(&own_keys(target))
+    })
+}
+
+/// An array of strings, each stored before the next is made.
+fn names_as_array(names: &[String]) -> u64 {
+    with_new_array(names.len(), |array| {
+        for (index, name) in names.iter().enumerate() {
+            let text = new_string(name);
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(array, index, Value::from_bits(text))
+            });
+        }
+        array.to_value().to_bits()
+    })
+}
 
 /// The own property names of `this`'s first argument.
 fn own_keys(object: u64) -> Vec<String> {
@@ -1302,19 +1514,25 @@ extern "C" fn object_keys(
         // Each string is stored **before the next one is made**. Collecting them into a Rust
         // vector first leaves every earlier string reachable from nothing the collector can
         // see while the next allocates — which under stress returns an array of freed cells.
-        let names = own_keys(target);
-        with_new_array(names.len(), |array| {
-            for (index, name) in names.iter().enumerate() {
-                let text = new_string(name);
-                with_runtime(|runtime| {
-                    runtime
-                        .heap
-                        .set_element(array, index, Value::from_bits(text))
-                });
-            }
-            array.to_value().to_bits()
-        })
+        // **Only the enumerable ones**, which is the whole difference from
+        // `getOwnPropertyNames` — and the reason the two stopped being the same function.
+        names_as_array(&enumerable_keys(target))
     })
+}
+
+/// The own property names a `for-in` or `Object.keys` would see.
+fn enumerable_keys(object: u64) -> Vec<String> {
+    let Some(handle) = handle_of(object) else {
+        return Vec::new();
+    };
+    own_keys(object)
+        .into_iter()
+        .filter(|name| {
+            own_property(object, name).is_none_or(|(slot, _)| {
+                with_runtime(|runtime| runtime.heap.attributes_of(handle, slot).enumerable)
+            })
+        })
+        .collect()
 }
 
 /// `Object.values`.
@@ -1331,7 +1549,7 @@ extern "C" fn object_values(
         // SAFETY: as above.
         let target = unsafe { argument(argc, argv, 0) };
         // As in `object_keys`: read and store one at a time rather than collecting first.
-        let names = own_keys(target);
+        let names = enumerable_keys(target);
         with_new_array(names.len(), |array| {
             for (index, name) in names.iter().enumerate() {
                 // SAFETY: `name` is a live Rust string.
@@ -1878,6 +2096,11 @@ pub unsafe extern "C" fn crisol_property_store(
         };
         if shape != current {
             runtime.heap.transition(handle, shape, width);
+        } else if !runtime.heap.attributes_of(handle, slot.index()).writable {
+            // **A write to a non-writable property is silently ignored**, not an error —
+            // outside strict mode, which is the only mode there is here. Only an existing
+            // property can be non-writable, which is why this is on the no-transition path.
+            return;
         }
         runtime
             .heap

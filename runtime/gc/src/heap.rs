@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 
-use crisol_value::{ShapeId, Value};
+use crisol_value::{Attributes, ShapeId, Value};
 
 use crate::handle::GcRef;
 
@@ -71,6 +71,17 @@ struct Object {
     ///
     /// Holds no references, so the collector traces nothing through it.
     text: Option<Box<str>>,
+    /// What each property permits, for the ones that are not the default.
+    ///
+    /// **Per object rather than in the shape**, which is not where a production engine puts
+    /// them. A shape would let every object sharing it answer without a lookup, and would mean
+    /// rebuilding the shape chain whenever `defineProperty` changes an existing property —
+    /// attributes do not affect *layout*, so the chain would be rebuilt for something it does
+    /// not describe.
+    ///
+    /// The cost is that attribute lookup is not shape-cached. The benefit is that an object
+    /// nobody calls `defineProperty` on carries an empty map and pays nothing.
+    attributes: std::collections::HashMap<u32, Attributes>,
 }
 
 #[derive(Debug)]
@@ -317,6 +328,52 @@ impl Heap {
                 }
                 object.slots.resize(slots, Value::UNDEFINED);
                 object.shape = shape;
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// What the property in `slot` permits.
+    ///
+    /// Absent means the default an assignment creates: writable, enumerable and configurable.
+    #[must_use]
+    pub fn attributes_of(&self, handle: GcRef, slot: u32) -> Attributes {
+        let cells = self.cells.borrow();
+        let Some(cell) = cells.get(handle.slot() as usize) else {
+            return Attributes::DATA;
+        };
+        if cell.generation != handle.generation() {
+            return Attributes::DATA;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object
+                .attributes
+                .get(&slot)
+                .copied()
+                .unwrap_or(Attributes::DATA),
+            State::Free => Attributes::DATA,
+        }
+    }
+
+    /// Sets what the property in `slot` permits.
+    pub fn set_attributes(&self, handle: GcRef, slot: u32, attributes: Attributes) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                if attributes == Attributes::DATA {
+                    // The default is the absence of an entry, so an object returned to it stops
+                    // carrying one.
+                    object.attributes.remove(&slot);
+                } else {
+                    object.attributes.insert(slot, attributes);
+                }
                 true
             }
             State::Free => false,
@@ -677,6 +734,7 @@ impl Heap {
             internals: vec![Value::UNDEFINED; internals],
             elements: None,
             text: None,
+            attributes: std::collections::HashMap::new(),
         };
 
         let handle = match self.free.borrow_mut().pop() {

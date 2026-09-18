@@ -34,11 +34,14 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**14 passed, 207 failed, 0 crashed, 158 refused.** `String.prototype` exists and strings are
-measured in UTF-16 code units rather than bytes (D-115) — `"é".length` was 2 and is 1.
+**19 passed, 202 failed, 0 crashed, 158 refused.** Property descriptors exist (D-116), so
+`Object.keys` and `getOwnPropertyNames` finally differ, a non-writable property ignores a write,
+and `defineProperty` can redefine one. Attributes live on the object rather than in the shape
+because they do not affect layout — the trade-off and its cost are recorded.
 
-Where the failures are: `Object` (51, almost all wanting `defineProperty` and so property
-descriptors), `Array.prototype` (54), `String.prototype` (18), `Date.prototype` (13).
+Where the failures are: `Array.prototype` (54), `Object` (46), `String.prototype` (18),
+`Date.prototype` (13). Accessor descriptors — `get` and `set` — are ignored rather than refused,
+which is the one part that fails quietly.
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -74,7 +77,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1183 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1188 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

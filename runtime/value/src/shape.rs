@@ -48,6 +48,46 @@ impl ShapeId {
     }
 }
 
+/// What a property permits, beyond holding a value.
+///
+/// **Assignment and `defineProperty` default to opposite ends of this.** `o.x = 1` creates a
+/// property that is writable, enumerable and configurable; `Object.defineProperty(o, "x", {})`
+/// creates one that is none of those. Getting that backwards makes a defined property behave
+/// like an assigned one, which every test of the difference catches and nothing else does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Attributes {
+    /// Whether a write is allowed. A write to a non-writable property is silently ignored
+    /// outside strict mode, which is why it is not an error here.
+    pub writable: bool,
+    /// Whether `Object.keys` and `for-in` see it.
+    pub enumerable: bool,
+    /// Whether it can be deleted or redefined.
+    pub configurable: bool,
+}
+
+impl Attributes {
+    /// What `o.x = 1` creates: everything permitted.
+    pub const DATA: Self = Self {
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    };
+
+    /// What `Object.defineProperty` creates when the descriptor says nothing: nothing
+    /// permitted.
+    pub const DEFINED: Self = Self {
+        writable: false,
+        enumerable: false,
+        configurable: false,
+    };
+}
+
+impl Default for Attributes {
+    fn default() -> Self {
+        Self::DATA
+    }
+}
+
 /// Where a property's value lives in an object's slot array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slot(u32);

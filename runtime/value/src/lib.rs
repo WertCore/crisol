@@ -11,5 +11,5 @@ mod shape;
 mod value;
 
 pub use key::PropertyKey;
-pub use shape::{ShapeId, Shapes, Slot};
+pub use shape::{Attributes, ShapeId, Shapes, Slot};
 pub use value::{ADDRESS_BITS, Address, Kind, Value};

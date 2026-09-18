@@ -1665,3 +1665,90 @@ fn string_methods_work_on_a_computed_receiver() {
         "ABC",
     );
 }
+
+// ---- property descriptors ---------------------------------------------------------------
+
+/// **A defined property defaults to none of writable, enumerable or configurable** — the
+/// opposite of what assignment creates. That difference is the whole reason descriptors exist,
+/// and reusing the assignment default passes every test that does not check it.
+#[test]
+fn define_property_defaults_to_the_opposite_of_assignment() {
+    check(
+        "descriptor-assigned",
+        "let o = {}; o.x = 1; return Object.getOwnPropertyDescriptor(o, \"x\").writable;",
+        "true",
+    );
+    check(
+        "descriptor-defined",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         return Object.getOwnPropertyDescriptor(o, \"x\").writable;",
+        "false",
+    );
+    check(
+        "descriptor-value",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 7}); return o.x;",
+        "7",
+    );
+}
+
+/// **`Object.keys` sees only enumerable properties; `getOwnPropertyNames` sees all.** That is
+/// the difference which made them the same function until now.
+#[test]
+fn keys_and_own_names_differ_on_enumerability() {
+    check(
+        "descriptor-keys-hidden",
+        "let o = {a: 1}; Object.defineProperty(o, \"b\", {value: 2}); return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "descriptor-names-all",
+        "let o = {a: 1}; Object.defineProperty(o, \"b\", {value: 2}); \
+         return Object.getOwnPropertyNames(o).length;",
+        "2",
+    );
+    check(
+        "descriptor-enumerable-true",
+        "let o = {}; Object.defineProperty(o, \"b\", {value: 2, enumerable: true}); \
+         return Object.keys(o).length;",
+        "1",
+    );
+}
+
+/// **A write to a non-writable property is silently ignored**, not an error — outside strict
+/// mode, which is the only mode there is here.
+#[test]
+fn a_write_to_a_non_writable_property_is_ignored() {
+    check(
+        "descriptor-readonly",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); o.x = 9; return o.x;",
+        "1",
+    );
+    check(
+        "descriptor-writable",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, writable: true}); o.x = 9; return o.x;",
+        "9",
+    );
+}
+
+/// `defineProperty` redefines rather than assigns, so it writes past a non-writable property
+/// that an assignment could not.
+#[test]
+fn define_property_can_redefine_a_non_writable_property() {
+    check(
+        "descriptor-redefine",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+}
+
+/// **`undefined` for an absent property**, which is how a caller tells "not there" from
+/// "there and not writable".
+#[test]
+fn a_descriptor_for_a_missing_property_is_undefined() {
+    check(
+        "descriptor-missing",
+        "let o = {}; return Object.getOwnPropertyDescriptor(o, \"nope\");",
+        "undefined",
+    );
+}
