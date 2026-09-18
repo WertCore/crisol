@@ -119,6 +119,26 @@ fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcom
     Some(outcome)
 }
 
+/// Which built-in a case is testing, from its path.
+///
+/// The thrown message says `is not a function` without naming what was called — the callee is a
+/// value, and by the time the call fails nothing holds the name it was read from. The path does
+/// know, and it is what turns 90 identical failures into a list of what to write.
+fn area_of(case: &Path) -> String {
+    let parts: Vec<&str> = case
+        .iter()
+        .filter_map(|part| part.to_str())
+        .skip_while(|part| *part != "built-ins")
+        .skip(1)
+        .collect();
+    match parts.as_slice() {
+        [] => "unknown".to_owned(),
+        [one] => (*one).to_owned(),
+        [one, two, ..] if *two == "prototype" => format!("{one}.prototype"),
+        [one, ..] => (*one).to_owned(),
+    }
+}
+
 /// What a failing case threw, reduced to something worth counting.
 ///
 /// The entry point prints `uncaught: …`. A test262 assertion message names the value it saw, so
@@ -211,6 +231,8 @@ fn the_suite_is_attempted_and_the_result_reported() {
     let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
     let mut passing = Vec::new();
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
+    let mut areas: BTreeMap<String, usize> = BTreeMap::new();
+    let mut examples: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
 
     for (index, case) in cases.iter().step_by(step).enumerate() {
         let Some(outcome) = attempt(&root, case, &work, index) else {
@@ -224,7 +246,10 @@ fn the_suite_is_attempted_and_the_result_reported() {
             }
             Outcome::Failed(reason) => {
                 failed += 1;
+                let reason_key = reason.clone();
                 *failures.entry(reason).or_default() += 1;
+                *areas.entry(area_of(case)).or_default() += 1;
+                examples.entry(reason_key).or_default().push(case.clone());
             }
             Outcome::Crashed => crashed.push(case.clone()),
             Outcome::Refused(reason) => *refusals.entry(reason).or_default() += 1,
@@ -252,6 +277,22 @@ fn the_suite_is_attempted_and_the_result_reported() {
     println!("what ran and then threw, most common first:");
     for (reason, count) in by_reason.iter().take(20) {
         println!("  {count:>5}  {reason}");
+    }
+    let mut by_area: Vec<(&String, &usize)> = areas.iter().collect();
+    by_area.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+    // A count says how much and a path says what. The thrown message cannot name the method
+    // that was missing — the callee is a value by then — so the cases themselves have to.
+    if let Some((reason, _)) = by_reason.first()
+        && let Some(cases) = examples.get(*reason)
+    {
+        println!("examples of the most common failure ({reason}):");
+        for case in cases.iter().take(8) {
+            println!("  {}", case.display());
+        }
+    }
+    println!("which built-ins those failures are testing:");
+    for (area, count) in by_area.iter().take(20) {
+        println!("  {count:>5}  {area}");
     }
     // Named rather than counted, so a fall in the number can be read as "these stopped
     // passing" rather than taken on trust. A fix that makes a case *correctly* fail looks

@@ -3436,3 +3436,51 @@ against `undefined`, and it is the list of builtins to write.
 The cost is a branch after every property access. The IR roughly doubles for property-heavy
 code, which is the price of the unwinding being visible in the graph rather than implied — and
 it is the shape a later pass can collapse once the IR can prove a receiver is an object.
+
+## D-113
+
+**Every function inherits from `Function.prototype`, so `call` and `apply` exist.**
+
+Status: Accepted
+
+A closure was an object with a `prototype` *property* and no `[[Prototype]]` *link*, so `f.call`
+resolved to nothing. That is not a small gap: test262 reaches a method through `call` whenever
+it wants to test what the method does to a receiver it was not written for —
+`Array.prototype.indexOf.call(true)` is a whole family of cases, and every one of them failed
+with `is not a function`.
+
+`this` inside `call` is the **function**, not the receiver; the receiver is the first argument.
+That inversion is the whole of what `call` does.
+
+`Function.prototype` is built first, before the array prototype and the globals, because every
+function made afterwards links to it — including the two that live on it.
+
+**Consequence:** built-in functions are now made in exactly one place. Four builders had each
+been allocating a cell, writing the index and defining properties in their own way, and only
+one of them would have gained the prototype link. A function made here and one made by
+`crisol_create_closure` now agree on what a function *is*: a cell whose internal zero says which
+code it runs, inheriting from `Function.prototype`.
+
+## D-114
+
+**The array methods, and what their edge cases are for.**
+
+Status: Accepted
+
+Fourteen more, chosen by what test262 was calling. The ones worth recording are the pairs that
+differ only at an edge, because a single implementation covering both is how the edge gets lost:
+
+- **`includes` finds `NaN` and `indexOf` does not.** The first uses SameValueZero and the second
+  `===`, so `[NaN].includes(NaN)` is `true` and `[NaN].indexOf(NaN)` is `-1`.
+- **`find` answers `undefined` and `findIndex` answers `-1`** when nothing matches. They share an
+  implementation, which is safe only because that difference is the parameter.
+- **Empty is `true` for `every` and `false` for `some`.** Both stop on the opposite answer, and
+  on an empty array neither stops — so the answer is whichever the loop falls through to.
+- **`concat` spreads an array argument and appends anything else whole**, which is what makes
+  `[1].concat([2, 3])` three elements and `[1].concat(2)` two.
+- **A negative index counts from the end** and past either end clamps, so `slice(-1)` is the last
+  element and `slice(5)` on a short array is empty rather than an error.
+- **`null` and `undefined` join as empty**, not as their names.
+
+`unshift` grows the array before moving anything, so no element is overwritten before it has
+moved — the same reason `reverse` reads both ends before writing either.

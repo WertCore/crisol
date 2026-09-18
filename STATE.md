@@ -34,11 +34,16 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**6 passed, 215 failed, 0 crashed, 158 refused.** Property access on `null` or `undefined` and
-calling a non-function now raise `TypeError` (D-112), so the accidental passes are gone again
-and the failures say what is missing: `TypeError: is not a function` (90 — a method that does
-not exist, called), `cannot read a property of undefined` (33), then `Date` (18), `Proxy` (12),
-`RegExp` (8), `Symbol` (7), `JSON` (6).
+**8 passed, 213 failed, 0 crashed, 158 refused.** Fourteen more array methods (D-114) and
+`Function.prototype.call`/`apply` (D-113), which test262 uses to apply a method to a receiver
+it was not written for.
+
+The harness now prints example paths for the most common failure, because the thrown message
+cannot name what was missing — by the time a call fails the callee is a value, and nothing holds
+the name it was read from. The paths do, and that is what identified `call` as the gap.
+
+Where the failures are: `Array.prototype` (55), `Object` (51 — mostly `defineProperty`),
+`String.prototype` (24), `Date.prototype` (13).
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -74,7 +79,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1146 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1175 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

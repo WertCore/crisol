@@ -577,6 +577,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(ARRAY_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(pending_root());
         roots.extend(GLOBALS.with(std::cell::Cell::get));
+        roots.extend(FUNCTION_PROTOTYPE.with(std::cell::Cell::get));
         roots
     }));
 }
@@ -586,6 +587,9 @@ thread_local! {
     static ARRAY_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The object holding every global binding.
     static GLOBALS: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every function inherits from, which is where `call` and `apply` live.
+    static FUNCTION_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// A function implemented here rather than compiled, called through the uniform convention.
@@ -602,6 +606,20 @@ const NATIVES: &[(&str, Native)] = &[
     ("reduce", array_reduce),
     ("push", array_push),
     ("indexOf", array_index_of),
+    ("lastIndexOf", array_last_index_of),
+    ("includes", array_includes),
+    ("join", array_join),
+    ("slice", array_slice),
+    ("concat", array_concat),
+    ("reverse", array_reverse),
+    ("pop", array_pop),
+    ("shift", array_shift),
+    ("unshift", array_unshift),
+    ("find", array_find),
+    ("findIndex", array_find_index),
+    ("every", array_every),
+    ("some", array_some),
+    ("fill", array_fill),
 ];
 
 /// Every global that is a function, in the order their indices name them.
@@ -746,6 +764,59 @@ extern "C" fn construct_plain_object(
 ///
 /// Numbered after [`NATIVES`] and [`GLOBAL_NATIVES`], continuing the one negative index space
 /// so `crisol_closure_code` still has a single rule.
+/// Methods on `Function.prototype`, which every function inherits.
+const FUNCTION_NATIVES: &[(&str, Native)] = &[("call", function_call), ("apply", function_apply)];
+
+/// `f.call(receiver, …args)`.
+///
+/// **`this` here is the function being called**, not its receiver — the receiver is the first
+/// argument. That inversion is the whole of what `call` does, and it is why so many test262
+/// cases reach a method through it: `Array.prototype.indexOf.call(true)` tests what `indexOf`
+/// does to a receiver that is not an array.
+extern "C" fn function_call(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let receiver = unsafe { argument(argc, argv, 0) };
+        let rest: Vec<u64> = (1..argc as usize)
+            // SAFETY: as above.
+            .map(|position| unsafe { argument(argc, argv, position) })
+            .collect();
+        call_value(this_value, receiver, &rest)
+    })
+}
+
+/// `f.apply(receiver, args)`, where the arguments arrive as an array.
+extern "C" fn function_apply(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let receiver = unsafe { argument(argc, argv, 0) };
+        // SAFETY: as above.
+        let given = unsafe { argument(argc, argv, 1) };
+        let rest: Vec<u64> = match elements_of(given) {
+            Some((array, length)) => (0..length).map(|index| element_at(array, index)).collect(),
+            // `null` or `undefined` means no arguments, which is not an error.
+            None => Vec::new(),
+        };
+        call_value(this_value, receiver, &rest)
+    })
+}
+
 const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "keys", object_keys),
     ("Object", "getOwnPropertyNames", object_keys),
@@ -1105,6 +1176,9 @@ impl Runtime {
             heap,
             shapes: RefCell::new(Shapes::new()),
         };
+        // **First**, because every function made afterwards links to it — including the ones
+        // that live on it.
+        runtime.build_function_prototype();
         runtime.build_array_prototype();
         runtime.build_globals();
         runtime
@@ -1242,6 +1316,48 @@ impl Runtime {
         self.define(globals.handle(), "Infinity", Value::number(f64::INFINITY));
     }
 
+    /// Allocates a built-in function: its index, its `prototype`, and its own prototype link.
+    ///
+    /// One place, so a function made here and one made by `crisol_create_closure` agree about
+    /// what a function *is* — a cell whose internal zero says which code it runs, inheriting
+    /// from `Function.prototype` so `call` and `apply` are reachable.
+    fn native_function(&self, index: usize) -> GcRef {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let function = scope.alloc_with_internals(shape, 0, 1);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "there are a handful of built-ins"
+        )]
+        let encoded = -((index as f64) + 1.0);
+        self.heap
+            .set_internal(function.handle(), 0, Value::number(encoded));
+        if let Some(prototype) = FUNCTION_PROTOTYPE.with(std::cell::Cell::get) {
+            self.heap.set_prototype(function.handle(), Some(prototype));
+        }
+        function.handle()
+    }
+
+    /// Builds the object every function inherits from.
+    ///
+    /// The object is rooted **before** its own methods are made, because those are functions
+    /// and will link to it.
+    fn build_function_prototype(&self) {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let prototype = scope.alloc(shape, 0);
+        FUNCTION_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+
+        let base = NATIVES.len()
+            + GLOBAL_NATIVES.len()
+            + NAMESPACE_NATIVES.len()
+            + ANONYMOUS_NATIVES.len();
+        for (index, (name, _)) in FUNCTION_NATIVES.iter().enumerate() {
+            let function = self.native_function(base + index);
+            self.define(prototype.handle(), name, function.to_value());
+        }
+    }
+
     /// Builds the object every array inherits its methods from.
     ///
     /// Rooted through `ARRAY_PROTOTYPE` **before** the methods are installed, because
@@ -1254,32 +1370,8 @@ impl Runtime {
         ARRAY_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
 
         for (index, (name, _)) in NATIVES.iter().enumerate() {
-            // The closure carries `-(index + 1)`, which `crisol_closure_code` reads back as a
-            // built-in. No captures: a built-in closes over nothing.
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "there are a handful of built-ins"
-            )]
-            let encoded = -((index as f64) + 1.0);
-            let method = scope.alloc_with_internals(shape, 0, 1);
-            self.heap
-                .set_internal(method.handle(), 0, Value::number(encoded));
-
-            let key = PropertyKey::new(name);
-            let (target, slot, width) = {
-                let mut shapes = self.shapes.borrow_mut();
-                let target = shapes.add(
-                    self.heap.shape_of(prototype.handle()).unwrap_or(shape),
-                    &key,
-                );
-                let Some(slot) = shapes.lookup(target, &key) else {
-                    continue;
-                };
-                (target, slot, shapes.len(target) as usize)
-            };
-            self.heap.transition(prototype.handle(), target, width);
-            self.heap
-                .set(prototype.handle(), slot.index(), method.to_value());
+            let method = self.native_function(index);
+            self.define(prototype.handle(), name, method.to_value());
         }
     }
 }
@@ -1608,6 +1700,13 @@ pub extern "C" fn crisol_create_closure(function: u64, captures: u64) -> u64 {
         )]
         let index = Value::number(function as f64);
         runtime.heap.set_internal(closure.handle(), 0, index);
+        // Inherits from `Function.prototype`, which is what makes `f.call` and `f.apply` reach
+        // anything at all.
+        if let Some(prototype) = FUNCTION_PROTOTYPE.with(std::cell::Cell::get) {
+            runtime
+                .heap
+                .set_prototype(closure.handle(), Some(prototype));
+        }
 
         // **Every function gets a `prototype` object.** `new f()` links an instance to it and
         // `x instanceof f` looks for it, so a function without one makes both silently wrong —
@@ -1771,6 +1870,46 @@ fn index_value(index: usize) -> u64 {
     )]
     let number = index as f64;
     Value::number(number).to_bits()
+}
+
+/// Whether `element` is `wanted`, by `===`.
+fn same_value(element: Value, wanted: Value) -> bool {
+    match (element.as_number(), wanted.as_number()) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) if element.kind() == crisol_value::Kind::String => text_of(element.to_bits())
+            .zip(text_of(wanted.to_bits()))
+            .is_some_and(|(a, b)| a == b),
+        (None, None) => element == wanted,
+        _ => false,
+    }
+}
+
+/// An index argument, resolved the way the specification does.
+///
+/// **A negative index counts from the end** — `[1,2,3].slice(-1)` is `[3]` — and anything past
+/// either end clamps rather than erroring. `undefined` takes `fallback`, which is why `slice()`
+/// with no arguments is the whole array and `slice(1)` runs to the end.
+fn relative_index(value: u64, length: usize, fallback: usize) -> usize {
+    let Some(number) = Value::from_bits(value).as_number() else {
+        return fallback;
+    };
+    if number.is_nan() {
+        return 0;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+    let span = length as f64;
+    let resolved = if number < 0.0 {
+        (span + number).max(0.0)
+    } else {
+        number.min(span)
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped into 0..=length just above"
+    )]
+    let index = resolved as usize;
+    index
 }
 
 /// `Array.prototype.map` — a new array of the results.
@@ -1954,6 +2093,409 @@ extern "C" fn array_push(
     })
 }
 
+/// `Array.prototype.lastIndexOf`.
+extern "C" fn array_last_index_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
+    for index in (0..length).rev() {
+        if same_value(Value::from_bits(element_at(array, index)), wanted) {
+            return index_value(index);
+        }
+    }
+    Value::number(-1.0).to_bits()
+}
+
+/// `Array.prototype.includes`.
+///
+/// **Unlike `indexOf` this finds `NaN`**: it uses SameValueZero rather than `===`, so
+/// `[NaN].includes(NaN)` is true where `[NaN].indexOf(NaN)` is `-1`.
+extern "C" fn array_includes(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
+    let seeking_nan = wanted.as_number().is_some_and(f64::is_nan);
+    for index in 0..length {
+        let element = Value::from_bits(element_at(array, index));
+        let found = if seeking_nan {
+            element.as_number().is_some_and(f64::is_nan)
+        } else {
+            same_value(element, wanted)
+        };
+        if found {
+            return Value::TRUE.to_bits();
+        }
+    }
+    Value::FALSE.to_bits()
+}
+
+/// `Array.prototype.join`.
+extern "C" fn array_join(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    let separator = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
+        ",".to_owned()
+    } else {
+        to_text(given).unwrap_or_else(|| ",".to_owned())
+    };
+
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let mut out = String::new();
+        for index in 0..length {
+            if index > 0 {
+                out.push_str(&separator);
+            }
+            let element = Value::from_bits(element_at(array, index));
+            // **`null` and `undefined` join as empty**, not as their names.
+            if !matches!(
+                element.kind(),
+                crisol_value::Kind::Null | crisol_value::Kind::Undefined
+            ) && let Some(text) = to_text(element.to_bits())
+            {
+                out.push_str(&text);
+            }
+        }
+        new_string(&out)
+    })
+}
+
+/// `Array.prototype.slice`.
+extern "C" fn array_slice(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    // SAFETY: as above.
+    let end = relative_index(unsafe { argument(argc, argv, 1) }, length, length);
+    let taken = end.saturating_sub(start);
+
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        with_new_array(taken, |result| {
+            for offset in 0..taken {
+                let element = element_at(array, start + offset);
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(result, offset, Value::from_bits(element))
+                });
+            }
+            result.to_value().to_bits()
+        })
+    })
+}
+
+/// `Array.prototype.concat`.
+extern "C" fn array_concat(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // **An array argument is spread and anything else appended whole**, which is what makes
+        // `[1].concat([2, 3])` three elements and `[1].concat(2)` two.
+        let mut flattened: Vec<u64> = Vec::new();
+        let mut take = |value: u64| {
+            if let Some((array, length)) = elements_of(value) {
+                for index in 0..length {
+                    flattened.push(element_at(array, index));
+                }
+            } else {
+                flattened.push(value);
+            }
+        };
+        take(this_value);
+        for position in 0..argc as usize {
+            // SAFETY: as above.
+            take(unsafe { argument(argc, argv, position) });
+        }
+        array_of_values(&flattened)
+    })
+}
+
+/// `Array.prototype.reverse`, in place.
+extern "C" fn array_reverse(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    for index in 0..length / 2 {
+        let mirror = length - 1 - index;
+        let left = element_at(array, index);
+        let right = element_at(array, mirror);
+        with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(array, index, Value::from_bits(right));
+            runtime
+                .heap
+                .set_element(array, mirror, Value::from_bits(left));
+        });
+    }
+    this_value
+}
+
+/// `Array.prototype.pop`.
+extern "C" fn array_pop(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    if length == 0 {
+        return Value::UNDEFINED.to_bits();
+    }
+    let last = element_at(array, length - 1);
+    with_runtime(|runtime| runtime.heap.truncate_elements(array, length - 1));
+    last
+}
+
+/// `Array.prototype.shift`.
+extern "C" fn array_shift(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    if length == 0 {
+        return Value::UNDEFINED.to_bits();
+    }
+    let first = element_at(array, 0);
+    with_runtime(|runtime| {
+        for index in 1..length {
+            let moved = runtime
+                .heap
+                .element(array, index)
+                .unwrap_or(Value::UNDEFINED);
+            runtime.heap.set_element(array, index - 1, moved);
+        }
+        runtime.heap.truncate_elements(array, length - 1);
+    });
+    first
+}
+
+/// `Array.prototype.unshift`.
+extern "C" fn array_unshift(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let added = argc as usize;
+    if added == 0 {
+        return index_value(length);
+    }
+    with_runtime(|runtime| {
+        // Grown first, then moved from the back, so nothing is overwritten before it has moved.
+        runtime
+            .heap
+            .set_element(array, length + added - 1, Value::UNDEFINED);
+        for index in (0..length).rev() {
+            let moved = runtime
+                .heap
+                .element(array, index)
+                .unwrap_or(Value::UNDEFINED);
+            runtime.heap.set_element(array, index + added, moved);
+        }
+        for position in 0..added {
+            // SAFETY: the convention guarantees `argc` readable values at `argv`.
+            let value = unsafe { argument(argc, argv, position) };
+            runtime
+                .heap
+                .set_element(array, position, Value::from_bits(value));
+        }
+    });
+    index_value(length + added)
+}
+
+/// `find` and `findIndex`, which differ only in what they answer with.
+fn find_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        for index in 0..length {
+            let element = element_at(array, index);
+            let verdict = call_value(
+                callback,
+                this_value,
+                &[element, index_value(index), this_value],
+            );
+            if is_truthy(Value::from_bits(verdict)) {
+                return if want_index {
+                    index_value(index)
+                } else {
+                    element
+                };
+            }
+        }
+        // **`find` answers `undefined` and `findIndex` answers `-1`** when nothing matches.
+        if want_index {
+            Value::number(-1.0).to_bits()
+        } else {
+            Value::UNDEFINED.to_bits()
+        }
+    })
+}
+
+/// `Array.prototype.find`.
+extern "C" fn array_find(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    find_with(this_value, argc, argv, false)
+}
+
+/// `Array.prototype.findIndex`.
+extern "C" fn array_find_index(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    find_with(this_value, argc, argv, true)
+}
+
+/// `every` and `some`, which differ only in what stops them.
+fn quantify(this_value: u64, argc: u64, argv: *const u64, want_all: bool) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        for index in 0..length {
+            let element = element_at(array, index);
+            let verdict = call_value(
+                callback,
+                this_value,
+                &[element, index_value(index), this_value],
+            );
+            if is_truthy(Value::from_bits(verdict)) != want_all {
+                return if want_all { Value::FALSE } else { Value::TRUE }.to_bits();
+            }
+        }
+        // **Empty is `true` for `every` and `false` for `some`**, which follows from each
+        // stopping on the opposite answer and neither ever stopping.
+        if want_all { Value::TRUE } else { Value::FALSE }.to_bits()
+    })
+}
+
+/// `Array.prototype.every`.
+extern "C" fn array_every(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    quantify(this_value, argc, argv, true)
+}
+
+/// `Array.prototype.some`.
+extern "C" fn array_some(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    quantify(this_value, argc, argv, false)
+}
+
+/// `Array.prototype.fill`.
+extern "C" fn array_fill(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let start = relative_index(unsafe { argument(argc, argv, 1) }, length, 0);
+    // SAFETY: as above.
+    let end = relative_index(unsafe { argument(argc, argv, 2) }, length, length);
+    with_runtime(|runtime| {
+        for index in start..end {
+            runtime
+                .heap
+                .set_element(array, index, Value::from_bits(value));
+        }
+    });
+    this_value
+}
+
 /// `Array.prototype.indexOf`, by `===` on numbers and by identity otherwise.
 extern "C" fn array_index_of(
     _closure: u64,
@@ -2039,9 +2581,13 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + NAMESPACE_NATIVES.len();
-        return ANONYMOUS_NATIVES
+        if let Some(function) = ANONYMOUS_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + ANONYMOUS_NATIVES.len();
+        return FUNCTION_NATIVES
             .get(native.wrapping_sub(offset))
-            .map_or(fallback, |function| *function as *const u8);
+            .map_or(fallback, |(_, function)| *function as *const u8);
     }
     #[expect(
         clippy::cast_possible_truncation,

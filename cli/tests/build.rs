@@ -1378,3 +1378,185 @@ fn a_chain_stops_at_the_first_missing_link() {
         "TypeError",
     );
 }
+
+// ---- more array methods -----------------------------------------------------------------
+
+#[test]
+fn searching_methods_agree_with_the_specification() {
+    check("arr-lastindexof", "return [1, 2, 1].lastIndexOf(1);", "2");
+    check("arr-includes", "return [1, 2].includes(2);", "true");
+    // **`includes` finds NaN and `indexOf` does not** — SameValueZero against `===`.
+    check(
+        "arr-includes-nan",
+        "return [0 / 0].includes(0 / 0);",
+        "true",
+    );
+    check("arr-indexof-nan", "return [0 / 0].indexOf(0 / 0);", "-1");
+}
+
+#[test]
+fn join_uses_a_separator_and_skips_nothing_values() {
+    check("arr-join", "return [1, 2, 3].join(\"-\");", "1-2-3");
+    check("arr-join-default", "return [1, 2].join();", "1,2");
+    // `null` and `undefined` join as empty, not as their names.
+    check(
+        "arr-join-nullish",
+        "return [1, null, 2].join(\"-\");",
+        "1--2",
+    );
+}
+
+/// **A negative index counts from the end**, and past either end clamps.
+#[test]
+fn slice_handles_relative_indices() {
+    check(
+        "arr-slice",
+        "return [1, 2, 3, 4].slice(1, 3).join(\",\");",
+        "2,3",
+    );
+    check("arr-slice-negative", "return [1, 2, 3].slice(-1)[0];", "3");
+    check("arr-slice-all", "return [1, 2].slice().length;", "2");
+    check("arr-slice-past-end", "return [1, 2].slice(5).length;", "0");
+}
+
+/// **An array argument is spread and anything else appended whole.**
+#[test]
+fn concat_spreads_only_arrays() {
+    check("arr-concat-array", "return [1].concat([2, 3]).length;", "3");
+    check("arr-concat-value", "return [1].concat(2).length;", "2");
+}
+
+#[test]
+fn the_mutating_methods_change_the_array_in_place() {
+    check(
+        "arr-reverse",
+        "return [1, 2, 3].reverse().join(\",\");",
+        "3,2,1",
+    );
+    check(
+        "arr-pop",
+        "let a = [1, 2]; let x = a.pop(); return x + a.length;",
+        "3",
+    );
+    check(
+        "arr-shift",
+        "let a = [1, 2]; let x = a.shift(); return x + a.length;",
+        "2",
+    );
+    check(
+        "arr-unshift",
+        "let a = [2]; a.unshift(0, 1); return a.join(\",\");",
+        "0,1,2",
+    );
+    check("arr-pop-empty", "return [].pop();", "undefined");
+    check(
+        "arr-fill",
+        "return [1, 2, 3].fill(9, 1).join(\",\");",
+        "1,9,9",
+    );
+}
+
+/// **`find` answers `undefined` and `findIndex` answers `-1`** when nothing matches.
+#[test]
+fn find_and_find_index_differ_when_nothing_matches() {
+    check(
+        "arr-find",
+        "return [1, 5].find(function (x) { return x > 2; });",
+        "5",
+    );
+    check(
+        "arr-find-none",
+        "return [1].find(function (x) { return x > 2; });",
+        "undefined",
+    );
+    check(
+        "arr-findindex",
+        "return [1, 5].findIndex(function (x) { return x > 2; });",
+        "1",
+    );
+    check(
+        "arr-findindex-none",
+        "return [1].findIndex(function (x) { return x > 2; });",
+        "-1",
+    );
+}
+
+/// **Empty is `true` for `every` and `false` for `some`** — each stops on the opposite answer,
+/// and on an empty array neither ever stops.
+#[test]
+fn every_and_some_agree_on_the_empty_array() {
+    check(
+        "arr-every",
+        "return [2, 4].every(function (x) { return x > 1; });",
+        "true",
+    );
+    check(
+        "arr-every-false",
+        "return [2, 0].every(function (x) { return x > 1; });",
+        "false",
+    );
+    check(
+        "arr-some",
+        "return [0, 4].some(function (x) { return x > 1; });",
+        "true",
+    );
+    check(
+        "arr-every-empty",
+        "return [].every(function (x) { return false; });",
+        "true",
+    );
+    check(
+        "arr-some-empty",
+        "return [].some(function (x) { return true; });",
+        "false",
+    );
+}
+
+// ---- Function.prototype -----------------------------------------------------------------
+
+/// **`this` inside `call` is the function**, not its receiver — the receiver is the first
+/// argument. That inversion is the whole of what `call` does, and it is how test262 applies a
+/// method to a receiver the method was not written for.
+#[test]
+fn call_invokes_a_function_with_a_chosen_receiver() {
+    check(
+        "fn-call",
+        "let f = function () { return this.x; }; let o = {x: 5}; return f.call(o);",
+        "5",
+    );
+    check(
+        "fn-call-args",
+        "let f = function (a, b) { return a + b; }; return f.call(null, 2, 3);",
+        "5",
+    );
+    check(
+        "fn-call-method",
+        "return [1, 2, 3].indexOf.call([4, 5], 5);",
+        "1",
+    );
+}
+
+#[test]
+fn apply_takes_its_arguments_as_an_array() {
+    check(
+        "fn-apply",
+        "let f = function (a, b) { return a + b; }; return f.apply(null, [2, 3]);",
+        "5",
+    );
+    // `null` for the argument list means no arguments, which is not an error.
+    check(
+        "fn-apply-none",
+        "let f = function () { return 7; }; return f.apply(null, null);",
+        "7",
+    );
+}
+
+/// A method reached through `call` on a receiver it was not written for must not crash.
+#[test]
+fn a_method_applied_to_a_wrong_receiver_answers_rather_than_failing() {
+    check(
+        "fn-call-boolean",
+        "return Array.prototype.indexOf.call(true);",
+        "undefined",
+    );
+}
