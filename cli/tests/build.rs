@@ -393,3 +393,69 @@ fn a_property_on_a_function_does_not_break_calling_it() {
         "5",
     );
 }
+
+// ---- captured variables are shared, not copied (D-97) ----------------------------------
+
+/// JavaScript captures the **binding**, not the value. A closure that copied what it captured
+/// would pass every read-only test and give a plausible wrong answer the moment anything wrote.
+#[test]
+fn a_write_inside_a_closure_is_seen_outside_it() {
+    check(
+        "capture-write",
+        "let n = 0; let f = function () { n = 1; }; f(); return n;",
+        "1",
+    );
+}
+
+#[test]
+fn a_write_outside_a_closure_is_seen_inside_it() {
+    // The other direction, and the one a snapshot-at-creation implementation gets wrong even
+    // if writes from inside somehow worked.
+    check(
+        "capture-read-after",
+        "let n = 1; let f = function () { return n; }; n = 2; return f();",
+        "2",
+    );
+}
+
+#[test]
+fn a_counter_in_a_closure_accumulates() {
+    check(
+        "capture-counter",
+        "let total = 0; let add = function (x) { total = total + x; }; \
+         add(1); add(2); add(3); return total;",
+        "6",
+    );
+}
+
+#[test]
+fn two_closures_over_one_variable_see_each_other() {
+    check(
+        "capture-shared",
+        "let n = 0; let set = function (v) { n = v; }; let get = function () { return n; }; \
+         set(7); return get();",
+        "7",
+    );
+}
+
+/// A shared *parameter* has no cell to arrive in — the caller passes a plain value — so the
+/// callee wraps it at entry. Without that, this reads the unwrapped argument as a cell.
+#[test]
+fn a_captured_parameter_is_shared_too() {
+    check(
+        "capture-parameter",
+        "let outer = function (n) { let bump = function () { n = n + 1; }; bump(); return n; }; \
+         return outer(5);",
+        "6",
+    );
+}
+
+/// A variable nobody assigns must stay a plain value, or every closure pays for a cell.
+#[test]
+fn a_captured_but_never_assigned_variable_still_reads_correctly() {
+    check(
+        "capture-readonly",
+        "let n = 10; let f = function (x) { return x + n; }; return f(5);",
+        "15",
+    );
+}

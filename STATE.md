@@ -24,9 +24,10 @@ and a constructor returning an object replacing the instance. Heap objects carry
 the collector traces, and engine state lives beside the property slots rather than in them
 (D-96), which is what made every class constructor silently uncallable.
 
-**Known defect: captured variables are copied, not shared** (D-97). Assigning a captured
-variable gives a plausible wrong answer rather than failing. The fix is heap cells for
-variables that are both captured and assigned.
+**Captured variables are shared, not copied** (D-97). A variable that is both captured and
+assigned lives in a heap cell that the closure and the enclosing scope hold jointly, so a
+counter mutated inside a closure accumulates. Decided by a pre-pass, because the lowering only
+discovers a capture after it has emitted the enclosing code.
 
 `CRISOL_GC_STRESS=1` collects on every allocation and is the only thing that tests any of
 this: with the offsets read from the wrong end of the frame, every acceptance test still
@@ -37,7 +38,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1023 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1029 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

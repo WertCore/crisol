@@ -3018,9 +3018,9 @@ at all until something stores one, which is what an object literal already does.
 
 ## D-97
 
-**Captured variables are copied, which is wrong, and is recorded rather than hidden.**
+**A variable that is both captured and assigned lives in a heap cell, shared rather than copied.**
 
-Status: Accepted, with a known defect
+Status: Accepted — the defect below is fixed
 
 `Op::Closure` copies each captured value into the closure when it is created. JavaScript
 captures the *binding*, not the value, so two programs give the wrong answer today:
@@ -3033,12 +3033,27 @@ let n = 1; let f = function () { return n; }; n = 2; f();  // gives 1, should be
 Both compile, run, and print a plausible number. That is the failure mode D-59 argues is worse
 than not building at all, so it is written down here rather than left to be discovered.
 
-The fix is the standard one: a variable that is both captured and assigned lives in a heap cell,
-and the closure and the enclosing scope share the cell rather than the value. It needs a
-frontend pass to find those variables, which is why it is not in the same change as the
-discovery.
+The fix is the standard one. Such a variable lives in a heap cell; the closure and the
+enclosing scope hold the same cell, so a write through either is seen by both.
 
-**Not refused in the meantime**, and that is a deliberate trade against D-59's principle: a
-counter mutated inside a closure is ordinary JavaScript, and refusing every one of them would
-reject far more real programs than the defect currently spoils. The honest position is that
-this is a bug with a known fix and a written-down reproduction, not a design.
+**The decision has to be made before lowering, which is why it is a separate pass.** The
+lowering discovers a capture *when it happens* — a name is captured exactly when resolving it
+walks out of the current scope — and by then the enclosing function's code is already emitted.
+Whether a variable is a cell changes every read and write of it, so the question cannot be
+answered late. `escape::shared_variables` walks the AST first and answers it for the program.
+
+**It over-approximates by name, on purpose.** A name assigned anywhere and mentioned inside any
+function anywhere is shared, so `let n = 1; function f() { let n = 2; n = 3; }` gives both `n`s
+a cell although neither is shared. Being too eager costs a cell and an indirection; being too
+clever costs correctness, and that failure reads a stale value rather than stopping. Real scope
+resolution is worth having later — guessing at it is not.
+
+A cell is an ordinary one-property object, so this needed no new IR operation and no new runtime
+call. That is slower than a dedicated representation and is the right first version: correct
+now, and a measurement before inventing machinery to make it faster.
+
+**Consequence:** a shared *parameter* has no cell to arrive in, because the caller passes a
+plain value. The callee wraps it at entry, reading the argument before `make_cell` overwrites
+the slot. Captures are the opposite and must **not** be wrapped: the value arriving is already
+the enclosing scope's cell, and making a second one there would hand the closure a private copy
+— which is the bug, reintroduced at the use site.

@@ -110,6 +110,10 @@ pub fn lower(name: &str, source: &str) -> Result<Lowered, ParseFailed> {
         });
     }
     let mut lowering = Lowering::new(name);
+    // Answered before lowering, because whether a variable is a cell changes every read and
+    // write of it — and the lowering only discovers a capture once it has already emitted the
+    // enclosing function's code.
+    lowering.shared = crate::escape::shared_variables(&parsed.program);
     lowering.program(&parsed.program);
     Ok(lowering.finish())
 }
@@ -128,6 +132,11 @@ struct Scope {
     /// Discovered during lowering rather than by a pre-pass: a name is a capture exactly when
     /// resolving it walks out of this scope, so the resolution *is* the analysis.
     captures: Vec<(String, u32)>,
+    /// Slots holding a cell rather than the value itself.
+    ///
+    /// Per scope, because slot numbers restart in every function — slot zero is a different
+    /// variable in each one, so a single set would confuse them.
+    cells: std::collections::HashSet<u32>,
 }
 
 struct Lowering {
@@ -135,7 +144,17 @@ struct Lowering {
     /// Innermost last. A nested function pushes; finishing it pops.
     scopes: Vec<Scope>,
     unsupported: Vec<Unsupported>,
+    /// Names a closure must share rather than copy, from [`crate::escape`].
+    shared: std::collections::HashSet<String>,
 }
+
+/// The property a cell keeps its value in.
+///
+/// A cell is an ordinary one-property object, so it needs no new IR operation and no new
+/// runtime call — it allocates, stores and loads exactly like an object literal. That is
+/// slower than a dedicated representation and is the right first version: correctness now,
+/// and a measurement before inventing machinery to make it faster.
+const CELL_KEY: &str = "value";
 
 impl Lowering {
     fn new(name: &str) -> Self {
@@ -146,6 +165,7 @@ impl Lowering {
         let entry = function.entry;
         let mut lowering = Self {
             functions: vec![function],
+            shared: std::collections::HashSet::new(),
             scopes: vec![Scope {
                 function: 0,
                 current: entry,
@@ -153,6 +173,7 @@ impl Lowering {
                 slots: HashMap::new(),
                 next_slot: 0,
                 captures: Vec::new(),
+                cells: std::collections::HashSet::new(),
             }],
             unsupported: Vec::new(),
         };
@@ -254,6 +275,63 @@ impl Lowering {
         }
     }
 
+    /// Reads a variable, going through its cell when it has one.
+    ///
+    /// Every read of a local goes through here, so a shared variable cannot be read directly by
+    /// some path that forgot — which would produce a stale value rather than a failure.
+    fn read(&mut self, slot: u32) -> ValueId {
+        let held = self.emit(Type::Unknown, Op::Load { slot });
+        if self.scope().cells.contains(&slot) {
+            return self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object: held,
+                    key: PropertyKey::new(CELL_KEY),
+                },
+            );
+        }
+        held
+    }
+
+    /// Writes a variable, through its cell when it has one.
+    fn write(&mut self, slot: u32, value: ValueId) {
+        if self.scope().cells.contains(&slot) {
+            let cell = self.emit(Type::Unknown, Op::Load { slot });
+            self.emit_effect(Op::PropertyStore {
+                object: cell,
+                key: PropertyKey::new(CELL_KEY),
+                value,
+            });
+            return;
+        }
+        self.emit_effect(Op::Store { slot, value });
+    }
+
+    /// Binds a freshly declared variable to its first value.
+    ///
+    /// A variable closures must share gets its cell here, at the declaration — not where it is
+    /// later resolved. A captured name already holds the cell the enclosing scope made, and
+    /// making a second one at the use site would hand the closure a private copy, which is
+    /// precisely the bug cells exist to fix.
+    fn bind(&mut self, name: &str, slot: u32, value: ValueId) {
+        if self.shared.contains(name) {
+            self.make_cell(slot);
+        }
+        self.write(slot, value);
+    }
+
+    /// Gives `slot` a fresh cell, for a variable closures must share rather than copy.
+    ///
+    /// Called where the variable is *declared*, not where it is resolved: a captured name
+    /// already holds the cell the enclosing scope made, and making a second one there would
+    /// give the closure a private copy — exactly the bug this exists to fix.
+    fn make_cell(&mut self, slot: u32) {
+        let shape = crisol_value::Shapes::new().root();
+        let cell = self.emit(Type::Object(None), Op::CreateObject { shape });
+        self.emit_effect(Op::Store { slot, value: cell });
+        self.scope_mut().cells.insert(slot);
+    }
+
     fn slot(&mut self, name: &str) -> u32 {
         if let Some(slot) = self.scope().slots.get(name) {
             return *slot;
@@ -271,6 +349,11 @@ impl Lowering {
         let slot = self.declare(name);
         if captured {
             self.scope_mut().captures.push((name.to_owned(), slot));
+            if self.shared.contains(name) {
+                // The value arriving is the *cell* the enclosing scope made, not a copy of
+                // what was in it — which is what makes a write here visible out there.
+                self.scope_mut().cells.insert(slot);
+            }
         }
         slot
     }
@@ -333,7 +416,7 @@ impl Lowering {
                     // `declare`, not `slot`: a `let` shadows an outer binding rather than
                     // capturing it.
                     let slot = self.declare(name.as_str());
-                    self.emit_effect(Op::Store { slot, value });
+                    self.bind(name.as_str(), slot, value);
                 }
             }
             Statement::ReturnStatement(statement) => {
@@ -434,10 +517,7 @@ impl Lowering {
                 // an unset slot rather than working. Recorded rather than silently half-right.
                 self.note("function declaration hoisting", declaration.span.start);
                 let slot = self.declare(&name);
-                self.emit_effect(Op::Store {
-                    slot,
-                    value: closure,
-                });
+                self.bind(&name, slot, closure);
             }
             Statement::ClassDeclaration(class) => {
                 let name = class
@@ -446,7 +526,7 @@ impl Lowering {
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
                 let value = self.class(class, &name);
                 let slot = self.declare(&name);
-                self.emit_effect(Op::Store { slot, value });
+                self.bind(&name, slot, value);
             }
             Statement::EmptyStatement(_) => {}
             other => {
@@ -475,7 +555,7 @@ impl Lowering {
                     return self.emit(Type::Undefined, Op::Const(Constant::Undefined));
                 }
                 let slot = self.slot(identifier.name.as_str());
-                self.emit(Type::Unknown, Op::Load { slot })
+                self.read(slot)
             }
             Expression::BinaryExpression(binary) => self.binary(binary),
             Expression::AssignmentExpression(assignment) => {
@@ -487,7 +567,7 @@ impl Lowering {
                 match &assignment.left {
                     oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
                         let slot = self.slot(identifier.name.as_str());
-                        self.emit_effect(Op::Store { slot, value });
+                        self.write(slot, value);
                     }
                     oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) => {
                         let object = self.expression(&member.object);
@@ -615,7 +695,7 @@ impl Lowering {
             }
             Expression::ThisExpression(_) => {
                 let slot = self.slot("this");
-                self.emit(Type::Unknown, Op::Load { slot })
+                self.read(slot)
             }
             Expression::UnaryExpression(unary) => self.unary(unary),
             Expression::LogicalExpression(logical) => self.logical(logical),
@@ -879,6 +959,7 @@ impl Lowering {
             slots: HashMap::new(),
             next_slot: 0,
             captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
         });
 
         if binds_this {
@@ -893,10 +974,17 @@ impl Lowering {
         }
 
         let mut parameter_slots = Vec::with_capacity(params.items.len());
+        let mut shared_parameters = Vec::new();
         for param in &params.items {
             match param.pattern.get_identifier_name() {
                 // `declare`, not `slot`: a parameter shadows an outer binding of the same name.
-                Some(param_name) => parameter_slots.push(self.declare(param_name.as_str())),
+                Some(param_name) => {
+                    let slot = self.declare(param_name.as_str());
+                    if self.shared.contains(param_name.as_str()) {
+                        shared_parameters.push(slot);
+                    }
+                    parameter_slots.push(slot);
+                }
                 None => {
                     self.note("destructuring parameter", param.span.start);
                     // Still consumes a position, or every later parameter would shift down one
@@ -905,6 +993,15 @@ impl Lowering {
                     parameter_slots.push(placeholder);
                 }
             }
+        }
+
+        // A shared parameter arrives as a plain value — the caller has no cell to pass — so it
+        // is wrapped here, before any of the body can read it. Read first, then make the cell:
+        // `make_cell` overwrites the slot, and the incoming argument is what goes inside.
+        for slot in shared_parameters {
+            let arrived = self.emit(Type::Unknown, Op::Load { slot });
+            self.make_cell(slot);
+            self.write(slot, arrived);
         }
 
         if let Some(body) = body {
@@ -1039,6 +1136,7 @@ impl Lowering {
             slots: HashMap::new(),
             next_slot: 0,
             captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
         });
         self.declare("this");
         self.terminate(Terminator::Return(None));
