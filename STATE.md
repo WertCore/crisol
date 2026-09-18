@@ -10,7 +10,8 @@ measures them from (D-93). Object literals and property access compile.
 
 Every compiled function now takes `(closure, this, new.target, argc, argv)` (D-94), so a
 call site does not need to know which function it is reaching — the prerequisite for closures,
-classes and array methods. `this` arrives but is not yet bound to its slot.
+classes and array methods. `this` is bound to the slot the function names, and a function
+knows its own `FunctionId` so a closure can be resolved without relying on compile order.
 
 `CRISOL_GC_STRESS=1` collects on every allocation and is the only thing that tests any of
 this: with the offsets read from the wrong end of the frame, every acceptance test still
@@ -21,7 +22,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1004 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1006 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

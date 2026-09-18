@@ -386,6 +386,9 @@ fn every_problem_is_reported_not_just_the_first() {
 /// A function taking `count` captured values.
 fn callee(count: usize) -> Function {
     let mut function = Function::new("callee");
+    // These two make a module, so each has to know its own position in it — the callee is
+    // function 1, which is what `Op::Closure` below names.
+    function.id = FunctionId(1);
     function.captures = (0..u32::try_from(count).expect("small")).collect();
     function
 }
@@ -393,6 +396,7 @@ fn callee(count: usize) -> Function {
 /// A program whose entry block closes over `@1` with `count` values.
 fn caller(count: usize) -> Function {
     let mut function = Function::new("caller");
+    function.id = FunctionId(0);
     let mut captures = Vec::new();
     for value in 0..count {
         let id = function.value();

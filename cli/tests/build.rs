@@ -206,3 +206,10 @@ fn objects_survive_a_collection_at_every_allocation() {
         "an object held only by a compiled frame must survive collection"
     );
 }
+
+#[test]
+fn this_at_the_top_level_is_undefined() {
+    // A module's `this` is `undefined`, not the global object. The entry point passes it
+    // explicitly, so this checks the value actually arrives rather than defaulting.
+    check("this-toplevel", "return this;", "undefined");
+}

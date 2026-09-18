@@ -522,6 +522,27 @@ pub struct Function {
     /// (D-59), and a parameter is a local that arrives pre-assigned. When that pass lands
     /// these become entry-block parameters and this list goes away.
     pub parameters: Vec<u32>,
+    /// Its own index in the module's function list.
+    ///
+    /// [`Op::Closure`] names a callee by [`FunctionId`], and a backend has to turn that into
+    /// the right compiled function. It could instead rely on compiling them in order and
+    /// counting — which is true today and is exactly the kind of coupling that breaks quietly
+    /// the first time anything compiles them in a different order or skips one.
+    ///
+    /// [`crate::verify_module`] checks `functions[i].id == i`, so the field cannot drift from
+    /// the position it claims.
+    pub id: FunctionId,
+    /// The slot holding `this`, when the function binds one.
+    ///
+    /// `None` for an arrow function, which does not bind its own `this` but captures the
+    /// enclosing one — so for an arrow, `this` arrives as a capture like any other value.
+    ///
+    /// Recorded rather than left implicit. The frontend declares `this` ahead of the
+    /// parameters, so it is slot zero in every ordinary function, and the backend could simply
+    /// assume that. It would be right today and wrong the first time anything is declared
+    /// earlier, and the failure would be a `this` bound to some other local — a plausible
+    /// value, not a crash.
+    pub this_slot: Option<u32>,
     /// Slots that receive the captured values, positionally matching [`Op::Closure`]'s
     /// `captures`.
     ///
@@ -547,8 +568,10 @@ impl Function {
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
+            id: FunctionId(0),
             name: name.to_owned(),
             parameters: Vec::new(),
+            this_slot: None,
             captures: Vec::new(),
             entry: BlockId(0),
             blocks: vec![Block {

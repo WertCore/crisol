@@ -690,10 +690,14 @@ impl Lowering<'_> {
         let closure = incoming[0];
         let argc = incoming[3];
         let argv = incoming[4];
-        // `incoming[1]` and `incoming[2]` are `this` and `new.target`. They are not bound yet:
-        // the frontend models `this` as a *slot* it declares ahead of the parameters, and
-        // nothing in `Function` says which slot that is — relying on "slot zero by
-        // construction" would couple the two silently. That needs a field on `Function`.
+        // `this` goes to the slot the function says holds it. An arrow has none: it captures
+        // the enclosing `this` instead, so the value arrives as a capture below and the one
+        // passed here is ignored.
+        if let Some(slot) = function.this_slot {
+            let variable = self.variable(slot);
+            self.builder.def_var(variable, incoming[1]);
+        }
+        // `incoming[2]` is `new.target`, which nothing reads until classes.
 
         let undefined = self
             .builder

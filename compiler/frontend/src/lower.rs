@@ -139,7 +139,10 @@ struct Lowering {
 
 impl Lowering {
     fn new(name: &str) -> Self {
-        let function = Function::new(name);
+        // Function zero is the program itself. Stamped rather than left to the default, so
+        // every producer of a `Function` reads the same way.
+        let mut function = Function::new(name);
+        function.id = FunctionId(0);
         let entry = function.entry;
         let mut lowering = Self {
             functions: vec![function],
@@ -156,7 +159,8 @@ impl Lowering {
         // The program is a function body, so it has a `this` — `undefined` in a module, the
         // global object in a script. Binding it here means a top-level arrow captures it
         // rather than inventing one.
-        lowering.declare("this");
+        let this_slot = lowering.declare("this");
+        lowering.functions[0].this_slot = Some(this_slot);
         lowering
     }
 
@@ -861,7 +865,11 @@ impl Lowering {
         binds_this: bool,
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
-        let function = Function::new(name);
+        let mut function = Function::new(name);
+        // Stamped here rather than left at zero: `verify_module` checks it against the
+        // position, so a missed one fails the build instead of producing a closure that runs
+        // whichever function happens to be first.
+        function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
         let entry = function.entry;
         self.functions.push(function);
         self.scopes.push(Scope {
@@ -876,7 +884,12 @@ impl Lowering {
         if binds_this {
             // Ahead of the parameters so it is slot 0 in every ordinary function. `this` is a
             // reserved word, so no source name can collide with it.
-            self.declare("this");
+            //
+            // Recorded on the function rather than left to that ordering: the backend has to
+            // know which slot to bind the incoming `this` to, and inferring it from the
+            // position would break silently the day anything is declared earlier.
+            let this_slot = self.declare("this");
+            self.functions[index].this_slot = Some(this_slot);
         }
 
         let mut parameter_slots = Vec::with_capacity(params.items.len());
@@ -1015,6 +1028,7 @@ impl Lowering {
     fn implicit_constructor(&mut self, name: &str) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
+        function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
         let entry = function.entry;
         function.captures = Vec::new();
         self.functions.push(function);
