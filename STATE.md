@@ -34,14 +34,11 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**12 passed, 209 failed, 0 crashed, 158 refused.** `Object` and `Array` exist (D-110), and
-hoisting now declares every name before lowering any body (D-111) — which cleared 24 cases
-failing with `Test262Error is not defined`, the suite's own error class, reported missing by a
-compiler that had just compiled it.
-
-What the failures now want: `JSON` (20), `Date` (18), `Proxy` (13), `RegExp` (9), `Symbol` (7),
-and 19 expecting a `TypeError` or `SyntaxError` we do not raise. 38 more compare against
-`undefined`, which is a method on an object that does exist rather than a missing global.
+**6 passed, 215 failed, 0 crashed, 158 refused.** Property access on `null` or `undefined` and
+calling a non-function now raise `TypeError` (D-112), so the accidental passes are gone again
+and the failures say what is missing: `TypeError: is not a function` (90 — a method that does
+not exist, called), `cannot read a property of undefined` (33), then `Date` (18), `Proxy` (12),
+`RegExp` (8), `Symbol` (7), `JSON` (6).
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -77,7 +74,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1137 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1146 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

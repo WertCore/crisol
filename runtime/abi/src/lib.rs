@@ -1336,13 +1336,13 @@ pub unsafe extern "C" fn crisol_property_store(
     key: *const u8,
     length: u64,
     value: u64,
-) {
+) -> u64 {
     let Some(handle) = handle_of(object) else {
-        return;
+        return nullish_access(object);
     };
     // SAFETY: the caller promises `key` names `length` readable bytes of UTF-8.
     let Some(name) = (unsafe { key_text(key, length) }) else {
-        return;
+        return Value::UNDEFINED.to_bits();
     };
     let key = PropertyKey::new(&name);
 
@@ -1365,6 +1365,7 @@ pub unsafe extern "C" fn crisol_property_store(
             .heap
             .set(handle, slot.index(), Value::from_bits(value));
     });
+    Value::UNDEFINED.to_bits()
 }
 
 /// `object[key]`, or `undefined` if it has no such property.
@@ -1380,7 +1381,7 @@ pub unsafe extern "C" fn crisol_property_store(
 #[must_use]
 pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, length: u64) -> u64 {
     let Some(handle) = handle_of(object) else {
-        return Value::UNDEFINED.to_bits();
+        return nullish_access(object);
     };
     // SAFETY: as above.
     let Some(name) = (unsafe { key_text(key, length) }) else {
@@ -1672,7 +1673,23 @@ pub extern "C" fn crisol_not_a_function(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    Value::UNDEFINED.to_bits()
+    raise("is not a function", "TypeError")
+}
+
+/// The `TypeError` a property access on `null` or `undefined` raises.
+///
+/// Answering `undefined` instead makes `x.y.z` on a missing `x` fail two lines later carrying a
+/// value that looks like a legitimate absence — which is why nearly every test expecting a
+/// `TypeError` saw a wrong value rather than the error.
+fn nullish_access(object: u64) -> u64 {
+    let what = match Value::from_bits(object).kind() {
+        crisol_value::Kind::Null => "null",
+        crisol_value::Kind::Undefined => "undefined",
+        // A number or a boolean has no properties here, but reading one is not an error — the
+        // specification wraps it, and until that exists `undefined` is the closer answer.
+        _ => return Value::UNDEFINED.to_bits(),
+    };
+    raise(&format!("cannot read a property of {what}"), "TypeError")
 }
 
 /// Roots `values` on the shadow stack for the duration of `body`.
@@ -2132,7 +2149,7 @@ pub extern "C" fn crisol_create_array(length: u64) -> u64 {
 #[must_use]
 pub extern "C" fn crisol_computed_load(object: u64, key: u64) -> u64 {
     let Some(handle) = handle_of(object) else {
-        return Value::UNDEFINED.to_bits();
+        return nullish_access(object);
     };
     let key = Value::from_bits(key);
 
@@ -2151,9 +2168,9 @@ pub extern "C" fn crisol_computed_load(object: u64, key: u64) -> u64 {
 
 /// `object[key] = value`.
 #[unsafe(no_mangle)]
-pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) {
+pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) -> u64 {
     let Some(handle) = handle_of(object) else {
-        return;
+        return nullish_access(object);
     };
     let key = Value::from_bits(key);
 
@@ -2165,10 +2182,10 @@ pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) {
         })
     });
     if stored {
-        return;
+        return Value::UNDEFINED.to_bits();
     }
     let Some(name) = key_of(key) else {
-        return;
+        return Value::UNDEFINED.to_bits();
     };
     let text = name.as_str().to_owned();
     // SAFETY: as above.

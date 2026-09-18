@@ -232,6 +232,11 @@ bb0:  ; entry
     v3: unknown = load $1
     v4: number = const 0.0
     v5: unknown = get v3[v4]  ; safepoint []
+    v6: bool = is-exception v5
+    branch v6 -> bb1, bb2
+bb1:
+    return v5
+bb2:
     store $2, v5
     return
 }
@@ -248,7 +253,12 @@ bb0:  ; entry
     v2: number = const 2.0
     v3: unknown = load $1
     v4: number = const 0.0
-    set v3[v4] = v2  ; safepoint []
+    v5: unknown = set v3[v4] = v2  ; safepoint []
+    v6: bool = is-exception v5
+    branch v6 -> bb1, bb2
+bb1:
+    return v5
+bb2:
     return
 }
 
@@ -263,11 +273,21 @@ bb0:  ; entry
     v1: number = const 5.0
     v2: unknown = load $1
     v3: number = const 1.0
-    set v2[v3] = v1  ; safepoint []
-    v4: unknown = load $1
-    v5: number = const 1.0
-    v6: unknown = get v4[v5]  ; safepoint []
-    store $2, v6
+    v4: unknown = set v2[v3] = v1  ; safepoint []
+    v5: bool = is-exception v4
+    branch v5 -> bb1, bb2
+bb1:
+    return v4
+bb2:
+    v6: unknown = load $1
+    v7: number = const 1.0
+    v8: unknown = get v6[v7]  ; safepoint []
+    v9: bool = is-exception v8
+    branch v9 -> bb3, bb4
+bb3:
+    return v8
+bb4:
+    store $2, v8
     return
 }
 
@@ -781,6 +801,11 @@ bb0:  ; entry
     store $1, v0
     v2: unknown = load $1
     v3: unknown = get v2."a"  ; safepoint []
+    v4: bool = is-exception v3
+    branch v4 -> bb1, bb2
+bb1:
+    return v3
+bb2:
     store $2, v3
     return
 }
@@ -797,8 +822,18 @@ bb0:  ; entry
     store $1, v0
     v2: unknown = load $1
     v3: unknown = get v2."a"  ; safepoint []
-    v4: unknown = get v3."b"  ; safepoint []
-    store $2, v4
+    v4: bool = is-exception v3
+    branch v4 -> bb1, bb2
+bb1:
+    return v3
+bb2:
+    v5: unknown = get v3."b"  ; safepoint []
+    v6: bool = is-exception v5
+    branch v6 -> bb3, bb4
+bb3:
+    return v5
+bb4:
+    store $2, v5
     return
 }
 
@@ -1555,7 +1590,12 @@ function C.constructor($1) {
 bb0:  ; entry
     v0: unknown = load $1
     v1: unknown = load $0
-    set v1."x" = v0  ; safepoint []
+    v2: unknown = set v1."x" = v0  ; safepoint []
+    v3: bool = is-exception v2
+    branch v3 -> bb1, bb2
+bb1:
+    return v2
+bb2:
     return
 }
 
@@ -1601,13 +1641,23 @@ function C.constructor($1) {
 bb0:  ; entry
     v0: unknown = load $1
     v1: unknown = load $0
-    set v1."x" = v0  ; safepoint []
+    v2: unknown = set v1."x" = v0  ; safepoint []
+    v3: bool = is-exception v2
+    branch v3 -> bb1, bb2
+bb1:
+    return v2
+bb2:
     return
 }
 function C.m {
 bb0:  ; entry
     v0: unknown = load $0
     v1: unknown = get v0."x"  ; safepoint []
+    v2: bool = is-exception v1
+    branch v2 -> bb1, bb2
+bb1:
+    return v1
+bb2:
     return v1
 }
 
@@ -1678,7 +1728,12 @@ function C.constructor($1) {
 bb0:  ; entry
     v0: unknown = load $1
     v1: unknown = load $0
-    set v1."x" = v0  ; safepoint []
+    v2: unknown = set v1."x" = v0  ; safepoint []
+    v3: bool = is-exception v2
+    branch v3 -> bb1, bb2
+bb1:
+    return v2
+bb2:
     return
 }
 

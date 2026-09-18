@@ -3407,3 +3407,32 @@ declaration still reads the slot's value at that moment, which is `undefined` un
 declaration runs — right for `var`, wrong for a function declaration, whose closure the
 specification installs before any statement executes. That difference is now the only part of
 hoisting still missing.
+
+## D-112
+
+**Property access raises `TypeError` on `null` and `undefined`, and every access checks.**
+
+Status: Accepted
+
+Reading a property of nothing answered `undefined`. That is not a shortcut with a small cost:
+`x.y.z` on a missing `x` then fails *two lines later* carrying a value that looks like a
+legitimate absence, so the failure names the wrong place. 33 of test262's sampled cases were
+exactly this, reported as a wrong value rather than the error they expected.
+
+All four accesses now raise — static and computed, read and write — which means the two store
+helpers had to start returning a value for the caller to check. A store is no longer an
+effect-only operation in the IR; it produces the exception signal or `undefined`, and the
+frontend follows it with the same branch a call gets (D-104).
+
+Calling a non-function raises too. That needed no new machinery at all: `crisol_not_a_function`
+already existed as the fallback that kept a bad callee from jumping through a null pointer
+(D-95), and raising there is a one-line change no call site knew about.
+
+**Consequence: the sampled pass count fell from 12 to 6, and the failures got sharper.** 90 now
+read `TypeError: is not a function` and 33 `cannot read a property of undefined` — a method
+that does not exist, called. That is a truer description of what is missing than a comparison
+against `undefined`, and it is the list of builtins to write.
+
+The cost is a branch after every property access. The IR roughly doubles for property-heavy
+code, which is the price of the unwinding being visible in the graph rather than implied — and
+it is the shape a later pass can collapse once the IR can prove a receiver is an object.

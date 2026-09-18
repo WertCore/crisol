@@ -299,10 +299,15 @@ fn extra_arguments_are_ignored() {
 }
 
 #[test]
-fn calling_something_that_is_not_a_function_does_not_crash() {
-    // `5()` is a TypeError, which needs a throw path M13 does not have. What must not happen
-    // is a jump through a null pointer, so the runtime hands back a real fallback instead.
-    check("call-non-function", "let x = 5; return x();", "undefined");
+fn calling_something_that_is_not_a_function_is_a_type_error() {
+    // This used to answer `undefined`, because there was no way to throw. The fallback that
+    // made it safe — a real function with the uniform signature — is now where the `TypeError`
+    // is raised, and no call site changed to make that happen (D-95).
+    check(
+        "call-non-function",
+        "let r = 0; try { let x = 5; x(); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
 }
 
 #[test]
@@ -1321,5 +1326,55 @@ fn a_function_can_call_one_declared_after_it() {
         "hoist-forward-reference",
         "function first() { return second(); } function second() { return 4; } return first();",
         "4",
+    );
+}
+
+// ---- TypeError where the specification requires it --------------------------------------
+
+/// **Reading a property of `null` or `undefined` throws.** Answering `undefined` makes
+/// `x.y.z` on a missing `x` fail two lines later carrying a value that looks like a legitimate
+/// absence.
+#[test]
+fn a_property_of_nothing_is_a_type_error() {
+    check(
+        "nullish-read",
+        "let r = 0; try { let x = null; x.y; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "nullish-read-undefined",
+        "let r = 0; try { let x = undefined; x.y; } catch (e) { r = e.message; } return r;",
+        "cannot read a property of undefined",
+    );
+    check(
+        "nullish-write",
+        "let r = 0; try { let x = null; x.y = 1; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "nullish-computed",
+        "let r = 0; try { let x = null; x[0]; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// The throw has to cross a call, which is what makes it more than a local check.
+#[test]
+fn a_type_error_propagates_out_of_a_call() {
+    check(
+        "nullish-across-call",
+        "let f = function (o) { return o.x; }; \
+         let r = 0; try { f(null); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// A property *chain* stops at the first failure rather than carrying `undefined` onwards.
+#[test]
+fn a_chain_stops_at_the_first_missing_link() {
+    check(
+        "nullish-chain",
+        "let o = {}; let r = 0; try { o.a.b; } catch (e) { r = e.name; } return r;",
+        "TypeError",
     );
 }

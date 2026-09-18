@@ -1005,11 +1005,15 @@ impl Lowering {
                     }
                     oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) => {
                         let object = self.expression(&member.object);
-                        self.emit_effect(Op::PropertyStore {
-                            object,
-                            key: PropertyKey::new(member.property.name.as_str()),
-                            value,
-                        });
+                        let outcome = self.emit(
+                            Type::Unknown,
+                            Op::PropertyStore {
+                                object,
+                                key: PropertyKey::new(member.property.name.as_str()),
+                                value,
+                            },
+                        );
+                        self.propagate(outcome);
                     }
                     oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) => {
                         // Evaluation order matters and is observable: the object, then the
@@ -1019,7 +1023,9 @@ impl Lowering {
                         // silently.
                         let object = self.expression(&member.object);
                         let key = self.expression(&member.expression);
-                        self.emit_effect(Op::ComputedStore { object, key, value });
+                        let outcome =
+                            self.emit(Type::Unknown, Op::ComputedStore { object, key, value });
+                        self.propagate(outcome);
                     }
                     _ => self.note("assignment target", assignment.span.start),
                 }
@@ -1027,13 +1033,17 @@ impl Lowering {
             }
             Expression::StaticMemberExpression(member) => {
                 let object = self.expression(&member.object);
-                self.emit(
+                let value = self.emit(
                     Type::Unknown,
                     Op::PropertyLoad {
                         object,
                         key: PropertyKey::new(member.property.name.as_str()),
                     },
-                )
+                );
+                // Reading a property of `null` throws, so this is followed by the same check a
+                // call is. Every operation that can raise gets one — that is what makes the
+                // unwinding visible in the graph rather than implied (D-104).
+                self.propagate(value)
             }
             Expression::CallExpression(call) => {
                 // A method call must pass its receiver. `o.m()` has `this === o` inside `m`,
@@ -1167,7 +1177,8 @@ impl Lowering {
             Expression::ComputedMemberExpression(member) => {
                 let object = self.expression(&member.object);
                 let key = self.expression(&member.expression);
-                self.emit(Type::Unknown, Op::ComputedLoad { object, key })
+                let value = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+                self.propagate(value)
             }
             Expression::UpdateExpression(update) => self.update(update),
             Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression),

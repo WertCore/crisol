@@ -258,6 +258,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     store.params.push(AbiParam::new(pointer));
     store.params.push(AbiParam::new(types::I64));
     store.params.push(AbiParam::new(types::I64));
+    store.returns.push(AbiParam::new(types::I64));
 
     let mut load = module.make_signature();
     load.params.push(AbiParam::new(types::I64));
@@ -306,6 +307,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     computed_store.params.push(AbiParam::new(types::I64));
     computed_store.params.push(AbiParam::new(types::I64));
     computed_store.params.push(AbiParam::new(types::I64));
+    computed_store.returns.push(AbiParam::new(types::I64));
 
     let mut strict_equal = module.make_signature();
     strict_equal.params.push(AbiParam::new(types::I64));
@@ -1493,6 +1495,9 @@ impl Lowering<'_> {
                     )]
                     let index = crisol_value::Value::number(position as f64).to_bits();
                     let index = self.builder.ins().iconst(types::I64, index as i64);
+                    // The result is the exception signal or `undefined`; an element store on a
+                    // freshly made array cannot throw, so it is discarded here rather than
+                    // checked at every element.
                     self.builder
                         .ins()
                         .call(self.objects.computed_store, &[array, index, value]);
@@ -1512,10 +1517,11 @@ impl Lowering<'_> {
                 let object = self.value(*object);
                 let key = self.value(*key);
                 let value = self.value(*value);
-                self.builder
+                let call = self
+                    .builder
                     .ins()
                     .call(self.objects.computed_store, &[object, key, value]);
-                None
+                Some(self.builder.inst_results(call)[0])
             }
             Op::GlobalLoad { name } => {
                 let (pointer, length) = self.key_operands(name)?;
@@ -1541,10 +1547,13 @@ impl Lowering<'_> {
                 let object = self.value(*object);
                 let value = self.value(*value);
                 let (pointer, length) = self.key_operands(key)?;
-                self.builder
+                let call = self
+                    .builder
                     .ins()
                     .call(self.objects.store, &[object, pointer, length, value]);
-                None
+                // A store answers with the exception signal or `undefined`, because writing a
+                // property of `null` throws. The frontend checks it like any call.
+                Some(self.builder.inst_results(call)[0])
             }
             Op::PropertyLoad { object, key } => {
                 let object = self.value(*object);

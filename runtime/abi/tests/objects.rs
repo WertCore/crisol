@@ -9,9 +9,12 @@ use crisol_abi::{crisol_create_object, crisol_property_load, crisol_property_sto
 use crisol_value::Value;
 
 /// Calls the store helper the way compiled code does — a pointer and a length, not a `&str`.
-fn store(object: u64, key: &str, value: u64) {
+fn store(object: u64, key: &str, value: u64) -> Value {
     // SAFETY: `key` is a live Rust string, so its pointer and length describe readable UTF-8.
-    unsafe { crisol_property_store(object, key.as_ptr(), key.len() as u64, value) }
+    // The result is the exception signal or `undefined`: a store on `null` throws.
+    Value::from_bits(unsafe {
+        crisol_property_store(object, key.as_ptr(), key.len() as u64, value)
+    })
 }
 
 fn load(object: u64, key: &str) -> Value {
@@ -29,7 +32,7 @@ fn a_fresh_object_is_an_object_with_no_properties() {
 #[test]
 fn a_stored_property_reads_back() {
     let object = crisol_create_object();
-    store(object, "a", Value::number(1.0).to_bits());
+    let _ = store(object, "a", Value::number(1.0).to_bits());
     assert_eq!(load(object, "a"), Value::number(1.0));
 }
 
@@ -39,7 +42,7 @@ fn a_stored_property_reads_back() {
 fn several_properties_each_get_their_own_slot() {
     let object = crisol_create_object();
     for (index, key) in ["a", "b", "c"].iter().enumerate() {
-        store(object, key, Value::number(index as f64).to_bits());
+        let _ = store(object, key, Value::number(index as f64).to_bits());
     }
     for (index, key) in ["a", "b", "c"].iter().enumerate() {
         assert_eq!(
@@ -74,12 +77,12 @@ fn width(object: u64) -> u32 {
 #[test]
 fn reassigning_a_property_does_not_give_it_a_second_slot() {
     let object = crisol_create_object();
-    store(object, "x", Value::number(1.0).to_bits());
-    store(object, "y", Value::number(9.0).to_bits());
+    let _ = store(object, "x", Value::number(1.0).to_bits());
+    let _ = store(object, "y", Value::number(9.0).to_bits());
     assert_eq!(width(object), 2);
 
     for round in 0..10 {
-        store(object, "x", Value::number(f64::from(round)).to_bits());
+        let _ = store(object, "x", Value::number(f64::from(round)).to_bits());
     }
     assert_eq!(width(object), 2, "ten assignments to x must add no slots");
     assert_eq!(load(object, "x"), Value::number(9.0));
@@ -94,17 +97,14 @@ fn reassigning_a_property_does_not_give_it_a_second_slot() {
 fn two_objects_do_not_share_state() {
     let first = crisol_create_object();
     let second = crisol_create_object();
-    store(first, "a", Value::number(1.0).to_bits());
+    let _ = store(first, "a", Value::number(1.0).to_bits());
     assert_eq!(load(second, "a"), Value::UNDEFINED);
 }
 
-/// A store through a non-object is ignored rather than faulting. The specification says
-/// `TypeError`, which needs an unwinding path M13 does not have; what must not happen is a
-/// write through a bit pattern that is not an address.
+/// A store through a non-object must not write through a bit pattern that is not an address.
 #[test]
-fn a_store_through_a_non_object_is_ignored() {
-    store(Value::number(3.0).to_bits(), "a", Value::TRUE.to_bits());
-    store(Value::UNDEFINED.to_bits(), "a", Value::TRUE.to_bits());
+fn a_store_through_a_non_object_writes_nothing() {
+    let _ = store(Value::number(3.0).to_bits(), "a", Value::TRUE.to_bits());
     assert_eq!(load(Value::number(3.0).to_bits(), "a"), Value::UNDEFINED);
 }
 
@@ -120,4 +120,23 @@ fn a_null_or_invalid_key_is_not_dereferenced() {
     // SAFETY: two readable bytes that are not UTF-8 — the length is honest.
     let loaded = unsafe { crisol_property_load(object, invalid.as_ptr(), 2) };
     assert_eq!(Value::from_bits(loaded), Value::UNDEFINED);
+}
+
+/// A store through `null` or `undefined` answers with the exception signal rather than doing
+/// nothing. The caller checks it, which is what carries the `TypeError` to a handler.
+#[test]
+fn a_store_through_nothing_raises_rather_than_being_ignored() {
+    assert!(
+        store(Value::NULL.to_bits(), "a", Value::TRUE.to_bits()).is_exception(),
+        "a store through null must raise"
+    );
+    assert!(
+        store(Value::UNDEFINED.to_bits(), "a", Value::TRUE.to_bits()).is_exception(),
+        "a store through undefined must raise"
+    );
+    // A number has no properties, and writing one is not an error — the specification wraps it.
+    assert!(
+        !store(Value::number(3.0).to_bits(), "a", Value::TRUE.to_bits()).is_exception(),
+        "a store through a primitive is ignored, not raised"
+    );
 }
