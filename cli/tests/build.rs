@@ -1858,3 +1858,106 @@ fn a_string_key_reaches_the_same_property_a_name_does() {
         "1",
     );
 }
+
+// ---- for-in ------------------------------------------------------------------------------
+
+#[test]
+fn for_in_visits_every_enumerable_name() {
+    check(
+        "forin-count",
+        "let o = {a: 1, b: 2}; let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "2",
+    );
+    check(
+        "forin-names",
+        "let o = {a: 1, b: 2}; let s = \"\"; for (let k in o) { s = s + k; } return s;",
+        "ab",
+    );
+    check(
+        "forin-values",
+        "let o = {a: 1, b: 2}; let t = 0; for (let k in o) { t = t + o[k]; } return t;",
+        "3",
+    );
+}
+
+/// **Inherited enumerable properties are visited too**, which is what separates `for-in` from
+/// `Object.keys`.
+#[test]
+fn for_in_walks_the_prototype_chain() {
+    check(
+        "forin-inherited",
+        "let base = {a: 1}; let o = Object.create(base); o.b = 2; \
+         let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "2",
+    );
+    // A name found on the object shadows the same name further up, so it is visited once.
+    check(
+        "forin-shadowed",
+        "let base = {a: 1}; let o = Object.create(base); o.a = 2; \
+         let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "1",
+    );
+}
+
+/// A non-enumerable property is not visited — the same rule `Object.keys` follows.
+#[test]
+fn for_in_skips_non_enumerable_properties() {
+    check(
+        "forin-hidden",
+        "let o = {a: 1}; Object.defineProperty(o, \"b\", {value: 2}); \
+         let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "1",
+    );
+}
+
+#[test]
+fn for_in_over_nothing_runs_zero_times() {
+    check(
+        "forin-empty",
+        "let n = 0; for (let k in {}) { n = n + 1; } return n;",
+        "0",
+    );
+    // `for (k in undefined)` runs zero times rather than throwing.
+    check(
+        "forin-undefined",
+        "let n = 0; for (let k in undefined) { n = n + 1; } return n;",
+        "0",
+    );
+}
+
+#[test]
+fn for_in_supports_break_and_continue() {
+    check(
+        "forin-break",
+        "let o = {a: 1, b: 2, c: 3}; let n = 0; \
+         for (let k in o) { if (k === \"b\") { break; } n = n + 1; } return n;",
+        "1",
+    );
+    check(
+        "forin-continue",
+        "let o = {a: 1, b: 2, c: 3}; let n = 0; \
+         for (let k in o) { if (k === \"b\") { continue; } n = n + 1; } return n;",
+        "2",
+    );
+}
+
+/// An array's indices are enumerable names, so `for-in` visits them as strings.
+#[test]
+fn for_in_over_an_array_visits_its_indices() {
+    check(
+        "forin-array",
+        "let a = [10, 20]; let s = \"\"; for (let k in a) { s = s + k; } return s;",
+        "01",
+    );
+}
+
+/// **`for (k in o)` assigns to an existing binding rather than declaring one**, so the last
+/// name visited is still there afterwards.
+#[test]
+fn for_in_can_assign_to_an_existing_variable() {
+    check(
+        "forin-assign",
+        "let k = \"\"; let o = {a: 1}; for (k in o) { } return k;",
+        "a",
+    );
+}

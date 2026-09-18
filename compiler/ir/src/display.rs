@@ -105,6 +105,7 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::PropertyStore { object, key, value } => write!(f, "set {object}.{key:?} = {value}"),
         Op::ComputedLoad { object, key } => write!(f, "get {object}[{key}]"),
         Op::Delete { object, key } => write!(f, "delete {object}[{key}]"),
+        Op::Enumerate { object } => write!(f, "enumerate {object}"),
         Op::ComputedStore { object, key, value } => write!(f, "set {object}[{key}] = {value}"),
         Op::CreateObject { shape } => write!(f, "object #{}", shape.index()),
         Op::CaughtValue => write!(f, "caught"),

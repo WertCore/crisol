@@ -314,6 +314,140 @@ impl Lowering {
         }
     }
 
+    /// `for (name in object) body`.
+    ///
+    /// Lowered as an ordinary counted loop over a list of names taken **before** the body runs.
+    /// The specification allows a property deleted during the loop to be skipped and one added
+    /// not to be visited, so taking the list up front is within it — and it keeps the loop from
+    /// depending on an enumeration order that its own body is changing.
+    ///
+    /// `continue` goes to the increment and not the test, for the same reason it does in a
+    /// `for` loop: skipping the increment is a hang rather than a wrong answer.
+    fn for_in_statement(&mut self, statement: &oxc_ast::ast::ForInStatement<'_>) {
+        let subject = self.expression(&statement.right);
+        let names = self.emit(Type::Object(None), Op::Enumerate { object: subject });
+
+        let list = self.temporary();
+        self.emit_effect(Op::Store {
+            slot: list,
+            value: names,
+        });
+        let position = self.temporary();
+        let zero = self.emit(Type::Number, Op::Const(Constant::Number(0.0)));
+        self.emit_effect(Op::Store {
+            slot: position,
+            value: zero,
+        });
+
+        let header = self.new_block();
+        let body = self.new_block();
+        let step = self.new_block();
+        let exit = self.new_block();
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(header);
+        let held = self.emit(Type::Unknown, Op::Load { slot: list });
+        let length = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: held,
+                key: PropertyKey::new("length"),
+            },
+        );
+        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let more = self.emit(
+            Type::Bool,
+            Op::Compare {
+                op: CompareOp::Less,
+                left: at,
+                right: length,
+            },
+        );
+        self.terminate(Terminator::Branch {
+            condition: more,
+            then_block: body,
+            then_args: Vec::new(),
+            else_block: exit,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(body);
+        let held = self.emit(Type::Unknown, Op::Load { slot: list });
+        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let name = self.emit(
+            Type::Unknown,
+            Op::ComputedLoad {
+                object: held,
+                key: at,
+            },
+        );
+        self.bind_loop_variable(&statement.left, name);
+
+        self.breaks.push(exit);
+        self.continues.push(step);
+        self.statement(&statement.body);
+        self.breaks.pop();
+        self.continues.pop();
+        self.terminate(Terminator::Jump {
+            target: step,
+            args: Vec::new(),
+        });
+
+        self.switch_to(step);
+        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
+        let next = self.emit(
+            Type::Unknown,
+            Op::Binary {
+                op: BinaryOp::Add,
+                left: at,
+                right: one,
+            },
+        );
+        self.emit_effect(Op::Store {
+            slot: position,
+            value: next,
+        });
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(exit);
+    }
+
+    /// Binds the name a `for-in` is currently visiting.
+    ///
+    /// `for (let k in o)` declares `k`; `for (k in o)` assigns to whatever `k` already names.
+    /// Treating the second as a declaration would shadow the outer binding, so the loop would
+    /// run correctly and leave nothing behind.
+    fn bind_loop_variable(&mut self, left: &oxc_ast::ast::ForStatementLeft<'_>, value: ValueId) {
+        match left {
+            oxc_ast::ast::ForStatementLeft::VariableDeclaration(declaration) => {
+                let Some(first) = declaration.declarations.first() else {
+                    return;
+                };
+                let Some(name) = first.id.get_identifier_name() else {
+                    self.note("destructuring for-in binding", declaration.span.start);
+                    return;
+                };
+                let slot = self.declare(name.as_str());
+                self.bind(name.as_str(), slot, value);
+            }
+            oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(identifier) => {
+                let slot = self.slot(identifier.name.as_str());
+                self.write(slot, value);
+            }
+            // A member expression or a pattern. Reported without a position, because a
+            // `ForStatementLeft` does not carry one without the span trait in scope and the
+            // construct is named precisely enough to find.
+            _ => self.note("for-in binding that is not a plain name", 0),
+        }
+    }
+
     /// `for (init; test; update) body`.
     ///
     /// Four blocks rather than three, because **`continue` goes to the update, not the test**.
@@ -888,6 +1022,7 @@ impl Lowering {
                 self.switch_to(exit);
             }
             Statement::ForStatement(statement) => self.for_statement(statement),
+            Statement::ForInStatement(statement) => self.for_in_statement(statement),
             Statement::DoWhileStatement(statement) => {
                 let body = self.new_block();
                 let header = self.new_block();
@@ -1695,7 +1830,6 @@ impl Lowering {
 /// A statement's kind, for the unsupported list.
 fn kind_of(statement: &Statement<'_>) -> &'static str {
     match statement {
-        Statement::ForInStatement(_) => "for-in statement",
         Statement::ForOfStatement(_) => "for-of statement",
         Statement::FunctionDeclaration(_) => "function declaration",
         Statement::ClassDeclaration(_) => "class declaration",

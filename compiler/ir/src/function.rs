@@ -301,6 +301,16 @@ pub enum Op {
         /// The name.
         key: PropertyKey,
     },
+    /// The names a `for-in` over `object` visits, as an array.
+    ///
+    /// Computed once, before the loop runs. The specification allows a property deleted during
+    /// the loop to be skipped and one added not to be visited; taking the list up front is
+    /// within that, and it means the loop cannot be affected by its own body in a way that
+    /// depends on enumeration order.
+    Enumerate {
+        /// What to enumerate.
+        object: ValueId,
+    },
     /// `delete object[key]`.
     ///
     /// One operation for both spellings, because `delete o.x` and `delete o["x"]` are the same
@@ -446,6 +456,7 @@ impl Op {
                 | Self::ComputedLoad { .. }
                 | Self::ComputedStore { .. }
                 | Self::Delete { .. }
+                | Self::Enumerate { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -473,7 +484,7 @@ impl Op {
                 all.extend(args);
                 all
             }
-            Self::PropertyLoad { object, .. } => vec![*object],
+            Self::PropertyLoad { object, .. } | Self::Enumerate { object } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
             Self::ComputedLoad { object, key } | Self::Delete { object, key } => {
                 vec![*object, *key]

@@ -3587,3 +3587,33 @@ saying a word. Only a number key worked, which is why every array test passed ov
 Clippy objects to boxing a collection and is right in general; here the point is the *inline*
 size, which every cell in the heap pays for including the free ones — eight bytes against
 forty-eight, twice. The allocation happens only for an object that has attributes or deletions.
+
+## D-118
+
+**`for-in` takes its list of names before the body runs, and built-in methods are not
+enumerable.**
+
+Status: Accepted
+
+Lowered as an ordinary counted loop over a list computed once. The specification allows a
+property deleted during the loop to be skipped and one added not to be visited, so taking the
+list up front is within it — and it keeps the loop from depending on an enumeration order its
+own body is changing.
+
+**Inherited enumerable properties are visited**, which is what separates `for-in` from
+`Object.keys`, so the enumeration walks the prototype chain. A name found on an object shadows
+the same name further up and is visited once, at the first place it appears.
+
+`for (let k in o)` declares `k`; `for (k in o)` assigns to whatever `k` already names. Treating
+the second as a declaration would shadow the outer binding, so the loop would run correctly and
+leave nothing behind — a failure with no symptom inside the loop at all.
+
+**The test for it caught that every built-in method was enumerable.** `for (k in [])` visited
+`map`, `filter` and the rest: the loop was right and the properties were wrong. Every method the
+specification puts on a prototype is `{ writable: true, enumerable: false, configurable: true }`,
+which descriptors (D-116) had just made expressible — the feature and the bug it exposed landed
+one after the other.
+
+**Consequence:** built-in methods are now defined through one function that sets those
+attributes. Four builders had been defining them four ways; the one that mattered was the one
+nobody had thought about, because nothing could observe enumerability until `for-in` existed.

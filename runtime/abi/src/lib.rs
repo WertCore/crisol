@@ -71,6 +71,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_truthy",
     "crisol_global_load",
     "crisol_delete",
+    "crisol_enumerate",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -1922,15 +1923,8 @@ impl Runtime {
         // an object.
         for (index, (namespace, method, _)) in NAMESPACE_NATIVES.iter().enumerate() {
             let owner = self.ensure_global_object(globals.handle(), namespace);
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "there are a handful of built-ins"
-            )]
-            let encoded = -((NATIVES.len() + GLOBAL_NATIVES.len() + index) as f64 + 1.0);
-            let function = scope.alloc_with_internals(shape, 0, 1);
-            self.heap
-                .set_internal(function.handle(), 0, Value::number(encoded));
-            self.define(owner, method, function.to_value());
+            let function = self.native_function(NATIVES.len() + GLOBAL_NATIVES.len() + index);
+            self.define_method(owner, method, function.to_value());
         }
         // `Array.prototype` is the object every array already inherits from, not a new one —
         // otherwise `[].map === Array.prototype.map` would be false.
@@ -1968,6 +1962,32 @@ impl Runtime {
         function.handle()
     }
 
+    /// Defines a built-in method, which is **not enumerable**.
+    ///
+    /// Every method the specification puts on a prototype is `{ writable: true, enumerable:
+    /// false, configurable: true }`. Defining them as ordinary properties made `for (k in [])`
+    /// visit `map`, `filter` and every other array method — the loop was right and the
+    /// properties were wrong.
+    fn define_method(&self, object: GcRef, name: &str, value: Value) {
+        self.define(object, name, value);
+        let key = PropertyKey::new(name);
+        let slot = self
+            .heap
+            .shape_of(object)
+            .and_then(|shape| self.shapes.borrow().lookup(shape, &key));
+        if let Some(slot) = slot {
+            self.heap.set_attributes(
+                object,
+                slot.index(),
+                crisol_value::Attributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+    }
+
     /// Builds the object every function inherits from.
     ///
     /// The object is rooted **before** its own methods are made, because those are functions
@@ -1984,7 +2004,7 @@ impl Runtime {
             + ANONYMOUS_NATIVES.len();
         for (index, (name, _)) in FUNCTION_NATIVES.iter().enumerate() {
             let function = self.native_function(base + index);
-            self.define(prototype.handle(), name, function.to_value());
+            self.define_method(prototype.handle(), name, function.to_value());
         }
     }
 
@@ -2002,7 +2022,7 @@ impl Runtime {
             + FUNCTION_NATIVES.len();
         for (index, (name, _)) in STRING_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
-            self.define(prototype.handle(), name, method.to_value());
+            self.define_method(prototype.handle(), name, method.to_value());
         }
     }
 
@@ -2019,7 +2039,7 @@ impl Runtime {
 
         for (index, (name, _)) in NATIVES.iter().enumerate() {
             let method = self.native_function(index);
-            self.define(prototype.handle(), name, method.to_value());
+            self.define_method(prototype.handle(), name, method.to_value());
         }
     }
 }
@@ -3821,5 +3841,39 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
         }
         runtime.heap.set_deleted(handle, slot.index(), true);
         Value::TRUE.to_bits()
+    })
+}
+
+/// Every name a `for-in` over `object` visits, as an array of strings.
+///
+/// **Inherited enumerable properties are visited too**, which is what separates `for-in` from
+/// `Object.keys` — and the reason it walks the prototype chain rather than reading one object.
+/// A name found on an object shadows the same name further up, so each is visited once and at
+/// the first place it appears.
+///
+/// A non-object visits nothing, which is not an error: `for (k in undefined)` runs zero times
+/// rather than throwing.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_enumerate(object: u64) -> u64 {
+    with_rooted(&[object], || {
+        let mut names: Vec<String> = Vec::new();
+        let mut current = object;
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let Some(handle) = handle_of(current) else {
+                break;
+            };
+            for name in enumerable_keys(current) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            let next = with_runtime(|runtime| runtime.heap.prototype_of(handle));
+            match next {
+                Some(parent) => current = parent.to_value().to_bits(),
+                None => break,
+            }
+        }
+        names_as_array(&names)
     })
 }
