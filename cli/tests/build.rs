@@ -308,3 +308,88 @@ fn closures_and_captures_survive_a_collection_at_every_allocation() {
         "a captured value must survive collection"
     );
 }
+
+// ---- classes ----------------------------------------------------------------------------
+
+#[test]
+fn a_class_constructs_and_its_field_reads_back() {
+    check(
+        "class-field",
+        "class Point { constructor(x) { this.x = x; } } let p = new Point(4); return p.x;",
+        "4",
+    );
+}
+
+/// Methods live on one shared prototype, not on each instance, so this only works if the
+/// property lookup walks the chain.
+#[test]
+fn a_method_is_found_through_the_prototype() {
+    check(
+        "class-method",
+        "class Box { constructor(v) { this.v = v; } get() { return this.v; } } \
+         let b = new Box(9); return b.get();",
+        "9",
+    );
+}
+
+/// `this` inside a method is the receiver. Losing it is silent — the call still returns
+/// something, it is only `this` that is wrong.
+#[test]
+fn this_inside_a_method_is_the_receiver() {
+    check(
+        "class-this",
+        "class Sum { constructor(a, b) { this.a = a; this.b = b; } total() { return this.a + this.b; } } \
+         let s = new Sum(2, 3); return s.total();",
+        "5",
+    );
+}
+
+/// **A constructor returning an object replaces `this`; one returning a primitive does not.**
+/// Both halves, because a lowering that ignored the rule passes the second test.
+#[test]
+fn a_constructor_returning_a_primitive_still_yields_the_instance() {
+    check(
+        "class-return-primitive",
+        "class C { constructor() { this.x = 1; return 42; } } return new C().x;",
+        "1",
+    );
+}
+
+#[test]
+fn a_constructor_returning_an_object_replaces_the_instance() {
+    check(
+        "class-return-object",
+        "class C { constructor() { this.x = 1; return {x: 7}; } } return new C().x;",
+        "7",
+    );
+}
+
+#[test]
+fn two_instances_share_a_prototype_but_not_their_fields() {
+    check(
+        "class-two-instances",
+        "class P { constructor(n) { this.n = n; } get() { return this.n; } } \
+         let a = new P(1); let b = new P(2); return a.get() + b.get();",
+        "3",
+    );
+}
+
+/// Storing a property on a function must not break calling it.
+///
+/// A closure keeps its function index and captures as engine-private state. They used to live
+/// in the property slots, and a shape numbers properties from zero — so the first property
+/// stored on a function overwrote the index and the function silently stopped being callable.
+/// `class C {}` does exactly that to its own constructor, via `prototype`.
+#[test]
+fn a_property_on_a_function_does_not_break_calling_it() {
+    check(
+        "function-property",
+        "let f = function () { return 1; }; f.x = 5; return f();",
+        "1",
+    );
+    check(
+        "function-property-read",
+        "let f = function () { return 1; }; f.x = 5; return f.x;",
+        "5",
+    );
+}

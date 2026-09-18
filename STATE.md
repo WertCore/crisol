@@ -19,6 +19,15 @@ is reached indirectly — `twice(inc, 5)` compiles to a native binary and prints
 non-function returns `undefined` rather than crashing (D-95). All of it holds under
 `CRISOL_GC_STRESS=1`.
 
+**Classes work** — fields, methods found through the prototype chain, `this` as the receiver,
+and a constructor returning an object replacing the instance. Heap objects carry a prototype
+the collector traces, and engine state lives beside the property slots rather than in them
+(D-96), which is what made every class constructor silently uncallable.
+
+**Known defect: captured variables are copied, not shared** (D-97). Assigning a captured
+variable gives a plausible wrong answer rather than failing. The fix is heap cells for
+variables that are both captured and assigned.
+
 `CRISOL_GC_STRESS=1` collects on every allocation and is the only thing that tests any of
 this: with the offsets read from the wrong end of the frame, every acceptance test still
 printed the right answer, because none of them allocated enough to collect at all. That is what unblocks allocation in compiled code — until the
@@ -28,7 +37,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1013 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1023 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

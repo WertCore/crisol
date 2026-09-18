@@ -53,6 +53,8 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_closure_set_capture",
     "crisol_closure_code",
     "crisol_not_a_function",
+    "crisol_construct_this",
+    "crisol_construct_result",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -670,14 +672,87 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
     let key = PropertyKey::new(&name);
 
     with_runtime(|runtime| {
-        let Some(shape) = runtime.heap.shape_of(handle) else {
-            return Value::UNDEFINED.to_bits();
-        };
-        let slot = runtime.shapes.borrow().lookup(shape, &key);
-        slot.and_then(|slot| runtime.heap.get(handle, slot.index()))
-            .unwrap_or(Value::UNDEFINED)
-            .to_bits()
+        // Walks the prototype chain. A class's methods live on one shared prototype object,
+        // not on each instance, so a lookup that stopped at the receiver would find every
+        // field and no method at all.
+        //
+        // Bounded rather than "until the chain ends": `a.__proto__ = b; b.__proto__ = a` is a
+        // cycle the specification forbids, and nothing has rejected it yet. An unbounded walk
+        // would hang inside a property read, which is a far worse failure than a miss.
+        let mut current = Some(handle);
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let Some(object) = current else { break };
+            let Some(shape) = runtime.heap.shape_of(object) else {
+                break;
+            };
+            let found = runtime.shapes.borrow().lookup(shape, &key);
+            if let Some(slot) = found
+                && let Some(value) = runtime.heap.get(object, slot.index())
+            {
+                return value.to_bits();
+            }
+            current = runtime.heap.prototype_of(object);
+        }
+        Value::UNDEFINED.to_bits()
     })
+}
+
+/// How far a property lookup walks before giving up.
+///
+/// Deep chains are rare and a cycle is illegal, so this is a backstop rather than a budget —
+/// reaching it means the heap holds a chain the specification says cannot exist.
+const PROTOTYPE_CHAIN_LIMIT: usize = 1000;
+
+/// Allocates the `this` for `new callee(...)`, inheriting from `callee.prototype`.
+///
+/// This is `OrdinaryCreateFromConstructor`: the prototype link is established here rather than
+/// by a separate step that could be omitted, which is why `Op::Construct` is one operation
+/// rather than the sequence it stands for.
+///
+/// A callee with no `prototype` property still yields an object, just one with no prototype.
+/// That is wrong for a real constructor and right for the only way to reach it here — a
+/// `new` on something that is not a class — and it beats returning nothing at all.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_construct_this(callee: u64) -> u64 {
+    let prototype = {
+        let key = PropertyKey::new("prototype");
+        handle_of(callee).and_then(|handle| {
+            with_runtime(|runtime| {
+                let shape = runtime.heap.shape_of(handle)?;
+                let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+                runtime.heap.get(handle, slot.index())
+            })
+        })
+    };
+
+    with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        let scope = runtime.heap.scope();
+        let object = scope.alloc(shape, 0);
+        if let Some(prototype) = prototype.and_then(|value| value.as_address()) {
+            runtime
+                .heap
+                .set_prototype(object.handle(), Some(GcRef::from_address(prototype)));
+        }
+        object.to_value().to_bits()
+    })
+}
+
+/// Which value `new` evaluates to.
+///
+/// **A constructor returning an object replaces the newly created `this`; one returning a
+/// primitive does not.** That rule is why `Op::Construct` exists as one operation — spelling
+/// `new` out as allocate-then-call would put it at every call site, and the first lowering to
+/// forget it would produce a constructor whose explicit `return` is silently ignored.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_construct_result(this_value: u64, returned: u64) -> u64 {
+    if Value::from_bits(returned).kind() == crisol_value::Kind::Object {
+        returned
+    } else {
+        this_value
+    }
 }
 
 /// Reads a key passed as a pointer and a length.
@@ -721,17 +796,22 @@ pub extern "C" fn crisol_closure_capture(closure: u64, index: u64) -> u64 {
     with_runtime(|runtime| {
         runtime
             .heap
-            .get(handle, index + CLOSURE_CAPTURES_AT)
+            .internal(handle, index + CLOSURE_CAPTURES_AT)
             .unwrap_or(Value::UNDEFINED)
             .to_bits()
     })
 }
 
-/// Where a closure's captures begin, in slots.
+/// Where a closure's captures begin, among its engine-private values.
 ///
-/// Slot zero holds which function the closure runs, so captures start at one. The index is
+/// Internal zero holds which function the closure runs, so captures start at one. The index is
 /// stored rather than the code address because a code address does not fit a NaN-boxed value's
-/// 48-bit payload on every platform, and a heap slot holds a `Value`.
+/// 48-bit payload on every platform.
+///
+/// These are `internals`, **not property slots**. A shape numbers properties from zero, so a
+/// closure keeping its function index in property slot zero lost it as soon as anything stored
+/// a property on the function — and `class C {}` stores `prototype` on its constructor, which
+/// made every class constructor silently uncallable.
 const CLOSURE_CAPTURES_AT: u32 = 1;
 
 /// Every compiled function's entry point, indexed by `FunctionId`.
@@ -776,13 +856,15 @@ pub extern "C" fn crisol_create_closure(function: u64, captures: u64) -> u64 {
     with_runtime(|runtime| {
         let shape = runtime.shapes.borrow().root();
         let scope = runtime.heap.scope();
-        let closure = scope.alloc(shape, captures + CLOSURE_CAPTURES_AT as usize);
+        // No property slots: a function's properties arrive later through the ordinary path,
+        // and its engine-private state is kept where they cannot reach it.
+        let closure = scope.alloc_with_internals(shape, 0, captures + CLOSURE_CAPTURES_AT as usize);
         #[expect(
             clippy::cast_precision_loss,
             reason = "a function index is far below 2^53"
         )]
         let index = Value::number(function as f64);
-        runtime.heap.set(closure.handle(), 0, index);
+        runtime.heap.set_internal(closure.handle(), 0, index);
         closure.to_value().to_bits()
     })
 }
@@ -799,7 +881,7 @@ pub extern "C" fn crisol_closure_set_capture(closure: u64, index: u64, value: u6
     with_runtime(|runtime| {
         runtime
             .heap
-            .set(handle, index + CLOSURE_CAPTURES_AT, Value::from_bits(value));
+            .set_internal(handle, index + CLOSURE_CAPTURES_AT, Value::from_bits(value));
     });
 }
 
@@ -840,7 +922,8 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
     let Some(handle) = handle_of(closure) else {
         return fallback;
     };
-    let index = with_runtime(|runtime| runtime.heap.get(handle, 0).and_then(|v| v.as_number()));
+    let index =
+        with_runtime(|runtime| runtime.heap.internal(handle, 0).and_then(|v| v.as_number()));
     let Some(index) = index else {
         return fallback;
     };

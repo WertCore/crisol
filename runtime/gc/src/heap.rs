@@ -29,11 +29,29 @@ pub struct Stats {
     pub swept: u64,
 }
 
-/// An object: its shape, and one value per slot the shape names.
+/// An object: its shape, one value per slot the shape names, and what it inherits from.
 #[derive(Debug)]
 struct Object {
     shape: ShapeId,
     slots: Vec<Value>,
+    /// Its `[[Prototype]]`, or `None` for an object at the end of the chain.
+    ///
+    /// A `GcRef` rather than a `Value` because a prototype is an object or nothing — there is
+    /// no boxed form to get wrong — and because the collector has to trace it, which is easier
+    /// to not forget when the type says it is a reference.
+    prototype: Option<GcRef>,
+    /// Engine-private state: a closure's function index and its captured values.
+    ///
+    /// **Separate from `slots`, and that separation is the whole point.** Properties are
+    /// addressed by *shape*, and a shape assigns slot numbers from zero — so a closure keeping
+    /// its function index in slot zero lost it the moment anything stored a property on the
+    /// function. `class C {}` does exactly that: it stores `prototype` on the constructor,
+    /// which took slot zero and overwrote the index, and the constructor silently stopped
+    /// being callable.
+    ///
+    /// Traced like any other reference, because captures are values the program can still
+    /// reach.
+    internals: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -286,6 +304,78 @@ impl Heap {
         }
     }
 
+    /// Reads engine-private state, which no property access can reach.
+    #[must_use]
+    pub fn internal(&self, handle: GcRef, index: u32) -> Option<Value> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.internals.get(index as usize).copied(),
+            State::Free => None,
+        }
+    }
+
+    /// Writes engine-private state, returning whether the index existed.
+    pub fn set_internal(&self, handle: GcRef, index: u32, value: Value) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => match object.internals.get_mut(index as usize) {
+                Some(existing) => {
+                    *existing = value;
+                    true
+                }
+                None => false,
+            },
+            State::Free => false,
+        }
+    }
+
+    /// What `handle` inherits from, if anything.
+    #[must_use]
+    pub fn prototype_of(&self, handle: GcRef) -> Option<GcRef> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.prototype,
+            State::Free => None,
+        }
+    }
+
+    /// Sets what `handle` inherits from, returning whether it happened.
+    ///
+    /// No cycle check. `a.__proto__ = b; b.__proto__ = a` would make a property lookup loop
+    /// forever, and the specification forbids it — but the check belongs where prototypes are
+    /// *assigned* from source, not here, because the constructor path cannot produce a cycle
+    /// and would pay for the walk on every `new`.
+    pub fn set_prototype(&self, handle: GcRef, prototype: Option<GcRef>) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.prototype = prototype;
+                true
+            }
+            State::Free => false,
+        }
+    }
+
     /// Runs a collection.
     ///
     /// Mark from the roots, sweep what was not reached. Precise rather than conservative: the
@@ -349,11 +439,21 @@ impl Heap {
             // Collected before releasing the borrow: the worklist cannot be extended while
             // `cells` is held, and re-borrowing per child would be a borrow error rather
             // than merely slow.
-            let children: Vec<GcRef> = object
+            // The prototype is traced like any slot. Missing it would free a class's shared
+            // prototype the moment nothing else referred to it — and every instance would go
+            // on pointing at a reclaimed object, which is the use-after-free §3.1 names.
+            let mut children: Vec<GcRef> = object
                 .slots
                 .iter()
                 .filter_map(|value| value.as_address().map(GcRef::from_address))
                 .collect();
+            children.extend(object.prototype);
+            children.extend(
+                object
+                    .internals
+                    .iter()
+                    .filter_map(|value| value.as_address().map(GcRef::from_address)),
+            );
             drop(cells);
             worklist.extend(children);
         }
@@ -392,7 +492,7 @@ impl Heap {
         (swept, retired)
     }
 
-    fn allocate(&self, shape: ShapeId, slots: usize) -> GcRef {
+    fn allocate(&self, shape: ShapeId, slots: usize, internals: usize) -> GcRef {
         if self.stress.get() {
             self.collect();
         }
@@ -400,6 +500,8 @@ impl Heap {
         let object = Object {
             shape,
             slots: vec![Value::UNDEFINED; slots],
+            prototype: None,
+            internals: vec![Value::UNDEFINED; internals],
         };
 
         let handle = match self.free.borrow_mut().pop() {
@@ -447,7 +549,22 @@ pub struct Scope<'heap> {
 impl<'heap> Scope<'heap> {
     /// Allocates an object with `slots` slots, rooted for this scope.
     pub fn alloc(&self, shape: ShapeId, slots: usize) -> Rooted<'_> {
-        let handle = self.heap.allocate(shape, slots);
+        let handle = self.heap.allocate(shape, slots, 0);
+        self.root(handle)
+    }
+
+    /// Allocates with room for engine-private state as well.
+    ///
+    /// A closure needs this: its function index and captures must not live in the property
+    /// slots, because a shape assigns those from zero and would hand slot zero to the first
+    /// property stored on the function.
+    pub fn alloc_with_internals(
+        &self,
+        shape: ShapeId,
+        slots: usize,
+        internals: usize,
+    ) -> Rooted<'_> {
+        let handle = self.heap.allocate(shape, slots, internals);
         self.root(handle)
     }
 

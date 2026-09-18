@@ -2990,3 +2990,55 @@ entry point calls; the rest carry their source name only as a readable suffix.
 it. A variadic call would need the backend and the runtime to agree on argument layout, and
 those two meet only at link time, where a disagreement is silent. The cost is a call per
 capture at closure creation, which is not the hot path — calling the closure is.
+
+## D-96
+
+**A closure's function index and captures are engine-private, not property slots.**
+
+Status: Accepted
+
+They were property slots, and it was silently wrong. A shape numbers properties from zero, so
+the first property stored on a function took slot zero — where the function index lived. The
+function then named whatever that property held, `crisol_closure_code` found no number, and
+the call landed on `crisol_not_a_function`.
+
+`class C {}` does exactly that to its own constructor: the class lowering stores `prototype` on
+it. So **every class constructor was uncallable**, and the failure was invisible — `new C()`
+still returned a correctly prototyped object, because `crisol_construct_this` runs before the
+constructor. Only the constructor's *body* never ran, so instances came back with no fields and
+`p.x` was `undefined`. Nothing crashed and no test caught it until one ran a class end to end.
+
+Heap objects now carry an `internals` array beside their slots: engine state that no property
+access can reach, traced by the collector like anything else, since captures are values the
+program can still get at.
+
+**Consequence:** the two kinds of state can no longer collide by construction, rather than by
+everyone remembering to leave slot zero alone. It also means a function has no property slots
+at all until something stores one, which is what an object literal already does.
+
+## D-97
+
+**Captured variables are copied, which is wrong, and is recorded rather than hidden.**
+
+Status: Accepted, with a known defect
+
+`Op::Closure` copies each captured value into the closure when it is created. JavaScript
+captures the *binding*, not the value, so two programs give the wrong answer today:
+
+```js
+let n = 0; let f = function () { n = 1; }; f(); n;   // gives 0, should be 1
+let n = 1; let f = function () { return n; }; n = 2; f();  // gives 1, should be 2
+```
+
+Both compile, run, and print a plausible number. That is the failure mode D-59 argues is worse
+than not building at all, so it is written down here rather than left to be discovered.
+
+The fix is the standard one: a variable that is both captured and assigned lives in a heap cell,
+and the closure and the enclosing scope share the cell rather than the value. It needs a
+frontend pass to find those variables, which is why it is not in the same change as the
+discovery.
+
+**Not refused in the meantime**, and that is a deliberate trade against D-59's principle: a
+counter mutated inside a closure is ordinary JavaScript, and refusing every one of them would
+reject far more real programs than the defect currently spoils. The honest position is that
+this is a bug with a known fix and a written-down reproduction, not a design.

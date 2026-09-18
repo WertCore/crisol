@@ -170,6 +170,8 @@ const CLOSURE_CAPTURE_SYMBOL: &str = "crisol_closure_capture";
 const CREATE_CLOSURE_SYMBOL: &str = "crisol_create_closure";
 const SET_CAPTURE_SYMBOL: &str = "crisol_closure_set_capture";
 const CLOSURE_CODE_SYMBOL: &str = "crisol_closure_code";
+const CONSTRUCT_THIS_SYMBOL: &str = "crisol_construct_this";
+const CONSTRUCT_RESULT_SYMBOL: &str = "crisol_construct_result";
 
 /// The symbol holding the addresses of the program's compiled functions.
 pub const FUNCTION_TABLE_SYMBOL: &str = "crisol_functions";
@@ -191,6 +193,10 @@ struct ObjectHelpers<T> {
     set_capture: T,
     /// `crisol_closure_code(closure) -> address`
     code: T,
+    /// `crisol_construct_this(callee) -> object`
+    construct_this: T,
+    /// `crisol_construct_result(this, returned) -> value`
+    construct_result: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -237,6 +243,15 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     code.params.push(AbiParam::new(types::I64));
     code.returns.push(AbiParam::new(pointer));
 
+    let mut construct_this = module.make_signature();
+    construct_this.params.push(AbiParam::new(types::I64));
+    construct_this.returns.push(AbiParam::new(types::I64));
+
+    let mut construct_result = module.make_signature();
+    construct_result.params.push(AbiParam::new(types::I64));
+    construct_result.params.push(AbiParam::new(types::I64));
+    construct_result.returns.push(AbiParam::new(types::I64));
+
     let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
         module
             .declare_function(symbol, Linkage::Import, signature)
@@ -252,6 +267,8 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         create_closure: declare(CREATE_CLOSURE_SYMBOL, &create_closure)?,
         set_capture: declare(SET_CAPTURE_SYMBOL, &set_capture)?,
         code: declare(CLOSURE_CODE_SYMBOL, &code)?,
+        construct_this: declare(CONSTRUCT_THIS_SYMBOL, &construct_this)?,
+        construct_result: declare(CONSTRUCT_RESULT_SYMBOL, &construct_result)?,
     })
 }
 
@@ -691,6 +708,12 @@ impl Backend for Cranelift {
             code: self
                 .module
                 .declare_func_in_func(self.objects.code, &mut context.func),
+            construct_this: self
+                .module
+                .declare_func_in_func(self.objects.construct_this, &mut context.func),
+            construct_result: self
+                .module
+                .declare_func_in_func(self.objects.construct_result, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature
@@ -1181,53 +1204,36 @@ impl Lowering<'_> {
                 let callee = self.value(*callee);
                 let this_value = self.value(*this_value);
 
-                // The arguments go in a slot of this function's own frame. Not a heap list:
-                // that would allocate on the hottest path in the language, and the collector
-                // already reaches frame slots through the stack maps (D-94).
-                let slots = args.len().max(ARGV_MIN_SLOTS);
-                let size = u32::try_from(slots * 8).unwrap_or(u32::MAX);
-                let argv_slot = self.builder.create_sized_stack_slot(
-                    cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        size,
-                        3,
-                    ),
-                );
-                for (position, argument) in args.iter().enumerate() {
-                    let value = self.value(*argument);
-                    let offset = i32::try_from(position * 8).unwrap_or(i32::MAX);
-                    self.builder
-                        .ins()
-                        .stack_store(self.pointer, value, argv_slot, offset);
-                }
-                // Any slot past the last argument is filled with `undefined`. The callee never
-                // *uses* what it reads there — its guard discards it — but it does read it,
-                // and leaving stack garbage where a value belongs is how a later change that
-                // does trust it becomes very hard to debug.
-                let undefined = self
+                let (argv, argc) = self.build_arguments(args);
+                // `new.target` is `undefined` for an ordinary call — that is what distinguishes
+                // `f()` from `new f()` inside the callee.
+                let undefined = self.undefined();
+                Some(self.call_through(callee, this_value, undefined, argc, argv))
+            }
+            Op::Construct { callee, args } => {
+                let callee = self.value(*callee);
+                // The receiver is allocated from `callee.prototype` before the constructor
+                // runs, which is `OrdinaryCreateFromConstructor` — establishing the prototype
+                // link here rather than in a separate step that could be omitted.
+                let created = self
                     .builder
                     .ins()
-                    .iconst(types::I64, crisol_value::Value::UNDEFINED.to_bits() as i64);
-                for position in args.len()..slots {
-                    let offset = i32::try_from(position * 8).unwrap_or(i32::MAX);
-                    self.builder
-                        .ins()
-                        .stack_store(self.pointer, undefined, argv_slot, offset);
-                }
-                let argv = self.builder.ins().stack_addr(self.pointer, argv_slot, 0);
-                let argc = i64::try_from(args.len()).unwrap_or(i64::MAX);
-                let argc = self.builder.ins().iconst(types::I64, argc);
+                    .call(self.objects.construct_this, &[callee]);
+                let this_value = self.builder.inst_results(created)[0];
 
-                // `new.target` is `undefined` for an ordinary call. `Op::Construct` is what
-                // passes a constructor, and it is not lowered yet.
-                let code = self.builder.ins().call(self.objects.code, &[callee]);
-                let code = self.builder.inst_results(code)[0];
-                let call = self.builder.ins().call_indirect(
-                    self.uniform,
-                    code,
-                    &[callee, this_value, undefined, argc, argv],
-                );
-                Some(self.builder.inst_results(call)[0])
+                let (argv, argc) = self.build_arguments(args);
+                // `new.target` is the constructor being invoked, which is what makes `new f()`
+                // distinguishable from `f()` inside the body.
+                let returned = self.call_through(callee, this_value, callee, argc, argv);
+
+                // **A constructor returning an object replaces `this`; one returning a
+                // primitive does not.** The runtime decides, so the rule lives in one place
+                // rather than at every `new`.
+                let result = self
+                    .builder
+                    .ins()
+                    .call(self.objects.construct_result, &[this_value, returned]);
+                Some(self.builder.inst_results(result)[0])
             }
             Op::CreateObject { .. } => {
                 // No shape argument: an object literal is empty until its first property is
@@ -1271,6 +1277,75 @@ impl Lowering<'_> {
             self.types.insert(id.index(), instruction.ty);
         }
         Ok(())
+    }
+
+    /// Boxed `undefined`, which several lowerings need.
+    fn undefined(&mut self) -> ClifValue {
+        self.builder
+            .ins()
+            .iconst(types::I64, crisol_value::Value::UNDEFINED.to_bits() as i64)
+    }
+
+    /// Lays out `args` for a call, returning where they are and how many there are.
+    ///
+    /// They go in a slot of this function's own frame. Not a heap list: that would allocate on
+    /// the hottest path in the language, and the collector already reaches frame slots through
+    /// the stack maps (D-94).
+    ///
+    /// Shared by `Op::Call` and `Op::Construct` rather than written twice. The two must agree
+    /// with the *callee's* prologue about the layout, and three copies of one contract is two
+    /// too many.
+    fn build_arguments(&mut self, args: &[crisol_ir::ValueId]) -> (ClifValue, ClifValue) {
+        let slots = args.len().max(ARGV_MIN_SLOTS);
+        let size = u32::try_from(slots * 8).unwrap_or(u32::MAX);
+        let argv_slot =
+            self.builder
+                .create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    size,
+                    3,
+                ));
+        for (position, argument) in args.iter().enumerate() {
+            let value = self.value(*argument);
+            let offset = i32::try_from(position * 8).unwrap_or(i32::MAX);
+            self.builder
+                .ins()
+                .stack_store(self.pointer, value, argv_slot, offset);
+        }
+        // Any slot past the last argument holds `undefined`. The callee never *uses* what it
+        // reads there — its guard discards it — but it does read it, and leaving stack garbage
+        // where a value belongs is how a later change that does trust it becomes very hard to
+        // debug.
+        let undefined = self.undefined();
+        for position in args.len()..slots {
+            let offset = i32::try_from(position * 8).unwrap_or(i32::MAX);
+            self.builder
+                .ins()
+                .stack_store(self.pointer, undefined, argv_slot, offset);
+        }
+        let argv = self.builder.ins().stack_addr(self.pointer, argv_slot, 0);
+        let argc = i64::try_from(args.len()).unwrap_or(i64::MAX);
+        let argc = self.builder.ins().iconst(types::I64, argc);
+        (argv, argc)
+    }
+
+    /// Calls whatever `callee` names, through the uniform convention.
+    fn call_through(
+        &mut self,
+        callee: ClifValue,
+        this_value: ClifValue,
+        new_target: ClifValue,
+        argc: ClifValue,
+        argv: ClifValue,
+    ) -> ClifValue {
+        let code = self.builder.ins().call(self.objects.code, &[callee]);
+        let code = self.builder.inst_results(code)[0];
+        let call = self.builder.ins().call_indirect(
+            self.uniform,
+            code,
+            &[callee, this_value, new_target, argc, argv],
+        );
+        self.builder.inst_results(call)[0]
     }
 
     /// A property key as the pair the runtime takes: where the constant is, and how long.
@@ -1497,6 +1572,12 @@ impl Jit {
             code: self
                 .module
                 .declare_func_in_func(self.objects.code, &mut context.func),
+            construct_this: self
+                .module
+                .declare_func_in_func(self.objects.construct_this, &mut context.func),
+            construct_result: self
+                .module
+                .declare_func_in_func(self.objects.construct_result, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature

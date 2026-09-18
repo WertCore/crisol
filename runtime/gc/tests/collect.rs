@@ -583,3 +583,66 @@ fn a_transition_through_a_stale_handle_is_refused() {
         "a freed slot must not be resurrected"
     );
 }
+
+// ---- prototypes -------------------------------------------------------------------------
+
+/// The claim the collector has to honour: a prototype is reachable *through* its instances.
+///
+/// A class's methods live on one shared prototype object, and nothing else refers to it once
+/// the class expression is done. If it were not traced, the first collection would free it and
+/// every instance would carry a handle to a reclaimed object.
+#[test]
+fn a_prototype_reachable_only_through_an_instance_survives() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let instance = {
+        let scope = heap.scope();
+        let prototype = scope.alloc(shape, 1);
+        let instance = scope.alloc(shape, 1);
+        assert!(heap.set_prototype(instance.handle(), Some(prototype.handle())));
+        instance.handle()
+    };
+    heap.set_extra_roots(Box::new(move || vec![instance]));
+
+    assert_eq!(
+        heap.collect().swept,
+        0,
+        "the prototype is reachable through the instance"
+    );
+    assert_eq!(heap.live(), 2);
+    assert!(heap.prototype_of(instance).is_some_and(|p| heap.is_live(p)));
+}
+
+#[test]
+fn an_object_with_no_prototype_is_at_the_end_of_the_chain() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+    let object = scope.alloc(shape, 1);
+    assert_eq!(heap.prototype_of(object.handle()), None);
+}
+
+#[test]
+fn a_prototype_can_be_replaced_and_the_old_one_becomes_collectable() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let (instance, second) = {
+        let scope = heap.scope();
+        let first = scope.alloc(shape, 1);
+        let second = scope.alloc(shape, 1);
+        let instance = scope.alloc(shape, 1);
+        heap.set_prototype(instance.handle(), Some(first.handle()));
+        heap.set_prototype(instance.handle(), Some(second.handle()));
+        (instance.handle(), second.handle())
+    };
+    heap.set_extra_roots(Box::new(move || vec![instance]));
+
+    // The first prototype is now unreachable; the second is not.
+    assert_eq!(heap.collect().swept, 1);
+    assert_eq!(heap.prototype_of(instance), Some(second));
+}

@@ -569,14 +569,25 @@ collector already traces frame slots, so arguments are rooted for free. `new.tar
 signature from the start even though nothing reads it until classes, because adding a
 parameter later rewrites every call site.
 
-**To do — the direct fast path.** When the callee *is* statically known, the uniform path is
-pure overhead: the arguments can go straight into registers and the call can be direct. This
-is deliberately not built first, because there is nothing to measure until calls work at all,
-and two call paths from day one are two chances to miscompile in a way that shows up on only
-one of them. It is **not deferred to M20** — measure against QuickJS as soon as calls run, and
-build it inside M13 if the number says so. Note that the first fix for slow calls may not be
-this at all: every live variable is currently spilled to the frame at every safepoint, because
-the IR cannot yet say which slots can hold references. Narrowing that is the bigger win.
+**Unconditional — benchmark against QuickJS inside M13.** §7's kill criterion fires right
+after this milestone, so the number is needed here rather than in M20. This is the part that
+rots if left to "when it matters": the optimisations are obvious once there is a measurement
+and unorderable without one.
+
+**Conditional — which call optimisation, decided by that number.** Three are known, cheapest
+first, and the order is deliberate:
+
+1. **Remove the `crisol_closure_code` call.** Every call currently makes a full C call just to
+   read slot zero and index the function table, before the indirect call it actually wants.
+   Pure overhead on the hottest path in the language, and removing it needs no analysis.
+2. **Narrow the stack maps.** Every live variable is spilled to the frame at every safepoint,
+   because the IR cannot say which slots can hold references. Calls are safepoints, so this is
+   a per-call cost proportional to how much is live.
+3. **The direct fast path.** When the callee is known, arguments can go in registers and the
+   call can be direct. Listed last because it is the most expensive of the three: a callee
+   arrives as an SSA value from a slot load, so *proving* which function it is means
+   devirtualisation, not just a second code path — and two call paths are two chances to
+   miscompile in a way that shows up on only one of them.
 
 ---
 
