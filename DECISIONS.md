@@ -3359,3 +3359,51 @@ reading the table before entering `with_runtime` found it empty whenever a globa
 thing a program touched, which is usually. And `raise` built two strings and then stored them,
 leaving the first reachable only from a Rust local while the second allocated; under stress that
 collected it, and the error came back with an unreadable message.
+
+## D-110
+
+**`Object` and `Array` are objects that are also callable, built from one negative index space.**
+
+Status: Accepted
+
+A global like `Object` is a function *and* a namespace: `Object({})` constructs and
+`Object.keys(o)` does not. Both are the same cell — a closure carrying a built-in index, with
+the methods hung on it as ordinary properties.
+
+The index space now spans four tables in order: the array methods, the named global functions,
+the namespace methods, and the ones reachable only as a namespace's own body. One space because
+`crisol_closure_code` decodes a single negative number; four tables because they are bound in
+different ways. **The first attempt pointed the namespace body at index 0 of the first table, so
+calling `Object()` ran `Array.prototype.map`** — which is what the separate table and the named
+constant exist to prevent.
+
+`Array.prototype` is the object arrays already inherit from rather than a fresh one, or
+`[].map === Array.prototype.map` would be false.
+
+`Object.keys` and `Object.getOwnPropertyNames` are the same function, which is wrong in general
+— the second includes non-enumerable properties — and right here, because nothing can make a
+property non-enumerable yet.
+
+## D-111
+
+**Hoisting declares every name before lowering any body.**
+
+Status: Accepted
+
+One pass over the statements lowered each function as it was reached, so a function could not
+call one declared further down: the name resolved to nothing and became a global, failing at
+run time with `ReferenceError`.
+
+test262 concatenates `assert.js` ahead of the `sta.js` that defines the error class it throws,
+so **24 sampled cases failed with `Test262Error is not defined`** — the suite's own class,
+reported missing by a compiler that had just compiled it.
+
+Declaring first also gives a function its cell before its body is lowered, which is what lets a
+recursive function capture itself (D-108). The two are the same requirement seen from different
+directions: a body must be lowered against the complete set of bindings, not a prefix of it.
+
+**Consequence:** this is hoisting of *bindings*, not of assignments. A call before the
+declaration still reads the slot's value at that moment, which is `undefined` until the
+declaration runs — right for `var`, wrong for a function declaration, whose closure the
+specification installs before any statement executes. That difference is now the only part of
+hoisting still missing.

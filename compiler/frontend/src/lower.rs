@@ -538,30 +538,45 @@ impl Lowering {
     /// block's scope, which needs block scoping the lowering does not model, so those are left
     /// where they are and still refused — visibly, rather than bound in the wrong scope.
     fn hoist(&mut self, statements: &[Statement<'_>]) {
-        for statement in statements {
-            let Statement::FunctionDeclaration(declaration) = statement else {
-                continue;
-            };
-            let name = declaration
-                .id
-                .as_ref()
-                .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-            // The binding is made **before** the function is lowered, so a closure that
-            // refers to itself captures the cell rather than the empty slot that preceded it.
-            // Building the closure first and binding after is what made `function f() { f() }`
-            // capture `undefined`.
-            let slot = self.declare(&name);
-            if self.shared.contains(&name) {
+        let named: Vec<(String, &oxc_ast::ast::Function<'_>)> = statements
+            .iter()
+            .filter_map(|statement| {
+                let Statement::FunctionDeclaration(declaration) = statement else {
+                    return None;
+                };
+                let name = declaration
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+                Some((name, declaration.as_ref()))
+            })
+            .collect();
+
+        // **Every name first, then every body.** One pass would lower a function before a
+        // declaration further down the list had been declared, so a reference to it would
+        // resolve to nothing and become a global — which is exactly what happened when
+        // test262's `assert.js` was concatenated ahead of the `sta.js` that defines
+        // `Test262Error`.
+        //
+        // Binding before lowering is also what lets a function refer to *itself*: the closure
+        // captures the cell rather than the empty slot that preceded it.
+        for (name, _) in &named {
+            let slot = self.declare(name);
+            if self.shared.contains(name) {
                 self.make_cell(slot);
             }
-            let (id, names) = self.lower_function(
-                &name,
+        }
+
+        for (name, declaration) in &named {
+            let (id, captures) = self.lower_function(
+                name,
                 &declaration.params,
                 declaration.body.as_deref(),
                 None,
                 true,
             );
-            let closure = self.close_over(id, &names);
+            let closure = self.close_over(id, &captures);
+            let slot = self.declare(name);
             self.write(slot, closure);
         }
     }

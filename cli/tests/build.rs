@@ -1221,3 +1221,105 @@ fn global_this_and_the_value_globals_resolve() {
     check("global-infinity", "return Infinity;", "Infinity");
     check("global-this-exists", "return typeof globalThis;", "object");
 }
+
+// ---- Object and Array globals -----------------------------------------------------------
+
+#[test]
+fn object_keys_lists_own_properties() {
+    check(
+        "object-keys",
+        "let o = {a: 1, b: 2}; return Object.keys(o).length;",
+        "2",
+    );
+    check(
+        "object-keys-first",
+        "let o = {a: 1, b: 2}; return Object.keys(o)[0];",
+        "a",
+    );
+    check(
+        "object-values",
+        "let o = {a: 7}; return Object.values(o)[0];",
+        "7",
+    );
+}
+
+/// **Own, so the prototype chain is not walked** — which is the whole point, and why it cannot
+/// be written as a property read compared against `undefined`.
+#[test]
+fn has_own_does_not_see_inherited_properties() {
+    check(
+        "has-own-true",
+        "let o = {a: 1}; return Object.hasOwn(o, \"a\");",
+        "true",
+    );
+    check(
+        "has-own-false",
+        "let o = {a: 1}; return Object.hasOwn(o, \"b\");",
+        "false",
+    );
+    check(
+        "has-own-inherited",
+        "class C { constructor() {} m() {} } let c = new C(); return Object.hasOwn(c, \"m\");",
+        "false",
+    );
+}
+
+#[test]
+fn object_create_links_a_prototype() {
+    check(
+        "object-create",
+        "let base = {greet: 1}; let o = Object.create(base); return o.greet;",
+        "1",
+    );
+    check(
+        "object-get-prototype",
+        "let base = {}; let o = Object.create(base); return Object.getPrototypeOf(o) === base;",
+        "true",
+    );
+}
+
+#[test]
+fn object_assign_copies_own_properties() {
+    check(
+        "object-assign",
+        "let t = {}; Object.assign(t, {a: 1}, {b: 2}); return t.a + t.b;",
+        "3",
+    );
+}
+
+#[test]
+fn array_is_array_distinguishes_arrays_from_objects() {
+    check("is-array-true", "return Array.isArray([1]);", "true");
+    check("is-array-false", "return Array.isArray({});", "false");
+    check("is-array-primitive", "return Array.isArray(1);", "false");
+}
+
+/// `Array.prototype` must be the object arrays already inherit from, not a fresh one —
+/// otherwise `[].map === Array.prototype.map` is false.
+#[test]
+fn array_prototype_is_the_one_arrays_use() {
+    check(
+        "array-prototype-identity",
+        "return [].map === Array.prototype.map;",
+        "true",
+    );
+}
+
+#[test]
+fn the_namespace_globals_are_callable() {
+    check("object-call", "return typeof Object({});", "object");
+    check("object-typeof", "return typeof Object;", "function");
+    check("array-of", "return Array.of(1, 2, 3).length;", "3");
+}
+
+/// **Every declaration is bound before any body is lowered.** A function may call one declared
+/// further down the list — which is how test262 concatenates `assert.js` ahead of the `sta.js`
+/// that defines the error class it throws.
+#[test]
+fn a_function_can_call_one_declared_after_it() {
+    check(
+        "hoist-forward-reference",
+        "function first() { return second(); } function second() { return 4; } return first();",
+        "4",
+    );
+}

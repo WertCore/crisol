@@ -713,6 +713,319 @@ extern "C" fn to_boolean_global(
     crisol_truthy(value)
 }
 
+/// Built-ins reachable only as the body of a namespace object, not by any name.
+///
+/// Numbered last, after [`NATIVES`], [`GLOBAL_NATIVES`] and [`NAMESPACE_NATIVES`]. A table of
+/// its own because the index space is shared: the first version of this pointed at index 0 of
+/// the *first* table, so calling `Object()` ran `Array.prototype.map`.
+const ANONYMOUS_NATIVES: &[Native] = &[construct_plain_object];
+
+/// The index within [`ANONYMOUS_NATIVES`] of the plain-object constructor.
+///
+/// `Object()` and `Array()` both answer with a plain object, which is right for `Object` and
+/// wrong for `Array` — `Array(3)` should give a three-element array. Recorded rather than left
+/// to be discovered.
+const CONSTRUCT_PLAIN_OBJECT: usize = 0;
+
+/// What a namespace object does when called: give back an object.
+extern "C" fn construct_plain_object(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    // `new Object()` already has a receiver; a plain call does not.
+    if handle_of(this_value).is_some() {
+        return this_value;
+    }
+    crisol_create_object()
+}
+
+/// Methods that hang off a global object rather than being one.
+///
+/// Numbered after [`NATIVES`] and [`GLOBAL_NATIVES`], continuing the one negative index space
+/// so `crisol_closure_code` still has a single rule.
+const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
+    ("Object", "keys", object_keys),
+    ("Object", "getOwnPropertyNames", object_keys),
+    ("Object", "values", object_values),
+    ("Object", "create", object_create),
+    ("Object", "getPrototypeOf", object_get_prototype),
+    ("Object", "setPrototypeOf", object_set_prototype),
+    ("Object", "hasOwn", object_has_own),
+    ("Object", "assign", object_assign),
+    ("Array", "isArray", array_is_array),
+    ("Array", "of", array_of),
+];
+
+/// The own property names of `this`'s first argument.
+fn own_keys(object: u64) -> Vec<String> {
+    let Some(handle) = handle_of(object) else {
+        return Vec::new();
+    };
+    with_runtime(|runtime| {
+        let mut names: Vec<String> = Vec::new();
+        // **Indices come first and in numeric order**, before the string-named properties, which
+        // is the enumeration order the specification fixes rather than insertion order.
+        if let Some(count) = runtime.heap.element_count(handle) {
+            for index in 0..count {
+                names.push(number_text(index_as_f64(index)));
+            }
+        }
+        if let Some(shape) = runtime.heap.shape_of(handle) {
+            for (key, _) in runtime.shapes.borrow().properties(shape) {
+                names.push(key.as_str().to_owned());
+            }
+        }
+        names
+    })
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "an index this large is unreachable"
+)]
+fn index_as_f64(index: usize) -> f64 {
+    index as f64
+}
+
+/// Builds an array holding `values`, rooted while it is filled.
+fn array_of_values(values: &[u64]) -> u64 {
+    with_new_array(values.len(), |array| {
+        for (index, value) in values.iter().enumerate() {
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(array, index, Value::from_bits(*value))
+            });
+        }
+        array.to_value().to_bits()
+    })
+}
+
+/// `Object.keys` and `Object.getOwnPropertyNames`.
+///
+/// The same function for both, which is **not** right in general — `getOwnPropertyNames`
+/// includes non-enumerable properties and `keys` does not — and is right here, because nothing
+/// can make a property non-enumerable yet. Recorded so the day descriptors land this splits.
+extern "C" fn object_keys(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        // Each string is stored **before the next one is made**. Collecting them into a Rust
+        // vector first leaves every earlier string reachable from nothing the collector can
+        // see while the next allocates — which under stress returns an array of freed cells.
+        let names = own_keys(target);
+        with_new_array(names.len(), |array| {
+            for (index, name) in names.iter().enumerate() {
+                let text = new_string(name);
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(array, index, Value::from_bits(text))
+                });
+            }
+            array.to_value().to_bits()
+        })
+    })
+}
+
+/// `Object.values`.
+extern "C" fn object_values(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        // As in `object_keys`: read and store one at a time rather than collecting first.
+        let names = own_keys(target);
+        with_new_array(names.len(), |array| {
+            for (index, name) in names.iter().enumerate() {
+                // SAFETY: `name` is a live Rust string.
+                let value =
+                    unsafe { crisol_property_load(target, name.as_ptr(), name.len() as u64) };
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(array, index, Value::from_bits(value))
+                });
+            }
+            array.to_value().to_bits()
+        })
+    })
+}
+
+/// `Object.create(proto)`.
+extern "C" fn object_create(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let proto = unsafe { argument(argc, argv, 0) };
+        let created = crisol_create_object();
+        if let (Some(object), Some(parent)) = (handle_of(created), handle_of(proto)) {
+            with_runtime(|runtime| runtime.heap.set_prototype(object, Some(parent)));
+        } else if Value::from_bits(proto).kind() == crisol_value::Kind::Null {
+            // `Object.create(null)` is the one way to get an object with no prototype at all.
+            if let Some(object) = handle_of(created) {
+                with_runtime(|runtime| runtime.heap.set_prototype(object, None));
+            }
+        }
+        created
+    })
+}
+
+/// `Object.getPrototypeOf(o)`.
+extern "C" fn object_get_prototype(
+    _closure: u64,
+    _this: u64,
+    argc_or: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let _ = argc_or;
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    let Some(handle) = handle_of(target) else {
+        return Value::NULL.to_bits();
+    };
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .prototype_of(handle)
+            .map_or_else(|| Value::NULL.to_bits(), |p| p.to_value().to_bits())
+    })
+}
+
+/// `Object.setPrototypeOf(o, proto)`.
+extern "C" fn object_set_prototype(
+    _closure: u64,
+    _this: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let proto = unsafe { argument(argc, argv, 1) };
+    if let Some(handle) = handle_of(target) {
+        let parent = handle_of(proto);
+        with_runtime(|runtime| runtime.heap.set_prototype(handle, parent));
+    }
+    target
+}
+
+/// `Object.hasOwn(o, key)`.
+extern "C" fn object_has_own(
+    _closure: u64,
+    _this: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let key = unsafe { argument(argc, argv, 1) };
+    let Some(wanted) = to_text(key) else {
+        return Value::FALSE.to_bits();
+    };
+    // **Own**, so the prototype chain is not walked — which is the whole point of the method,
+    // and the reason it cannot be written as a property read against `undefined`.
+    if own_keys(target).contains(&wanted) {
+        Value::TRUE
+    } else {
+        Value::FALSE
+    }
+    .to_bits()
+}
+
+/// `Object.assign(target, …sources)`.
+extern "C" fn object_assign(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        for position in 1..argc as usize {
+            // SAFETY: as above.
+            let source = unsafe { argument(argc, argv, position) };
+            for name in own_keys(source) {
+                // SAFETY: `name` is a live Rust string.
+                let value =
+                    unsafe { crisol_property_load(source, name.as_ptr(), name.len() as u64) };
+                // SAFETY: as above.
+                unsafe {
+                    crisol_property_store(target, name.as_ptr(), name.len() as u64, value);
+                }
+            }
+        }
+        target
+    })
+}
+
+/// `Array.isArray(value)`.
+extern "C" fn array_is_array(
+    _closure: u64,
+    _this: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    let is = handle_of(value)
+        .is_some_and(|handle| with_runtime(|runtime| runtime.heap.element_count(handle).is_some()));
+    if is { Value::TRUE } else { Value::FALSE }.to_bits()
+}
+
+/// `Array.of(…values)`.
+extern "C" fn array_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let values: Vec<u64> = (0..argc as usize)
+            // SAFETY: as above.
+            .map(|position| unsafe { argument(argc, argv, position) })
+            .collect();
+        array_of_values(&values)
+    })
+}
+
 /// One argument of a native call, or `undefined` if it was not passed.
 ///
 /// # Safety
@@ -835,6 +1148,44 @@ impl Runtime {
             .map_or(Value::UNDEFINED, Value::string)
     }
 
+    /// The global named `name`, if it is an object.
+    fn global_object(&self, globals: GcRef, name: &str) -> Option<GcRef> {
+        let key = PropertyKey::new(name);
+        let shape = self.heap.shape_of(globals)?;
+        let slot = self.shapes.borrow().lookup(shape, &key)?;
+        self.heap
+            .get(globals, slot.index())
+            .and_then(|value| value.as_address())
+            .map(GcRef::from_address)
+    }
+
+    /// The global named `name`, creating it as a callable object if it is not there.
+    fn ensure_global_object(&self, globals: GcRef, name: &str) -> GcRef {
+        if let Some(existing) = self.global_object(globals, name) {
+            return existing;
+        }
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        // One internal slot, holding the index of the built-in it runs when called. `Object`
+        // and `Array` are constructors as well as namespaces, so they need to be callable.
+        let object = scope.alloc_with_internals(shape, 0, 1);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "there are a handful of built-ins"
+        )]
+        let encoded = -((NATIVES.len()
+            + GLOBAL_NATIVES.len()
+            + NAMESPACE_NATIVES.len()
+            + CONSTRUCT_PLAIN_OBJECT) as f64
+            + 1.0);
+        self.heap
+            .set_internal(object.handle(), 0, Value::number(encoded));
+        let text = self.string(name);
+        self.define(object.handle(), "name", text);
+        self.define(globals, name, object.to_value());
+        object.handle()
+    }
+
     /// Builds the object every unresolved name is looked up in.
     ///
     /// Rooted before anything is put in it, because each entry allocates and under stress each
@@ -860,6 +1211,30 @@ impl Runtime {
             let text = self.string(name);
             self.define(function.handle(), "name", text);
             self.define(globals.handle(), name, function.to_value());
+        }
+        // `Object` and `Array` are functions that also carry methods. Created here rather than
+        // in `GLOBAL_NATIVES` because they need properties hung off them, and the constructor
+        // they answer to is the same `make_error`-shaped thing: called or `new`ed, it returns
+        // an object.
+        for (index, (namespace, method, _)) in NAMESPACE_NATIVES.iter().enumerate() {
+            let owner = self.ensure_global_object(globals.handle(), namespace);
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "there are a handful of built-ins"
+            )]
+            let encoded = -((NATIVES.len() + GLOBAL_NATIVES.len() + index) as f64 + 1.0);
+            let function = scope.alloc_with_internals(shape, 0, 1);
+            self.heap
+                .set_internal(function.handle(), 0, Value::number(encoded));
+            self.define(owner, method, function.to_value());
+        }
+        // `Array.prototype` is the object every array already inherits from, not a new one —
+        // otherwise `[].map === Array.prototype.map` would be false.
+        if let (Some(array), Some(prototype)) = (
+            self.global_object(globals.handle(), "Array"),
+            ARRAY_PROTOTYPE.with(std::cell::Cell::get),
+        ) {
+            self.define(array, "prototype", prototype.to_value());
         }
         self.define(globals.handle(), "globalThis", globals.to_value());
         self.define(globals.handle(), "undefined", Value::UNDEFINED);
@@ -1639,11 +2014,17 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             reason = "checked negative, and the count of built-ins is tiny"
         )]
         let native = (-index - 1.0) as usize;
-        return NATIVES
-            .iter()
-            .chain(GLOBAL_NATIVES.iter())
-            .nth(native)
-            .map_or(fallback, |(_, function)| *function as *const u8);
+        if let Some((_, function)) = NATIVES.iter().chain(GLOBAL_NATIVES.iter()).nth(native) {
+            return *function as *const u8;
+        }
+        let offset = NATIVES.len() + GLOBAL_NATIVES.len();
+        if let Some((_, _, function)) = NAMESPACE_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + NAMESPACE_NATIVES.len();
+        return ANONYMOUS_NATIVES
+            .get(native.wrapping_sub(offset))
+            .map_or(fallback, |function| *function as *const u8);
     }
     #[expect(
         clippy::cast_possible_truncation,
