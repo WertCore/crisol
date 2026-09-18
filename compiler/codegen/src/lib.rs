@@ -179,12 +179,24 @@ const COMPUTED_STORE_SYMBOL: &str = "crisol_computed_store";
 const STRICT_EQUAL_SYMBOL: &str = "crisol_strict_equal";
 const THROW_SYMBOL: &str = "crisol_throw";
 const PENDING_EXCEPTION_SYMBOL: &str = "crisol_pending_exception";
+const CREATE_STRING_SYMBOL: &str = "crisol_create_string";
+
+/// The runtime symbol each unary operator calls when its operand's type is not known.
+///
+/// A table rather than fields, because these all share one shape — one value in, one out — and
+/// the backend picks by operator exactly as it does for the binary helpers.
+const UNARY_SYMBOLS: &[(crisol_ir::UnaryOp, &str)] = &[
+    (crisol_ir::UnaryOp::Negate, "crisol_negate"),
+    (crisol_ir::UnaryOp::ToNumber, "crisol_to_number"),
+    (crisol_ir::UnaryOp::Not, "crisol_not"),
+    (crisol_ir::UnaryOp::TypeOf, "crisol_typeof"),
+];
 
 /// The symbol holding the addresses of the program's compiled functions.
 pub const FUNCTION_TABLE_SYMBOL: &str = "crisol_functions";
 
 /// The runtime entry points objects and closures need, as declared in a module.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ObjectHelpers<T> {
     /// `crisol_create_object() -> value`
     create: T,
@@ -216,6 +228,10 @@ struct ObjectHelpers<T> {
     throw: T,
     /// `crisol_pending_exception() -> value`
     pending: T,
+    /// `crisol_create_string(text, length) -> string`
+    create_string: T,
+    /// One per unary operator that needs a runtime coercion.
+    unary: Vec<(crisol_ir::UnaryOp, T)>,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -297,6 +313,26 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     let mut pending = module.make_signature();
     pending.returns.push(AbiParam::new(types::I64));
 
+    let mut create_string = module.make_signature();
+    create_string.params.push(AbiParam::new(pointer));
+    create_string.params.push(AbiParam::new(types::I64));
+    create_string.returns.push(AbiParam::new(types::I64));
+
+    let mut unary_signature = module.make_signature();
+    unary_signature.params.push(AbiParam::new(types::I64));
+    unary_signature.returns.push(AbiParam::new(types::I64));
+    let mut unary = Vec::with_capacity(UNARY_SYMBOLS.len());
+    for (op, symbol) in UNARY_SYMBOLS {
+        unary.push((
+            *op,
+            module
+                .declare_function(symbol, Linkage::Import, &unary_signature)
+                .map_err(|error| CodegenError::Backend {
+                    message: error.to_string(),
+                })?,
+        ));
+    }
+
     let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
         module
             .declare_function(symbol, Linkage::Import, signature)
@@ -320,6 +356,8 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         strict_equal: declare(STRICT_EQUAL_SYMBOL, &strict_equal)?,
         throw: declare(THROW_SYMBOL, &throw)?,
         pending: declare(PENDING_EXCEPTION_SYMBOL, &pending)?,
+        create_string: declare(CREATE_STRING_SYMBOL, &create_string)?,
+        unary,
     })
 }
 
@@ -359,16 +397,18 @@ fn symbol_name(function: &Function) -> String {
     format!("crisol_fn{}_{readable}", function.id.index())
 }
 
-/// Every property key a function names, in the order first seen.
+/// Every piece of text a function names, in the order first seen.
 ///
-/// Collected before lowering because a key becomes a constant in the object's data section,
-/// and defining data needs the module — which the lowering deliberately does not hold.
+/// Property keys **and** string literals, because both become bytes in the object's data
+/// section and are reached the same way. Collected before lowering because defining data needs
+/// the module, which the lowering deliberately does not hold.
 fn keys_of(function: &Function) -> Vec<String> {
     let mut keys = Vec::new();
     for block in &function.blocks {
         for instruction in &block.instructions {
             let key = match &instruction.op {
                 Op::PropertyLoad { key, .. } | Op::PropertyStore { key, .. } => key.as_str(),
+                Op::Const(Constant::String(text)) => text.as_str(),
                 _ => continue,
             };
             if !keys.iter().any(|seen: &String| seen == key) {
@@ -456,6 +496,9 @@ const fn may_hold_a_reference(ty: crisol_ir::Type) -> bool {
         crisol_ir::Type::String | crisol_ir::Type::Object(_) | crisol_ir::Type::Unknown => true,
     }
 }
+
+/// A borrowed piece of interned text, so the two lookups read the same.
+struct TextRef<'a>(&'a str);
 
 /// What both emitted tables are aligned to.
 ///
@@ -815,6 +858,20 @@ impl Backend for Cranelift {
             pending: self
                 .module
                 .declare_func_in_func(self.objects.pending, &mut context.func),
+            create_string: self
+                .module
+                .declare_func_in_func(self.objects.create_string, &mut context.func),
+            unary: self
+                .objects
+                .unary
+                .iter()
+                .map(|(op, id)| {
+                    (
+                        *op,
+                        self.module.declare_func_in_func(*id, &mut context.func),
+                    )
+                })
+                .collect(),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature
@@ -1112,6 +1169,17 @@ impl Lowering<'_> {
                 )]
                 Some(self.builder.ins().iconst(types::I64, bits as i64))
             }
+            Op::Const(Constant::String(text)) => {
+                // A call rather than a constant: a string is a heap cell, so it has to be
+                // allocated. The bytes are already in the data section — the same constant a
+                // property key of the same text would use, interned once.
+                let (pointer, length) = self.text_operands(text)?;
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.create_string, &[pointer, length]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::Const(Constant::Undefined) => Some(
                 self.builder
                     .ins()
@@ -1229,12 +1297,20 @@ impl Lowering<'_> {
                         let inverted = self.builder.ins().bxor_imm_u(is_true, 1);
                         Some(self.box_condition(inverted))
                     }
-                    // `~`, `typeof`, and the coercing forms of the above need the runtime:
-                    // `~` needs modular `ToInt32` (D-87), and `typeof` produces a string.
+                    // Everything else is a call. The coercing forms of the above need
+                    // `ToNumber` or `ToBoolean`, and `typeof` produces a string — none of
+                    // which is an instruction. `~` still has none, because it needs modular
+                    // `ToInt32` (D-87).
                     other => {
-                        return Err(CodegenError::Unsupported {
-                            operation: format!("unary operator {}", other.symbol()),
-                        });
+                        let Some((_, helper)) =
+                            self.objects.unary.iter().find(|(op, _)| *op == *other)
+                        else {
+                            return Err(CodegenError::Unsupported {
+                                operation: format!("unary operator {}", other.symbol()),
+                            });
+                        };
+                        let call = self.builder.ins().call(*helper, &[value]);
+                        Some(self.builder.inst_results(call)[0])
                     }
                 }
             }
@@ -1549,15 +1625,21 @@ impl Lowering<'_> {
         &mut self,
         key: &crisol_value::PropertyKey,
     ) -> Result<(ClifValue, ClifValue), CodegenError> {
-        let Some(global) = self.keys.get(key.as_str()).copied() else {
+        self.text_operands(key.as_str())
+    }
+
+    /// Where a piece of interned text is, and how long.
+    fn text_operands(&mut self, text: &str) -> Result<(ClifValue, ClifValue), CodegenError> {
+        let key = TextRef(text);
+        let Some(global) = self.keys.get(key.0).copied() else {
             // Unreachable unless `keys_of` and the lowering disagree about which operations
             // name a key, which is exactly the kind of drift worth failing loudly on.
             return Err(CodegenError::Backend {
-                message: format!("the property key {:?} was never interned", key.as_str()),
+                message: format!("the text {:?} was never interned", key.0),
             });
         };
         let address = self.builder.ins().symbol_value(self.pointer, global);
-        let length = i64::try_from(key.as_str().len()).unwrap_or(i64::MAX);
+        let length = i64::try_from(key.0.len()).unwrap_or(i64::MAX);
         let length = self.builder.ins().iconst(types::I64, length);
         Ok((address, length))
     }
@@ -1789,6 +1871,20 @@ impl Jit {
             pending: self
                 .module
                 .declare_func_in_func(self.objects.pending, &mut context.func),
+            create_string: self
+                .module
+                .declare_func_in_func(self.objects.create_string, &mut context.func),
+            unary: self
+                .objects
+                .unary
+                .iter()
+                .map(|(op, id)| {
+                    (
+                        *op,
+                        self.module.declare_func_in_func(*id, &mut context.func),
+                    )
+                })
+                .collect(),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature

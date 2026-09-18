@@ -957,3 +957,119 @@ fn instanceof_rejects_an_unrelated_object_and_a_primitive() {
         "false",
     );
 }
+
+// ---- strings ----------------------------------------------------------------------------
+
+#[test]
+fn a_string_literal_prints() {
+    check("string-literal", "return \"hello\";", "hello");
+}
+
+/// **Strings compare by their characters, not by identity.** Each literal allocates a fresh
+/// cell today, so an identity comparison would make this false.
+#[test]
+fn strings_compare_by_value() {
+    check("string-eq", "return \"a\" === \"a\";", "true");
+    check("string-ne", "return \"a\" === \"b\";", "false");
+    check(
+        "string-eq-built",
+        "let a = \"foo\"; let b = \"fo\" + \"o\"; return a === b;",
+        "true",
+    );
+}
+
+/// **`+` concatenates when either operand is a string**, and adds otherwise — `1 + "2"` is
+/// `"12"`, not `3`.
+#[test]
+fn plus_concatenates_with_a_string_operand() {
+    check("string-concat", "return \"a\" + \"b\";", "ab");
+    check("string-number-right", "return \"n=\" + 2;", "n=2");
+    check("string-number-left", "return 1 + \"2\";", "12");
+    check("number-plus-number", "return 1 + 2;", "3");
+}
+
+#[test]
+fn a_string_has_a_length() {
+    check("string-length", "return \"hello\".length;", "5");
+    check("string-length-empty", "return \"\".length;", "0");
+}
+
+#[test]
+fn a_string_can_be_a_property_value_and_an_element() {
+    check("string-in-object", "let o = {s: \"hi\"}; return o.s;", "hi");
+    check(
+        "string-in-array",
+        "let a = [\"x\", \"y\"]; return a[1];",
+        "y",
+    );
+}
+
+/// Strings allocate, so they are collected like anything else.
+#[test]
+fn strings_survive_a_collection() {
+    check(
+        "string-stress",
+        "let a = \"one\"; let b = \"two\"; let c = a + b; let o = {v: c}; return o.v;",
+        "onetwo",
+    );
+}
+
+// ---- unary operators on values of unknown type ------------------------------------------
+
+#[test]
+fn negation_coerces_before_negating() {
+    check("unary-negate", "let x = 3; return -x;", "-3");
+    check("unary-negate-string", "let s = \"4\"; return -s;", "-4");
+}
+
+#[test]
+fn unary_plus_is_to_number() {
+    check("unary-plus", "let s = \"5\"; return +s;", "5");
+}
+
+#[test]
+fn not_applies_to_boolean_conversion() {
+    check("unary-not-zero", "let x = 0; return !x;", "true");
+    check("unary-not-object", "let o = {}; return !o;", "false");
+}
+
+/// **`typeof null` is `"object"`** — a bug old enough to be part of the language — and a
+/// function reports `"function"` although it is an object, so neither can be read off the
+/// value's kind alone.
+#[test]
+fn typeof_reports_the_specified_names() {
+    check("typeof-number", "return typeof 1;", "number");
+    check("typeof-string", "return typeof \"a\";", "string");
+    check("typeof-boolean", "return typeof true;", "boolean");
+    check("typeof-undefined", "return typeof undefined;", "undefined");
+    check("typeof-null", "return typeof null;", "object");
+    check("typeof-object", "return typeof {};", "object");
+    check(
+        "typeof-function",
+        "let f = function () {}; return typeof f;",
+        "function",
+    );
+}
+
+/// The three things a bit comparison gets wrong, on values the lattice knows nothing about.
+#[test]
+fn strict_equality_on_unknown_values_follows_the_specification() {
+    // `NaN === NaN` is false, and two NaNs have identical bits.
+    check(
+        "eq-nan",
+        "let a = 0 / 0; let b = 0 / 0; return a === b;",
+        "false",
+    );
+    // `+0 === -0` is true, and their bits differ.
+    check(
+        "eq-zeroes",
+        "let a = 0; let b = -0; return a === b;",
+        "true",
+    );
+    // Different types are never equal, whatever the payloads.
+    check(
+        "eq-types",
+        "let a = 0; let b = \"0\"; return a === b;",
+        "false",
+    );
+}

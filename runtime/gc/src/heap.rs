@@ -62,6 +62,15 @@ struct Object {
     /// `None` rather than an empty vector, so `[]` and `{}` stay distinguishable — the first
     /// has a `length` and the second does not.
     elements: Option<Vec<Value>>,
+    /// The characters, for a string. `None` for everything else.
+    ///
+    /// A string is a heap cell like an object because a `Value` carries 48 bits and text does
+    /// not fit in them. It is *not* an object in the language's sense — it has no properties
+    /// and no shape that matters — but it is collected the same way, which is what it needs
+    /// from here.
+    ///
+    /// Holds no references, so the collector traces nothing through it.
+    text: Option<Box<str>>,
 }
 
 #[derive(Debug)]
@@ -311,6 +320,44 @@ impl Heap {
                 true
             }
             State::Free => false,
+        }
+    }
+
+    /// Turns `handle` into a string holding `text`.
+    ///
+    /// Separate from allocation for the same reason `make_array` is: the cell is allocated
+    /// first so it is rooted, and only then filled.
+    pub fn make_string(&self, handle: GcRef, text: &str) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.text = Some(text.into());
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// The characters of `handle`, if it is a string.
+    ///
+    /// Takes a closure rather than returning the text, so a caller cannot hold a borrow of the
+    /// heap across an allocation — which is how a collection would find the cells already
+    /// borrowed and panic.
+    pub fn with_text<R>(&self, handle: GcRef, body: impl FnOnce(&str) -> R) -> Option<R> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.text.as_deref().map(body),
+            State::Free => None,
         }
     }
 
@@ -629,6 +676,7 @@ impl Heap {
             prototype: None,
             internals: vec![Value::UNDEFINED; internals],
             elements: None,
+            text: None,
         };
 
         let handle = match self.free.borrow_mut().pop() {

@@ -43,9 +43,11 @@ const SAMPLE: usize = 400;
 enum Outcome {
     /// The compiler named something it does not handle.
     Refused(String),
-    /// It built, then died.
+    /// It built and then threw — which is how a test262 case reports failure.
+    Failed,
+    /// It built and then died on a signal, which is a bug here rather than a wrong answer.
     Crashed,
-    /// It built and exited cleanly.
+    /// It built, ran and returned normally. **This is a pass.**
     Ran,
 }
 
@@ -104,6 +106,9 @@ fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcom
         Err(error) => Outcome::Refused(stage_of(&error)),
         Ok(()) => match Command::new(&binary).output() {
             Ok(output) if output.status.success() => Outcome::Ran,
+            // Exit 1 is the entry point reporting an uncaught throw, which is exactly how a
+            // case signals a failed assertion. Anything else — a signal, a panic — is ours.
+            Ok(output) if output.status.code() == Some(1) => Outcome::Failed,
             _ => Outcome::Crashed,
         },
     };
@@ -170,6 +175,7 @@ fn the_suite_is_attempted_and_the_result_reported() {
 
     let mut attempted = 0usize;
     let mut ran = 0usize;
+    let mut failed = 0usize;
     let mut crashed = Vec::new();
     let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -180,6 +186,7 @@ fn the_suite_is_attempted_and_the_result_reported() {
         attempted += 1;
         match outcome {
             Outcome::Ran => ran += 1,
+            Outcome::Failed => failed += 1,
             Outcome::Crashed => crashed.push(case.clone()),
             Outcome::Refused(reason) => *refusals.entry(reason).or_default() += 1,
         }
@@ -193,9 +200,10 @@ fn the_suite_is_attempted_and_the_result_reported() {
         "test262: {attempted} attempted of {} discovered",
         cases.len()
     );
-    println!("  ran to completion: {ran}");
-    println!("  crashed:           {}", crashed.len());
-    println!("  refused:           {}", attempted - ran - crashed.len());
+    println!("  passed:   {ran}");
+    println!("  failed:   {failed}");
+    println!("  crashed:  {}", crashed.len());
+    println!("  refused:  {}", attempted - ran - failed - crashed.len());
     println!("what the compiler refused, most common first:");
     for (reason, count) in ranked.iter().take(20) {
         println!("  {count:>5}  {reason}");

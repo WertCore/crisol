@@ -196,15 +196,23 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
                  unsigned long long this_value, unsigned long long new_target,\n\
                  unsigned long long argc, unsigned long long *argv);\n\
              extern void crisol_print(unsigned long long);\n\
+             extern void crisol_report_uncaught(void);\n\
              int main(void) {{\n\
                  unsigned long long argv[{slots}] = {{ {undefined}ULL }};\n\
                  crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
                  crisol_register_functions(&crisol_functions[1], crisol_functions[0]);\n\
-                 crisol_print(crisol_program(0ULL, {undefined}ULL, {undefined}ULL, 0ULL, argv));\n\
+                 unsigned long long result =\n\
+                     crisol_program(0ULL, {undefined}ULL, {undefined}ULL, 0ULL, argv);\n\
+                 if (result == {exception}ULL) {{\n\
+                     crisol_report_uncaught();\n\
+                     return 1;\n\
+                 }}\n\
+                 crisol_print(result);\n\
                  return 0;\n\
              }}\n",
             undefined = crisol_value::Value::UNDEFINED.to_bits(),
             slots = crisol_codegen::ARGV_MIN_SLOTS,
+            exception = crisol_value::Value::EXCEPTION.to_bits(),
         ),
     )
     .map_err(|error| BuildError::Link {

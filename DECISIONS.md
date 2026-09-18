@@ -3228,3 +3228,45 @@ its own. It should never reach a program; if a propagation is ever missed the va
 inside a half-unwound call is not. The value in flight is also a **GC root** — the frame that
 made it has returned and no handler holds it yet, so without that, throwing an object and
 catching it after any allocation would catch a freed one.
+
+## D-105
+
+**Strings are heap cells, and `===` on them compares characters.**
+
+Status: Accepted
+
+A `Value` carries 48 bits and text does not fit, so a string is a cell the collector owns —
+like an object, though it has no properties and no shape that matters. A literal allocates a
+fresh cell **on every evaluation**, which is correct because strings are primitives and `===`
+compares characters, and wasteful because `"a"` in a loop allocates each time. Interning
+constants is the obvious fix and wants a table that is a permanent GC root; correctness first.
+
+`+` concatenates when *either* operand is a string, which is why the test is on the operands
+rather than on both being numbers: `1 + "2"` is `"12"` and not `3`. An object operand still
+gives `NaN`, because `ToPrimitive` calls user code.
+
+`ToNumber` had been "the number, or `NaN`". It now follows the specification for the types that
+exist: a string parses, **an empty or all-whitespace one is `0` rather than `NaN`** — the one
+case a plain `parse` gets wrong, since Rust rejects an empty string — a boolean is `1` or `0`,
+and `null` is `0` while `undefined` is `NaN`.
+
+**Known wrong:** `.length` counts **bytes**, and JavaScript counts UTF-16 code units. It reads
+correctly for every ASCII test, which is exactly why it is written down here.
+
+## D-106
+
+**An uncaught throw exits non-zero, and that is what made a pass rate possible.**
+
+Status: Accepted
+
+test262 reports failure **by throwing**. Once exceptions existed, 221 of 379 sampled cases
+"ran to completion" — and reporting that as a pass rate would have claimed 58%, because a case
+whose assertion fired threw, propagated out of `crisol_program`, and the entry point printed the
+signal as `undefined` and exited successfully.
+
+The entry point now checks for the signal, reports what was thrown, and exits 1. The runner
+reads exit 1 as a *failed test* and anything else — a signal, a panic — as a bug here. The real
+figures are **16 passed, 205 failed, 0 crashed, 158 refused**.
+
+That the number fell from 221 to 16 is the whole argument for the harness having reported
+three numbers separately from the start, rather than collapsing "it finished" into "it passed".

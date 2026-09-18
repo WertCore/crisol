@@ -62,6 +62,12 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_strict_equal",
     "crisol_throw",
     "crisol_pending_exception",
+    "crisol_create_string",
+    "crisol_negate",
+    "crisol_to_number",
+    "crisol_not",
+    "crisol_typeof",
+    "crisol_report_uncaught",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -73,7 +79,31 @@ pub const SYMBOLS: &[&str] = &[
 /// string would make `"5" * 2` evaluate to `0` instead of `10`.
 fn to_number(bits: u64) -> f64 {
     let value = Value::from_bits(bits);
-    value.as_number().unwrap_or(f64::NAN)
+    match value.kind() {
+        crisol_value::Kind::Number => value.as_number().unwrap_or(f64::NAN),
+        // **An empty or all-whitespace string is `0`, not `NaN`** — `+"" === 0` — which is the
+        // one case a plain `parse` gets wrong, because Rust rejects an empty string.
+        crisol_value::Kind::String => text_of(bits).map_or(f64::NAN, |text| {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                0.0
+            } else {
+                trimmed.parse().unwrap_or(f64::NAN)
+            }
+        }),
+        crisol_value::Kind::Boolean => {
+            if value.as_boolean().unwrap_or(false) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        // `null` is `0` and `undefined` is `NaN`, which is the asymmetry behind `null >= 0`
+        // being true while `null == 0` is false.
+        crisol_value::Kind::Null => 0.0,
+        // An object needs `ToPrimitive`, which calls user code.
+        _ => f64::NAN,
+    }
 }
 
 fn from_number(number: f64) -> u64 {
@@ -129,9 +159,18 @@ pub fn to_uint32(number: f64) -> u32 {
 /// the body; the `extern "C"` surface is what the backend emits calls to.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_add(left: u64, right: u64) -> u64 {
-    // `+` concatenates when either operand is a string after `ToPrimitive`. Strings need the
-    // runtime's string table, which does not exist yet, so a string operand gives `NaN` rather
-    // than a wrong concatenation or a silent numeric answer.
+    // **`+` concatenates when either operand is a string**, and adds otherwise. The test is on
+    // the operands rather than on both being numbers, because `1 + "2"` is `"12"` and not `3`.
+    //
+    // An object operand still gives `NaN`: `ToPrimitive` calls user code, and guessing at it
+    // would turn `{} + ""` into something that reads plausibly and is wrong.
+    let is_string = |bits: u64| Value::from_bits(bits).kind() == crisol_value::Kind::String;
+    if is_string(left) || is_string(right) {
+        return match (to_text(left), to_text(right)) {
+            (Some(a), Some(b)) => new_string(&(a + &b)),
+            _ => from_number(f64::NAN),
+        };
+    }
     from_number(to_number(left) + to_number(right))
 }
 
@@ -242,7 +281,11 @@ pub extern "C" fn crisol_print(bits: u64) {
         crisol_value::Kind::Number => {
             println!("{}", number_text(value.as_number().unwrap_or(f64::NAN)));
         }
-        crisol_value::Kind::String | crisol_value::Kind::Symbol | crisol_value::Kind::Object => {
+        crisol_value::Kind::String => match text_of(bits) {
+            Some(text) => println!("{text}"),
+            None => println!("[unreadable string]"),
+        },
+        crisol_value::Kind::Symbol | crisol_value::Kind::Object => {
             // Reaching into the heap needs a runtime this crate does not have. Saying so beats
             // printing a pointer that looks like a number.
             println!("[unprintable: the heap is not wired up yet]");
@@ -788,6 +831,19 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
     with_runtime(|runtime| {
         // `length` on an array is not stored anywhere — it *is* the element count, and has to
         // answer correctly after `a[9] = 1` grew the array without any property being written.
+        if name == "length"
+            && let Some(characters) = runtime.heap.with_text(handle, str::len)
+        {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a string this long cannot be allocated"
+            )]
+            // **Bytes, not characters.** JavaScript counts UTF-16 code units, so this is wrong
+            // for anything outside ASCII — recorded here rather than left to be discovered,
+            // because it reads correctly for every test that happens to use ASCII.
+            let length = characters as f64;
+            return Value::number(length).to_bits();
+        }
         if name == "length"
             && let Some(count) = runtime.heap.element_count(handle)
         {
@@ -1543,6 +1599,17 @@ pub extern "C" fn crisol_strict_equal(left: u64, right: u64) -> u64 {
     let right = Value::from_bits(right);
     let equal = match (left.as_number(), right.as_number()) {
         (Some(a), Some(b)) => a == b,
+        // **Strings compare by their characters, not by identity.** They are primitives, so
+        // `"a" === "a"` is true however many separate cells the two came from — and constants
+        // do allocate a fresh one per evaluation today.
+        (None, None)
+            if left.kind() == crisol_value::Kind::String
+                && right.kind() == crisol_value::Kind::String =>
+        {
+            text_of(left.to_bits())
+                .zip(text_of(right.to_bits()))
+                .is_some_and(|(a, b)| a == b)
+        }
         (None, None) => left.kind() == right.kind() && left.to_bits() == right.to_bits(),
         _ => false,
     };
@@ -1633,4 +1700,137 @@ pub extern "C" fn crisol_instanceof(left: u64, right: u64) -> u64 {
         }
         Value::FALSE.to_bits()
     })
+}
+
+/// The characters of a string value.
+fn text_of(bits: u64) -> Option<String> {
+    let value = Value::from_bits(bits);
+    if value.kind() != crisol_value::Kind::String {
+        return None;
+    }
+    let handle = value.as_address().map(GcRef::from_address)?;
+    with_runtime(|runtime| runtime.heap.with_text(handle, ToOwned::to_owned))
+}
+
+/// Allocates a string cell holding `text`.
+fn new_string(text: &str) -> u64 {
+    with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        let scope = runtime.heap.scope();
+        let cell = scope.alloc(shape, 0);
+        runtime.heap.make_string(cell.handle(), text);
+        // The same 48 bits the handle packs into, re-tagged as a string rather than an object.
+        // `to_value` is where that packing lives, so this cannot drift from it.
+        cell.handle().to_value().as_address().map_or_else(
+            || Value::UNDEFINED.to_bits(),
+            |address| Value::string(address).to_bits(),
+        )
+    })
+}
+
+/// A string literal, from bytes the object file carries.
+///
+/// A fresh cell per evaluation, which is correct because strings are primitives and `===`
+/// compares characters — and wasteful, because `"a"` in a loop allocates every time. Interning
+/// constants is the obvious fix and is deliberately not done yet: it wants a table that is a
+/// permanent GC root, and correctness first.
+///
+/// # Safety
+///
+/// `text` must point to `length` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_create_string(text: *const u8, length: u64) -> u64 {
+    // SAFETY: the caller promises `length` readable UTF-8 bytes at `text`.
+    let Some(text) = (unsafe { key_text(text, length) }) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    new_string(&text)
+}
+
+/// How a value reads as text, for `+` and for printing.
+fn to_text(bits: u64) -> Option<String> {
+    let value = Value::from_bits(bits);
+    match value.kind() {
+        crisol_value::Kind::String => text_of(bits),
+        crisol_value::Kind::Number => value.as_number().map(number_text),
+        crisol_value::Kind::Undefined => Some("undefined".to_owned()),
+        crisol_value::Kind::Null => Some("null".to_owned()),
+        crisol_value::Kind::Boolean => {
+            Some(if value.as_boolean()? { "true" } else { "false" }.to_owned())
+        }
+        // An object needs `ToPrimitive`, which calls user code. Recorded rather than guessed at
+        // with something that would read plausibly.
+        _ => None,
+    }
+}
+
+/// `-value`, after `ToNumber`.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_negate(value: u64) -> u64 {
+    from_number(-to_number(value))
+}
+
+/// `+value` — `ToNumber`, which is why `+"1"` is `1`.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_to_number(value: u64) -> u64 {
+    from_number(to_number(value))
+}
+
+/// `!value` — `ToBoolean` then inverted, so it never fails.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_not(value: u64) -> u64 {
+    if is_truthy(Value::from_bits(value)) {
+        Value::FALSE
+    } else {
+        Value::TRUE
+    }
+    .to_bits()
+}
+
+/// `typeof value`.
+///
+/// **`typeof null` is `"object"`**, which is a bug in the language old enough to be part of it —
+/// and `typeof` a function is `"function"` although a function is an object, so neither answer
+/// can be read off the value's kind alone.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_typeof(value: u64) -> u64 {
+    let value = Value::from_bits(value);
+    let name = match value.kind() {
+        crisol_value::Kind::Undefined => "undefined",
+        crisol_value::Kind::Null => "object",
+        crisol_value::Kind::Boolean => "boolean",
+        crisol_value::Kind::Number => "number",
+        crisol_value::Kind::String => "string",
+        crisol_value::Kind::Symbol => "symbol",
+        crisol_value::Kind::Object => {
+            // A closure keeps its function index where no property can reach it, so having one
+            // is what makes an object callable — and callable is what `typeof` reports on.
+            let callable = value
+                .as_address()
+                .map(GcRef::from_address)
+                .is_some_and(|handle| {
+                    with_runtime(|runtime| runtime.heap.internal(handle, 0).is_some())
+                });
+            if callable { "function" } else { "object" }
+        }
+    };
+    new_string(name)
+}
+
+/// Reports the throw that reached the top of the program.
+///
+/// Called by the entry point when `crisol_program` answers with the exception signal rather
+/// than a value. Without it an uncaught `throw` would exit successfully and print the signal as
+/// `undefined` — which is how a test suite that reports failure *by throwing* would score every
+/// failing case as a pass.
+#[unsafe(no_mangle)]
+pub extern "C" fn crisol_report_uncaught() {
+    let thrown = crisol_pending_exception();
+    let described = to_text(thrown).unwrap_or_else(|| "an object".to_owned());
+    eprintln!("uncaught: {described}");
 }

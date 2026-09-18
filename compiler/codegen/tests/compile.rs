@@ -231,9 +231,11 @@ fn strict_equality_on_numbers_is_float_equality() {
 }
 
 #[test]
-fn strict_equality_on_unknown_values_is_still_refused() {
-    // On boxed values of unknown type a bit comparison gets NaN and ±0 wrong, which is D-53's
-    // whole subject. The lattice has proved nothing here, so the backend refuses.
+fn strict_equality_on_unknown_values_becomes_a_call() {
+    // On boxed values of unknown type a bit comparison gets `NaN` and `±0` wrong, which is
+    // D-53's whole subject. The lattice has proved nothing here, so this is a call to the
+    // runtime rather than an instruction — it used to be refused outright, and `switch` needs
+    // it, since every case comparison is exactly this.
     let mut function = Function::new("eq_unknown");
     let left = function.value();
     let right = function.value();
@@ -266,10 +268,13 @@ fn strict_equality_on_unknown_values_is_still_refused() {
     entry.terminator = Terminator::Return(Some(result));
 
     let mut backend = host();
-    assert!(matches!(
-        backend.compile(&function).expect_err("refused"),
-        CodegenError::Unsupported { .. }
-    ));
+    let _ = backend.compile(&function).expect("compiles");
+    let object = backend.finish().expect("emits");
+    let needle = b"crisol_strict_equal";
+    assert!(
+        object.windows(needle.len()).any(|window| window == needle),
+        "it must reach the runtime rather than compare bits"
+    );
 }
 
 #[test]
