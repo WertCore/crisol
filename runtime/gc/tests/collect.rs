@@ -424,3 +424,81 @@ fn a_mixed_workload_under_stress_mode_keeps_exactly_what_is_reachable() {
     assert_eq!(heap.live(), 1, "only the anchor is reachable now");
     assert!(heap.stats().collections >= 50);
 }
+
+// ---- roots the shadow stack cannot see (ROADMAP §3.1) ----------------------------------
+
+/// Compiled machine code holds values in registers and frame slots and pushes nothing onto the
+/// shadow stack, so to `mark` they look exactly like garbage.
+///
+/// Both halves are here deliberately. "It survived" says nothing unless it could have died,
+/// and the first test is what makes the second one evidence rather than decoration.
+
+#[test]
+fn an_object_only_a_compiled_frame_holds_dies_when_nothing_reports_it() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    {
+        let scope = heap.scope();
+        scope.alloc(shape, 1);
+    }
+    // The scope is gone. A compiled frame still holding this is exactly the situation, and
+    // with no provider installed the collector cannot know that.
+    assert_eq!(
+        heap.collect().swept,
+        1,
+        "unreported, so indistinguishable from garbage"
+    );
+    assert_eq!(heap.live(), 0);
+}
+
+#[test]
+fn an_object_only_a_compiled_frame_holds_survives_when_a_provider_reports_it() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let held = {
+        let scope = heap.scope();
+        scope.alloc(shape, 1).handle()
+    };
+
+    // Stands in for the native frame walk. What the real one returns differs only in where it
+    // read the handle from; to `mark` both are a root no scope holds.
+    heap.set_extra_roots(Box::new(move || vec![held]));
+    assert!(heap.has_extra_roots());
+
+    assert_eq!(
+        heap.collect().swept,
+        0,
+        "reported by the provider, so it is live"
+    );
+    assert_eq!(heap.live(), 1);
+}
+
+#[test]
+fn a_provider_root_keeps_what_it_points_at_alive_too() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    // A compiled frame reports one handle; the object graph hanging off it has to be traced
+    // as well, or the collector frees an object the program can still reach in one hop.
+    let held = {
+        let scope = heap.scope();
+        let root = scope.alloc(shape, 1);
+        let reachable = scope.alloc(shape, 1);
+        heap.set(root.handle(), 0, reachable.to_value());
+        root.handle()
+    };
+
+    heap.set_extra_roots(Box::new(move || vec![held]));
+
+    assert_eq!(heap.collect().swept, 0);
+    assert_eq!(
+        heap.live(),
+        2,
+        "the provider's root is traced, not just marked"
+    );
+}

@@ -508,6 +508,16 @@ impl Lowering<'_> {
         }
         // Cranelift hands out the variable; it is not constructed from the slot number.
         let variable = self.builder.declare_var(types::I64);
+        // **Every slot is declared as needing a stack map**, because any of them may hold a
+        // reference and nothing here knows which. That sounds conservative and is not: a
+        // NaN-boxed value carries its own tag (D-53), so the collector reads each slot and
+        // asks what it is. A number in a slot is reported and then ignored — precisely, not
+        // heuristically, which is the difference from scanning the stack for things that look
+        // like pointers (ROADMAP §2.1).
+        //
+        // The cost is that every slot is spilled at every safepoint. Narrowing that needs the
+        // IR to carry which slots can hold references, which is M20's.
+        self.builder.declare_var_needs_stack_map(variable);
         self.slots.insert(slot, variable);
         variable
     }

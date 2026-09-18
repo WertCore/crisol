@@ -103,3 +103,44 @@ fn compiled_roots_are_empty_when_no_program_registered_a_table() {
     let roots = unsafe { crisol_abi::compiled_roots(16) };
     assert!(roots.is_empty());
 }
+
+// ---- handing the roots to the collector ------------------------------------------------
+
+/// Installing a root provider must not turn the collector into one that keeps everything.
+///
+/// This is the failure that would hide the most: a provider that over-reports still passes
+/// every "does it survive" test, and the leak shows up only as memory that never comes back.
+#[test]
+fn installing_the_provider_does_not_root_everything() {
+    use crisol_gc::Heap;
+    use crisol_value::Shapes;
+
+    let shapes = Shapes::new();
+    let heap = Heap::new();
+    // SAFETY: nothing compiled is running, so no collection can observe a non-safepoint stack.
+    unsafe { crisol_abi::install_compiled_roots(&heap) };
+    assert!(heap.has_extra_roots());
+
+    {
+        let scope = heap.scope();
+        scope.alloc(shapes.root(), 0);
+    }
+    // No compiled frames exist in this process, so the walk has nothing to report and an
+    // unrooted object must still die.
+    assert_eq!(heap.collect().swept, 1);
+    assert_eq!(heap.live(), 0);
+}
+
+/// The walk runs against this test's own native stack, which has no registered stack maps.
+///
+/// It must come back empty rather than reading whatever the frames happen to contain — the
+/// difference between "no roots" and "some stack garbage reinterpreted as handles".
+#[test]
+fn a_scan_with_no_registered_maps_yields_no_roots() {
+    // SAFETY: as above.
+    let roots = unsafe { crisol_abi::compiled_roots(crisol_abi::FRAME_LIMIT) };
+    assert!(
+        roots.is_empty(),
+        "unregistered maps must mean no roots, not garbage"
+    );
+}

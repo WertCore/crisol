@@ -2818,3 +2818,31 @@ The table exists in the linked binary — verified with `nm`, not assumed. What 
 runtime side: walking native frames to find return addresses, matching them against the table,
 and reading the live slots. Until that lands, collection during compiled code is still unsafe,
 and §M13's GC stress requirement is not met.
+
+## D-91
+
+**The collector asks for compiled roots through a callback, rather than calling the runtime.**
+
+Status: Accepted
+
+`mark` started from the shadow stack alone, which is every root a Rust embedder has and none
+of the ones compiled code holds. Compiled code keeps values in registers and frame slots and
+pushes nothing, so without this a collection frees values a running program is still using —
+the use-after-free ROADMAP §3.1 calls the worst failure mode of this milestone to debug.
+
+The obvious wiring is for `Heap::mark` to call `crisol_abi::compiled_roots` directly. That
+inverts the dependency: `crisol-abi` needs `crisol-gc` to allocate, so `crisol-gc` cannot
+depend on `crisol-abi`. Instead the collector declares the hole — `set_extra_roots`, taking a
+closure — and `crisol-abi::install_compiled_roots` fills it, because walking a native stack is
+the ABI's business and the bit layout of a frame is not something the collector should know.
+
+The seam is worth having for its own sake: the tests can install a provider that returns a
+known handle, so the "a root only compiled code holds survives" behaviour is checked without
+generating and running machine code. Both halves are tested — the paired case where nothing
+reports the object and it is correctly swept is what makes the surviving case evidence.
+
+**Consequence:** a heap with no provider installed is not wrong, it is an embedder running no
+compiled code. That makes "forgot to install" indistinguishable from "nothing to install" at
+the API level, which is a real hazard: the symptom is a freed live value, far from the cause.
+`has_extra_roots` exists so a caller can assert it, and the compiled entry point installs
+before it runs anything.

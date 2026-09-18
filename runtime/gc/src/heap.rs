@@ -48,6 +48,27 @@ struct Entry {
     state: State,
 }
 
+/// A source of roots the collector cannot find by itself.
+///
+/// A newtype purely because `dyn Fn` has no `Debug`, and a `Heap` that could not be printed
+/// would be harder to debug than one whose provider prints as a placeholder.
+#[derive(Default)]
+struct ExtraRoots(Option<Box<dyn Fn() -> Vec<GcRef>>>);
+
+impl std::fmt::Debug for ExtraRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Whether one is installed is the part worth seeing. A closure's address is not, and
+        // calling it to print the roots would collect-time work in a `Debug` impl.
+        f.debug_tuple("ExtraRoots")
+            .field(&if self.0.is_some() {
+                "installed"
+            } else {
+                "none"
+            })
+            .finish()
+    }
+}
+
 /// A garbage-collected heap.
 ///
 /// # Rooting
@@ -80,6 +101,13 @@ struct Entry {
 /// nested scopes are the normal shape of a call stack.
 #[derive(Debug, Default)]
 pub struct Heap {
+    /// A source of roots the shadow stack does not hold — compiled frames, once a program has
+    /// registered its stack maps.
+    ///
+    /// `None` means there are none, which is the truth for an embedder running no compiled
+    /// code. It is *not* a default that silently loses roots: a compiled program installs one
+    /// before it runs anything, and `collect` refuses when compiled frames exist without it.
+    extra_roots: RefCell<ExtraRoots>,
     cells: RefCell<Vec<Entry>>,
     free: RefCell<Vec<u32>>,
     roots: RefCell<Vec<GcRef>>,
@@ -92,6 +120,25 @@ impl Heap {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs a source of roots the shadow stack cannot see.
+    ///
+    /// A compiled program calls this before running anything, passing something that walks its
+    /// native frames. Without it the collector sees only what Rust code has rooted, and every
+    /// value held by compiled code looks like garbage.
+    ///
+    /// Replacing an existing provider is allowed and takes effect on the next collection; there
+    /// is no way to *remove* one, because a program that stopped reporting its compiled roots
+    /// midway would be strictly worse than one that never reported them.
+    pub fn set_extra_roots(&self, provider: Box<dyn Fn() -> Vec<GcRef>>) {
+        self.extra_roots.borrow_mut().0 = Some(provider);
+    }
+
+    /// Whether a source of compiled roots has been installed.
+    #[must_use]
+    pub fn has_extra_roots(&self) -> bool {
+        self.extra_roots.borrow().0.is_some()
     }
 
     /// Collect on every allocation.
@@ -225,6 +272,16 @@ impl Heap {
     /// Marks everything reachable from the shadow stack, returning how many survived.
     fn mark(&self) -> usize {
         let mut worklist: Vec<GcRef> = self.roots.borrow().clone();
+        // Roots the shadow stack cannot see. Compiled machine code holds values in registers
+        // and frame slots and pushes nothing, so without this every one of them looks like
+        // garbage — and marking would free values a running program is still using (§3.1).
+        //
+        // A callback rather than a direct call into the runtime: the collector defines the
+        // hole and whoever knows how to walk a native stack fills it. Reversing that would
+        // make this crate depend on the ABI crate, which depends on this one to allocate.
+        if let Some(extra) = self.extra_roots.borrow().0.as_ref() {
+            worklist.extend(extra());
+        }
         let mut marked = 0;
 
         while let Some(handle) = worklist.pop() {

@@ -168,9 +168,23 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
     })?;
     std::fs::write(
         &entry_path,
-        "extern unsigned long long crisol_program(void);\n\
+        // The program hands its stack map table to the runtime before running anything. The
+        // runtime cannot look the symbol up itself: an `extern` reference in `crisol-abi`
+        // would make that crate fail to link anywhere the symbol does not exist, including
+        // its own tests.
+        //
+        // Element 0 is the row count and the rows begin at element 1 — the layout the backend
+        // writes (D-90). Registering *before* `crisol_program` runs is the whole point: a
+        // collection can happen on the first allocation.
+        "extern unsigned long long crisol_stack_maps[];\n\
+         extern void crisol_register_stack_maps(const void *rows, unsigned long long count);\n\
+         extern unsigned long long crisol_program(void);\n\
          extern void crisol_print(unsigned long long);\n\
-         int main(void) { crisol_print(crisol_program()); return 0; }\n",
+         int main(void) {\n\
+             crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
+             crisol_print(crisol_program());\n\
+             return 0;\n\
+         }\n",
     )
     .map_err(|error| BuildError::Link {
         message: format!("cannot write the entry point: {error}"),

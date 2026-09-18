@@ -20,6 +20,7 @@
 
 #![doc(html_root_url = "https://docs.rs/crisol-abi/0.0.0")]
 
+use crisol_gc::{GcRef, Heap};
 use crisol_value::Value;
 
 /// Every symbol this crate provides to generated code.
@@ -315,18 +316,28 @@ static mut STACK_MAPS: Option<StackMaps> = None;
 /// else.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn crisol_register_stack_maps(table: *const StackMapRow, count: u64) {
-    if table.is_null() || count == 0 {
+    let len = usize::try_from(count).unwrap_or(0);
+    // A zero-row table is registered, not skipped. Returning early here would make "the
+    // program never registered its table" and "the program has no safepoints" indistinguishable
+    // — and the first is a bug that frees live values while the second is ordinary.
+    if table.is_null() {
         return;
     }
-    let Ok(len) = usize::try_from(count) else {
-        return;
-    };
     // SAFETY: the caller promises `table` points at `count` valid rows living as long as the
-    // process, which is what a data symbol in the program does.
+    // process, which is what a data symbol in the program does. A length of zero is fine:
+    // `from_raw_parts` accepts it for a non-null, aligned pointer.
     let rows = unsafe { std::slice::from_raw_parts(table, len) };
     // SAFETY: called once, from the entry point, before any other thread exists.
     unsafe {
         STACK_MAPS = Some(StackMaps { rows });
+    }
+
+    // Registration is otherwise invisible: a program that never registered its table runs
+    // exactly the same until the first collection, at which point it frees live values. This
+    // makes the step observable so a test can check it happened rather than infer it from the
+    // program producing the right answer.
+    if std::env::var_os("CRISOL_DEBUG_STACK_MAPS").is_some() {
+        println!("crisol: registered {len} stack map rows");
     }
 }
 
@@ -457,4 +468,36 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
         }
     }
     roots
+}
+
+/// How many frames a root scan walks before giving up.
+///
+/// A bound rather than "until the stack ends" because the walk follows frame pointers, and a
+/// corrupt one turns an unbounded loop into a hang inside the collector — the single worst
+/// place to hang, since nothing has run yet that could report why.
+pub const FRAME_LIMIT: usize = 1024;
+
+/// Teaches `heap` to find the roots that live only in compiled frames.
+///
+/// Until this is called a collection sees just the shadow stack, so every value held by
+/// compiled code looks like garbage. Call it once, before running any compiled code.
+///
+/// Values that are not heap references — a number in a spilled slot, say — are reported by the
+/// walk and dropped here: a NaN-boxed value carries its own tag, so this is precise rather
+/// than a guess about which bit patterns look like pointers (D-53).
+///
+/// # Safety
+///
+/// The caller promises collections happen only at safepoints, since that is when the stack
+/// maps describe the frames truthfully. Allocation-triggered collection satisfies this — an
+/// allocation site *is* a safepoint — but a collection forced from arbitrary code does not.
+pub unsafe fn install_compiled_roots(heap: &Heap) {
+    heap.set_extra_roots(Box::new(|| {
+        // SAFETY: the caller of `install_compiled_roots` promised collections happen only at
+        // safepoints, and this closure runs only from a collection.
+        unsafe { compiled_roots(FRAME_LIMIT) }
+            .into_iter()
+            .filter_map(|value| value.as_address().map(GcRef::from_address))
+            .collect()
+    }));
 }
