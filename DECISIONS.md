@@ -1483,7 +1483,7 @@ first thing to revisit if pause times matter. §M9 asks for mark-sweep and that 
 
 ## D-56 — A cycle in the module graph is ordered, not rejected
 
-**Status:** Accepted (M10) · **Affects:** M10, M13, M17
+**Status:** Accepted (M10); its MSRV clause **superseded by D-85** · **Affects:** M10, M13, M17
 
 The easy mistake is to treat a module graph the way a build system treats a dependency graph,
 where a cycle is an error to report and refuse. In ES modules a cycle is **specified
@@ -1520,7 +1520,7 @@ the specification does not.
 
 ## D-57 — `require` is found by an exhaustive visit, not by matching the shapes we expected
 
-**Status:** Accepted (M10) · **Affects:** M10, M12, §3.5
+**Status:** Accepted (M10); its MSRV clause **superseded by D-85** · **Affects:** M10, M12, §3.5
 
 §M10's acceptance is "resolves and parses a real `node_modules` tree containing React,
 producing a complete module graph with no unresolved imports". React 19 is CommonJS from top to
@@ -2406,6 +2406,241 @@ and assert the call's receiver *is* the object the method was loaded from.
 
 ---
 
+## D-84 — The Cranelift backend, and three things the plan did not anticipate
+
+**Status:** Accepted (M13) · **Affects:** M13, M14, M20
+
+§4 names Cranelift and §M13 needs stack maps at safepoints, which is the deciding feature
+rather than a convenience. A JavaScript value is NaN-boxed into 64 bits (D-53), so Cranelift
+sees `I64` everywhere and reaching a number is a bitcast — no separate float register class in
+the calling convention, no boxing at a call boundary.
+
+Three things came out differently from what the plan implies.
+
+### The oxc pin caps Cranelift at 0.128
+
+`oxc_allocator 0.91` depends on `bumpalo` **exactly** `=3.19.0`; Cranelift 0.132+ needs
+`^3.20.2`. No version satisfies both, so the workspace cannot resolve.
+
+D-57 pinned oxc at 0.91 because newer oxc needs Rust 1.96 against a 1.87 MSRV, reasoning that
+"a parser dependency in Track B is not a reason to raise the floor for everybody". That still
+holds — 0.128 is a current, supported Cranelift — but the pin now constrains the *backend* as
+well, which is a stronger consequence than the original decision weighed. Worth revisiting when
+either side moves.
+
+`all-arch` is not a default feature. Without it only the host ISA is available, so three of
+§M13's four named targets would fail to construct — and a backend that only built for the host
+would pass every test written on one machine.
+
+### Stack maps are per-value, not a flag
+
+There is no `enable_safepoints` setting in this version; asking for one fails, which is how
+this was found. Stack maps are requested with `declare_value_needs_stack_map` per value.
+
+**That is the better fit.** §M11 made safepoints carry an explicit live set, and this API wants
+exactly that set rather than a whole-function switch — the two line up without translation.
+
+`Report::stack_map_entries` counts what was handed over, because §M13's deliverable is
+*emission* and a test that only checks the function compiled verifies nothing about it. The
+count is honest about its limit: **`cranelift-object` does not write stack maps into a section**,
+so M13's GC integration will have to carry them out of band. Claiming "stack maps are emitted"
+without that distinction is the kind of statement that looks true until someone goes looking for
+the section.
+
+### `+` is a call, and that is D-79 arriving in the machine code
+
+Every arithmetic operator except `+` is typed `Number` by the IR and lowers to a native `f64`
+instruction. `+` is typed `Unknown` because it may concatenate — and **an `Unknown` cannot
+become a float add**, because the operands might be strings.
+
+So `Add` lowers to a call to `crisol_add`. That is not a shortcoming: it is what every engine
+does before type feedback narrows the operands, and the alternative is a miscompilation.
+Narrowing it is M20's, and the IR already carries the type a pass would need. There is a test
+that looks for the symbol in the object file, because an `fadd` would leave no relocation to
+find.
+
+**Everything else is refused rather than approximated.** `%`, `**` and the bitwise operators
+need int32 coercion or a libm call; `===` on boxed values is a bit comparison *except* for NaN
+and ±0, which is D-53's whole subject. A backend that guessed at any of them would emit code
+that runs and is wrong — indistinguishable from correct code by testing the compiler, and only
+visible by running the program and noticing the answer.
+
+### A test that was wrong about liveness
+
+The stack-map test first declared a value whose only use *was* the call's argument, and asserted
+one entry. The count was 0 — **and the test was wrong, not the backend**: a value whose last use
+is the call argument does not need to survive the collection. Corrected to use the value after
+the call.
+
+---
+
+## D-85 — The floor is 1.96, and it is now verified
+
+**Status:** Accepted (M13) · **Supersedes:** D-57's MSRV clause · **Affects:** whole workspace
+
+D-57 pinned oxc at 0.91 to hold a 1.87 floor, reasoning that "a parser dependency in Track B is
+not a reason to raise the floor for everybody". Two things have changed that.
+
+**The pin stopped being about the parser.** `oxc_allocator 0.91` requires `bumpalo` *exactly*
+`=3.19.0`, and Cranelift 0.132+ requires `^3.20.2` — so the pin capped the **backend** at 0.128
+as well. A constraint chosen to protect embeddability was, by then, deciding which code
+generator the project could use.
+
+**The conflict dissolves on upgrade.** `oxc_allocator 0.150` has **no `bumpalo` dependency at
+all**. Upgrading removes the wall rather than working around it, which is why this is a version
+bump and not a vendored patch.
+
+The floor is now **1.96**: oxc 0.150 needs 1.96 and Cranelift 0.135.2 needs 1.95, so 1.96 is the
+lower bound of "both current". The alternative considered was a per-crate floor — 1.96 for the
+two compiler crates and 1.87 for the other twenty-five, since Track A touches neither dependency
+— and it was rejected in favour of one honest number for the workspace.
+
+### The floor was never verified
+
+This is the part worth recording. `rust-version = "1.87"` was declared and **nothing ever built
+against it**: every CI job used `stable`, and there was no MSRV job. The number was an
+aspiration presented as a guarantee, and a crate could have broken it at any point without
+anyone noticing until an embedder complained.
+
+There is now an `msrv` job that reads the floor **out of `Cargo.toml`** — rather than repeating
+it, so the job cannot drift from the number it checks — installs exactly that toolchain, and
+runs `cargo check --workspace --all-features`.
+
+`check` and not `test`: the promise is that the crates *compile* on the floor. Running the suite
+there would also bind dev-dependencies to it, which is not part of what an embedder relies on
+and would raise the floor for a reason nobody asked for.
+
+An unverified MSRV is indistinguishable from a false one — the same argument as
+`CRISOL_REQUIRE_GPU`, where a skipped test and a passing test look alike.
+
+### What the upgrade cost
+
+Three API changes, each an improvement upstream:
+
+- `ParserReturn::errors` became `diagnostics`.
+- **Arrow bodies are a proper enum now.** The old code reconstructed concise-versus-block from a
+  boolean plus a guess at the single statement inside; `get_expression()` and
+  `get_function_body()` make it a type distinction, which deleted a comment apologising for the
+  old shape.
+- `MemFlags` became `MemFlagsData` for `bitcast`, and `finalize` takes the target's frontend
+  config.
+
+**Every frontend test passed unchanged, including the corpus snapshot.** A fifty-nine-release
+jump in the parser produced byte-identical IR, which is the strongest evidence available that
+the upgrade changed nothing about meaning.
+
+### Raising the floor changed what clippy advises
+
+A second-order effect worth recording, because it failed CI in a crate the upgrade never
+touched.
+
+Clippy gates lints on the declared MSRV. `collapsible_if` suggests a **let-chain**, which
+stabilised in 1.88 — so at a 1.87 floor the lint stayed quiet, and at 1.96 it fires. One
+instance existed, in `ui/umbrella/examples/todo.rs`, and CI caught it on all three desktop
+platforms.
+
+The consequence to remember: **an MSRV bump can fail CI in code the change never touched**, and
+a crate-scoped local gate cannot see it. The lint fired in Track A, while every edit was in the
+compiler crates.
+
+**The second instance was inside `#[cfg(target_os = "windows")]`**, which a macOS clippy run
+structurally cannot see — the first fix went green locally and failed Windows anyway. That gap
+is closeable: `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` were already installed, and
+`cargo clippy --target <triple>` type-checks platform-gated code without needing a linker.
+
+So the local gate now includes a cross-target clippy pass for the two non-host desktop targets.
+Earlier in the project three CI failures were attributed to "what local runs structurally
+cannot catch" — for *this* class of failure that was not true, only unattempted.
+
+---
+
+## D-86 — The type lattice makes `===` cheap, and deleting a test cannot fail a test run
+
+**Status:** Accepted (M13) · **Affects:** M13, M20
+
+The first backend refused `===` outright, reasoning that "`===` on boxed values is a bit
+comparison *except* for NaN and ±0". That is true, and it was **over-cautious for the case the
+IR had already proved**.
+
+On two values the lattice typed `Number`, `===` is exactly `f64` equality: `NaN === NaN` is
+false and `fcmp eq` on NaN is false; `+0 === -0` is true and `fcmp eq` on the two zeroes is
+true. The hard cases are hard *because the operands are boxed*, and the lattice says when they
+are not. So `===` now lowers to a native comparison when both operands are `Type::Number`, and
+is still refused otherwise.
+
+This is the first place the type lattice (D-58) has paid for itself in emitted code, and it is
+worth noting the shape: the lattice did not make a *fast* path possible, it made a **correct**
+one possible that had been refused for want of the information.
+
+### The operators that are calls, and why each one
+
+| operator | why not an instruction |
+|---|---|
+| `+` | may concatenate — the IR types it `Unknown` (D-79) |
+| `%`, `**` | libm calls |
+| `&`, `\|`, `^`, `<<`, `>>`, `>>>` | `ToInt32` wraps **modulo 2^32** |
+
+The bitwise row is the one worth stating: Cranelift's float-to-int conversion **saturates**, so
+lowering `1e10 \| 0` with it would clamp rather than wrap. That is a *wrong number*, not a slow
+one, and it would look entirely plausible.
+
+One symbol per operator rather than a single `crisol_binary(op, a, b)`: an opcode passed at
+runtime is a branch the linker cannot see through, and separate symbols are what let a later
+pass replace one operator without touching the others.
+
+### Deleting a test cannot fail a test run
+
+While replacing two superseded tests, a slice-based edit also removed the two **stack map**
+tests — the ones verifying §M13's own deliverable. The suite went green, because removing a
+test never fails.
+
+That asymmetry is worth naming: every other kind of mistake in a test file shows up as a
+failure, and this one shows up as a slightly smaller number that nobody is watching. Caught by
+reading the list of test names in the output rather than the pass count, and the count is now
+asserted alongside them.
+
+---
+
+## D-87 — The runtime ABI, and a contract nothing checked until link time
+
+**Status:** Accepted (M13) · **Affects:** M13
+
+`crisol-abi` defines the symbols generated code calls. Until it existed, every object file the
+backend produced referenced undefined symbols, so "compiles" and "links" were separated by a gap
+nothing measured.
+
+Every function takes and returns `u64` — a value NaN-boxed into 64 bits (D-53). No wrapper type
+at the boundary: the caller is machine code with no notion of Rust types, so a
+`#[repr(transparent)]` newtype would be a comment rather than a guarantee.
+
+### `ToInt32` is why the bitwise operators are calls
+
+The specification truncates toward zero and wraps **modulo 2³²**. The hardware's conversion
+**saturates**. So `1e10 | 0` is `1410065408` in JavaScript and `i32::MAX` if lowered as an
+instruction — *both are numbers*, and only one is right. There is a test asserting the correct
+value and asserting that the saturating cast gives a different one, so the reason these are
+calls is visible rather than asserted.
+
+Related, and each with a test: `%` takes the sign of the **dividend** (`-5 % 3` is `-2`, not
+`1`); the shift count is masked to five bits, so `1 << 32` is `1`; and `>>>` is the only shift
+whose result reads as unsigned, which is why `-1 >>> 0` is `4294967295` and it cannot be folded
+in with the other two.
+
+**A non-numeric operand yields `NaN`, never `0`.** Strings need the runtime's string table,
+which does not exist yet. Returning `0` would make `"5" * 2` evaluate to `0` instead of `10` —
+arithmetic that looks like arithmetic, rather than a gap that looks like a gap.
+
+### The symbol contract
+
+The backend declares imports **by name** and this crate defines them **by name**, and nothing
+connects the two until a linker runs. A typo on either side is silent through every compiler
+test — the object file still builds, with an undefined symbol in it — and fails only when
+someone first tries to produce a binary.
+
+So `crisol-abi::SYMBOLS` is the defining list, `crisol_codegen::helper_symbols()` exposes what
+the backend emits, and a test compares them. It was checked by introducing a typo and watching
+it fail, because a test that reads two lists and finds them equal is exactly the kind that can
+pass while comparing nothing.
 ## D-83 — A class is sugar, and reading the snapshot found two bugs no test would have
 
 **Status:** Accepted (M13) · **Affects:** M13

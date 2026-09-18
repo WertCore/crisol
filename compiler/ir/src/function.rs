@@ -133,7 +133,7 @@ impl Constant {
 /// The shift operators are also not what they look like: they coerce to **int32** (or uint32
 /// for `UnsignedShiftRight`) and back to a double, so `1 << 31` is negative and
 /// `1 << 32` is `1`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     /// `+` — numeric addition **or** string concatenation.
     Add,

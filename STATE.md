@@ -1,7 +1,17 @@
 # Crisol — State
 
-**Current milestone:** M13 — codegen (M12's surface is complete; its acceptance is blocked on M13, see below)
-**Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
+**Current milestone:** M13 — codegen. Lowering is complete; the backend compiles a numeric
+subset to object code for all four targets, and `crisol-abi` defines the symbols it calls.
+
+**Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
+is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
+
+**Totals:** 948 tests passing; the `node_modules` and test262 cases skip without their suites.
+
+> The live total lives **here**, beside the milestone, not at the end of the newest section.
+> Four separate merges duplicated or misplaced it there — twice putting a current figure
+> inside a *historical* milestone's section, where it read as true and was false. The other
+> `**Totals:**` lines below are frozen historical records and must not be edited.
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -1013,7 +1023,6 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 921 tests passing — 915 at the last measured point plus 6 new; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
@@ -1612,6 +1621,80 @@ four were in M11's recorded `unsupported` list**. That is a gap in the plan, not
 implementation: the roadmap reads as though M13 begins where M11 stopped, and it does not.
 
 `Op::Binary` and `Op::Unary` are now in the IR, and the lowering covers arithmetic, bitwise,
+unary, logical, conditional, array literals, functions, closures and classes. Array *methods*
+lower too — they are an ordinary method call on an array, receiver included — so **the lowering
+side of §M13's acceptance is complete**.
+
+### The floor moved to 1.96, and is now checked
+
+oxc is at **0.150** and Cranelift at **0.135.2** (D-85). The `bumpalo` conflict that capped
+Cranelift at 0.128 dissolved on upgrade — oxc 0.150 has no `bumpalo` dependency at all — so this
+is a version bump rather than a workaround.
+
+**`rust-version` was declared for a year and never verified:** every CI job used `stable`, so
+nothing confirmed the workspace built on the floor it advertised. There is now an `msrv` job
+that reads the number **out of `Cargo.toml`** (so it cannot drift from what it checks) and runs
+`cargo check --workspace --all-features` on exactly that toolchain. `check`, not `test` — the
+promise is that the crates compile, and testing there would bind dev-dependencies to the floor
+too.
+
+Every frontend test passed unchanged across the upgrade, **snapshot included** — a fifty-nine
+release jump in the parser produced byte-identical IR.
+
+### The Cranelift backend
+
+`crisol-codegen` compiles IR to object code for all four of §M13's targets (D-84). Values are
+`I64`, because a JavaScript value is NaN-boxed into 64 bits — reaching a number is a bitcast.
+
+Three things differed from what the plan implies:
+
+- **The oxc pin caps Cranelift at 0.128.** `oxc_allocator 0.91` requires `bumpalo` *exactly*
+  `=3.19.0`; Cranelift 0.132+ needs `^3.20.2`, and no version satisfies both. D-57's reasoning
+  still holds, but the pin now constrains the *backend* too, which is a stronger consequence
+  than that decision weighed. `all-arch` is also not a default feature — without it three of
+  the four named targets fail to construct, and a host-only backend passes every test written
+  on one machine.
+- **Stack maps are per-value, not a flag.** There is no `enable_safepoints` setting; asking for
+  one fails, which is how this was found. `declare_value_needs_stack_map` wants exactly the
+  live set §M11 made explicit, so the two line up without translation. `Report` counts what was
+  handed over, and says plainly that **`cranelift-object` does not write maps into a section**
+  — M13's GC integration must carry them out of band.
+- **`+` lowers to a call**, which is D-79 arriving in the machine code. `-`, `*` and `/` are
+  native `f64` instructions; `%`, `**` and the bitwise family are calls too — the bitwise ones
+  because `ToInt32` wraps **modulo 2^32** and Cranelift's float-to-int conversion *saturates*,
+  so `1e10 | 0` would come out clamped rather than wrapped. A wrong number, not a slow one.
+- **`===` lowers natively when the lattice proved both operands are numbers** (D-86), and is
+  refused otherwise. On numbers it is exactly `f64` equality — NaN compares false, ±0 compares
+  true — and the hard cases are hard only because the operands are boxed. The first backend
+  refused it outright, which was over-cautious for the case the IR had already proved. This is
+  the first place the type lattice has paid for itself in emitted code, and it bought a
+  **correct** lowering rather than a fast one.
+
+The stack-map test was first written against a value whose only use *was* the call argument. It
+reported 0 entries, and **the test was wrong, not the backend**: a value whose last use is the
+call argument does not need to survive the collection.
+
+### The runtime ABI, and a contract nothing checked until link time
+
+`crisol-abi` defines the symbols generated code calls (D-87). Until it existed, every object
+file the backend produced referenced **undefined symbols** — "compiles" and "links" were
+separated by a gap nothing measured.
+
+`ToInt32` is why the bitwise operators are calls: the specification wraps **modulo 2³²** and the
+hardware **saturates**, so `1e10 | 0` is `1410065408` in JavaScript and `i32::MAX` as an
+instruction. Both are numbers; only one is right, and there is a test asserting the saturating
+cast gives the other answer so the reason is visible rather than claimed.
+
+A non-numeric operand yields `NaN`, never `0` — returning `0` would make `"5" * 2` evaluate to
+`0` instead of `10`, which looks like arithmetic rather than a gap.
+
+**The symbol contract is checked from both sides.** The backend declares imports by name and the
+ABI defines them by name, and nothing connects the two until a linker runs — a typo is silent
+through every compiler test, since the object file still builds with an undefined symbol in it.
+`SYMBOLS` is the defining list, `helper_symbols()` exposes what the backend emits, and a test
+compares them; verified by introducing a typo and watching it fail.
+
+**Still ahead for M13's acceptance:** actually linking and running a binary, and GC stress.
 unary, logical, conditional and array literals. array *methods*, then the Cranelift backend.
 
 ### Classes, and two bugs the snapshot caught
@@ -1695,7 +1778,15 @@ Both mutation-tested.
      and Linux. [#13](https://github.com/WertCore/crisol/issues/13) and
      [#14](https://github.com/WertCore/crisol/issues/14) need a human at a keyboard and a
      screen reader, so they cannot be closed from here at all.
-3. Whichever comes first, run **the whole gate** before pushing — `fmt`, `clippy --workspace
+3. **Add a cross-target clippy pass to the local gate.** `cargo clippy --target
+   x86_64-pc-windows-msvc` and `--target x86_64-unknown-linux-gnu` type-check `cfg`-gated code
+   without a linker, and both targets are already installed. Raising the MSRV surfaced a
+   `collapsible_if` inside a `#[cfg(target_os = "windows")]` block that a macOS run cannot see:
+   the fix went green locally and failed Windows anyway. Three CI failures earlier in this
+   project were attributed to "what local runs structurally cannot catch" — for this class that
+   was not true, only unattempted.
+
+4. Whichever comes first, run **the whole gate** before pushing — `fmt`, `clippy --workspace
    --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, both
    headless examples, and **`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`**. Two
    of five is how PR #25 failed on formatting alone.
