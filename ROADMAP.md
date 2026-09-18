@@ -88,6 +88,37 @@ product claim.
 **Rejected — reference counting:** pathological with closures and cycles. Would need a
 cycle collector anyway, which is most of a tracing GC with extra steps.
 
+**Deferred — concurrent marking with write barriers (the Go approach):** not rejected, but
+not next, and for a reason worth stating because the instinct to reach for it is a good one.
+
+Concurrent collection does not make collection *cheaper*. It makes it **later**: total work
+goes up — barriers on pointer stores, synchronisation, re-scanning what changed during the
+mark — in exchange for no single long pause. Go pays that willingly because Go targets
+servers where a tail-latency spike is a product problem.
+
+Three things make it the wrong first move here:
+
+- **The heap is small.** M8's acceptance is around 10 MiB of process footprint. A
+  stop-the-world mark-sweep over a few thousand objects is likely sub-millisecond, so
+  concurrency would be solving a problem that may not exist at this scale.
+- **A barrier on every pointer store fights the product claim.** The premise is AOT-compiled
+  specialised native code; adding a branch to every store to buy latency we have not shown we
+  lack is a bad trade for this engine.
+- **Mobile's binding constraint is footprint, not pause** (§3.6: memory pressure is a
+  termination risk, not a slowdown). Concurrent marking makes footprint slightly *worse*
+  through floating garbage.
+
+**Generational comes first** for the opposite reasons: UI work allocates per-frame temporaries
+that die young, so a nursery collection touches few live objects and gives short pauses. Note
+that generational needs a write barrier too — for old→young references — so this is not
+"barriers versus none", it is a narrower barrier buying a larger win.
+
+**And nothing has been measured.** No pause time has been recorded against compiled code,
+because the collector cannot yet see compiled frames at all. Choosing a concurrency design to
+fix an unmeasured cost is the kind of decision this project records *against*. If young-generation
+pauses later hurt frame times on a real workload, the order is generational first, then
+concurrent marking if pauses remain too long — and M20 is where that measurement belongs.
+
 **Consequences, accepted now:**
 
 - Every heap-allocated JS value lives behind a `GcRef` handle, never a raw pointer

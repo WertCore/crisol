@@ -72,13 +72,39 @@ impl std::fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
+/// Where a live value sits in a frame at one safepoint.
+///
+/// Cranelift **spills every live value to the frame** before a safepoint, which is the detail
+/// that makes precise collection tractable here: the collector needs to read stack slots and
+/// nothing else. Go's collector needed register maps as well, but only once it began preempting
+/// goroutines *mid-function* — safepoints at calls and allocations stay in the simpler regime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafepointMap {
+    /// Offset of the safepoint from the start of the function's machine code.
+    ///
+    /// The collector has a **return address**, so it looks up the instruction *after* the call.
+    /// This is that offset.
+    pub code_offset: u32,
+    /// How large the frame is, so the collector can find slot zero from the frame pointer.
+    pub frame_size: u32,
+    /// Byte offsets within the frame holding live values.
+    pub live_offsets: Vec<u32>,
+}
+
 /// What compiling one function produced.
 ///
 /// `stack_map_entries` exists because §M13's deliverable is *"stack map emission at
 /// safepoints"*, and a test that only checks the function compiled does not verify emission at
 /// all. Counting the entries makes the deliverable measurable rather than asserted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
+    /// Every safepoint in the function, with what is live at it.
+    ///
+    /// This is the table a precise collector needs. Extracting it is the whole reason D-87's
+    /// note — "`cranelift-object` does not write stack maps into a section" — is a statement
+    /// about the *writer* rather than about the information being unavailable: the compiled
+    /// buffer exposes it, and carrying it across is this crate's job.
+    pub safepoints: Vec<SafepointMap>,
     /// How many values were declared live across a safepoint.
     ///
     /// **This counts what was handed to Cranelift, not what reached the object file.**
@@ -126,6 +152,27 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
     (BinaryOp::ShiftRight, "crisol_shift_right"),
     (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
 ];
+
+/// Reads the safepoint tables out of a compiled function.
+///
+/// Read after compilation rather than from the IR, because the offsets only exist once
+/// registers have been allocated and live values spilled — the IR knows *which* values are
+/// live, and only the machine code knows *where*.
+fn read_safepoints(context: &cranelift_codegen::Context) -> Vec<SafepointMap> {
+    let Some(compiled) = context.compiled_code() else {
+        return Vec::new();
+    };
+    compiled
+        .buffer
+        .user_stack_maps()
+        .iter()
+        .map(|(code_offset, frame_size, map)| SafepointMap {
+            code_offset: *code_offset,
+            frame_size: *frame_size,
+            live_offsets: map.entries().map(|(_, offset)| offset).collect(),
+        })
+        .collect()
+}
 
 /// The runtime symbols the backend emits calls to.
 ///
@@ -295,7 +342,11 @@ impl Backend for Cranelift {
             .map_err(|error| CodegenError::Backend {
                 message: error.to_string(),
             })?;
-        Ok(Report { stack_map_entries })
+        let safepoints = read_safepoints(&context);
+        Ok(Report {
+            safepoints,
+            stack_map_entries,
+        })
     }
 
     fn finish(self) -> Result<Vec<u8>, CodegenError> {
@@ -832,7 +883,11 @@ impl Jit {
             function.name.clone(),
             self.module.get_finalized_function(id),
         );
-        Ok(Report { stack_map_entries })
+        let safepoints = read_safepoints(&context);
+        Ok(Report {
+            safepoints,
+            stack_map_entries,
+        })
     }
 
     /// The address of a compiled function, if it was compiled.

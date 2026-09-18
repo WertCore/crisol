@@ -396,3 +396,54 @@ fn every_listed_target_can_be_constructed() {
         );
     }
 }
+#[test]
+fn a_safepoint_reports_where_live_values_sit() {
+    // The table a precise collector needs: not "how many" but "at code offset X, live values
+    // are at frame offsets Y". Cranelift spills every live value to the frame before a
+    // safepoint, so stack slots are the whole story here.
+    use crisol_ir::*;
+    let mut function = Function::new("mapped");
+    let kept = function.value();
+    let called = function.value();
+    let after = function.value();
+    let entry = function.get_mut(BlockId::ENTRY).expect("entry");
+    entry.instructions = vec![
+        Instruction {
+            result: Some(kept),
+            ty: Type::Number,
+            op: Op::Const(Constant::Number(1.0)),
+            safepoint: None,
+        },
+        Instruction {
+            result: Some(called),
+            ty: Type::Unknown,
+            op: Op::Binary {
+                op: BinaryOp::Add,
+                left: kept,
+                right: kept,
+            },
+            safepoint: Some(Safepoint { live: vec![kept] }),
+        },
+        Instruction {
+            result: Some(after),
+            ty: Type::Number,
+            op: Op::Binary {
+                op: BinaryOp::Multiply,
+                left: kept,
+                right: called,
+            },
+            safepoint: None,
+        },
+    ];
+    entry.terminator = Terminator::Return(Some(after));
+
+    let mut backend = crisol_codegen::Cranelift::new("aarch64-apple-darwin").expect("target");
+    let report = crisol_codegen::Backend::compile(&mut backend, &function).expect("compiles");
+    assert_eq!(report.safepoints.len(), 1, "one call, one safepoint");
+    let map = &report.safepoints[0];
+    assert!(
+        !map.live_offsets.is_empty(),
+        "the live value needs a frame offset"
+    );
+    assert!(map.frame_size > 0, "and a frame to be in");
+}
