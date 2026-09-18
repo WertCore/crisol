@@ -43,8 +43,9 @@ const SAMPLE: usize = 400;
 enum Outcome {
     /// The compiler named something it does not handle.
     Refused(String),
-    /// It built and then threw — which is how a test262 case reports failure.
-    Failed,
+    /// It built and then threw — which is how a test262 case reports failure. Carries what
+    /// was thrown, because the *reason* is the list worth reading once cases start running.
+    Failed(String),
     /// It built and then died on a signal, which is a bug here rather than a wrong answer.
     Crashed,
     /// It built, ran and returned normally. **This is a pass.**
@@ -108,12 +109,42 @@ fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcom
             Ok(output) if output.status.success() => Outcome::Ran,
             // Exit 1 is the entry point reporting an uncaught throw, which is exactly how a
             // case signals a failed assertion. Anything else — a signal, a panic — is ours.
-            Ok(output) if output.status.code() == Some(1) => Outcome::Failed,
+            Ok(output) if output.status.code() == Some(1) => {
+                Outcome::Failed(thrown_reason(&String::from_utf8_lossy(&output.stderr)))
+            }
             _ => Outcome::Crashed,
         },
     };
     let _ = std::fs::remove_dir_all(&directory);
     Some(outcome)
+}
+
+/// What a failing case threw, reduced to something worth counting.
+///
+/// The entry point prints `uncaught: …`. A test262 assertion message names the value it saw, so
+/// the messages are nearly all distinct — grouping needs the *shape* of the complaint rather
+/// than its text, or every case is its own row and the list says nothing.
+fn thrown_reason(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with("uncaught: "))
+        .map_or("nothing", |line| &line["uncaught: ".len()..])
+        .trim();
+    // Grouped by the *shape* of the complaint, not its text. test262's messages name the value
+    // they saw — "Expected SameValue(«undefined», «1») to be true" — so keeping them whole puts
+    // every case in its own row and the ranking says nothing.
+    let trimmed = line.trim_start_matches("Test262Error: ");
+    let shape: String = trimmed
+        .split_whitespace()
+        .take_while(|word| !word.starts_with('\u{ab}'))
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if shape.is_empty() {
+        trimmed.chars().take(60).collect()
+    } else {
+        shape
+    }
 }
 
 /// Which stage refused, and the first construct it named.
@@ -178,6 +209,8 @@ fn the_suite_is_attempted_and_the_result_reported() {
     let mut failed = 0usize;
     let mut crashed = Vec::new();
     let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+    let mut passing = Vec::new();
+    let mut failures: BTreeMap<String, usize> = BTreeMap::new();
 
     for (index, case) in cases.iter().step_by(step).enumerate() {
         let Some(outcome) = attempt(&root, case, &work, index) else {
@@ -185,8 +218,14 @@ fn the_suite_is_attempted_and_the_result_reported() {
         };
         attempted += 1;
         match outcome {
-            Outcome::Ran => ran += 1,
-            Outcome::Failed => failed += 1,
+            Outcome::Ran => {
+                ran += 1;
+                passing.push(case.clone());
+            }
+            Outcome::Failed(reason) => {
+                failed += 1;
+                *failures.entry(reason).or_default() += 1;
+            }
             Outcome::Crashed => crashed.push(case.clone()),
             Outcome::Refused(reason) => *refusals.entry(reason).or_default() += 1,
         }
@@ -207,6 +246,19 @@ fn the_suite_is_attempted_and_the_result_reported() {
     println!("what the compiler refused, most common first:");
     for (reason, count) in ranked.iter().take(20) {
         println!("  {count:>5}  {reason}");
+    }
+    let mut by_reason: Vec<(&String, &usize)> = failures.iter().collect();
+    by_reason.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+    println!("what ran and then threw, most common first:");
+    for (reason, count) in by_reason.iter().take(20) {
+        println!("  {count:>5}  {reason}");
+    }
+    // Named rather than counted, so a fall in the number can be read as "these stopped
+    // passing" rather than taken on trust. A fix that makes a case *correctly* fail looks
+    // exactly like a regression in the total.
+    println!("what passed:");
+    for case in &passing {
+        println!("  {}", case.display());
     }
     for case in crashed.iter().take(10) {
         println!("crashed: {}", case.display());

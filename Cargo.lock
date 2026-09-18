@@ -791,6 +791,7 @@ dependencies = [
  "oxc_parser",
  "oxc_resolver",
  "oxc_span",
+ "oxc_syntax",
 ]
 
 [[package]]

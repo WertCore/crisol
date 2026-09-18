@@ -3270,3 +3270,60 @@ figures are **16 passed, 205 failed, 0 crashed, 158 refused**.
 
 That the number fell from 221 to 16 is the whole argument for the harness having reported
 three numbers separately from the start, rather than collapsing "it finished" into "it passed".
+
+## D-107
+
+**A branch on a value of unknown type is `ToBoolean`, not a bit comparison.**
+
+Status: Accepted
+
+The backend lowered every branch as "does this equal boxed `true`", with a comment saying that
+was sound because the IR had typed the condition `Bool`. It had not: the frontend emits a
+branch on whatever `if`, `while`, `&&` and `||` are given.
+
+So **every truthy value that was not literally `true` took the false path** — a non-empty
+string, a non-zero number, any object. The shape that exposed it is test262's own error class:
+
+```js
+this.message = message || "";
+```
+
+which assigned `""` whatever it was handed, so every failing case reported an error with no
+message. The condition now goes through `crisol_truthy` unless the lattice has proved it a
+boolean, in which case the comparison is still right and still free.
+
+An empty string is falsy and every other string is truthy — the one case where a string's
+characters decide a branch, and the reason `is_truthy` needs the text rather than the kind.
+
+## D-108
+
+**Every function has a `prototype` object, and its name is bound before its body is lowered.**
+
+Status: Accepted
+
+Two bugs with one shape: a function that refers to itself.
+
+`new f()` links an instance to `f.prototype` and `x instanceof f` looks for it, and only the
+*class* lowering was creating one. So a plain constructor function produced objects that its own
+`instanceof` denied — and test262's error class guards on exactly that:
+
+```js
+if (!(this instanceof Test262Error)) return new Test262Error(message);
+```
+
+which recursed instead of initialising. Closures now get a `prototype` eagerly. That costs an
+allocation per closure that most never use; creating it on first read would avoid it, at the
+price of a property read that mutates the heap.
+
+The second: `hoist` built the closure and *then* bound the name, so a recursive function
+captured the slot's value from before it was bound — nothing. The binding and its cell are now
+made first, and the closure written into them afterwards. A function declaration's own name
+therefore counts as an assignment in the escape pass (D-97), because that is what gives it a
+cell, and a cell is what a closure can share with the scope that fills it in.
+
+**Consequence, and the reason the pass count fell from 16 to 13:** several cases had been
+passing because their checks never fired. A test whose guard took the wrong branch, or whose
+error carried no message, exits cleanly and scores as a pass. Making the semantics right makes
+those cases fail correctly. The harness now prints the passing cases by name so a fall can be
+read rather than trusted — and reading them shows they are tests of `Object.defineProperty`,
+`Promise` and `RegExp`, none of which exist here. The 13 are mostly accidents too.

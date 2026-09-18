@@ -84,6 +84,21 @@ impl<'a> Visit<'a> for Escape {
         oxc_ast_visit::walk::walk_assignment_expression(self, assignment);
     }
 
+    fn visit_function(
+        &mut self,
+        function: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        // **A function's own name is a binding something writes to.** It is bound after the
+        // closure is built, so a closure that refers to itself — `function f() { … f() … }` —
+        // captures whatever the slot held at creation, which is nothing. Counting the
+        // declaration as an assignment is what gives the name a cell, and a cell is shared.
+        if let Some(id) = &function.id {
+            self.assigned.insert(id.name.to_string());
+        }
+        oxc_ast_visit::walk::walk_function(self, function, flags);
+    }
+
     fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
         // `n++` is an assignment, and forgetting it would leave the most common mutation of a
         // captured variable — a loop counter — silently copied.

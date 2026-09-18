@@ -101,6 +101,7 @@ oxc_ast = "0.150"
 oxc_ast_visit = "0.150"
 oxc_parser = "0.150"
 oxc_span = "0.150"
+oxc_syntax = "0.150"
 oxc_resolver = "11.13.1"
 
 # JavaScript-compatible regular expressions. §M12 names it explicitly, because Rust's `regex`

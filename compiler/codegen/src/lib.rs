@@ -180,6 +180,7 @@ const STRICT_EQUAL_SYMBOL: &str = "crisol_strict_equal";
 const THROW_SYMBOL: &str = "crisol_throw";
 const PENDING_EXCEPTION_SYMBOL: &str = "crisol_pending_exception";
 const CREATE_STRING_SYMBOL: &str = "crisol_create_string";
+const TRUTHY_SYMBOL: &str = "crisol_truthy";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -232,6 +233,8 @@ struct ObjectHelpers<T> {
     create_string: T,
     /// One per unary operator that needs a runtime coercion.
     unary: Vec<(crisol_ir::UnaryOp, T)>,
+    /// `crisol_truthy(value) -> boolean`
+    truthy: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -318,6 +321,10 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     create_string.params.push(AbiParam::new(types::I64));
     create_string.returns.push(AbiParam::new(types::I64));
 
+    let mut truthy = module.make_signature();
+    truthy.params.push(AbiParam::new(types::I64));
+    truthy.returns.push(AbiParam::new(types::I64));
+
     let mut unary_signature = module.make_signature();
     unary_signature.params.push(AbiParam::new(types::I64));
     unary_signature.returns.push(AbiParam::new(types::I64));
@@ -357,6 +364,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         throw: declare(THROW_SYMBOL, &throw)?,
         pending: declare(PENDING_EXCEPTION_SYMBOL, &pending)?,
         create_string: declare(CREATE_STRING_SYMBOL, &create_string)?,
+        truthy: declare(TRUTHY_SYMBOL, &truthy)?,
         unary,
     })
 }
@@ -861,6 +869,9 @@ impl Backend for Cranelift {
             create_string: self
                 .module
                 .declare_func_in_func(self.objects.create_string, &mut context.func),
+            truthy: self
+                .module
+                .declare_func_in_func(self.objects.truthy, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1660,9 +1671,18 @@ impl Lowering<'_> {
                 else_block,
                 ..
             } => {
+                let known_boolean = self.is_boolean(*condition);
                 let condition = self.value(*condition);
-                // Truthiness is a bit comparison against boxed `true` only because the IR
-                // typed this `Bool`. A general `ToBoolean` is a runtime call.
+                // A bit comparison against boxed `true` is right **only** when the IR has
+                // proved this is a boolean. On anything else every truthy value that is not
+                // literally `true` — a non-empty string, a number, an object — would take the
+                // false branch, so `if (name)` and `x || y` are a `ToBoolean` call.
+                let condition = if known_boolean {
+                    condition
+                } else {
+                    let call = self.builder.ins().call(self.objects.truthy, &[condition]);
+                    self.builder.inst_results(call)[0]
+                };
                 let boxed_true = self
                     .builder
                     .ins()
@@ -1874,6 +1894,9 @@ impl Jit {
             create_string: self
                 .module
                 .declare_func_in_func(self.objects.create_string, &mut context.func),
+            truthy: self
+                .module
+                .declare_func_in_func(self.objects.truthy, &mut context.func),
             unary: self
                 .objects
                 .unary

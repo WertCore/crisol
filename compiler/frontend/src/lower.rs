@@ -546,6 +546,14 @@ impl Lowering {
                 .id
                 .as_ref()
                 .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+            // The binding is made **before** the function is lowered, so a closure that
+            // refers to itself captures the cell rather than the empty slot that preceded it.
+            // Building the closure first and binding after is what made `function f() { f() }`
+            // capture `undefined`.
+            let slot = self.declare(&name);
+            if self.shared.contains(&name) {
+                self.make_cell(slot);
+            }
             let (id, names) = self.lower_function(
                 &name,
                 &declaration.params,
@@ -554,8 +562,7 @@ impl Lowering {
                 true,
             );
             let closure = self.close_over(id, &names);
-            let slot = self.declare(&name);
-            self.bind(&name, slot, closure);
+            self.write(slot, closure);
         }
     }
 

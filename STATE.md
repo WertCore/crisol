@@ -34,8 +34,18 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-What is still refused, most common first: `delete` (59), regular expression literals (26),
-computed property keys (21), template literals (20), `for-in` (14), array holes (11).
+**13 passed, 208 failed, 0 crashed, 158 refused.** The pass count *fell* from 16 as the
+semantics tightened — a case whose guard took the wrong branch exits cleanly and scores as a
+pass, and D-107 and D-108 stopped several from doing that. The harness prints passing cases by
+name so a fall can be read rather than trusted; they are tests of `Object.defineProperty`,
+`Promise` and `RegExp`, so the 13 are largely accidents as well.
+
+Why the failures fail, most common first: `Expected SameValue(«undefined», …)` (101 — a
+builtin that does not exist reads as `undefined`), `Expected a … to be thrown but no` (46 — we
+do not raise `TypeError`), an unreadable thrown object (33).
+
+What is still refused: `delete` (59), regular expression literals (26), computed property keys
+(21), template literals (20), `for-in` (14), array holes (11).
 
 **M13's acceptance is met.** `main.ts` containing arithmetic, closures, classes and array
 methods compiles to a standalone binary that runs and produces correct output, with GC stress
@@ -68,7 +78,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1101 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1112 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

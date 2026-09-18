@@ -68,6 +68,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_not",
     "crisol_typeof",
     "crisol_report_uncaught",
+    "crisol_truthy",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -1047,6 +1048,32 @@ pub extern "C" fn crisol_create_closure(function: u64, captures: u64) -> u64 {
         )]
         let index = Value::number(function as f64);
         runtime.heap.set_internal(closure.handle(), 0, index);
+
+        // **Every function gets a `prototype` object.** `new f()` links an instance to it and
+        // `x instanceof f` looks for it, so a function without one makes both silently wrong —
+        // `instanceof` answers `false` for an object the constructor just made. The class
+        // lowering stores its own over this, which is the same property being assigned.
+        //
+        // Eager, and that costs an allocation per closure that most never use. Creating it on
+        // first read would avoid that, at the price of a property read that mutates the heap.
+        let prototype = scope.alloc(shape, 0);
+        let key = PropertyKey::new("prototype");
+        let (target, slot, width) = {
+            let mut shapes = runtime.shapes.borrow_mut();
+            let current = runtime
+                .heap
+                .shape_of(closure.handle())
+                .unwrap_or_else(|| shapes.root());
+            let target = shapes.add(current, &key);
+            match shapes.lookup(target, &key) {
+                Some(slot) => (target, slot, shapes.len(target) as usize),
+                None => return closure.to_value().to_bits(),
+            }
+        };
+        runtime.heap.transition(closure.handle(), target, width);
+        runtime
+            .heap
+            .set(closure.handle(), slot.index(), prototype.to_value());
         closure.to_value().to_bits()
     })
 }
@@ -1390,8 +1417,10 @@ fn is_truthy(value: Value) -> bool {
         crisol_value::Kind::Undefined | crisol_value::Kind::Null => false,
         crisol_value::Kind::Boolean => value.as_boolean().unwrap_or(false),
         crisol_value::Kind::Number => value.as_number().is_some_and(|n| n != 0.0 && !n.is_nan()),
-        // A string is falsy only when empty, which needs the string table. Objects are always
-        // truthy, and that half is right.
+        // **An empty string is falsy and every other string is truthy** — the one case where a
+        // string's characters decide a branch.
+        crisol_value::Kind::String => text_of(value.to_bits()).is_some_and(|text| !text.is_empty()),
+        // An object is always truthy, including `new Boolean(false)`.
         _ => true,
     }
 }
@@ -1831,6 +1860,49 @@ pub extern "C" fn crisol_typeof(value: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_report_uncaught() {
     let thrown = crisol_pending_exception();
-    let described = to_text(thrown).unwrap_or_else(|| "an object".to_owned());
-    eprintln!("uncaught: {described}");
+    let described = to_text(thrown).or_else(|| describe_error(thrown));
+    eprintln!("uncaught: {}", described.as_deref().unwrap_or("an object"));
+}
+
+/// How a thrown *object* describes itself.
+///
+/// An `Error` carries its explanation in `message` and its kind in `name`, so an object without
+/// them is genuinely opaque and anything else is readable. This is not `ToPrimitive`: it reads
+/// two known properties rather than calling user code, which is the difference between a
+/// diagnostic and running more of the program that just failed.
+fn describe_error(thrown: u64) -> Option<String> {
+    let read = |name: &str| {
+        let key = name.to_owned();
+        // SAFETY: `key` is a live Rust string, so its pointer and length describe UTF-8.
+        let bits = unsafe { crisol_property_load(thrown, key.as_ptr(), key.len() as u64) };
+        // An **absent** property reads as `undefined`, and `to_text` would turn that into the
+        // characters "undefined" — so every error without a `name` described itself as one
+        // called `undefined`. Requiring a string is what distinguishes missing from empty.
+        (Value::from_bits(bits).kind() == crisol_value::Kind::String)
+            .then(|| to_text(bits))
+            .flatten()
+    };
+    match (read("name"), read("message")) {
+        (Some(name), Some(message)) => Some(format!("{name}: {message}")),
+        (None, Some(message)) => Some(message),
+        (Some(name), None) => Some(name),
+        (None, None) => None,
+    }
+}
+
+/// `ToBoolean` — whether a value takes the true branch.
+///
+/// **A branch cannot be a bit comparison against boxed `true`.** Every truthy value that is not
+/// literally `true` — a non-empty string, a number, any object — would take the false path, so
+/// `if (name)` and `x || y` would be wrong for everything except booleans. That is how
+/// `this.message = message || ""` came to assign `""` whatever it was given.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_truthy(value: u64) -> u64 {
+    if is_truthy(Value::from_bits(value)) {
+        Value::TRUE
+    } else {
+        Value::FALSE
+    }
+    .to_bits()
 }

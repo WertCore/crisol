@@ -1073,3 +1073,82 @@ fn strict_equality_on_unknown_values_follows_the_specification() {
         "false",
     );
 }
+
+// ---- truthiness -------------------------------------------------------------------------
+
+/// **A branch is not a bit comparison against `true`.** Every truthy value that is not
+/// literally `true` would take the false path, so these all tested backwards.
+#[test]
+fn a_branch_on_a_non_boolean_follows_to_boolean() {
+    check("truthy-string", "if (\"a\") { return 1; } return 2;", "1");
+    check(
+        "truthy-empty-string",
+        "if (\"\") { return 1; } return 2;",
+        "2",
+    );
+    check("truthy-number", "if (3) { return 1; } return 2;", "1");
+    check("truthy-zero", "if (0) { return 1; } return 2;", "2");
+    check("truthy-object", "if ({}) { return 1; } return 2;", "1");
+    check(
+        "truthy-undefined",
+        "if (undefined) { return 1; } return 2;",
+        "2",
+    );
+    check("truthy-null", "if (null) { return 1; } return 2;", "2");
+}
+
+/// `||` and `&&` are branches too, and this is the shape that made every test262 error lose
+/// its message: `this.message = message || ""` assigned `""` whatever it was given.
+#[test]
+fn or_returns_the_first_truthy_operand() {
+    check("or-string", "let m = \"boom\"; return m || \"\";", "boom");
+    check(
+        "or-empty",
+        "let m = \"\"; return m || \"fallback\";",
+        "fallback",
+    );
+    check(
+        "or-undefined",
+        "let m = undefined; return m || \"fallback\";",
+        "fallback",
+    );
+    check(
+        "and-string",
+        "let m = \"boom\"; return m && \"second\";",
+        "second",
+    );
+    check("and-empty", "let m = \"\"; return m && \"second\";", "");
+}
+
+#[test]
+fn a_loop_condition_is_also_to_boolean() {
+    check(
+        "truthy-while",
+        "let n = 3; let t = 0; while (n) { t = t + n; n = n - 1; } return t;",
+        "6",
+    );
+}
+
+/// **Every function has a `prototype` object**, not only a class. `new f()` links an instance
+/// to it and `instanceof` looks for it, so a function without one answers `false` for an object
+/// its own constructor just made.
+#[test]
+fn a_plain_function_is_a_constructor_too() {
+    check(
+        "function-prototype",
+        "function E(m) { this.message = m; } let e = new E(\"boom\"); return e instanceof E;",
+        "true",
+    );
+    check(
+        "function-prototype-field",
+        "function E(m) { this.message = m; } return new E(\"boom\").message;",
+        "boom",
+    );
+    // The guard test262's own error class uses, which recursed forever without a prototype.
+    check(
+        "function-instanceof-guard",
+        "function E(m) { if (!(this instanceof E)) { return new E(m); } this.message = m || \"\"; } \
+         return new E(\"x\").message;",
+        "x",
+    );
+}
