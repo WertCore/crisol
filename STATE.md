@@ -1,5 +1,6 @@
 # Crisol — State
 
+**Current milestone:** M13 — codegen (lowering complete; the backend compiles a numeric subset to object code for all four targets)
 **Current milestone:** M13 — codegen (lowering complete; backend compiles a numeric subset for all four targets; oxc and Cranelift are current, floor 1.96 and checked)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
