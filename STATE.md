@@ -6,7 +6,7 @@ subset to object code for all four targets, and `crisol-abi` defines the symbols
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 958 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 966 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure
@@ -1708,6 +1708,22 @@ with the other arm also returning a number so a wrong branch is plausible rather
 Helpers are registered **by the caller** from `crisol-abi`, which keeps the backend free of a
 dependency on its own runtime and turns the symbol check from a list comparison into something
 that fails to *resolve* when a name is wrong.
+
+### Source to a running binary
+
+`crisol build` produces a native executable (D-89): parse, lower, verify, compile, link. The
+tests build and **run** real programs, because one that checked the binary existed would pass
+for a binary that printed nothing.
+
+**PIC is not optional** — the object has to *call* the runtime helpers, and without `is_pic` the
+linker refuses. The failure was instructive: `6 - 4` linked and ran while `2 + 3` did not,
+because only the latter emits a call. A backend tested solely on native instructions would never
+have found it.
+
+Measured by building and running, §M13's four named items stand at: **arithmetic, comparisons,
+control flow and locals work end to end; closures, classes and array methods do not**, because
+`Op::Closure`, `Op::Construct` and `Op::CreateArray` are not lowered. One of four. The pipeline
+is real and the coverage is not there yet.
 
 **Still ahead for M13's acceptance:** actually linking and running a binary, and GC stress.
 

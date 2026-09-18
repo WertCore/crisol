@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Value as ClifValue, types};
-use cranelift_codegen::settings;
+use cranelift_codegen::settings::{self, Configurable as _};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{Linkage, Module as _};
 use cranelift_object::{ObjectBuilder, ObjectModule};
@@ -179,7 +179,16 @@ impl Cranelift {
         // better fit: §M11 made safepoints carry an explicit live set, and this API wants
         // exactly that set rather than a whole-function switch. Asking for a flag named
         // `enable_safepoints` fails, which is how this was found.
-        let flags = settings::builder();
+        // Position-independent code, because the object has to *call* the runtime helpers.
+        // Without this the linker refuses with "illegal text-relocations" on macOS and
+        // silently produces a non-PIE elsewhere — the first program that used `+` failed to
+        // link, while one using only `-` succeeded, because only the former emits a call.
+        let mut flags = settings::builder();
+        flags
+            .set("is_pic", "true")
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
         let isa = cranelift_codegen::isa::lookup(parsed.clone())
             .map_err(|_| CodegenError::UnknownTarget {
                 triple: triple.to_owned(),
@@ -384,6 +393,11 @@ impl Lowering<'_> {
         self.types.get(&id.index()) == Some(&crisol_ir::Type::Number)
     }
 
+    /// Whether the IR proved this value is a boolean.
+    fn is_boolean(&self, id: crisol_ir::ValueId) -> bool {
+        self.types.get(&id.index()) == Some(&crisol_ir::Type::Bool)
+    }
+
     fn value(&self, id: crisol_ir::ValueId) -> ClifValue {
         *self
             .values
@@ -510,6 +524,48 @@ impl Lowering<'_> {
                 let right = self.value(*right);
                 let call = self.builder.ins().call(helper, &[left, right]);
                 Some(self.builder.inst_results(call)[0])
+            }
+            Op::Unary { op, operand } => {
+                let value = self.value(*operand);
+                match op {
+                    // Negation on a known number is one instruction. On anything else it needs
+                    // `ToNumber` first, which is a call.
+                    crisol_ir::UnaryOp::Negate if self.is_number(*operand) => {
+                        let unpacked = self.as_f64(value);
+                        let negated = self.builder.ins().fneg(unpacked);
+                        Some(self.box_f64(negated))
+                    }
+                    // `+x` on a number is the identity — `ToNumber` of a number is itself.
+                    crisol_ir::UnaryOp::ToNumber if self.is_number(*operand) => Some(value),
+                    // `void x` evaluates its operand and gives `undefined`. The operand was
+                    // already emitted above, so its side effects have happened.
+                    crisol_ir::UnaryOp::Void => Some(
+                        self.builder
+                            .ins()
+                            .iconst(types::I64, crisol_value::Value::UNDEFINED.to_bits() as i64),
+                    ),
+                    // `!x` on a boolean is a comparison against boxed `true`, inverted.
+                    crisol_ir::UnaryOp::Not if self.is_boolean(*operand) => {
+                        let boxed_true = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, crisol_value::Value::TRUE.to_bits() as i64);
+                        let is_true = self.builder.ins().icmp(
+                            cranelift_codegen::ir::condcodes::IntCC::Equal,
+                            value,
+                            boxed_true,
+                        );
+                        let inverted = self.builder.ins().bxor_imm_u(is_true, 1);
+                        Some(self.box_condition(inverted))
+                    }
+                    // `~`, `typeof`, and the coercing forms of the above need the runtime:
+                    // `~` needs modular `ToInt32` (D-87), and `typeof` produces a string.
+                    other => {
+                        return Err(CodegenError::Unsupported {
+                            operation: format!("unary operator {}", other.symbol()),
+                        });
+                    }
+                }
             }
             Op::Compare {
                 op,

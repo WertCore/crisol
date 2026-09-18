@@ -677,6 +677,9 @@ name = "crisol"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "crisol-codegen",
+ "crisol-frontend",
+ "crisol-ir",
  "crisol-render-wgpu",
  "wgpu",
 ]

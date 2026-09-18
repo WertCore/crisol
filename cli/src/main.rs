@@ -81,12 +81,50 @@ fn main() -> ExitCode {
             doctor::report();
             ExitCode::SUCCESS
         }
-        Command::Build { .. } => unimplemented("build", "M13", "codegen"),
+        Command::Build { path } => build_command(&path),
         Command::Dev { .. } => unimplemented("dev", "M17", "React on the dev-mode interpreter"),
         Command::Run { .. } => unimplemented("run", "M16", "the DOM host API"),
         Command::Check { .. } => unimplemented("check", "M10", "the frontend and module graph"),
         Command::Package(request) => package(request),
     }
+}
+
+/// Runs `crisol build` and reports what came of it.
+///
+/// The runtime archive is located next to the running executable, which is where a `cargo
+/// build` of this workspace puts it. An installed toolchain would ship it alongside the binary
+/// for the same reason, so the lookup is the same in both cases.
+fn build_command(source: &std::path::Path) -> ExitCode {
+    let output = source.with_extension("");
+    let runtime = match runtime_archive() {
+        Some(path) => path,
+        None => {
+            eprintln!(
+                "cannot find the runtime archive (libcrisol_abi.a) next to this executable.\n\
+                 A compiled program links against it, so building needs it present."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match crisol::build::build(source, &output, &runtime) {
+        Ok(()) => {
+            println!("built {}", output.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Where the runtime archive lives.
+fn runtime_archive() -> Option<std::path::PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    let candidate = directory.join("libcrisol_abi.a");
+    candidate.is_file().then_some(candidate)
 }
 
 /// Runs `crisol package` and reports what came of it.
