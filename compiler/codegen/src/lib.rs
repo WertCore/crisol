@@ -181,6 +181,7 @@ const THROW_SYMBOL: &str = "crisol_throw";
 const PENDING_EXCEPTION_SYMBOL: &str = "crisol_pending_exception";
 const CREATE_STRING_SYMBOL: &str = "crisol_create_string";
 const TRUTHY_SYMBOL: &str = "crisol_truthy";
+const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -235,6 +236,8 @@ struct ObjectHelpers<T> {
     unary: Vec<(crisol_ir::UnaryOp, T)>,
     /// `crisol_truthy(value) -> boolean`
     truthy: T,
+    /// `crisol_global_load(name, length) -> value`
+    global_load: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -325,6 +328,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     truthy.params.push(AbiParam::new(types::I64));
     truthy.returns.push(AbiParam::new(types::I64));
 
+    let mut global_load = module.make_signature();
+    global_load.params.push(AbiParam::new(pointer));
+    global_load.params.push(AbiParam::new(types::I64));
+    global_load.returns.push(AbiParam::new(types::I64));
+
     let mut unary_signature = module.make_signature();
     unary_signature.params.push(AbiParam::new(types::I64));
     unary_signature.returns.push(AbiParam::new(types::I64));
@@ -365,6 +373,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         pending: declare(PENDING_EXCEPTION_SYMBOL, &pending)?,
         create_string: declare(CREATE_STRING_SYMBOL, &create_string)?,
         truthy: declare(TRUTHY_SYMBOL, &truthy)?,
+        global_load: declare(GLOBAL_LOAD_SYMBOL, &global_load)?,
         unary,
     })
 }
@@ -415,7 +424,9 @@ fn keys_of(function: &Function) -> Vec<String> {
     for block in &function.blocks {
         for instruction in &block.instructions {
             let key = match &instruction.op {
-                Op::PropertyLoad { key, .. } | Op::PropertyStore { key, .. } => key.as_str(),
+                Op::PropertyLoad { key, .. }
+                | Op::PropertyStore { key, .. }
+                | Op::GlobalLoad { name: key } => key.as_str(),
                 Op::Const(Constant::String(text)) => text.as_str(),
                 _ => continue,
             };
@@ -872,6 +883,9 @@ impl Backend for Cranelift {
             truthy: self
                 .module
                 .declare_func_in_func(self.objects.truthy, &mut context.func),
+            global_load: self
+                .module
+                .declare_func_in_func(self.objects.global_load, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1503,6 +1517,14 @@ impl Lowering<'_> {
                     .call(self.objects.computed_store, &[object, key, value]);
                 None
             }
+            Op::GlobalLoad { name } => {
+                let (pointer, length) = self.key_operands(name)?;
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.global_load, &[pointer, length]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::CaughtValue => {
                 let call = self.builder.ins().call(self.objects.pending, &[]);
                 Some(self.builder.inst_results(call)[0])
@@ -1897,6 +1919,9 @@ impl Jit {
             truthy: self
                 .module
                 .declare_func_in_func(self.objects.truthy, &mut context.func),
+            global_load: self
+                .module
+                .declare_func_in_func(self.objects.global_load, &mut context.func),
             unary: self
                 .objects
                 .unary

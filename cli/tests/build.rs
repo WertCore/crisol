@@ -1152,3 +1152,72 @@ fn a_plain_function_is_a_constructor_too() {
         "x",
     );
 }
+
+// ---- globals ----------------------------------------------------------------------------
+
+/// **A name that resolves to no binding is a global, not a fresh local.** Reading it as a local
+/// is what made every builtin compare equal to `undefined`.
+#[test]
+fn a_missing_global_is_a_reference_error() {
+    check(
+        "global-missing",
+        "let r = 0; try { nosuchthing; } catch (e) { r = e.name; } return r;",
+        "ReferenceError",
+    );
+    check(
+        "global-missing-message",
+        "let r = 0; try { nosuchthing; } catch (e) { r = e.message; } return r;",
+        "nosuchthing is not defined",
+    );
+}
+
+#[test]
+fn the_error_constructors_exist_and_carry_their_name() {
+    check(
+        "global-typeerror",
+        "return new TypeError(\"x\").name;",
+        "TypeError",
+    );
+    check(
+        "global-typeerror-message",
+        "return new TypeError(\"x\").message;",
+        "x",
+    );
+    check(
+        "global-rangeerror",
+        "return new RangeError(\"y\").name;",
+        "RangeError",
+    );
+    // Each is the same code with a different binding, so they must not share a name.
+    check(
+        "global-distinct",
+        "return new TypeError(\"a\").name === new RangeError(\"b\").name;",
+        "false",
+    );
+}
+
+/// A thrown error is caught and read like any other object.
+#[test]
+fn a_constructed_error_can_be_thrown_and_caught() {
+    check(
+        "global-throw-error",
+        "let r = 0; try { throw new TypeError(\"bad\"); } catch (e) { r = e.message; } return r;",
+        "bad",
+    );
+}
+
+#[test]
+fn the_conversion_globals_work() {
+    check("global-string", "return String(12);", "12");
+    check("global-number", "return Number(\"7\");", "7");
+    check("global-number-empty", "return Number();", "0");
+    check("global-boolean", "return Boolean(\"\");", "false");
+}
+
+#[test]
+fn global_this_and_the_value_globals_resolve() {
+    check("global-undefined", "return undefined;", "undefined");
+    check("global-nan", "return NaN;", "NaN");
+    check("global-infinity", "return Infinity;", "Infinity");
+    check("global-this-exists", "return typeof globalThis;", "object");
+}

@@ -684,6 +684,17 @@ impl Lowering {
         self.scope_mut().cells.insert(slot);
     }
 
+    /// Whether `name` names a binding anywhere in scope.
+    ///
+    /// A name that resolves nowhere is a **global**, not a new local. Treating it as a local is
+    /// what made `Object` a fresh empty variable rather than something the runtime provides,
+    /// so every test that used a builtin compared against `undefined`.
+    fn resolves(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope.slots.contains_key(name))
+    }
+
     fn slot(&mut self, name: &str) -> u32 {
         if let Some(slot) = self.scope().slots.get(name) {
             return *slot;
@@ -955,8 +966,15 @@ impl Lowering {
                 if identifier.name == "undefined" {
                     return self.emit(Type::Undefined, Op::Const(Constant::Undefined));
                 }
-                let slot = self.slot(identifier.name.as_str());
-                self.read(slot)
+                if self.resolves(identifier.name.as_str()) {
+                    let slot = self.slot(identifier.name.as_str());
+                    return self.read(slot);
+                }
+                let name = PropertyKey::new(identifier.name.as_str());
+                let value = self.emit(Type::Unknown, Op::GlobalLoad { name });
+                // A missing global is a `ReferenceError`, so the read can throw and has to be
+                // followed by the same check a call is.
+                self.propagate(value)
             }
             Expression::BinaryExpression(binary) => self.binary(binary),
             Expression::AssignmentExpression(assignment) => {

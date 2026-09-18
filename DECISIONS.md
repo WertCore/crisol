@@ -3327,3 +3327,35 @@ error carried no message, exits cleanly and scores as a pass. Making the semanti
 those cases fail correctly. The harness now prints the passing cases by name so a fall can be
 read rather than trusted — and reading them shows they are tests of `Object.defineProperty`,
 `Promise` and `RegExp`, none of which exist here. The 13 are mostly accidents too.
+
+## D-109
+
+**A name that resolves to no binding is a global, and a missing global is a `ReferenceError`.**
+
+Status: Accepted
+
+The lowering resolved an unknown name by *declaring a local for it*. So `Object` became a fresh
+empty variable holding `undefined`, and a test comparing a builtin against an expected value saw
+a wrong value rather than a missing one — 101 of test262's failures read
+`Expected SameValue(«undefined», …)` for exactly that reason.
+
+A name that resolves nowhere now becomes `Op::GlobalLoad`, looked up in an object the runtime
+owns. Absent means **`ReferenceError`**, which is the specification and is also the difference
+between "this builtin is wrong" and "this builtin does not exist" — the failures now say which.
+
+Globals that are functions are built-ins numbered *after* the array methods in one negative
+index space (D-101), so `crisol_closure_code` needs no second rule. `Error` and its subclasses
+are one implementation: they differ only in `name`, which is read off the constructor rather
+than hard-coded, so adding another is a line in a table.
+
+**Consequence:** the pass count fell from 13 to 2. Those cases were passing because a missing
+builtin read as `undefined` and their checks happened not to fire; they now throw, correctly.
+The number is a truer 2 than it was a 13, and the harness lists passing cases by name (D-108)
+so that can be read rather than taken on trust.
+
+**Two bugs this shook out, both about when things are reachable.** The globals table is filled
+while the runtime is constructed, and the runtime is constructed lazily on first use — so
+reading the table before entering `with_runtime` found it empty whenever a global was the first
+thing a program touched, which is usually. And `raise` built two strings and then stored them,
+leaving the first reachable only from a Rust local while the second allocated; under stress that
+collected it, and the error came back with an unreadable message.

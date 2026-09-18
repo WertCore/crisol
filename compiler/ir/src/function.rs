@@ -301,6 +301,16 @@ pub enum Op {
         /// The name.
         key: PropertyKey,
     },
+    /// Reads a name that resolves to no binding: a global.
+    ///
+    /// Distinct from [`Op::Load`] because a global is not a slot — it is a property of an
+    /// object the runtime owns, and it may not exist, which is a `ReferenceError` rather than
+    /// `undefined`. Making it look like a local read is what turned `Object` into a fresh
+    /// empty variable.
+    GlobalLoad {
+        /// The name.
+        name: PropertyKey,
+    },
     /// The value a `catch` binds — whatever the throw in flight is carrying.
     ///
     /// Nullary, because the value is not in any register the IR can name: it was recorded by
@@ -436,9 +446,11 @@ impl Op {
     #[must_use]
     pub fn operands(&self) -> Vec<ValueId> {
         match self {
-            Self::Const(_) | Self::Load { .. } | Self::CreateObject { .. } | Self::CaughtValue => {
-                Vec::new()
-            }
+            Self::Const(_)
+            | Self::Load { .. }
+            | Self::CreateObject { .. }
+            | Self::CaughtValue
+            | Self::GlobalLoad { .. } => Vec::new(),
             Self::Store { value, .. } | Self::Await { value } => vec![*value],
             Self::Call {
                 callee,

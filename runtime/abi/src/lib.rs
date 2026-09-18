@@ -69,6 +69,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_typeof",
     "crisol_report_uncaught",
     "crisol_truthy",
+    "crisol_global_load",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -575,6 +576,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         // triggered inside a borrow of the runtime's shape table.
         roots.extend(ARRAY_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(pending_root());
+        roots.extend(GLOBALS.with(std::cell::Cell::get));
         roots
     }));
 }
@@ -582,6 +584,8 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
 thread_local! {
     /// The prototype every array inherits from, once it has been built.
     static ARRAY_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The object holding every global binding.
+    static GLOBALS: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
 }
 
 /// A function implemented here rather than compiled, called through the uniform convention.
@@ -599,6 +603,115 @@ const NATIVES: &[(&str, Native)] = &[
     ("push", array_push),
     ("indexOf", array_index_of),
 ];
+
+/// Every global that is a function, in the order their indices name them.
+///
+/// Numbered *after* [`NATIVES`], so one negative index space covers both and
+/// `crisol_closure_code` needs no second rule.
+const GLOBAL_NATIVES: &[(&str, Native)] = &[
+    ("Error", make_error),
+    ("TypeError", make_error),
+    ("RangeError", make_error),
+    ("ReferenceError", make_error),
+    ("SyntaxError", make_error),
+    ("String", to_string_global),
+    ("Number", to_number_global),
+    ("Boolean", to_boolean_global),
+];
+
+/// `new Error(message)` and every error subclass.
+///
+/// One implementation for all of them because they differ only in `name`, which is read off the
+/// constructor rather than hard-coded — so `TypeError` and `RangeError` are the same code with
+/// different bindings, and adding another is a line in the table.
+///
+/// Called as a function rather than with `new` it behaves the same, which is what the
+/// specification says for `Error` and what test262's own class does deliberately.
+extern "C" fn make_error(
+    closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let message = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // `new Error(…)` gives a receiver to fill; a plain call gives `undefined`, so one is
+        // made here.
+        let target = handle_of(this_value).map_or_else(|| handle_of(crisol_create_object()), Some);
+        let Some(target) = target else {
+            return Value::UNDEFINED.to_bits();
+        };
+        with_runtime(|runtime| {
+            if Value::from_bits(message).kind() != crisol_value::Kind::Undefined {
+                let text = to_text(message).unwrap_or_default();
+                runtime.define(target, "message", Value::from_bits(new_string(&text)));
+            }
+            if let Some(name) = handle_of(closure).and_then(|c| {
+                let key = PropertyKey::new("name");
+                let shape = runtime.heap.shape_of(c)?;
+                let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+                runtime.heap.get(c, slot.index())
+            }) && name.kind() == crisol_value::Kind::String
+            {
+                runtime.define(target, "name", name);
+            }
+        });
+        target.to_value().to_bits()
+    })
+}
+
+/// `String(value)`.
+extern "C" fn to_string_global(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || match to_text(value) {
+        Some(text) => new_string(&text),
+        // An object needs `ToPrimitive`, which calls user code.
+        None => new_string("[object Object]"),
+    })
+}
+
+/// `Number(value)`.
+extern "C" fn to_number_global(
+    _closure: u64,
+    _this: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    // `Number()` with no argument is `0`, not `NaN`.
+    if argc == 0 {
+        return Value::number(0.0).to_bits();
+    }
+    from_number(to_number(value))
+}
+
+/// `Boolean(value)`.
+extern "C" fn to_boolean_global(
+    _closure: u64,
+    _this: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    crisol_truthy(value)
+}
 
 /// One argument of a native call, or `undefined` if it was not passed.
 ///
@@ -680,7 +793,78 @@ impl Runtime {
             shapes: RefCell::new(Shapes::new()),
         };
         runtime.build_array_prototype();
+        runtime.build_globals();
         runtime
+    }
+
+    /// Writes `value` as a property of `object`, transitioning its shape.
+    ///
+    /// The same three steps `crisol_property_store` takes, without going through a raw pointer
+    /// — the runtime knows its own keys.
+    fn define(&self, object: GcRef, name: &str, value: Value) {
+        let key = PropertyKey::new(name);
+        let Some(current) = self.heap.shape_of(object) else {
+            return;
+        };
+        let (target, slot, width) = {
+            let mut shapes = self.shapes.borrow_mut();
+            let target = shapes.add(current, &key);
+            let Some(slot) = shapes.lookup(target, &key) else {
+                return;
+            };
+            (target, slot, shapes.len(target) as usize)
+        };
+        if target != current {
+            self.heap.transition(object, target, width);
+        }
+        self.heap.set(object, slot.index(), value);
+    }
+
+    /// Allocates a string using this runtime directly.
+    ///
+    /// Not `new_string`, which goes through `with_runtime` — during construction that would
+    /// re-enter the thread-local currently being initialised.
+    fn string(&self, text: &str) -> Value {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let cell = scope.alloc(shape, 0);
+        self.heap.make_string(cell.handle(), text);
+        cell.handle()
+            .to_value()
+            .as_address()
+            .map_or(Value::UNDEFINED, Value::string)
+    }
+
+    /// Builds the object every unresolved name is looked up in.
+    ///
+    /// Rooted before anything is put in it, because each entry allocates and under stress each
+    /// allocation collects.
+    fn build_globals(&self) {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let globals = scope.alloc(shape, 0);
+        GLOBALS.with(|cell| cell.set(Some(globals.handle())));
+
+        for (index, (name, _)) in GLOBAL_NATIVES.iter().enumerate() {
+            #[expect(clippy::cast_precision_loss, reason = "there are a handful of globals")]
+            let encoded = -((NATIVES.len() + index) as f64 + 1.0);
+            let function = scope.alloc_with_internals(shape, 0, 1);
+            self.heap
+                .set_internal(function.handle(), 0, Value::number(encoded));
+            // A constructor needs a `prototype` for `instanceof` to find, exactly as a compiled
+            // function does.
+            let prototype = scope.alloc(shape, 0);
+            self.define(function.handle(), "prototype", prototype.to_value());
+            // The constructor's own name, which `make_error` reads back so that `TypeError`
+            // and `RangeError` can be the same code with different bindings.
+            let text = self.string(name);
+            self.define(function.handle(), "name", text);
+            self.define(globals.handle(), name, function.to_value());
+        }
+        self.define(globals.handle(), "globalThis", globals.to_value());
+        self.define(globals.handle(), "undefined", Value::UNDEFINED);
+        self.define(globals.handle(), "NaN", Value::number(f64::NAN));
+        self.define(globals.handle(), "Infinity", Value::number(f64::INFINITY));
     }
 
     /// Builds the object every array inherits its methods from.
@@ -1456,7 +1640,9 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
         )]
         let native = (-index - 1.0) as usize;
         return NATIVES
-            .get(native)
+            .iter()
+            .chain(GLOBAL_NATIVES.iter())
+            .nth(native)
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
     #[expect(
@@ -1905,4 +2091,55 @@ pub extern "C" fn crisol_truthy(value: u64) -> u64 {
         Value::FALSE
     }
     .to_bits()
+}
+
+/// Reads a global, or raises a `ReferenceError` if there is none.
+///
+/// **A missing global is an error, not `undefined`.** `foo` on its own throws where `foo.bar`
+/// would have quietly produced nothing — and reading it as `undefined` is what let a test
+/// comparing against a builtin report a wrong *value* instead of a missing one.
+///
+/// # Safety
+///
+/// `name` must point to `length` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_global_load(name: *const u8, length: u64) -> u64 {
+    // SAFETY: the caller promises `length` readable UTF-8 bytes at `name`.
+    let Some(text) = (unsafe { key_text(name, length) }) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let key = PropertyKey::new(&text);
+    // **Inside `with_runtime`, and that is load-bearing.** `GLOBALS` is filled while the
+    // runtime is constructed, and the runtime is constructed lazily on first use — so reading
+    // the cell first finds `None` whenever a global is the first thing a program touches,
+    // which it usually is. Every global then read as absent.
+    let found = with_runtime(|runtime| {
+        let globals = GLOBALS.with(std::cell::Cell::get)?;
+        let shape = runtime.heap.shape_of(globals)?;
+        let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+        runtime.heap.get(globals, slot.index())
+    });
+    match found {
+        Some(value) => value.to_bits(),
+        None => raise(&format!("{text} is not defined"), "ReferenceError"),
+    }
+}
+
+/// Throws a fresh error of `kind` carrying `message`.
+fn raise(message: &str, kind: &str) -> u64 {
+    let error = crisol_create_object();
+    let Some(handle) = handle_of(error) else {
+        return crisol_throw(Value::UNDEFINED.to_bits());
+    };
+    with_rooted(&[error], || {
+        // Stored one at a time. Creating both and then storing them leaves the first reachable
+        // only from a Rust local while the second allocates — and under stress that allocation
+        // collects it, which is how the message came back unreadable.
+        let text = new_string(message);
+        with_runtime(|runtime| runtime.define(handle, "message", Value::from_bits(text)));
+        let name = new_string(kind);
+        with_runtime(|runtime| runtime.define(handle, "name", Value::from_bits(name)));
+    });
+    crisol_throw(error)
 }
