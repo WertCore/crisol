@@ -279,6 +279,27 @@ pub enum Op {
         /// The name.
         key: PropertyKey,
     },
+    /// Reads a property whose name is computed: `o[k]`.
+    ///
+    /// Separate from [`Op::PropertyLoad`] because the key is a *value*, not a name known when
+    /// the IR is built. JavaScript makes no distinction between `a[0]` and `a["0"]` — element
+    /// access **is** property access with a computed key — so one operation covers both, and
+    /// the runtime decides whether the key names an element or a property.
+    ComputedLoad {
+        /// The receiver.
+        object: ValueId,
+        /// The key, as a value.
+        key: ValueId,
+    },
+    /// Writes a property whose name is computed: `o[k] = v`.
+    ComputedStore {
+        /// The receiver.
+        object: ValueId,
+        /// The key, as a value.
+        key: ValueId,
+        /// What to store.
+        value: ValueId,
+    },
     /// Writes a property.
     PropertyStore {
         /// The receiver.
@@ -374,6 +395,8 @@ impl Op {
                 | Self::Binary { op: BinaryOp::Add, .. }
                 | Self::PropertyLoad { .. }
                 | Self::PropertyStore { .. }
+                | Self::ComputedLoad { .. }
+                | Self::ComputedStore { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -399,6 +422,8 @@ impl Op {
             }
             Self::PropertyLoad { object, .. } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
+            Self::ComputedLoad { object, key } => vec![*object, *key],
+            Self::ComputedStore { object, key, value } => vec![*object, *key, *value],
             Self::CreateArray { elements } => elements.clone(),
             Self::Construct { callee, args } => {
                 let mut all = vec![*callee];

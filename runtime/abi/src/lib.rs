@@ -55,6 +55,9 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_not_a_function",
     "crisol_construct_this",
     "crisol_construct_result",
+    "crisol_create_array",
+    "crisol_computed_load",
+    "crisol_computed_store",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -232,17 +235,9 @@ pub extern "C" fn crisol_print(bits: u64) {
         crisol_value::Kind::Undefined => println!("undefined"),
         crisol_value::Kind::Null => println!("null"),
         crisol_value::Kind::Boolean => println!("{}", value.as_boolean().unwrap_or(false)),
-        crisol_value::Kind::Number => match value.as_number() {
-            Some(number) if number.is_nan() => println!("NaN"),
-            Some(number) if number.is_infinite() && number > 0.0 => println!("Infinity"),
-            Some(number) if number.is_infinite() => println!("-Infinity"),
-            // Whole numbers print without a decimal point, as JavaScript does — `1`, not `1.0`.
-            Some(number) if number.fract() == 0.0 && number.abs() < 1e21 => {
-                println!("{number:.0}");
-            }
-            Some(number) => println!("{number}"),
-            None => println!("NaN"),
-        },
+        crisol_value::Kind::Number => {
+            println!("{}", number_text(value.as_number().unwrap_or(f64::NAN)));
+        }
         crisol_value::Kind::String | crisol_value::Kind::Symbol | crisol_value::Kind::Object => {
             // Reaching into the heap needs a runtime this crate does not have. Saying so beats
             // printing a pointer that looks like a number.
@@ -335,6 +330,10 @@ pub unsafe extern "C" fn crisol_register_stack_maps(table: *const StackMapRow, c
     if table.is_null() {
         return;
     }
+    assert!(
+        table.is_aligned(),
+        "the stack map table is misaligned at {table:p}; the backend must align it (D-98)"
+    );
     // SAFETY: the caller promises `table` points at `count` valid rows living as long as the
     // process, which is what a data symbol in the program does. A length of zero is fine:
     // `from_raw_parts` accepts it for a non-null, aligned pointer.
@@ -672,6 +671,18 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
     let key = PropertyKey::new(&name);
 
     with_runtime(|runtime| {
+        // `length` on an array is not stored anywhere — it *is* the element count, and has to
+        // answer correctly after `a[9] = 1` grew the array without any property being written.
+        if name == "length"
+            && let Some(count) = runtime.heap.element_count(handle)
+        {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "an array this long cannot be allocated"
+            )]
+            let length = count as f64;
+            return Value::number(length).to_bits();
+        }
         // Walks the prototype chain. A class's methods live on one shared prototype object,
         // not on each instance, so a lookup that stopped at the receiver would find every
         // field and no method at all.
@@ -936,4 +947,139 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
     // SAFETY: written once by `crisol_register_functions` before any compiled code runs.
     let functions = unsafe { FUNCTIONS };
     functions.get(index).copied().unwrap_or(fallback)
+}
+
+/// How JavaScript spells a number.
+///
+/// Shared by printing and by property keys, because `a[1]` is `a["1"]` — the two have to agree
+/// on the spelling or they name different properties. `NaN`, the infinities and the
+/// no-decimal-point rule for whole numbers are all observable, and a second copy of them would
+/// eventually disagree with this one.
+fn number_text(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_owned();
+    }
+    if number.is_infinite() {
+        return if number > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        }
+        .to_owned();
+    }
+    // Whole numbers print without a decimal point, as JavaScript does — `1`, not `1.0`.
+    if number.fract() == 0.0 && number.abs() < 1e21 {
+        return format!("{number:.0}");
+    }
+    format!("{number}")
+}
+
+/// The array index a value names, if it names one.
+///
+/// `a[0]` and `a["0"]` are the same access in JavaScript, so a string that reads as a
+/// non-negative integer counts. Anything else — `a[-1]`, `a[1.5]`, `a["x"]` — is an ordinary
+/// property, which is why this returns `None` rather than rounding.
+fn as_index(key: Value) -> Option<usize> {
+    let number = key.as_number()?;
+    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked non-negative and integral just above"
+    )]
+    let index = number as usize;
+    Some(index)
+}
+
+/// How a computed key reads as a property name.
+///
+/// `a[0]` on a non-array is `a["0"]`, so a number becomes its own decimal spelling. Written
+/// through `Value`'s own formatting rather than Rust's, because `1e21` and `-0` do not print
+/// the same in the two languages and a property name that differs by a character is a
+/// different property.
+fn key_of(key: Value) -> Option<PropertyKey> {
+    key.as_number().map_or_else(
+        || match key.kind() {
+            crisol_value::Kind::Undefined => Some(PropertyKey::new("undefined")),
+            crisol_value::Kind::Null => Some(PropertyKey::new("null")),
+            crisol_value::Kind::Boolean => {
+                Some(PropertyKey::new(if key.as_boolean().unwrap_or(false) {
+                    "true"
+                } else {
+                    "false"
+                }))
+            }
+            // A string or symbol key needs the runtime's string table, which does not exist.
+            // `None` reads as a missing property, which beats naming the wrong one.
+            _ => None,
+        },
+        |number| Some(PropertyKey::new(&number_text(number))),
+    )
+}
+
+/// Allocates `[…]` with `length` elements, all `undefined`.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_create_array(length: u64) -> u64 {
+    let length = usize::try_from(length).unwrap_or(0);
+    with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        let scope = runtime.heap.scope();
+        let array = scope.alloc(shape, 0);
+        runtime.heap.make_array(array.handle(), length);
+        array.to_value().to_bits()
+    })
+}
+
+/// `object[key]`.
+///
+/// An index on an array reads an element; anything else is a property, including on an array —
+/// `a.length` and `a["length"]` are the same thing and neither is an element.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_computed_load(object: u64, key: u64) -> u64 {
+    let Some(handle) = handle_of(object) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let key = Value::from_bits(key);
+
+    let element =
+        with_runtime(|runtime| as_index(key).and_then(|index| runtime.heap.element(handle, index)));
+    if let Some(value) = element {
+        return value.to_bits();
+    }
+    let Some(name) = key_of(key) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let text = name.as_str().to_owned();
+    // SAFETY: `text` is a live Rust string, so its pointer and length describe readable UTF-8.
+    unsafe { crisol_property_load(object, text.as_ptr(), text.len() as u64) }
+}
+
+/// `object[key] = value`.
+#[unsafe(no_mangle)]
+pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) {
+    let Some(handle) = handle_of(object) else {
+        return;
+    };
+    let key = Value::from_bits(key);
+
+    let stored = with_runtime(|runtime| {
+        as_index(key).is_some_and(|index| {
+            runtime
+                .heap
+                .set_element(handle, index, Value::from_bits(value))
+        })
+    });
+    if stored {
+        return;
+    }
+    let Some(name) = key_of(key) else {
+        return;
+    };
+    let text = name.as_str().to_owned();
+    // SAFETY: as above.
+    unsafe { crisol_property_store(object, text.as_ptr(), text.len() as u64, value) }
 }

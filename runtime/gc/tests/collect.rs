@@ -646,3 +646,88 @@ fn a_prototype_can_be_replaced_and_the_old_one_becomes_collectable() {
     assert_eq!(heap.collect().swept, 1);
     assert_eq!(heap.prototype_of(instance), Some(second));
 }
+
+// ---- arrays -----------------------------------------------------------------------------
+
+/// Elements are references like any other, and the collector has to trace them. An array is
+/// often the only thing holding what it contains.
+#[test]
+fn an_object_reachable_only_from_an_array_element_survives() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let array = {
+        let scope = heap.scope();
+        let array = scope.alloc(shape, 0);
+        assert!(heap.make_array(array.handle(), 2));
+        let held = scope.alloc(shape, 1);
+        assert!(heap.set_element(array.handle(), 0, held.to_value()));
+        array.handle()
+    };
+    heap.set_extra_roots(Box::new(move || vec![array]));
+
+    assert_eq!(
+        heap.collect().swept,
+        0,
+        "the element is reachable through the array"
+    );
+    assert_eq!(heap.live(), 2);
+}
+
+#[test]
+fn an_array_is_distinguishable_from_an_object() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+
+    let object = scope.alloc(shape, 1);
+    assert_eq!(
+        heap.element_count(object.handle()),
+        None,
+        "an object has no length"
+    );
+
+    let empty = scope.alloc(shape, 0);
+    heap.make_array(empty.handle(), 0);
+    assert_eq!(
+        heap.element_count(empty.handle()),
+        Some(0),
+        "an empty array still has a length"
+    );
+}
+
+#[test]
+fn writing_past_the_end_grows_the_array() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+
+    let array = scope.alloc(shape, 0);
+    heap.make_array(array.handle(), 1);
+    assert!(heap.set_element(array.handle(), 3, Value::TRUE));
+    assert_eq!(heap.element_count(array.handle()), Some(4));
+    assert_eq!(heap.element(array.handle(), 3), Some(Value::TRUE));
+    assert_eq!(
+        heap.element(array.handle(), 2),
+        Some(Value::UNDEFINED),
+        "the gap is filled, not left holding whatever was there"
+    );
+}
+
+#[test]
+fn an_element_past_the_end_reads_as_nothing_rather_than_panicking() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+    let array = scope.alloc(shape, 0);
+    heap.make_array(array.handle(), 2);
+    assert_eq!(heap.element(array.handle(), 9), None);
+    assert!(
+        !heap.set_element(scope.alloc(shape, 0).handle(), 0, Value::TRUE),
+        "an ordinary object has no elements to write"
+    );
+}

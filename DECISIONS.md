@@ -3057,3 +3057,47 @@ plain value. The callee wraps it at entry, reading the argument before `make_cel
 the slot. Captures are the opposite and must **not** be wrapped: the value arriving is already
 the enclosing scope's cell, and making a second one there would hand the closure a private copy
 — which is the bug, reintroduced at the use site.
+
+## D-98
+
+**The emitted tables declare an alignment.**
+
+Status: Accepted
+
+Cranelift gives a data object no declared alignment unless asked, so `crisol_stack_maps` and
+`crisol_functions` were emitted with alignment 1. The runtime reads both as arrays of 8-byte
+values, and `slice::from_raw_parts` asserts alignment — **including for a zero-length slice**.
+
+For every program written until now the symbol happened to land on an 8-byte boundary. Then one
+did not: `let a = []; return a.length;` put the table at an odd address and the program aborted
+before running a line. Nothing about the program was unusual; the array work merely changed the
+data section enough to move it.
+
+That is the worst shape a latent bug can have — correct by luck, and the thing that breaks it
+is unrelated to the thing that is wrong. Both tables now set an alignment, and the runtime
+asserts it on registration rather than relying on `from_raw_parts` to notice, so a future
+regression names its cause.
+
+## D-99
+
+**A value that may hold a reference is in the stack map, not only the slots.**
+
+Status: Accepted
+
+Every *slot* was declared as needing a stack map. SSA values were not, and a temporary never
+stored into a slot is invisible to the collector. `[{v: 1}]` is exactly that: the object is an
+SSA value used directly as an element, so allocating the array collected it.
+
+Under `CRISOL_GC_STRESS=1` every array of objects came back holding stale handles. Without
+stress nothing failed at all — and three class tests that had been passing were also wrong,
+because a method closure and a receiver are the same kind of temporary.
+
+The slots are declared unconditionally because nothing there knows what they hold. Values are
+declared by their IR type, which is a real narrowing rather than a guess: a `Number` or a `Bool`
+cannot be a reference by the lattice's own statement, and `Unknown` means exactly that and is
+included.
+
+**Consequence, and the more important half:** the acceptance harness now builds each program
+once and runs it **twice**, the second time collecting on every allocation, requiring the same
+answer. Separate stress tests would not have caught this, because the programs that find these
+bugs are not the ones that look like collector tests. `[{v: 1}]` does not look like a GC test.

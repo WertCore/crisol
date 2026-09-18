@@ -46,20 +46,55 @@ fn build_and_run(name: &str, source: &str) -> Option<String> {
     crisol::build::build(&file, &binary, &runtime)
         .unwrap_or_else(|error| panic!("{name} should build: {error}"));
 
-    let output = Command::new(&binary).output().expect("run the binary");
-    assert!(
-        output.status.success(),
-        "{name} exited with {:?}",
-        output.status.code()
-    );
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Some(execute(name, &binary, false))
 }
 
+/// Runs a built program, optionally collecting on every allocation.
+fn execute(name: &str, binary: &Path, stress: bool) -> String {
+    let mut command = Command::new(binary);
+    if stress {
+        command.env("CRISOL_GC_STRESS", "1");
+    }
+    let output = command.output().expect("run the binary");
+    assert!(
+        output.status.success(),
+        "{name} exited with {:?}{}",
+        output.status.code(),
+        if stress { " under GC stress" } else { "" }
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Builds `source`, runs it **twice**, and requires the same answer both times.
+///
+/// The second run collects on every allocation. That is not extra caution — it is the only
+/// thing that tests rooting at all, and it has now caught two bugs that every ordinary run
+/// passed: stack map offsets read from the wrong end of the frame (D-93), and temporaries that
+/// never reach a slot being invisible to the collector (D-99).
+///
+/// Running *every* program both ways rather than writing separate stress tests, because the
+/// bugs it finds are not in the programs that look like they exercise the collector. `[{v: 1}]`
+/// does not look like a GC test.
 fn check(name: &str, source: &str, expected: &str) {
-    let Some(actual) = build_and_run(name, source) else {
+    let Some(runtime) = runtime() else {
         return;
     };
-    assert_eq!(actual, expected, "{name}: {source}");
+    let directory = std::env::temp_dir().join(format!("crisol-acceptance-{name}"));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime)
+        .unwrap_or_else(|error| panic!("{name} should build: {error}"));
+
+    assert_eq!(execute(name, &binary, false), expected, "{name}: {source}");
+    assert_eq!(
+        execute(name, &binary, true),
+        expected,
+        "{name} under GC stress: {source}"
+    );
 }
 
 #[test]
@@ -458,4 +493,102 @@ fn a_captured_but_never_assigned_variable_still_reads_correctly() {
         "let n = 10; let f = function (x) { return x + n; }; return f(5);",
         "15",
     );
+}
+
+// ---- arrays -----------------------------------------------------------------------------
+
+#[test]
+fn an_array_literal_indexes_and_reports_its_length() {
+    check("array-index", "let a = [10, 20, 30]; return a[1];", "20");
+    check(
+        "array-length",
+        "let a = [10, 20, 30]; return a.length;",
+        "3",
+    );
+    check("array-empty", "let a = []; return a.length;", "0");
+}
+
+#[test]
+fn an_element_can_be_written() {
+    check(
+        "array-write",
+        "let a = [1, 2, 3]; a[0] = 9; return a[0];",
+        "9",
+    );
+}
+
+/// `a[5] = 1` on a shorter array grows it, and the gap reads as `undefined`.
+#[test]
+fn writing_past_the_end_grows_the_array() {
+    check("array-grow", "let a = [1]; a[3] = 7; return a.length;", "4");
+    check(
+        "array-gap",
+        "let a = [1]; a[3] = 7; return a[2];",
+        "undefined",
+    );
+}
+
+#[test]
+fn an_index_past_the_end_is_undefined() {
+    check("array-oob", "let a = [1, 2]; return a[9];", "undefined");
+}
+
+/// A computed key that is not an index is an ordinary property — `a["x"]` is not an element,
+/// and neither is `a[1.5]`.
+#[test]
+fn a_non_index_key_is_a_property_not_an_element() {
+    check(
+        "array-non-index",
+        "let a = [1, 2]; a[1.5] = 8; return a.length;",
+        "2",
+    );
+    check(
+        "array-non-index-read",
+        "let a = [1, 2]; return a[1.5];",
+        "undefined",
+    );
+}
+
+/// Element access on an object is property access: `o[0]` and `o["0"]` name the same thing.
+#[test]
+fn a_computed_key_on_an_object_is_a_property() {
+    check("object-computed", "let o = {}; o[0] = 5; return o[0];", "5");
+}
+
+#[test]
+fn an_element_can_hold_an_object_and_be_reached_through_it() {
+    check(
+        "array-of-objects",
+        "let a = [{v: 1}, {v: 2}]; return a[0].v + a[1].v;",
+        "3",
+    );
+}
+
+/// Arrays allocate, and every element is a reference the collector must trace.
+#[test]
+fn arrays_survive_a_collection_at_every_allocation() {
+    let source = "let a = [{v: 1}, {v: 2}, {v: 3}]; \
+                  let total = 0; \
+                  total = total + a[0].v; total = total + a[1].v; total = total + a[2].v; \
+                  return total;";
+    let Some(relaxed) = build_and_run("array-stress-off", source) else {
+        return;
+    };
+    assert_eq!(relaxed, "6");
+
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-array-stress-on");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("it should build");
+
+    let output = Command::new(&binary)
+        .env("CRISOL_GC_STRESS", "1")
+        .output()
+        .expect("run the binary");
+    assert!(output.status.success(), "it must not crash under stress");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "6");
 }

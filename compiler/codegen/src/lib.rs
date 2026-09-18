@@ -172,6 +172,9 @@ const SET_CAPTURE_SYMBOL: &str = "crisol_closure_set_capture";
 const CLOSURE_CODE_SYMBOL: &str = "crisol_closure_code";
 const CONSTRUCT_THIS_SYMBOL: &str = "crisol_construct_this";
 const CONSTRUCT_RESULT_SYMBOL: &str = "crisol_construct_result";
+const CREATE_ARRAY_SYMBOL: &str = "crisol_create_array";
+const COMPUTED_LOAD_SYMBOL: &str = "crisol_computed_load";
+const COMPUTED_STORE_SYMBOL: &str = "crisol_computed_store";
 
 /// The symbol holding the addresses of the program's compiled functions.
 pub const FUNCTION_TABLE_SYMBOL: &str = "crisol_functions";
@@ -197,6 +200,12 @@ struct ObjectHelpers<T> {
     construct_this: T,
     /// `crisol_construct_result(this, returned) -> value`
     construct_result: T,
+    /// `crisol_create_array(length) -> array`
+    create_array: T,
+    /// `crisol_computed_load(object, key) -> value`
+    computed_load: T,
+    /// `crisol_computed_store(object, key, value)`
+    computed_store: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -252,6 +261,20 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     construct_result.params.push(AbiParam::new(types::I64));
     construct_result.returns.push(AbiParam::new(types::I64));
 
+    let mut create_array = module.make_signature();
+    create_array.params.push(AbiParam::new(types::I64));
+    create_array.returns.push(AbiParam::new(types::I64));
+
+    let mut computed_load = module.make_signature();
+    computed_load.params.push(AbiParam::new(types::I64));
+    computed_load.params.push(AbiParam::new(types::I64));
+    computed_load.returns.push(AbiParam::new(types::I64));
+
+    let mut computed_store = module.make_signature();
+    computed_store.params.push(AbiParam::new(types::I64));
+    computed_store.params.push(AbiParam::new(types::I64));
+    computed_store.params.push(AbiParam::new(types::I64));
+
     let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
         module
             .declare_function(symbol, Linkage::Import, signature)
@@ -269,6 +292,9 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         code: declare(CLOSURE_CODE_SYMBOL, &code)?,
         construct_this: declare(CONSTRUCT_THIS_SYMBOL, &construct_this)?,
         construct_result: declare(CONSTRUCT_RESULT_SYMBOL, &construct_result)?,
+        create_array: declare(CREATE_ARRAY_SYMBOL, &create_array)?,
+        computed_load: declare(COMPUTED_LOAD_SYMBOL, &computed_load)?,
+        computed_store: declare(COMPUTED_STORE_SYMBOL, &computed_store)?,
     })
 }
 
@@ -387,6 +413,31 @@ const FIXED_PARAMS: usize = 5;
 /// So a call passing no arguments still reserves one slot. That costs eight bytes of stack and
 /// removes a branch from every parameter of every function.
 pub const ARGV_MIN_SLOTS: usize = 1;
+
+/// Whether a value of this type could be a reference the collector must trace.
+///
+/// The slots are declared unconditionally because nothing there knows what they hold. Here the
+/// IR does, so a number or a boolean is left out — and that is a real narrowing rather than a
+/// guess: these are the types the lattice states, not an inference about bit patterns.
+///
+/// `Unknown` counts, because it means exactly that.
+const fn may_hold_a_reference(ty: crisol_ir::Type) -> bool {
+    match ty {
+        crisol_ir::Type::Never
+        | crisol_ir::Type::Undefined
+        | crisol_ir::Type::Null
+        | crisol_ir::Type::Bool
+        | crisol_ir::Type::Number => false,
+        crisol_ir::Type::String | crisol_ir::Type::Object(_) | crisol_ir::Type::Unknown => true,
+    }
+}
+
+/// What both emitted tables are aligned to.
+///
+/// They are arrays of 8-byte values — addresses and counts — and the runtime reads them as
+/// such. Eight rather than the natural alignment of a row so the count at element zero is
+/// aligned too.
+const TABLE_ALIGN: u64 = 8;
 
 /// The symbol holding the stack map table a compiled program's collector reads.
 pub const STACK_MAP_SYMBOL: &str = "crisol_stack_maps";
@@ -578,6 +629,7 @@ impl Cranelift {
             .unwrap_or(0);
 
         let mut description = cranelift_module::DataDescription::new();
+        description.set_align(TABLE_ALIGN);
         let mut bytes = Vec::with_capacity(8 + width * 8);
         bytes.extend_from_slice(&(width as u64).to_le_bytes());
         bytes.extend_from_slice(&vec![0u8; width * 8]);
@@ -607,6 +659,12 @@ impl Cranelift {
 
     fn emit_stack_map_table(&mut self) -> Result<(), CodegenError> {
         let mut description = cranelift_module::DataDescription::new();
+        // **Without this the symbol may land at an odd address.** Cranelift defaults a data
+        // object to no declared alignment, and both tables are read as arrays of 8-byte
+        // values — so the runtime's `from_raw_parts` asserts on a misaligned pointer, even for
+        // an empty table. It happened to land aligned for every program until one did not,
+        // which is the worst way for this to be found.
+        description.set_align(TABLE_ALIGN);
         let count = u64::try_from(self.rows.len()).unwrap_or(0);
         let mut bytes = Vec::with_capacity(8 + self.rows.len() * 16);
         bytes.extend_from_slice(&count.to_le_bytes());
@@ -714,6 +772,15 @@ impl Backend for Cranelift {
             construct_result: self
                 .module
                 .declare_func_in_func(self.objects.construct_result, &mut context.func),
+            create_array: self
+                .module
+                .declare_func_in_func(self.objects.create_array, &mut context.func),
+            computed_load: self
+                .module
+                .declare_func_in_func(self.objects.computed_load, &mut context.func),
+            computed_store: self
+                .module
+                .declare_func_in_func(self.objects.computed_store, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature
@@ -1235,6 +1302,52 @@ impl Lowering<'_> {
                     .call(self.objects.construct_result, &[this_value, returned]);
                 Some(self.builder.inst_results(result)[0])
             }
+            Op::CreateArray { elements } => {
+                // Allocated at its final length and then filled, so the array never exists in
+                // a half-built state across a safepoint — each element's evaluation can
+                // allocate, and a shorter array would be a live object the collector traces
+                // with fewer elements than the program thinks it has.
+                let length = i64::try_from(elements.len()).unwrap_or(i64::MAX);
+                let length = self.builder.ins().iconst(types::I64, length);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.create_array, &[length]);
+                let array = self.builder.inst_results(call)[0];
+
+                for (position, element) in elements.iter().enumerate() {
+                    let value = self.value(*element);
+                    let position = i64::try_from(position).unwrap_or(i64::MAX);
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "an index this large cannot be reached"
+                    )]
+                    let index = crisol_value::Value::number(position as f64).to_bits();
+                    let index = self.builder.ins().iconst(types::I64, index as i64);
+                    self.builder
+                        .ins()
+                        .call(self.objects.computed_store, &[array, index, value]);
+                }
+                Some(array)
+            }
+            Op::ComputedLoad { object, key } => {
+                let object = self.value(*object);
+                let key = self.value(*key);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.computed_load, &[object, key]);
+                Some(self.builder.inst_results(call)[0])
+            }
+            Op::ComputedStore { object, key, value } => {
+                let object = self.value(*object);
+                let key = self.value(*key);
+                let value = self.value(*value);
+                self.builder
+                    .ins()
+                    .call(self.objects.computed_store, &[object, key, value]);
+                None
+            }
             Op::CreateObject { .. } => {
                 // No shape argument: an object literal is empty until its first property is
                 // stored, and the lowering says so by allocating at the root shape and then
@@ -1273,6 +1386,14 @@ impl Lowering<'_> {
         };
 
         if let (Some(result), Some(id)) = (produced, instruction.result) {
+            // A value that may hold a reference has to be in the stack map too, not only the
+            // slots. `[{v: 1}]` never stores the object in a slot — it is an SSA value used
+            // directly as an element — so with only slots declared the collector could not see
+            // it, and the allocation of the *array* freed it. Under stress every array of
+            // objects came back with stale elements; without stress nothing failed at all.
+            if may_hold_a_reference(instruction.ty) {
+                self.builder.declare_value_needs_stack_map(result);
+            }
             self.values.insert(id.index(), result);
             self.types.insert(id.index(), instruction.ty);
         }
@@ -1578,6 +1699,15 @@ impl Jit {
             construct_result: self
                 .module
                 .declare_func_in_func(self.objects.construct_result, &mut context.func),
+            create_array: self
+                .module
+                .declare_func_in_func(self.objects.create_array, &mut context.func),
+            computed_load: self
+                .module
+                .declare_func_in_func(self.objects.computed_load, &mut context.func),
+            computed_store: self
+                .module
+                .declare_func_in_func(self.objects.computed_store, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature

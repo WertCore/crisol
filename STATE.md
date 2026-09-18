@@ -24,6 +24,15 @@ and a constructor returning an object replacing the instance. Heap objects carry
 the collector traces, and engine state lives beside the property slots rather than in them
 (D-96), which is what made every class constructor silently uncallable.
 
+**Arrays work** — literals, indexing, writing, growing past the end, `length`, and computed
+keys that are not indices falling back to ordinary properties. Elements live beside the
+property slots rather than in them, so a thousand-element array does not make a thousand
+shapes.
+
+**Every acceptance program now runs twice, the second time under GC stress** (D-99). That is
+not extra caution: it is the only thing that tests rooting, and it has caught two bugs that
+every ordinary run passed.
+
 **Captured variables are shared, not copied** (D-97). A variable that is both captured and
 assigned lives in a heap cell that the closure and the enclosing scope hold jointly, so a
 counter mutated inside a closure accumulates. Decided by a pre-pass, because the lowering only
@@ -38,7 +47,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1029 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1041 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

@@ -7,6 +7,58 @@ bb0:  ; entry
     return
 }
 
+=== computed-read ===
+--- source
+let a = [1, 2]; let x = a[0];
+--- ir
+function computed-read {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: number = const 2.0
+    v2: object = array [v0, v1]  ; safepoint []
+    store $1, v2
+    v3: unknown = load $1
+    v4: number = const 0.0
+    v5: unknown = get v3[v4]  ; safepoint []
+    store $2, v5
+    return
+}
+
+=== computed-write ===
+--- source
+let a = [1]; a[0] = 2;
+--- ir
+function computed-write {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: object = array [v0]  ; safepoint []
+    store $1, v1
+    v2: number = const 2.0
+    v3: unknown = load $1
+    v4: number = const 0.0
+    set v3[v4] = v2  ; safepoint []
+    return
+}
+
+=== computed-on-object ===
+--- source
+let o = {}; o[1] = 5; let x = o[1];
+--- ir
+function computed-on-object {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    store $1, v0
+    v1: number = const 5.0
+    v2: unknown = load $1
+    v3: number = const 1.0
+    set v2[v3] = v1  ; safepoint []
+    v4: unknown = load $1
+    v5: number = const 1.0
+    v6: unknown = get v4[v5]  ; safepoint []
+    store $2, v6
+    return
+}
+
 === number ===
 --- source
 let x = 1;

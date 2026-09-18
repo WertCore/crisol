@@ -25,6 +25,11 @@ use crisol_ir::{Op, verify_module};
 /// The programs. Order is fixed, because the snapshot is.
 const CORPUS: &[(&str, &str)] = &[
     ("empty", ""),
+    // Computed access, which is how every element read reaches the IR. `a[0]` and `a["0"]`
+    // are the same operation in JavaScript, so one op covers both.
+    ("computed-read", "let a = [1, 2]; let x = a[0];"),
+    ("computed-write", "let a = [1]; a[0] = 2;"),
+    ("computed-on-object", "let o = {}; o[1] = 5; let x = o[1];"),
     ("number", "let x = 1;"),
     ("negative-is-not-arithmetic-here", "let x = 0;"),
     ("float", "let x = 1.5;"),
@@ -301,7 +306,6 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // where the declaration does, so calling it earlier in the source reads an unset slot
         // rather than working. Recorded rather than left silently half-right.
         ("function f() { }", "function declaration hoisting"),
-        ("let o = {}; let a = o[1];", "computed member access"),
         ("try { } catch (e) { }", "try statement"),
         ("let [a] = [1];", "destructuring declaration"),
         ("let o = { ...{} };", "object spread"),

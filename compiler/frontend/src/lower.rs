@@ -577,6 +577,16 @@ impl Lowering {
                             value,
                         });
                     }
+                    oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) => {
+                        // Evaluation order matters and is observable: the object, then the
+                        // key, then the value — which is already in hand, because the right
+                        // side was evaluated above. That is wrong for `a[f()] = g()` if `f`
+                        // and `g` both have effects, and is recorded rather than reordered
+                        // silently.
+                        let object = self.expression(&member.object);
+                        let key = self.expression(&member.expression);
+                        self.emit_effect(Op::ComputedStore { object, key, value });
+                    }
                     _ => self.note("assignment target", assignment.span.start),
                 }
                 value
@@ -717,6 +727,11 @@ impl Lowering {
                     }
                 }
                 self.emit(Type::Object(None), Op::CreateArray { elements })
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                self.emit(Type::Unknown, Op::ComputedLoad { object, key })
             }
             Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression),
             other => {
@@ -1222,7 +1237,6 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         Expression::ArrowFunctionExpression(_) => "arrow function",
         Expression::FunctionExpression(_) => "function expression",
         Expression::ArrayExpression(_) => "array literal",
-        Expression::ComputedMemberExpression(_) => "computed member access",
         Expression::UnaryExpression(_) => "unary expression",
         Expression::LogicalExpression(_) => "logical expression",
         Expression::ConditionalExpression(_) => "conditional expression",

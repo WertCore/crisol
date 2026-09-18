@@ -52,6 +52,16 @@ struct Object {
     /// Traced like any other reference, because captures are values the program can still
     /// reach.
     internals: Vec<Value>,
+    /// Indexed elements, for an array. `None` for an ordinary object.
+    ///
+    /// Separate from `slots` because those are addressed by *shape*: every distinct property
+    /// name adds a shape. Storing `a[0]`, `a[1]`, … as named properties would give a thousand
+    /// element array a thousand shapes, and a dynamic index would have to format a number into
+    /// a string to look one up.
+    ///
+    /// `None` rather than an empty vector, so `[]` and `{}` stay distinguishable — the first
+    /// has a `length` and the second does not.
+    elements: Option<Vec<Value>>,
 }
 
 #[derive(Debug)]
@@ -304,6 +314,84 @@ impl Heap {
         }
     }
 
+    /// Turns `handle` into an array of `length` elements, all `undefined`.
+    ///
+    /// Separate from allocation so an array is still an object first — it has a shape, a
+    /// prototype and properties like anything else, and only additionally a run of elements.
+    pub fn make_array(&self, handle: GcRef, length: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.elements = Some(vec![Value::UNDEFINED; length]);
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// How many elements `handle` has, or `None` if it is not an array.
+    #[must_use]
+    pub fn element_count(&self, handle: GcRef) -> Option<usize> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.elements.as_ref().map(Vec::len),
+            State::Free => None,
+        }
+    }
+
+    /// Reads an element, or `None` if this is not an array or the index is past the end.
+    #[must_use]
+    pub fn element(&self, handle: GcRef, index: usize) -> Option<Value> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.elements.as_ref()?.get(index).copied(),
+            State::Free => None,
+        }
+    }
+
+    /// Writes an element, growing the array if `index` is past the end.
+    ///
+    /// Growing is what `a[5] = 1` on a three-element array does, and the gap fills with
+    /// `undefined`. That is not quite the specification — the gap should be *holes*, which
+    /// `in` and `forEach` treat differently from `undefined` (D-64) — and it is recorded there
+    /// rather than pretended away here.
+    pub fn set_element(&self, handle: GcRef, index: usize, value: Value) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                let Some(elements) = object.elements.as_mut() else {
+                    return false;
+                };
+                if index >= elements.len() {
+                    elements.resize(index + 1, Value::UNDEFINED);
+                }
+                elements[index] = value;
+                true
+            }
+            State::Free => false,
+        }
+    }
+
     /// Reads engine-private state, which no property access can reach.
     #[must_use]
     pub fn internal(&self, handle: GcRef, index: u32) -> Option<Value> {
@@ -454,6 +542,13 @@ impl Heap {
                     .iter()
                     .filter_map(|value| value.as_address().map(GcRef::from_address)),
             );
+            children.extend(
+                object
+                    .elements
+                    .iter()
+                    .flatten()
+                    .filter_map(|value| value.as_address().map(GcRef::from_address)),
+            );
             drop(cells);
             worklist.extend(children);
         }
@@ -502,6 +597,7 @@ impl Heap {
             slots: vec![Value::UNDEFINED; slots],
             prototype: None,
             internals: vec![Value::UNDEFINED; internals],
+            elements: None,
         };
 
         let handle = match self.free.borrow_mut().pop() {
