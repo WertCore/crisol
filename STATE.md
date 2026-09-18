@@ -1612,7 +1612,24 @@ four were in M11's recorded `unsupported` list**. That is a gap in the plan, not
 implementation: the roadmap reads as though M13 begins where M11 stopped, and it does not.
 
 `Op::Binary` and `Op::Unary` are now in the IR, and the lowering covers arithmetic, bitwise,
-unary, logical, conditional and array literals. classes, and array *methods*.
+unary, logical, conditional and array literals. array *methods*, then the Cranelift backend.
+
+### Classes, and two bugs the snapshot caught
+
+A class desugars to a constructor whose `prototype` holds the methods (D-83); `new` is one op,
+because "a constructor returning an object replaces `this`" is a rule no call site should have
+to remember.
+
+**Two bugs, neither caught by a test** — both produced IR that verified and dumped cleanly.
+Methods declared *after* the constructor were dropped, and since `constructor` conventionally
+comes first, the common ordering was the broken one. And **`this.x = x` lowered to `x = x`**,
+because oxc's `get_identifier_name` reports the *property* name for a member target — no note,
+no error, and it claimed to be faithful, which is exactly what the unsupported list exists to
+prevent.
+
+That is the third defect found by *reading* a generated snapshot rather than by a test, after
+the object-shape soundness bug and the missing call receiver. The pattern holds: a snapshot
+catches what a reader notices and misses what the IR cannot yet express.
 
 ### `this`, and a receiver the snapshot had been blessing
 
