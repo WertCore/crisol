@@ -2403,3 +2403,71 @@ The receiver test was first written as a substring match on `call v4(this=v1`. T
 the wrong reason as soon as an earlier instruction moves — and it did, because adding `this` as
 slot 0 shifted every other slot. It is now structural: find the `PropertyLoad`, find the `Call`,
 and assert the call's receiver *is* the object the method was loaded from.
+
+---
+
+## D-84 — The Cranelift backend, and three things the plan did not anticipate
+
+**Status:** Accepted (M13) · **Affects:** M13, M14, M20
+
+§4 names Cranelift and §M13 needs stack maps at safepoints, which is the deciding feature
+rather than a convenience. A JavaScript value is NaN-boxed into 64 bits (D-53), so Cranelift
+sees `I64` everywhere and reaching a number is a bitcast — no separate float register class in
+the calling convention, no boxing at a call boundary.
+
+Three things came out differently from what the plan implies.
+
+### The oxc pin caps Cranelift at 0.128
+
+`oxc_allocator 0.91` depends on `bumpalo` **exactly** `=3.19.0`; Cranelift 0.132+ needs
+`^3.20.2`. No version satisfies both, so the workspace cannot resolve.
+
+D-57 pinned oxc at 0.91 because newer oxc needs Rust 1.96 against a 1.87 MSRV, reasoning that
+"a parser dependency in Track B is not a reason to raise the floor for everybody". That still
+holds — 0.128 is a current, supported Cranelift — but the pin now constrains the *backend* as
+well, which is a stronger consequence than the original decision weighed. Worth revisiting when
+either side moves.
+
+`all-arch` is not a default feature. Without it only the host ISA is available, so three of
+§M13's four named targets would fail to construct — and a backend that only built for the host
+would pass every test written on one machine.
+
+### Stack maps are per-value, not a flag
+
+There is no `enable_safepoints` setting in this version; asking for one fails, which is how
+this was found. Stack maps are requested with `declare_value_needs_stack_map` per value.
+
+**That is the better fit.** §M11 made safepoints carry an explicit live set, and this API wants
+exactly that set rather than a whole-function switch — the two line up without translation.
+
+`Report::stack_map_entries` counts what was handed over, because §M13's deliverable is
+*emission* and a test that only checks the function compiled verifies nothing about it. The
+count is honest about its limit: **`cranelift-object` does not write stack maps into a section**,
+so M13's GC integration will have to carry them out of band. Claiming "stack maps are emitted"
+without that distinction is the kind of statement that looks true until someone goes looking for
+the section.
+
+### `+` is a call, and that is D-79 arriving in the machine code
+
+Every arithmetic operator except `+` is typed `Number` by the IR and lowers to a native `f64`
+instruction. `+` is typed `Unknown` because it may concatenate — and **an `Unknown` cannot
+become a float add**, because the operands might be strings.
+
+So `Add` lowers to a call to `crisol_add`. That is not a shortcoming: it is what every engine
+does before type feedback narrows the operands, and the alternative is a miscompilation.
+Narrowing it is M20's, and the IR already carries the type a pass would need. There is a test
+that looks for the symbol in the object file, because an `fadd` would leave no relocation to
+find.
+
+**Everything else is refused rather than approximated.** `%`, `**` and the bitwise operators
+need int32 coercion or a libm call; `===` on boxed values is a bit comparison *except* for NaN
+and ±0, which is D-53's whole subject. A backend that guessed at any of them would emit code
+that runs and is wrong — indistinguishable from correct code by testing the compiler, and only
+visible by running the program and noticing the answer.
+
+### A test that was wrong about liveness
+
+The stack-map test first declared a value whose only use *was* the call's argument, and asserted
+one entry. The count was 0 — **and the test was wrong, not the backend**: a value whose last use
+is the call argument does not need to survive the collection. Corrected to use the value after
+the call.

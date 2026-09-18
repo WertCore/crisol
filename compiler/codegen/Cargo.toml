@@ -12,3 +12,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crisol-ir.workspace = true
+crisol-value.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-object.workspace = true
+target-lexicon.workspace = true

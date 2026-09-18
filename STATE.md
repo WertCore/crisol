@@ -1,6 +1,6 @@
 # Crisol — State
 
-**Current milestone:** M13 — codegen (M12's surface is complete; its acceptance is blocked on M13, see below)
+**Current milestone:** M13 — codegen (lowering complete; the backend compiles a numeric subset to object code for all four targets)
 **Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 915 tests passing — 912 at the last measured point plus 3 new; the `node_modules` and test262 cases skip without their suites
+**Totals:** 932 tests passing — 921 at the last measured point plus 11 in `crisol-codegen`; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
@@ -1612,7 +1612,36 @@ four were in M11's recorded `unsupported` list**. That is a gap in the plan, not
 implementation: the roadmap reads as though M13 begins where M11 stopped, and it does not.
 
 `Op::Binary` and `Op::Unary` are now in the IR, and the lowering covers arithmetic, bitwise,
-unary, logical, conditional and array literals. classes, and array *methods*.
+unary, logical, conditional, array literals, functions, closures and classes. Array *methods*
+lower too — they are an ordinary method call on an array, receiver included — so **the lowering
+side of §M13's acceptance is complete**.
+
+### The Cranelift backend
+
+`crisol-codegen` compiles IR to object code for all four of §M13's targets (D-84). Values are
+`I64`, because a JavaScript value is NaN-boxed into 64 bits — reaching a number is a bitcast.
+
+Three things differed from what the plan implies:
+
+- **The oxc pin caps Cranelift at 0.128.** `oxc_allocator 0.91` requires `bumpalo` *exactly*
+  `=3.19.0`; Cranelift 0.132+ needs `^3.20.2`, and no version satisfies both. D-57's reasoning
+  still holds, but the pin now constrains the *backend* too, which is a stronger consequence
+  than that decision weighed. `all-arch` is also not a default feature — without it three of
+  the four named targets fail to construct, and a host-only backend passes every test written
+  on one machine.
+- **Stack maps are per-value, not a flag.** There is no `enable_safepoints` setting; asking for
+  one fails, which is how this was found. `declare_value_needs_stack_map` wants exactly the
+  live set §M11 made explicit, so the two line up without translation. `Report` counts what was
+  handed over, and says plainly that **`cranelift-object` does not write maps into a section**
+  — M13's GC integration must carry them out of band.
+- **`+` lowers to a call**, which is D-79 arriving in the machine code. Everything typed
+  `Number` becomes a native `f64` instruction; `%`, `**`, the bitwise operators and `===` are
+  **refused**, because guessing would emit code that runs and is wrong — invisible to the
+  compiler's own tests.
+
+The stack-map test was first written against a value whose only use *was* the call argument. It
+reported 0 entries, and **the test was wrong, not the backend**: a value whose last use is the
+call argument does not need to survive the collection.
 
 ### `this`, and a receiver the snapshot had been blessing
 
