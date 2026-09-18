@@ -34,16 +34,11 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**8 passed, 213 failed, 0 crashed, 158 refused.** Fourteen more array methods (D-114) and
-`Function.prototype.call`/`apply` (D-113), which test262 uses to apply a method to a receiver
-it was not written for.
+**14 passed, 207 failed, 0 crashed, 158 refused.** `String.prototype` exists and strings are
+measured in UTF-16 code units rather than bytes (D-115) — `"é".length` was 2 and is 1.
 
-The harness now prints example paths for the most common failure, because the thrown message
-cannot name what was missing — by the time a call fails the callee is a value, and nothing holds
-the name it was read from. The paths do, and that is what identified `call` as the gap.
-
-Where the failures are: `Array.prototype` (55), `Object` (51 — mostly `defineProperty`),
-`String.prototype` (24), `Date.prototype` (13).
+Where the failures are: `Object` (51, almost all wanting `defineProperty` and so property
+descriptors), `Array.prototype` (54), `String.prototype` (18), `Date.prototype` (13).
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -79,7 +74,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1175 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1183 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

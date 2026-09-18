@@ -578,6 +578,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(pending_root());
         roots.extend(GLOBALS.with(std::cell::Cell::get));
         roots.extend(FUNCTION_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(STRING_PROTOTYPE.with(std::cell::Cell::get));
         roots
     }));
 }
@@ -590,6 +591,8 @@ thread_local! {
     /// The prototype every function inherits from, which is where `call` and `apply` live.
     static FUNCTION_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
+    /// The prototype every string inherits from.
+    static STRING_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
 }
 
 /// A function implemented here rather than compiled, called through the uniform convention.
@@ -764,6 +767,410 @@ extern "C" fn construct_plain_object(
 ///
 /// Numbered after [`NATIVES`] and [`GLOBAL_NATIVES`], continuing the one negative index space
 /// so `crisol_closure_code` still has a single rule.
+/// Methods on `String.prototype`.
+const STRING_NATIVES: &[(&str, Native)] = &[
+    ("charAt", string_char_at),
+    ("charCodeAt", string_char_code_at),
+    ("indexOf", string_index_of),
+    ("lastIndexOf", string_last_index_of),
+    ("includes", string_includes),
+    ("startsWith", string_starts_with),
+    ("endsWith", string_ends_with),
+    ("slice", string_slice),
+    ("substring", string_substring),
+    ("toUpperCase", string_to_upper),
+    ("toLowerCase", string_to_lower),
+    ("trim", string_trim),
+    ("concat", string_concat),
+    ("repeat", string_repeat),
+    ("split", string_split),
+    ("toString", string_to_string),
+    ("valueOf", string_to_string),
+];
+
+/// A string as the code units JavaScript counts.
+///
+/// **UTF-16, not bytes and not scalar values.** `length`, `charAt` and every index are in code
+/// units, so an emoji is two positions and a `é` is one. Measuring bytes reads correctly for
+/// ASCII and wrongly for everything else, which is the worst way to be wrong.
+fn code_units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+/// The receiver of a string method, as text.
+fn this_text(this_value: u64) -> Option<String> {
+    // `String.prototype.slice.call(5)` coerces, which is why this is `to_text` and not a
+    // string-only read.
+    to_text(this_value)
+}
+
+/// `String.prototype.charAt`.
+extern "C" fn string_char_at(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return new_string("");
+    };
+    let units = code_units(&text);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let index = Value::from_bits(unsafe { argument(argc, argv, 0) })
+        .as_number()
+        .unwrap_or(0.0);
+    // **Out of range is the empty string, not `undefined`**, which is what distinguishes
+    // `charAt` from indexing.
+    if index < 0.0 || !index.is_finite() {
+        return new_string("");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked non-negative and finite"
+    )]
+    let at = index as usize;
+    units.get(at).map_or_else(
+        || new_string(""),
+        |unit| new_string(&String::from_utf16_lossy(&[*unit])),
+    )
+}
+
+/// `String.prototype.charCodeAt`.
+extern "C" fn string_char_code_at(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return from_number(f64::NAN);
+    };
+    let units = code_units(&text);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let index = Value::from_bits(unsafe { argument(argc, argv, 0) })
+        .as_number()
+        .unwrap_or(0.0);
+    if index < 0.0 || !index.is_finite() {
+        return from_number(f64::NAN);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked non-negative and finite"
+    )]
+    let at = index as usize;
+    // **Out of range is `NaN`**, where `charAt` gives the empty string — the pair disagree
+    // deliberately.
+    units.get(at).map_or_else(
+        || from_number(f64::NAN),
+        |unit| from_number(f64::from(*unit)),
+    )
+}
+
+/// `String.prototype.indexOf`.
+extern "C" fn string_index_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let (Some(text), Some(needle)) = (this_text(this_value), {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        to_text(unsafe { argument(argc, argv, 0) })
+    }) else {
+        return Value::number(-1.0).to_bits();
+    };
+    // Reported in code units, so the answer is an index into the same space `charAt` uses.
+    match text.find(&needle) {
+        Some(byte) => index_value(code_units(&text[..byte]).len()),
+        None => Value::number(-1.0).to_bits(),
+    }
+}
+
+/// `String.prototype.lastIndexOf`.
+extern "C" fn string_last_index_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let (Some(text), Some(needle)) = (this_text(this_value), {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        to_text(unsafe { argument(argc, argv, 0) })
+    }) else {
+        return Value::number(-1.0).to_bits();
+    };
+    match text.rfind(&needle) {
+        Some(byte) => index_value(code_units(&text[..byte]).len()),
+        None => Value::number(-1.0).to_bits(),
+    }
+}
+
+/// `String.prototype.includes`.
+extern "C" fn string_includes(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let (Some(text), Some(needle)) = (this_text(this_value), {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        to_text(unsafe { argument(argc, argv, 0) })
+    }) else {
+        return Value::FALSE.to_bits();
+    };
+    if text.contains(&needle) {
+        Value::TRUE
+    } else {
+        Value::FALSE
+    }
+    .to_bits()
+}
+
+/// `String.prototype.startsWith`.
+extern "C" fn string_starts_with(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let (Some(text), Some(needle)) = (this_text(this_value), {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        to_text(unsafe { argument(argc, argv, 0) })
+    }) else {
+        return Value::FALSE.to_bits();
+    };
+    if text.starts_with(&needle) {
+        Value::TRUE
+    } else {
+        Value::FALSE
+    }
+    .to_bits()
+}
+
+/// `String.prototype.endsWith`.
+extern "C" fn string_ends_with(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let (Some(text), Some(needle)) = (this_text(this_value), {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        to_text(unsafe { argument(argc, argv, 0) })
+    }) else {
+        return Value::FALSE.to_bits();
+    };
+    if text.ends_with(&needle) {
+        Value::TRUE
+    } else {
+        Value::FALSE
+    }
+    .to_bits()
+}
+
+/// The text between two code-unit positions.
+fn units_between(units: &[u16], start: usize, end: usize) -> u64 {
+    let slice = units.get(start..end.max(start)).unwrap_or(&[]);
+    new_string(&String::from_utf16_lossy(slice))
+}
+
+/// `String.prototype.slice`.
+extern "C" fn string_slice(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return new_string("");
+    };
+    let units = code_units(&text);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let start = relative_index(unsafe { argument(argc, argv, 0) }, units.len(), 0);
+    // SAFETY: as above.
+    let end = relative_index(unsafe { argument(argc, argv, 1) }, units.len(), units.len());
+    units_between(&units, start, end)
+}
+
+/// `String.prototype.substring`.
+///
+/// **Unlike `slice` a negative index clamps to zero rather than counting from the end**, and
+/// the two arguments swap if they are the wrong way round. Sharing an implementation with
+/// `slice` would get both wrong.
+extern "C" fn string_substring(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return new_string("");
+    };
+    let units = code_units(&text);
+    let clamp = |bits: u64, fallback: usize| -> usize {
+        let Some(number) = Value::from_bits(bits).as_number() else {
+            return fallback;
+        };
+        if number.is_nan() || number < 0.0 {
+            return 0;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+        let span = units.len() as f64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped into 0..=len just above"
+        )]
+        let index = number.min(span) as usize;
+        index
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let first = clamp(unsafe { argument(argc, argv, 0) }, 0);
+    // SAFETY: as above.
+    let second = clamp(unsafe { argument(argc, argv, 1) }, units.len());
+    units_between(&units, first.min(second), first.max(second))
+}
+
+/// `String.prototype.toUpperCase`.
+extern "C" fn string_to_upper(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(&text.to_uppercase()))
+}
+
+/// `String.prototype.toLowerCase`.
+extern "C" fn string_to_lower(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(&text.to_lowercase()))
+}
+
+/// `String.prototype.trim`.
+extern "C" fn string_trim(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(text.trim()))
+}
+
+/// `String.prototype.concat`.
+extern "C" fn string_concat(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let mut out = this_text(this_value).unwrap_or_default();
+    for position in 0..argc as usize {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        let piece = unsafe { argument(argc, argv, position) };
+        out.push_str(&to_text(piece).unwrap_or_default());
+    }
+    new_string(&out)
+}
+
+/// `String.prototype.repeat`.
+extern "C" fn string_repeat(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return new_string("");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let count = Value::from_bits(unsafe { argument(argc, argv, 0) })
+        .as_number()
+        .unwrap_or(0.0);
+    // A negative or infinite count is a `RangeError`, which is worth raising rather than
+    // silently producing an empty string that reads like a legitimate answer.
+    if count < 0.0 || !count.is_finite() {
+        return raise("repeat count is out of range", "RangeError");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked non-negative and finite"
+    )]
+    let times = count as usize;
+    new_string(&text.repeat(times))
+}
+
+/// `String.prototype.split`.
+extern "C" fn string_split(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let pieces: Vec<String> = match to_text(given) {
+            // **An empty separator splits into characters**, and no separator at all gives a
+            // one-element array holding the whole string — not an empty one.
+            Some(separator) if separator.is_empty() => {
+                text.chars().map(|c| c.to_string()).collect()
+            }
+            Some(separator) => text.split(&separator).map(ToOwned::to_owned).collect(),
+            None => vec![text.clone()],
+        };
+        with_new_array(pieces.len(), |array| {
+            for (index, piece) in pieces.iter().enumerate() {
+                let value = new_string(piece);
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(array, index, Value::from_bits(value))
+                });
+            }
+            array.to_value().to_bits()
+        })
+    })
+}
+
+/// `String.prototype.toString` and `valueOf`.
+extern "C" fn string_to_string(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(&text))
+}
+
 /// Methods on `Function.prototype`, which every function inherits.
 const FUNCTION_NATIVES: &[(&str, Native)] = &[("call", function_call), ("apply", function_apply)];
 
@@ -1179,6 +1586,7 @@ impl Runtime {
         // **First**, because every function made afterwards links to it — including the ones
         // that live on it.
         runtime.build_function_prototype();
+        runtime.build_string_prototype();
         runtime.build_array_prototype();
         runtime.build_globals();
         runtime
@@ -1358,6 +1766,24 @@ impl Runtime {
         }
     }
 
+    /// Builds the object every string inherits from.
+    fn build_string_prototype(&self) {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let prototype = scope.alloc(shape, 0);
+        STRING_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+
+        let base = NATIVES.len()
+            + GLOBAL_NATIVES.len()
+            + NAMESPACE_NATIVES.len()
+            + ANONYMOUS_NATIVES.len()
+            + FUNCTION_NATIVES.len();
+        for (index, (name, _)) in STRING_NATIVES.iter().enumerate() {
+            let method = self.native_function(base + index);
+            self.define(prototype.handle(), name, method.to_value());
+        }
+    }
+
     /// Builds the object every array inherits its methods from.
     ///
     /// Rooted through `ARRAY_PROTOTYPE` **before** the methods are installed, because
@@ -1485,16 +1911,18 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
         // `length` on an array is not stored anywhere — it *is* the element count, and has to
         // answer correctly after `a[9] = 1` grew the array without any property being written.
         if name == "length"
-            && let Some(characters) = runtime.heap.with_text(handle, str::len)
+            && let Some(units) = runtime
+                .heap
+                .with_text(handle, |text| text.encode_utf16().count())
         {
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a string this long cannot be allocated"
             )]
-            // **Bytes, not characters.** JavaScript counts UTF-16 code units, so this is wrong
-            // for anything outside ASCII — recorded here rather than left to be discovered,
-            // because it reads correctly for every test that happens to use ASCII.
-            let length = characters as f64;
+            // **UTF-16 code units**, which is what JavaScript counts — so an emoji is two and
+            // `é` is one. This counted bytes, which reads correctly for ASCII and wrongly for
+            // everything else.
+            let length = units as f64;
             return Value::number(length).to_bits();
         }
         if name == "length"
@@ -2585,7 +3013,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + ANONYMOUS_NATIVES.len();
-        return FUNCTION_NATIVES
+        if let Some((_, function)) = FUNCTION_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + FUNCTION_NATIVES.len();
+        return STRING_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
@@ -2878,6 +3310,9 @@ fn new_string(text: &str) -> u64 {
         let scope = runtime.heap.scope();
         let cell = scope.alloc(shape, 0);
         runtime.heap.make_string(cell.handle(), text);
+        if let Some(prototype) = STRING_PROTOTYPE.with(std::cell::Cell::get) {
+            runtime.heap.set_prototype(cell.handle(), Some(prototype));
+        }
         // The same 48 bits the handle packs into, re-tagged as a string rather than an object.
         // `to_value` is where that packing lives, so this cannot drift from it.
         cell.handle().to_value().as_address().map_or_else(

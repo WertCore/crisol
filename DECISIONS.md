@@ -3484,3 +3484,33 @@ differ only at an edge, because a single implementation covering both is how the
 
 `unshift` grows the array before moving anything, so no element is overwritten before it has
 moved — the same reason `reverse` reads both ends before writing either.
+
+## D-115
+
+**A string is measured and indexed in UTF-16 code units.**
+
+Status: Accepted, correcting D-105
+
+`length` counted bytes. That reads correctly for every ASCII test and wrongly for everything
+else, which is the worst way to be wrong — `"é".length` was 2 and `"😀".length` was 4.
+JavaScript counts UTF-16 code units, so those are 1 and 2. Every index a string method takes or
+returns is in the same space, or `indexOf` and `charAt` would disagree about where something is.
+
+Strings now inherit from `String.prototype`, which is where the methods live, so they are
+reached by the same prototype walk an object's methods are.
+
+The pairs worth recording, again because one implementation covering both is how the difference
+is lost:
+
+- **`charAt` answers `""` out of range and `charCodeAt` answers `NaN`.**
+- **`substring` clamps a negative index to zero and swaps its arguments if they are reversed;
+  `slice` counts a negative index from the end and does not swap.** `"hello".substring(3, 1)` is
+  `"el"` and `"hello".slice(3, 1)` is `""`.
+- **An empty separator splits into characters, and no separator at all gives a one-element
+  array** holding the whole string rather than an empty one.
+
+`repeat` with a negative or infinite count raises a `RangeError` rather than answering with an
+empty string, which would read like a legitimate result.
+
+**Consequence:** the receiver is read with `to_text`, not a string-only accessor, because
+`String.prototype.slice.call(5)` coerces — which is exactly how test262 reaches these methods.

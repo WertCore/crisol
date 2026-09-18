@@ -1560,3 +1560,108 @@ fn a_method_applied_to_a_wrong_receiver_answers_rather_than_failing() {
         "undefined",
     );
 }
+
+// ---- String.prototype -------------------------------------------------------------------
+
+/// **`length` counts UTF-16 code units**, which is what JavaScript counts — not bytes. An
+/// accented letter is one and an emoji is two.
+#[test]
+fn string_length_counts_code_units() {
+    check("str-len-ascii", "return \"hello\".length;", "5");
+    check("str-len-accent", "return \"é\".length;", "1");
+    check("str-len-emoji", "return \"😀\".length;", "2");
+}
+
+/// **Out of range is `""` for `charAt` and `NaN` for `charCodeAt`** — the pair disagree
+/// deliberately, so one implementation covering both would lose it.
+#[test]
+fn char_at_and_char_code_at_disagree_out_of_range() {
+    check("str-charat", "return \"abc\".charAt(1);", "b");
+    check("str-charat-oob", "return \"abc\".charAt(9);", "");
+    check("str-charcodeat", "return \"A\".charCodeAt(0);", "65");
+    check("str-charcodeat-oob", "return \"A\".charCodeAt(9);", "NaN");
+}
+
+#[test]
+fn the_searching_methods_work() {
+    check("str-indexof", "return \"hello\".indexOf(\"l\");", "2");
+    check(
+        "str-indexof-missing",
+        "return \"hello\".indexOf(\"z\");",
+        "-1",
+    );
+    check(
+        "str-lastindexof",
+        "return \"hello\".lastIndexOf(\"l\");",
+        "3",
+    );
+    check(
+        "str-includes",
+        "return \"hello\".includes(\"ell\");",
+        "true",
+    );
+    check(
+        "str-startswith",
+        "return \"hello\".startsWith(\"he\");",
+        "true",
+    );
+    check("str-endswith", "return \"hello\".endsWith(\"lo\");", "true");
+}
+
+/// **`substring` clamps a negative index to zero and swaps its arguments; `slice` counts from
+/// the end and does not.** Sharing an implementation gets both wrong.
+#[test]
+fn slice_and_substring_differ_on_negative_and_reversed_arguments() {
+    check("str-slice", "return \"hello\".slice(1, 3);", "el");
+    check("str-slice-negative", "return \"hello\".slice(-2);", "lo");
+    check("str-substring", "return \"hello\".substring(1, 3);", "el");
+    check(
+        "str-substring-negative",
+        "return \"hello\".substring(-2, 2);",
+        "he",
+    );
+    check(
+        "str-substring-swapped",
+        "return \"hello\".substring(3, 1);",
+        "el",
+    );
+}
+
+#[test]
+fn the_transforming_methods_work() {
+    check("str-upper", "return \"aB\".toUpperCase();", "AB");
+    check("str-lower", "return \"aB\".toLowerCase();", "ab");
+    check("str-trim", "return \"  x  \".trim();", "x");
+    check("str-concat", "return \"a\".concat(\"b\", \"c\");", "abc");
+    check("str-repeat", "return \"ab\".repeat(3);", "ababab");
+}
+
+/// A negative repeat count is a `RangeError`, not an empty string that reads as an answer.
+#[test]
+fn a_negative_repeat_count_is_a_range_error() {
+    check(
+        "str-repeat-negative",
+        "let r = 0; try { \"a\".repeat(-1); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
+
+/// **An empty separator splits into characters**, and no separator gives one element holding
+/// the whole string — not an empty array.
+#[test]
+fn split_handles_its_separator_cases() {
+    check("str-split", "return \"a,b,c\".split(\",\").length;", "3");
+    check("str-split-piece", "return \"a,b,c\".split(\",\")[1];", "b");
+    check("str-split-empty", "return \"abc\".split(\"\").length;", "3");
+    check("str-split-none", "return \"abc\".split().length;", "1");
+}
+
+/// A method reached through a variable, so the receiver is not a literal.
+#[test]
+fn string_methods_work_on_a_computed_receiver() {
+    check(
+        "str-method-variable",
+        "let s = \"a\" + \"bc\"; return s.toUpperCase();",
+        "ABC",
+    );
+}
