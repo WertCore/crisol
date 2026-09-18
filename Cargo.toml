@@ -115,6 +115,12 @@ cranelift-codegen = { version = "0.135", features = ["all-arch"] }
 cranelift-frontend = "0.135"
 cranelift-module = "0.135"
 cranelift-object = "0.135"
+# A JIT alongside the object emitter. §2.3's "no interpreter in shipped artifacts" is about the
+# *application* binary; `crisol-codegen` is a build-time crate, and running generated code in
+# process is the only way to check that it computes the right answer rather than merely
+# compiling. M14's differential testing needs the same ability.
+cranelift-jit = "0.135"
+cranelift-native = "0.135"
 target-lexicon = "0.13"
 # lightningcss owns the CSS grammar; `selectors` owns matching. They agree on
 # cssparser 0.37, so there is exactly one tokenizer in the graph. See DECISIONS D-20.

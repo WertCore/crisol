@@ -2641,3 +2641,42 @@ So `crisol-abi::SYMBOLS` is the defining list, `crisol_codegen::helper_symbols()
 the backend emits, and a test compares them. It was checked by introducing a typo and watching
 it fail, because a test that reads two lists and finds them equal is exactly the kind that can
 pass while comparing nothing.
+
+---
+
+## D-88 — Compiling is not computing, and only running tells them apart
+
+**Status:** Accepted (M13) · **Affects:** M13, M14
+
+Every codegen test written before this one checked that a function **compiled**. None checked
+what it **returned**. `6 / 3` compiling says nothing about whether it yields `2`, and the gap
+had been open since the backend landed.
+
+`Jit` compiles into this process's memory and hands back a callable address, so the tests call
+the generated code and check the answer. Three of them can be made *no other way*:
+
+- **`1e10 | 0` returns `1410065408`.** This is the assertion the whole call-not-instruction
+  decision (D-87) exists for. A saturating conversion gives `i32::MAX` — a number, and the wrong
+  one. Inspecting the object file cannot distinguish them; only running can.
+- **`NaN === NaN` is `false` and `+0 === -0` is `true`**, checked by execution rather than by
+  reasoning about which instruction was emitted (D-86).
+- **A branch takes the right arm**, with the other arm returning a number too — so branching
+  wrongly produces a plausible answer rather than a crash.
+
+### Symbols are registered by the caller
+
+The helpers are **not** resolved from the host process. The test passes them in from
+`crisol-abi`, which keeps `crisol-codegen` free of a dependency on the runtime it generates
+calls to, and makes the contract visible at the point of use rather than implicit in a link
+order.
+
+It also turns the symbol check from a comparison into an *exercise*: D-87's test reads two lists
+and finds them equal, which is the kind of test that can pass while comparing nothing. This one
+fails to **resolve** if a name is wrong.
+
+### On shipping a JIT
+
+§2.3 promises no interpreter in shipped artifacts. That is about the **application** binary;
+`crisol-codegen` is a build-time crate and never ships inside one. M14's differential testing
+needs this same ability besides — comparing two backends' results is not possible with only an
+object emitter and a linker in the loop.
