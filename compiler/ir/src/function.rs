@@ -261,6 +261,14 @@ pub enum Op {
     Call {
         /// What is being called.
         callee: ValueId,
+        /// The receiver — what `this` is inside the callee.
+        ///
+        /// **Not optional.** A plain `f()` passes `undefined` explicitly rather than omitting
+        /// it, because "no receiver" and "a receiver that is `undefined`" are the same thing
+        /// in the language and making one of them absent invites a lowering to forget it.
+        /// `o.m()` must pass `o`: losing the receiver means `this` inside `m` is wrong, and
+        /// that is silent — the call still happens and still returns something.
+        this_value: ValueId,
         /// Its arguments.
         args: Vec<ValueId>,
     },
@@ -362,8 +370,12 @@ impl Op {
         match self {
             Self::Const(_) | Self::Load { .. } | Self::CreateObject { .. } => Vec::new(),
             Self::Store { value, .. } | Self::Await { value } => vec![*value],
-            Self::Call { callee, args } => {
-                let mut all = vec![*callee];
+            Self::Call {
+                callee,
+                this_value,
+                args,
+            } => {
+                let mut all = vec![*callee, *this_value];
                 all.extend(args);
                 all
             }

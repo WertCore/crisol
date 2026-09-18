@@ -14,7 +14,7 @@ let x = 1;
 function number {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -25,7 +25,7 @@ let x = 0;
 function negative-is-not-arithmetic-here {
 bb0:  ; entry
     v0: number = const 0.0
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -36,7 +36,7 @@ let x = 1.5;
 function float {
 bb0:  ; entry
     v0: number = const 1.5
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -47,7 +47,7 @@ let s = "hello";
 function string {
 bb0:  ; entry
     v0: string = const "hello"
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -58,7 +58,7 @@ let s = "a \"b\" c";
 function string-with-quotes {
 bb0:  ; entry
     v0: string = const "a \"b\" c"
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -69,9 +69,9 @@ let t = true; let f = false;
 function bool {
 bb0:  ; entry
     v0: bool = const true
-    store $0, v0
+    store $1, v0
     v1: bool = const false
-    store $1, v1
+    store $2, v1
     return
 }
 
@@ -82,7 +82,7 @@ let n = null;
 function null {
 bb0:  ; entry
     v0: null = const null
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -93,7 +93,7 @@ let u = undefined;
 function undefined {
 bb0:  ; entry
     v0: undefined = const undefined
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -104,7 +104,7 @@ let x;
 function declaration-without-init {
 bb0:  ; entry
     v0: undefined = const undefined
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -115,9 +115,9 @@ let a = 1; let b = 2;
 function two-declarations {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
+    store $2, v1
     return
 }
 
@@ -128,9 +128,9 @@ let a = 1; let b = a;
 function read-a-variable {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
-    store $1, v1
+    store $1, v0
+    v1: unknown = load $1
+    store $2, v1
     return
 }
 
@@ -141,9 +141,9 @@ let a = 1; a = 2;
 function assign {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -154,10 +154,10 @@ let a = 1; let b = (a = 2);
 function assign-is-an-expression {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $0, v1
     store $1, v1
+    store $2, v1
     return
 }
 
@@ -168,13 +168,13 @@ let a = 1; let b = 2; let c = a === b;
 function strict-equal {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
+    store $2, v1
+    v2: unknown = load $1
+    v3: unknown = load $2
     v4: bool = eq v2, v3
-    store $2, v4
+    store $3, v4
     return
 }
 
@@ -185,13 +185,13 @@ let a = 1; let b = 2; let c = a !== b;
 function strict-not-equal {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
+    store $2, v1
+    v2: unknown = load $1
+    v3: unknown = load $2
     v4: bool = ne v2, v3
-    store $2, v4
+    store $3, v4
     return
 }
 
@@ -202,13 +202,13 @@ let a = 1; let b = 2; let c = a < b;
 function less {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
+    store $2, v1
+    v2: unknown = load $1
+    v3: unknown = load $2
     v4: bool = lt v2, v3
-    store $2, v4
+    store $3, v4
     return
 }
 
@@ -219,13 +219,13 @@ let a = 1; let b = 2; let c = a <= b;
 function less-equal {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
+    store $2, v1
+    v2: unknown = load $1
+    v3: unknown = load $2
     v4: bool = le v2, v3
-    store $2, v4
+    store $3, v4
     return
 }
 
@@ -236,13 +236,13 @@ let a = 1; let b = 2; let c = a > b;
 function greater {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
+    store $2, v1
+    v2: unknown = load $1
+    v3: unknown = load $2
     v4: bool = gt v2, v3
-    store $2, v4
+    store $3, v4
     return
 }
 
@@ -253,13 +253,13 @@ let a = 1; let b = 2; let c = a >= b;
 function greater-equal {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
+    store $2, v1
+    v2: unknown = load $1
+    v3: unknown = load $2
     v4: bool = ge v2, v3
-    store $2, v4
+    store $3, v4
     return
 }
 
@@ -279,8 +279,8 @@ let a = 1; return a;
 function return-a-value {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     return v1
 }
 
@@ -300,8 +300,8 @@ let e = "boom"; throw e;
 function throw {
 bb0:  ; entry
     v0: string = const "boom"
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     throw v1
 }
 
@@ -312,14 +312,14 @@ let a = 1; if (a === 1) { a = 2; }
 function if-without-else {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     v2: number = const 1.0
     v3: bool = eq v1, v2
     branch v3 -> bb1, bb2
 bb1:
     v4: number = const 2.0
-    store $0, v4
+    store $1, v4
     jump bb3
 bb2:
     jump bb3
@@ -334,18 +334,18 @@ let a = 1; if (a === 1) { a = 2; } else { a = 3; }
 function if-else {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     v2: number = const 1.0
     v3: bool = eq v1, v2
     branch v3 -> bb1, bb2
 bb1:
     v4: number = const 2.0
-    store $0, v4
+    store $1, v4
     jump bb3
 bb2:
     v5: number = const 3.0
-    store $0, v5
+    store $1, v5
     jump bb3
 bb3:
     return
@@ -358,13 +358,13 @@ let a = 1; if (a === 1) { if (a === 1) { a = 2; } else { a = 3; } }
 function nested-if {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     v2: number = const 1.0
     v3: bool = eq v1, v2
     branch v3 -> bb1, bb2
 bb1:
-    v4: unknown = load $0
+    v4: unknown = load $1
     v5: number = const 1.0
     v6: bool = eq v4, v5
     branch v6 -> bb4, bb5
@@ -374,11 +374,11 @@ bb3:
     return
 bb4:
     v7: number = const 2.0
-    store $0, v7
+    store $1, v7
     jump bb6
 bb5:
     v8: number = const 3.0
-    store $0, v8
+    store $1, v8
     jump bb6
 bb6:
     jump bb3
@@ -391,19 +391,19 @@ let a = 1; if (a === 1) { return a; } a = 2;
 function if-with-return {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     v2: number = const 1.0
     v3: bool = eq v1, v2
     branch v3 -> bb1, bb2
 bb1:
-    v4: unknown = load $0
+    v4: unknown = load $1
     return v4
 bb2:
     jump bb3
 bb3:
     v5: number = const 2.0
-    store $0, v5
+    store $1, v5
     return
 }
 
@@ -414,16 +414,16 @@ let a = 1; while (a < 10) { a = 10; }
 function while {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     jump bb1
 bb1:
-    v1: unknown = load $0
+    v1: unknown = load $1
     v2: number = const 10.0
     v3: bool = lt v1, v2
     branch v3 -> bb2, bb3
 bb2:
     v4: number = const 10.0
-    store $0, v4
+    store $1, v4
     jump bb1
 bb3:
     return
@@ -436,15 +436,15 @@ let a = 1; while (a < 10) { if (a === 1) { a = 10; } }
 function while-with-if {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     jump bb1
 bb1:
-    v1: unknown = load $0
+    v1: unknown = load $1
     v2: number = const 10.0
     v3: bool = lt v1, v2
     branch v3 -> bb2, bb3
 bb2:
-    v4: unknown = load $0
+    v4: unknown = load $1
     v5: number = const 1.0
     v6: bool = eq v4, v5
     branch v6 -> bb4, bb5
@@ -452,7 +452,7 @@ bb3:
     return
 bb4:
     v7: number = const 10.0
-    store $0, v7
+    store $1, v7
     jump bb6
 bb5:
     jump bb6
@@ -467,7 +467,7 @@ let o = {};
 function empty-object {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -482,7 +482,7 @@ bb0:  ; entry
     set v0."a" = v1  ; safepoint []
     v2: string = const "two"
     set v0."b" = v2  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -495,7 +495,7 @@ bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: number = const 1.0
     set v0."a b" = v1  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -508,10 +508,10 @@ bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: number = const 1.0
     set v0."a" = v1  ; safepoint []
-    store $0, v0
-    v2: unknown = load $0
+    store $1, v0
+    v2: unknown = load $1
     v3: unknown = get v2."a"  ; safepoint []
-    store $1, v3
+    store $2, v3
     return
 }
 
@@ -524,11 +524,11 @@ bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: number = const 1.0
     set v0."a" = v1  ; safepoint []
-    store $0, v0
-    v2: unknown = load $0
+    store $1, v0
+    v2: unknown = load $1
     v3: unknown = get v2."a"  ; safepoint []
     v4: unknown = get v3."b"  ; safepoint []
-    store $1, v4
+    store $2, v4
     return
 }
 
@@ -539,10 +539,11 @@ let f = null; let v = f();
 function call-no-args {
 bb0:  ; entry
     v0: null = const null
-    store $0, v0
-    v1: unknown = load $0
-    v2: unknown = call v1()  ; safepoint []
-    store $1, v2
+    store $1, v0
+    v1: unknown = load $1
+    v2: undefined = const undefined
+    v3: unknown = call v1(this=v2)  ; safepoint []
+    store $2, v3
     return
 }
 
@@ -553,14 +554,15 @@ let f = null; let a = 1; let v = f(a, a);
 function call-with-args {
 bb0:  ; entry
     v0: null = const null
-    store $0, v0
+    store $1, v0
     v1: number = const 1.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
-    v4: unknown = load $1
-    v5: unknown = call v2(v3, v4)  ; safepoint []
-    store $2, v5
+    store $2, v1
+    v2: unknown = load $1
+    v3: undefined = const undefined
+    v4: unknown = load $2
+    v5: unknown = load $2
+    v6: unknown = call v2(this=v3, v4, v5)  ; safepoint []
+    store $3, v6
     return
 }
 
@@ -573,11 +575,11 @@ bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: number = const 1.0
     set v0."a" = v1  ; safepoint []
-    store $0, v0
-    v2: unknown = load $0
+    store $1, v0
+    v2: unknown = load $1
     v3: unknown = get v2."a"  ; safepoint []
-    v4: unknown = call v3()  ; safepoint []
-    store $1, v4
+    v4: unknown = call v3(this=v2)  ; safepoint []
+    store $2, v4
     return
 }
 
@@ -588,9 +590,9 @@ let a = 1; { a = 2; }
 function block-scope {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -612,7 +614,7 @@ bb0:  ; entry
     v0: number = const 1.0
     v1: number = const 2.0
     v2: unknown = + v0, v1  ; safepoint []
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -625,7 +627,7 @@ bb0:  ; entry
     v0: number = const 3.0
     v1: number = const 1.0
     v2: number = - v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -638,7 +640,7 @@ bb0:  ; entry
     v0: number = const 2.0
     v1: number = const 3.0
     v2: number = * v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -651,7 +653,7 @@ bb0:  ; entry
     v0: number = const 6.0
     v1: number = const 2.0
     v2: number = / v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -664,7 +666,7 @@ bb0:  ; entry
     v0: number = const 7.0
     v1: number = const 3.0
     v2: number = % v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -677,7 +679,7 @@ bb0:  ; entry
     v0: number = const 2.0
     v1: number = const 8.0
     v2: number = ** v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -690,7 +692,7 @@ bb0:  ; entry
     v0: string = const "x"
     v1: string = const "y"
     v2: unknown = + v0, v1  ; safepoint []
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -703,7 +705,7 @@ bb0:  ; entry
     v0: number = const 6.0
     v1: number = const 3.0
     v2: number = & v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -716,7 +718,7 @@ bb0:  ; entry
     v0: number = const 6.0
     v1: number = const 3.0
     v2: number = | v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -729,7 +731,7 @@ bb0:  ; entry
     v0: number = const 6.0
     v1: number = const 3.0
     v2: number = ^ v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -742,7 +744,7 @@ bb0:  ; entry
     v0: number = const 1.0
     v1: number = const 4.0
     v2: number = << v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -755,7 +757,7 @@ bb0:  ; entry
     v0: number = const 16.0
     v1: number = const 2.0
     v2: number = >> v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -768,7 +770,7 @@ bb0:  ; entry
     v0: number = const 1.0
     v1: number = const 0.0
     v2: number = >>> v0, v1
-    store $0, v2
+    store $1, v2
     return
 }
 
@@ -780,7 +782,7 @@ function negate {
 bb0:  ; entry
     v0: number = const 1.0
     v1: number = - v0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -792,7 +794,7 @@ function unary-plus {
 bb0:  ; entry
     v0: string = const "1"
     v1: number = + v0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -804,7 +806,7 @@ function logical-not {
 bb0:  ; entry
     v0: bool = const true
     v1: bool = ! v0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -816,7 +818,7 @@ function bitwise-not {
 bb0:  ; entry
     v0: number = const 0.0
     v1: number = ~ v0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -828,7 +830,7 @@ function typeof {
 bb0:  ; entry
     v0: number = const 1.0
     v1: string = typeof v0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -840,7 +842,7 @@ function void {
 bb0:  ; entry
     v0: number = const 0.0
     v1: undefined = void v0
-    store $0, v1
+    store $1, v1
     return
 }
 
@@ -851,17 +853,17 @@ let a = 1; let b = false && a;
 function logical-and-short-circuits {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: bool = const false
-    store $1, v1
+    store $2, v1
     branch v1 -> bb1, bb2
 bb1:
-    v2: unknown = load $0
-    store $1, v2
+    v2: unknown = load $1
+    store $2, v2
     jump bb2
 bb2:
-    v3: unknown = load $1
-    store $2, v3
+    v3: unknown = load $2
+    store $3, v3
     return
 }
 
@@ -872,17 +874,17 @@ let a = 1; let b = true || a;
 function logical-or-short-circuits {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: bool = const true
-    store $1, v1
+    store $2, v1
     branch v1 -> bb2, bb1
 bb1:
-    v2: unknown = load $0
-    store $1, v2
+    v2: unknown = load $1
+    store $2, v2
     jump bb2
 bb2:
-    v3: unknown = load $1
-    store $2, v3
+    v3: unknown = load $2
+    store $3, v3
     return
 }
 
@@ -893,9 +895,9 @@ let a = 0; let b = a ?? 1;
 function nullish-coalescing-is-not-or {
 bb0:  ; entry
     v0: number = const 0.0
-    store $0, v0
-    v1: unknown = load $0
-    store $1, v1
+    store $1, v0
+    v1: unknown = load $1
+    store $2, v1
     v2: null = const null
     v3: bool = eq v1, v2
     v4: undefined = const undefined
@@ -904,11 +906,11 @@ bb0:  ; entry
     branch v6 -> bb1, bb2
 bb1:
     v7: number = const 1.0
-    store $1, v7
+    store $2, v7
     jump bb2
 bb2:
-    v8: unknown = load $1
-    store $2, v8
+    v8: unknown = load $2
+    store $3, v8
     return
 }
 
@@ -922,15 +924,15 @@ bb0:  ; entry
     branch v0 -> bb1, bb2
 bb1:
     v1: number = const 1.0
-    store $0, v1
+    store $1, v1
     jump bb3
 bb2:
     v2: number = const 2.0
-    store $0, v2
+    store $1, v2
     jump bb3
 bb3:
-    v3: unknown = load $0
-    store $1, v3
+    v3: unknown = load $1
+    store $2, v3
     return
 }
 
@@ -945,7 +947,7 @@ bb0:  ; entry
     v2: number = const 3.0
     v3: number = * v1, v2
     v4: unknown = + v0, v3  ; safepoint []
-    store $0, v4
+    store $1, v4
     return
 }
 
@@ -959,7 +961,7 @@ bb0:  ; entry
     v1: number = const 2.0
     v2: number = const 3.0
     v3: object = array [v0, v1, v2]  ; safepoint []
-    store $0, v3
+    store $1, v3
     return
 }
 
@@ -970,7 +972,7 @@ let a = [];
 function empty-array {
 bb0:  ; entry
     v0: object = array []  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 
@@ -981,7 +983,7 @@ let f = (x) => x;
 function arrow-concise-body {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 function arrow($0) {
@@ -997,7 +999,7 @@ let f = (x) => { return x; };
 function arrow-block-body {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 function arrow($0) {
@@ -1013,7 +1015,7 @@ let f = () => 1;
 function arrow-no-parameters {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 function arrow {
@@ -1029,12 +1031,12 @@ let f = function (a, b) { return a; };
 function function-expression {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
-function anonymous($0, $1) {
+function anonymous($1, $2) {
 bb0:  ; entry
-    v0: unknown = load $0
+    v0: unknown = load $1
     return v0
 }
 
@@ -1045,10 +1047,10 @@ let a = 1; let f = () => a;
 function a-closure-captures-an-outer-local {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     v2: object = closure @1 [v1]  ; safepoint []
-    store $1, v2
+    store $2, v2
     return
 }
 function arrow captures [$0] {
@@ -1064,9 +1066,9 @@ let a = 1; let f = (a) => a;
 function a-parameter-shadows-rather-than-captures {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: object = closure @1 []  ; safepoint []
-    store $1, v1
+    store $2, v1
     return
 }
 function arrow($0) {
@@ -1082,9 +1084,9 @@ let a = 1; let f = () => { let a = 2; return a; };
 function a-local-shadows-rather-than-captures {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: object = closure @1 []  ; safepoint []
-    store $1, v1
+    store $2, v1
     return
 }
 function arrow {
@@ -1102,13 +1104,13 @@ let a = 1; let b = 2; let f = () => a + b;
 function two-captures-keep-their-order {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
+    store $1, v0
     v1: number = const 2.0
-    store $1, v1
-    v2: unknown = load $0
-    v3: unknown = load $1
+    store $2, v1
+    v2: unknown = load $1
+    v3: unknown = load $2
     v4: object = closure @1 [v2, v3]  ; safepoint []
-    store $2, v4
+    store $3, v4
     return
 }
 function arrow captures [$0, $1] {
@@ -1126,10 +1128,10 @@ let a = 1; let f = () => () => a;
 function a-nested-closure-captures-through-each-level {
 bb0:  ; entry
     v0: number = const 1.0
-    store $0, v0
-    v1: unknown = load $0
+    store $1, v0
+    v1: unknown = load $1
     v2: object = closure @1 [v1]  ; safepoint []
-    store $1, v2
+    store $2, v2
     return
 }
 function arrow captures [$0] {
@@ -1151,13 +1153,94 @@ let f = () => { let a = 1; };
 function a-function-that-runs-off-the-end-returns-undefined {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
-    store $0, v0
+    store $1, v0
     return
 }
 function arrow {
 bb0:  ; entry
     v0: number = const 1.0
     store $0, v0
+    return
+}
+
+=== a-method-call-passes-its-receiver ===
+--- source
+let o = { a: 1 }; let v = o.a();
+--- ir
+function a-method-call-passes-its-receiver {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: number = const 1.0
+    set v0."a" = v1  ; safepoint []
+    store $1, v0
+    v2: unknown = load $1
+    v3: unknown = get v2."a"  ; safepoint []
+    v4: unknown = call v3(this=v2)  ; safepoint []
+    store $2, v4
+    return
+}
+
+=== a-plain-call-passes-undefined ===
+--- source
+let f = null; let v = f();
+--- ir
+function a-plain-call-passes-undefined {
+bb0:  ; entry
+    v0: null = const null
+    store $1, v0
+    v1: unknown = load $1
+    v2: undefined = const undefined
+    v3: unknown = call v1(this=v2)  ; safepoint []
+    store $2, v3
+    return
+}
+
+=== an-arrow-captures-this ===
+--- source
+let f = function () { return () => this; };
+--- ir
+function an-arrow-captures-this {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $1, v0
+    return
+}
+function anonymous {
+bb0:  ; entry
+    v0: unknown = load $0
+    v1: object = closure @2 [v0]  ; safepoint []
+    return v1
+}
+function arrow captures [$0] {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== a-function-binds-its-own-this ===
+--- source
+let f = function () { return this; };
+--- ir
+function a-function-binds-its-own-this {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $1, v0
+    return
+}
+function anonymous {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== this-at-top-level ===
+--- source
+let t = this;
+--- ir
+function this-at-top-level {
+bb0:  ; entry
+    v0: unknown = load $0
+    store $1, v0
     return
 }
 

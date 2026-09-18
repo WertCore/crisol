@@ -141,7 +141,7 @@ impl Lowering {
     fn new(name: &str) -> Self {
         let function = Function::new(name);
         let entry = function.entry;
-        Self {
+        let mut lowering = Self {
             functions: vec![function],
             scopes: vec![Scope {
                 function: 0,
@@ -152,7 +152,12 @@ impl Lowering {
                 captures: Vec::new(),
             }],
             unsupported: Vec::new(),
-        }
+        };
+        // The program is a function body, so it has a `this` — `undefined` in a module, the
+        // global object in a script. Binding it here means a top-level arrow captures it
+        // rather than inventing one.
+        lowering.declare("this");
+        lowering
     }
 
     fn finish(mut self) -> Lowered {
@@ -417,6 +422,7 @@ impl Lowering {
                     &declaration.params,
                     declaration.body.as_deref(),
                     None,
+                    true,
                 );
                 let closure = self.close_over(id, &names);
                 // A declaration binds its name in the enclosing scope. Hoisting is not modelled
@@ -481,7 +487,32 @@ impl Lowering {
                 )
             }
             Expression::CallExpression(call) => {
-                let callee = self.expression(&call.callee);
+                // A method call must pass its receiver. `o.m()` has `this === o` inside `m`,
+                // and losing that is **silent** — the call still happens and still returns
+                // something, it is only `this` that is wrong.
+                //
+                // The object is evaluated once and reused, because `f().m()` must not call
+                // `f` twice.
+                let (callee, this_value) = match &call.callee {
+                    Expression::StaticMemberExpression(member) => {
+                        let object = self.expression(&member.object);
+                        let method = self.emit(
+                            Type::Unknown,
+                            Op::PropertyLoad {
+                                object,
+                                key: PropertyKey::new(member.property.name.as_str()),
+                            },
+                        );
+                        (method, object)
+                    }
+                    other => {
+                        let callee = self.expression(other);
+                        // A plain call passes `undefined` explicitly rather than omitting a
+                        // receiver, because the two are the same thing in the language.
+                        let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+                        (callee, undefined)
+                    }
+                };
                 let mut args = Vec::with_capacity(call.arguments.len());
                 for argument in &call.arguments {
                     match argument.as_expression() {
@@ -493,7 +524,14 @@ impl Lowering {
                         }
                     }
                 }
-                self.emit(Type::Unknown, Op::Call { callee, args })
+                self.emit(
+                    Type::Unknown,
+                    Op::Call {
+                        callee,
+                        this_value,
+                        args,
+                    },
+                )
             }
             Expression::ObjectExpression(object) => self.object(object),
             Expression::FunctionExpression(function) => {
@@ -501,8 +539,13 @@ impl Lowering {
                     .id
                     .as_ref()
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                let (id, names) =
-                    self.lower_function(&name, &function.params, function.body.as_deref(), None);
+                let (id, names) = self.lower_function(
+                    &name,
+                    &function.params,
+                    function.body.as_deref(),
+                    None,
+                    true,
+                );
                 self.close_over(id, &names)
             }
             Expression::ArrowFunctionExpression(arrow) => {
@@ -522,16 +565,30 @@ impl Lowering {
                 });
                 match concise.flatten() {
                     Some(expression) => {
-                        let (id, names) =
-                            self.lower_function("arrow", &arrow.params, None, Some(expression));
+                        let (id, names) = self.lower_function(
+                            "arrow",
+                            &arrow.params,
+                            None,
+                            Some(expression),
+                            false,
+                        );
                         self.close_over(id, &names)
                     }
                     None => {
-                        let (id, names) =
-                            self.lower_function("arrow", &arrow.params, Some(&arrow.body), None);
+                        let (id, names) = self.lower_function(
+                            "arrow",
+                            &arrow.params,
+                            Some(&arrow.body),
+                            None,
+                            false,
+                        );
                         self.close_over(id, &names)
                     }
                 }
+            }
+            Expression::ThisExpression(_) => {
+                let slot = self.slot("this");
+                self.emit(Type::Unknown, Op::Load { slot })
             }
             Expression::UnaryExpression(unary) => self.unary(unary),
             Expression::LogicalExpression(logical) => self.logical(logical),
@@ -766,12 +823,19 @@ impl Lowering {
     /// which value to put there. Pairing those two lists by position is the contract
     /// [`Function::captures`] describes, and building them anywhere but together is how a
     /// closure ends up reading an uninitialised slot.
+    ///
+    /// `binds_this` is false for an arrow function, and that one flag is the whole of
+    /// `this`-binding semantics. A non-arrow **declares** `this`, so it shadows. An arrow does
+    /// not, so a `this` inside it resolves outward and becomes an ordinary capture (D-81) —
+    /// which is exactly what the language specifies, and it falls out of the scope machinery
+    /// rather than needing a rule of its own.
     fn lower_function(
         &mut self,
         name: &str,
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
         expression_body: Option<&Expression<'_>>,
+        binds_this: bool,
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let function = Function::new(name);
@@ -785,6 +849,12 @@ impl Lowering {
             next_slot: 0,
             captures: Vec::new(),
         });
+
+        if binds_this {
+            // Ahead of the parameters so it is slot 0 in every ordinary function. `this` is a
+            // reserved word, so no source name can collide with it.
+            self.declare("this");
+        }
 
         let mut parameter_slots = Vec::with_capacity(params.items.len());
         for param in &params.items {

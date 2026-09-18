@@ -2362,3 +2362,44 @@ the claim true rather than soften it, since the check is worth having.
 function before its declaration reads an unset slot rather than working. Recorded in
 `unsupported` rather than left silently half-right — a hoisting bug looks like a scoping bug and
 is very hard to find from the symptom.
+
+---
+
+## D-82 — A call carries its receiver, and `this`-binding falls out of scoping
+
+**Status:** Accepted (M13) · **Affects:** M13
+
+`Op::Call` gained a `this_value`, and it is **not optional**. A plain `f()` passes `undefined`
+explicitly rather than omitting it, because "no receiver" and "a receiver that is `undefined`"
+are the same thing in the language — making one of them absent invites a lowering to forget it.
+
+**It had already been forgotten.** `o.m()` lowered to a `PropertyLoad` followed by a `Call` with
+no receiver, so `this` inside `m` was wrong. The corpus contained `let o = { a: 1 }; let v =
+o.a();` and **the snapshot had been recording that wrong IR as correct** since M11 — a reviewed
+snapshot only catches what a reader thinks to look for, and nobody looks for a field that does
+not exist yet.
+
+The failure mode is why it survived: losing a receiver is **silent**. The call still happens and
+still returns something. Only `this` is wrong, and only inside the callee.
+
+The object is evaluated **once** and shared between the property load and the receiver, because
+`f().m()` must not call `f` twice.
+
+### `this`-binding is one flag
+
+A non-arrow function **declares** `this`, so it shadows. An arrow does not, so a `this` inside it
+resolves outward and becomes an ordinary capture (D-81).
+
+That is the entire rule, and it falls out of the scope machinery rather than needing logic of
+its own — which is the payoff for having made `slot` (read, may capture) and `declare` (bind,
+always shadows) different operations. `this` is a reserved word, so using it as a slot name
+cannot collide with anything a program can write.
+
+The program itself binds `this` too, so a top-level arrow captures it rather than inventing one.
+
+### Testing against the dump, and not against value numbers
+
+The receiver test was first written as a substring match on `call v4(this=v1`. That passes for
+the wrong reason as soon as an earlier instruction moves — and it did, because adding `this` as
+slot 0 shifted every other slot. It is now structural: find the `PropertyLoad`, find the `Call`,
+and assert the call's receiver *is* the object the method was loaded from.
