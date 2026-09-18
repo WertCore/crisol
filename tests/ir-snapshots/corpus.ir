@@ -1244,3 +1244,136 @@ bb0:  ; entry
     return
 }
 
+=== class-with-a-constructor ===
+--- source
+class C { constructor(x) { this.x = x; } }
+--- ir
+function class-with-a-constructor {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: object = closure @1 []  ; safepoint []
+    set v1."prototype" = v0  ; safepoint []
+    store $1, v1
+    return
+}
+function C.constructor($1) {
+bb0:  ; entry
+    v0: unknown = load $1
+    v1: unknown = load $0
+    set v1."x" = v0  ; safepoint []
+    return
+}
+
+=== class-with-a-method ===
+--- source
+class C { m() { return 1; } }
+--- ir
+function class-with-a-method {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: object = closure @1 []  ; safepoint []
+    set v0."m" = v1  ; safepoint []
+    v2: object = closure @2 []  ; safepoint []
+    set v2."prototype" = v0  ; safepoint []
+    store $1, v2
+    return
+}
+function C.m {
+bb0:  ; entry
+    v0: number = const 1.0
+    return v0
+}
+function C.constructor {
+bb0:  ; entry
+    return
+}
+
+=== class-with-both ===
+--- source
+class C { constructor(x) { this.x = x; } m() { return this.x; } }
+--- ir
+function class-with-both {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: object = closure @1 []  ; safepoint []
+    v2: object = closure @2 []  ; safepoint []
+    set v0."m" = v2  ; safepoint []
+    set v1."prototype" = v0  ; safepoint []
+    store $1, v1
+    return
+}
+function C.constructor($1) {
+bb0:  ; entry
+    v0: unknown = load $1
+    v1: unknown = load $0
+    set v1."x" = v0  ; safepoint []
+    return
+}
+function C.m {
+bb0:  ; entry
+    v0: unknown = load $0
+    v1: unknown = get v0."x"  ; safepoint []
+    return v1
+}
+
+=== class-with-no-constructor-still-has-one ===
+--- source
+class C { }
+--- ir
+function class-with-no-constructor-still-has-one {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: object = closure @1 []  ; safepoint []
+    set v1."prototype" = v0  ; safepoint []
+    store $1, v1
+    return
+}
+function C.constructor {
+bb0:  ; entry
+    return
+}
+
+=== new-expression ===
+--- source
+class C { } let c = new C();
+--- ir
+function new-expression {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: object = closure @1 []  ; safepoint []
+    set v1."prototype" = v0  ; safepoint []
+    store $1, v1
+    v2: unknown = load $1
+    v3: object = new v2()  ; safepoint []
+    store $2, v3
+    return
+}
+function C.constructor {
+bb0:  ; entry
+    return
+}
+
+=== new-with-arguments ===
+--- source
+class C { constructor(x) { this.x = x; } } let c = new C(1);
+--- ir
+function new-with-arguments {
+bb0:  ; entry
+    v0: object = object #0  ; safepoint []
+    v1: object = closure @1 []  ; safepoint []
+    set v1."prototype" = v0  ; safepoint []
+    store $1, v1
+    v2: unknown = load $1
+    v3: number = const 1.0
+    v4: object = new v2(v3)  ; safepoint []
+    store $2, v4
+    return
+}
+function C.constructor($1) {
+bb0:  ; entry
+    v0: unknown = load $1
+    v1: unknown = load $0
+    set v1."x" = v0  ; safepoint []
+    return
+}
+

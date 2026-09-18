@@ -2680,3 +2680,45 @@ fails to **resolve** if a name is wrong.
 `crisol-codegen` is a build-time crate and never ships inside one. M14's differential testing
 needs this same ability besides — comparing two backends' results is not possible with only an
 object emitter and a linker in the loop.
+## D-83 — A class is sugar, and reading the snapshot found two bugs no test would have
+
+**Status:** Accepted (M13) · **Affects:** M13
+
+A `class` desugars here rather than becoming an IR node, because a class **is** a constructor
+function whose `prototype` property holds an object carrying the methods. Every instance shares
+that one prototype object — an implementation that copied methods onto each instance would work
+until someone compared two objects' methods for identity, or counted `Object.keys`.
+
+`new` is **one op**, not the sequence it stands for. That sequence has a rule no call site should
+have to remember: **a constructor returning an object replaces the newly created `this`**, while
+one returning a primitive does not. Spelling `new` out as allocate-then-call would put that rule
+at every site, and the first lowering to forget it would produce a constructor whose explicit
+`return` is silently ignored. `Op::Construct` also covers `OrdinaryCreateFromConstructor`, so the
+prototype link cannot be omitted separately.
+
+### Two bugs, both found by reading the generated snapshot
+
+Neither was caught by a test, because both produced IR that verified and dumped cleanly.
+
+**Methods declared after the constructor were dropped.** The lowering returned as soon as it
+found the constructor. `constructor` conventionally comes first, so **the common ordering was
+the broken one** — `class C { constructor() {} m() {} }` lost `m` entirely.
+
+**`this.x = x` lowered to `x = x`.** oxc's `AssignmentTarget::get_identifier_name` reports the
+**property** name for a member target, so `this.x` came back as `"x"` and was treated as a
+variable. It produced a store to the parameter's own slot: no note, no error, verified fine.
+That is precisely the outcome the `unsupported` list exists to prevent (D-59) — a translation
+that runs and is wrong beats one that refuses, and this one *claimed to be faithful*.
+
+The fix matches on the target's **shape** rather than asking a helper for a name. Both bugs now
+have a regression test, and both mutations that reintroduce them fail.
+
+This is the third time reading a generated snapshot has found a defect no test did — after the
+object-shape soundness bug (D-59) and the missing call receiver (D-82). The pattern is
+consistent: a snapshot catches what a reader notices, and misses what the IR cannot yet express.
+
+### Recorded rather than half-done
+
+`extends` needs the prototype chain wired through the parent *and* `super` resolved inside
+methods; half of that produces a class that constructs and then fails its first inherited call.
+Static members, computed method names and non-method class elements are recorded too.
