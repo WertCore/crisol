@@ -256,3 +256,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --workspace --target ${{ matrix.target }}
+
+  # `rust-version` was declared for a year and never verified: every job above uses `stable`,
+  # so nothing ever confirmed the workspace builds on the floor it advertises. An unverified
+  # MSRV is indistinguishable from a false one — the same argument as `CRISOL_REQUIRE_GPU`,
+  # where a skipped test and a passing test look alike.
+  #
+  # `check` rather than `test`: the claim is that the crates *compile* on the floor. Running
+  # the suite there would also exercise dev-dependencies, which are not part of the promise an
+  # embedder cares about and would raise the floor for a reason nobody asked for.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the declared floor
+        id: floor
+        shell: bash
+        # Read from Cargo.toml rather than repeated here, so the job cannot drift from the
+        # number it is supposed to be checking.
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "declared floor: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on the declared floor
+        run: cargo check --workspace --all-features

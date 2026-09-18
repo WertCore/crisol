@@ -1483,7 +1483,7 @@ first thing to revisit if pause times matter. §M9 asks for mark-sweep and that 
 
 ## D-56 — A cycle in the module graph is ordered, not rejected
 
-**Status:** Accepted (M10) · **Affects:** M10, M13, M17
+**Status:** Accepted (M10); its MSRV clause **superseded by D-85** · **Affects:** M10, M13, M17
 
 The easy mistake is to treat a module graph the way a build system treats a dependency graph,
 where a cycle is an error to report and refuse. In ES modules a cycle is **specified
@@ -1520,7 +1520,7 @@ the specification does not.
 
 ## D-57 — `require` is found by an exhaustive visit, not by matching the shapes we expected
 
-**Status:** Accepted (M10) · **Affects:** M10, M12, §3.5
+**Status:** Accepted (M10); its MSRV clause **superseded by D-85** · **Affects:** M10, M12, §3.5
 
 §M10's acceptance is "resolves and parses a real `node_modules` tree containing React,
 producing a complete module graph with no unresolved imports". React 19 is CommonJS from top to
@@ -2471,3 +2471,60 @@ The stack-map test first declared a value whose only use *was* the call's argume
 one entry. The count was 0 — **and the test was wrong, not the backend**: a value whose last use
 is the call argument does not need to survive the collection. Corrected to use the value after
 the call.
+
+---
+
+## D-85 — The floor is 1.96, and it is now verified
+
+**Status:** Accepted (M13) · **Supersedes:** D-57's MSRV clause · **Affects:** whole workspace
+
+D-57 pinned oxc at 0.91 to hold a 1.87 floor, reasoning that "a parser dependency in Track B is
+not a reason to raise the floor for everybody". Two things have changed that.
+
+**The pin stopped being about the parser.** `oxc_allocator 0.91` requires `bumpalo` *exactly*
+`=3.19.0`, and Cranelift 0.132+ requires `^3.20.2` — so the pin capped the **backend** at 0.128
+as well. A constraint chosen to protect embeddability was, by then, deciding which code
+generator the project could use.
+
+**The conflict dissolves on upgrade.** `oxc_allocator 0.150` has **no `bumpalo` dependency at
+all**. Upgrading removes the wall rather than working around it, which is why this is a version
+bump and not a vendored patch.
+
+The floor is now **1.96**: oxc 0.150 needs 1.96 and Cranelift 0.135.2 needs 1.95, so 1.96 is the
+lower bound of "both current". The alternative considered was a per-crate floor — 1.96 for the
+two compiler crates and 1.87 for the other twenty-five, since Track A touches neither dependency
+— and it was rejected in favour of one honest number for the workspace.
+
+### The floor was never verified
+
+This is the part worth recording. `rust-version = "1.87"` was declared and **nothing ever built
+against it**: every CI job used `stable`, and there was no MSRV job. The number was an
+aspiration presented as a guarantee, and a crate could have broken it at any point without
+anyone noticing until an embedder complained.
+
+There is now an `msrv` job that reads the floor **out of `Cargo.toml`** — rather than repeating
+it, so the job cannot drift from the number it checks — installs exactly that toolchain, and
+runs `cargo check --workspace --all-features`.
+
+`check` and not `test`: the promise is that the crates *compile* on the floor. Running the suite
+there would also bind dev-dependencies to it, which is not part of what an embedder relies on
+and would raise the floor for a reason nobody asked for.
+
+An unverified MSRV is indistinguishable from a false one — the same argument as
+`CRISOL_REQUIRE_GPU`, where a skipped test and a passing test look alike.
+
+### What the upgrade cost
+
+Three API changes, each an improvement upstream:
+
+- `ParserReturn::errors` became `diagnostics`.
+- **Arrow bodies are a proper enum now.** The old code reconstructed concise-versus-block from a
+  boolean plus a guess at the single statement inside; `get_expression()` and
+  `get_function_body()` make it a type distinction, which deleted a comment apologising for the
+  old shape.
+- `MemFlags` became `MemFlagsData` for `bitcast`, and `finalize` takes the target's frontend
+  config.
+
+**Every frontend test passed unchanged, including the corpus snapshot.** A fifty-nine-release
+jump in the parser produced byte-identical IR, which is the strongest evidence available that
+the upgrade changed nothing about meaning.
