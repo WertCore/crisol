@@ -2528,3 +2528,17 @@ Three API changes, each an improvement upstream:
 **Every frontend test passed unchanged, including the corpus snapshot.** A fifty-nine-release
 jump in the parser produced byte-identical IR, which is the strongest evidence available that
 the upgrade changed nothing about meaning.
+
+### Raising the floor changed what clippy advises
+
+A second-order effect worth recording, because it failed CI in a crate the upgrade never
+touched.
+
+Clippy gates lints on the declared MSRV. `collapsible_if` suggests a **let-chain**, which
+stabilised in 1.88 — so at a 1.87 floor the lint stayed quiet, and at 1.96 it fires. One
+instance existed, in `ui/umbrella/examples/todo.rs`, and CI caught it on all three desktop
+platforms.
+
+The consequence to remember: **an MSRV bump can fail CI in code the change never touched**, and
+a crate-scoped local gate cannot see it. The lint fired in Track A, while every edit was in the
+compiler crates.

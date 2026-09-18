@@ -1049,12 +1049,12 @@ impl State {
             // Selecting the row is the visible proof that the drop landed on a particular
             // one rather than on the window. `list`'s children are the visible rows in
             // order, which is exactly what `selected` indexes.
-            if let Some(row) = self.row_of(node) {
-                if let Some(index) = self.tree.children(self.app.list).position(|id| id == row) {
-                    self.runtime.set(self.app.selected, index);
-                    let mut dom = Dom::new(&mut self.tree);
-                    self.runtime.flush(&mut dom);
-                }
+            if let Some(row) = self.row_of(node)
+                && let Some(index) = self.tree.children(self.app.list).position(|id| id == row)
+            {
+                self.runtime.set(self.app.selected, index);
+                let mut dom = Dom::new(&mut self.tree);
+                self.runtime.flush(&mut dom);
             }
         }
         self.mark_drop_target(None);
