@@ -3617,3 +3617,67 @@ one after the other.
 **Consequence:** built-in methods are now defined through one function that sets those
 attributes. Four builders had been defining them four ways; the one that mattered was the one
 nobody had thought about, because nothing could observe enumerability until `for-in` existed.
+
+## D-119
+
+**Computed property keys and template literals.**
+
+Status: Accepted
+
+A computed key `{[k]: v}` and a numeric key `{1: v}` both go through the computed store rather
+than a static name. The numeric case could have been converted to text in the frontend, but the
+number-to-name rule already lives in the runtime — putting a second copy in the compiler is how
+`{1: x}` and `o[1] = x` come to disagree about what the property is called.
+
+**The key is evaluated before the value**, which is the order the specification gives and is
+observable whenever either has an effect.
+
+A template literal is lowered as concatenation, because that is what it is. **The first piece is
+always a string** even when the template opens with a substitution: starting from the empty
+string is the whole reason `` `${1}${2}` `` is `"12"` and not `3`. An empty trailing piece emits
+nothing, so `` `${a}${b}` `` does not pay for two concatenations with `""`.
+
+## D-120
+
+**`for-of` covers arrays and strings, and is not the iterator protocol.**
+
+Status: Accepted, and deliberately partial
+
+There is no `Symbol`, so there is no `Symbol.iterator` to look up and a user-defined iterable
+cannot be recognised at all. What this covers is an array or a string; anything else raises a
+`TypeError` — the error the protocol would raise for a non-iterable, reached for a different
+reason. Recorded as partial rather than presented as done, because the failure for a custom
+iterable is indistinguishable from the failure for a number.
+
+**An array is indexed live, not copied.** `length` is read in the loop header each step, so a
+`push` inside the body is seen and `for (const x of a) a.push(x)` does not terminate — which is
+what a real engine does. Copying the elements up front would have made it terminate, which is
+the quieter answer and the wrong one.
+
+**A string is walked by code point, not code unit**: `for (const c of "😀")` runs once where
+`"😀".length` is 2 (D-115). The snapshot is indistinguishable from live indexing because a
+string cannot change.
+
+**Consequence:** `for-in` and `for-of` are one loop. They differ only in what produces the list —
+`Enumerate` gives names, `Iterate` gives something indexable — and sharing the lowering is what
+makes `break`, `continue` and the declare-versus-assign rule identical in both without being
+written twice.
+
+## D-121
+
+**The test count in STATE.md is measured, not incremented.**
+
+Status: Accepted, correcting several earlier entries
+
+The recorded total had been carried forward by hand — 1146, then 1175, 1183, 1188, 1200, 1207 —
+each step adding the tests a commit introduced to the previous line. The measured workspace
+total is **1146**, and every figure above it was arithmetic on a number nobody re-read.
+
+The same narrowing had turned the gate green while it was red. Running `cargo clippy` on the
+packages a change touched, rather than `--workspace`, hid a lint failure in `cli/src/build.rs`
+from the commit that introduced it (`3f182a4`) until now — six commits. A per-package gate is
+not a smaller version of the workspace gate; it is a different gate that happens to agree most
+of the time.
+
+Both failures have the same shape: a number or a check that was true once, reused as though it
+were still being taken.

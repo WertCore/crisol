@@ -157,10 +157,11 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("a working directory");
     let file = directory.join("main.js");
-    // `for-of` still lowers to a recorded gap rather than to nothing. This case has to be
-    // replaced whenever the construct it names becomes supported — which is the point: the
-    // test is about *refusing*, so it must always name something actually refused.
-    std::fs::write(&file, "for (let x of [1]) { } return 1;").expect("write");
+    // A regular expression literal still lowers to a recorded gap rather than to nothing. This
+    // case has to be replaced whenever the construct it names becomes supported — which is the
+    // point: the test is about *refusing*, so it must always name something actually refused.
+    // It named `for-of` until that landed, and this is the second time it has been rewritten.
+    std::fs::write(&file, "let r = /ab+/; return 1;").expect("write");
 
     let error =
         crisol::build::build(&file, &directory.join("main"), &runtime).expect_err("should refuse");
@@ -1959,5 +1960,147 @@ fn for_in_can_assign_to_an_existing_variable() {
         "forin-assign",
         "let k = \"\"; let o = {a: 1}; for (k in o) { } return k;",
         "a",
+    );
+}
+
+// ---- computed property keys and template literals ------------------------------------------
+
+#[test]
+fn an_object_literal_can_have_a_computed_key() {
+    check(
+        "key-computed",
+        "let k = \"a\"; let o = {[k]: 5}; return o.a;",
+        "5",
+    );
+    check(
+        "key-expression",
+        "let o = {[\"a\" + \"b\"]: 5}; return o.ab;",
+        "5",
+    );
+    check(
+        "key-mixed",
+        "let k = \"b\"; let o = {a: 1, [k]: 2}; return o.a + o.b;",
+        "3",
+    );
+}
+
+/// A numeric key goes through the same path, so `{1: x}` and `o[1] = x` cannot disagree about
+/// what the name is.
+#[test]
+fn a_numeric_key_names_the_same_property_an_index_does() {
+    check("key-numeric", "let o = {1: 5}; return o[1];", "5");
+    check(
+        "key-numeric-name",
+        "let o = {1: 5}; return Object.keys(o)[0];",
+        "1",
+    );
+}
+
+/// **The first piece of a template is always a string**, so `` `${1}${2}` `` is `"12"` and not
+/// `3` — starting from the empty string rather than the first substitution is the whole of why.
+#[test]
+fn a_template_literal_concatenates_rather_than_adding() {
+    check("template-plain", "return `abc`;", "abc");
+    check("template-one", "let x = 5; return `a${x}b`;", "a5b");
+    check(
+        "template-leading",
+        "let x = 1; let y = 2; return `${x}${y}`;",
+        "12",
+    );
+    check("template-empty", "return `${1}`;", "1");
+}
+
+#[test]
+fn a_template_substitutes_any_expression() {
+    check("template-expression", "return `${1 + 2}`;", "3");
+    check(
+        "template-call",
+        "let f = function () { return 7; }; return `n=${f()}`;",
+        "n=7",
+    );
+    check(
+        "template-nested",
+        "let a = \"x\"; return `${`[${a}]`}`;",
+        "[x]",
+    );
+}
+
+// ---- for-of ------------------------------------------------------------------------------
+
+#[test]
+fn for_of_walks_an_array_by_value() {
+    check(
+        "forof-sum",
+        "let a = [1, 2, 3]; let t = 0; for (let x of a) { t = t + x; } return t;",
+        "6",
+    );
+    check(
+        "forof-empty",
+        "let n = 0; for (let x of []) { n = n + 1; } return n;",
+        "0",
+    );
+    check(
+        "forof-break",
+        "let t = 0; for (let x of [1, 2, 3]) { if (x === 2) { break; } t = t + x; } return t;",
+        "1",
+    );
+    check(
+        "forof-continue",
+        "let t = 0; for (let x of [1, 2, 3]) { if (x === 2) { continue; } t = t + x; } return t;",
+        "4",
+    );
+}
+
+/// **A string is walked by code point, not code unit** — `for (const c of "😀")` runs once
+/// where `"😀".length` is 2.
+#[test]
+fn for_of_walks_a_string_by_code_point() {
+    check(
+        "forof-string",
+        "let s = \"\"; for (let c of \"abc\") { s = s + c + \"-\"; } return s;",
+        "a-b-c-",
+    );
+    check(
+        "forof-emoji",
+        "let n = 0; for (let c of \"😀\") { n = n + 1; } return n;",
+        "1",
+    );
+}
+
+/// **Not the iterator protocol**: without `Symbol` there is no `Symbol.iterator` to look up, so
+/// anything that is not an array or a string raises — the error the protocol would give, for a
+/// different reason.
+#[test]
+fn for_of_over_a_non_iterable_raises() {
+    check(
+        "forof-object",
+        "let r = \"\"; try { for (let x of {a: 1}) { } } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "forof-number",
+        "let r = \"\"; try { for (let x of 5) { } } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// The array is indexed live rather than copied, so a change during the loop is seen.
+#[test]
+fn for_of_follows_an_array_that_changes() {
+    check(
+        "forof-live",
+        "let a = [1, 2, 3]; let n = 0; for (let x of a) { n = n + 1; if (n === 1) { a.pop(); } } \
+         return n;",
+        "2",
+    );
+}
+
+/// `for (x of a)` assigns to an existing binding rather than declaring one.
+#[test]
+fn for_of_can_assign_to_an_existing_variable() {
+    check(
+        "forof-assign",
+        "let x = 0; for (x of [1, 2]) { } return x;",
+        "2",
     );
 }

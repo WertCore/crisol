@@ -176,7 +176,7 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
         // Element 0 is the row count and the rows begin at element 1 — the layout the backend
         // writes (D-90). Registering *before* `crisol_program` runs is the whole point: a
         // collection can happen on the first allocation.
-        &format!(
+        format!(
             // `crisol_program` takes the five operands every compiled function takes
             // (closure, this, new.target, argc, argv), because a call site cannot know which
             // function it is reaching. The program itself is called with none: no closure, no

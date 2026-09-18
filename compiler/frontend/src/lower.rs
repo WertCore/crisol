@@ -326,11 +326,51 @@ impl Lowering {
     fn for_in_statement(&mut self, statement: &oxc_ast::ast::ForInStatement<'_>) {
         let subject = self.expression(&statement.right);
         let names = self.emit(Type::Object(None), Op::Enumerate { object: subject });
+        self.indexed_loop(names, &statement.left, &statement.body);
+    }
 
+    /// `for (name of iterable) body`.
+    ///
+    /// **This is not the iterator protocol.** There is no `Symbol`, so there is no
+    /// `Symbol.iterator` to look up and a user-defined iterable cannot work. What this does
+    /// cover is an array or a string, which `crisol_iterate` turns into something indexable and
+    /// anything else rejects with a `TypeError` — the same error the protocol would raise, for
+    /// a different reason.
+    ///
+    /// An array is indexed **live**, not copied, so its `length` is re-read each step and a
+    /// `push` inside the loop is seen. That matches the array iterator, which is also why
+    /// `for (const x of a) a.push(x)` does not terminate here any more than it does in a real
+    /// engine.
+    fn for_of_statement(&mut self, statement: &oxc_ast::ast::ForOfStatement<'_>) {
+        if statement.r#await {
+            self.note("for-await-of statement", statement.span.start);
+            return;
+        }
+        let subject = self.expression(&statement.right);
+        let values = self.emit(Type::Object(None), Op::Iterate { object: subject });
+        // `crisol_iterate` raises on a non-iterable, so the signal has to be honoured here or
+        // the loop would run over the signal itself.
+        let values = self.propagate(values);
+        self.indexed_loop(values, &statement.left, &statement.body);
+    }
+
+    /// The loop both `for-in` and `for-of` are: walk `list` by index, binding each element.
+    ///
+    /// `length` is read in the header rather than once before it, so a list that grows or
+    /// shrinks during the body is followed rather than snapshotted.
+    ///
+    /// `continue` goes to the increment and not the test, for the same reason it does in a
+    /// `for` loop: skipping the increment is a hang rather than a wrong answer.
+    fn indexed_loop(
+        &mut self,
+        subject: ValueId,
+        left: &oxc_ast::ast::ForStatementLeft<'_>,
+        body_statement: &Statement<'_>,
+    ) {
         let list = self.temporary();
         self.emit_effect(Op::Store {
             slot: list,
-            value: names,
+            value: subject,
         });
         let position = self.temporary();
         let zero = self.emit(Type::Number, Op::Const(Constant::Number(0.0)));
@@ -384,11 +424,11 @@ impl Lowering {
                 key: at,
             },
         );
-        self.bind_loop_variable(&statement.left, name);
+        self.bind_loop_variable(left, name);
 
         self.breaks.push(exit);
         self.continues.push(step);
-        self.statement(&statement.body);
+        self.statement(body_statement);
         self.breaks.pop();
         self.continues.pop();
         self.terminate(Terminator::Jump {
@@ -419,7 +459,7 @@ impl Lowering {
         self.switch_to(exit);
     }
 
-    /// Binds the name a `for-in` is currently visiting.
+    /// Binds the name or value the loop is currently visiting.
     ///
     /// `for (let k in o)` declares `k`; `for (k in o)` assigns to whatever `k` already names.
     /// Treating the second as a declaration would shadow the outer binding, so the loop would
@@ -1023,6 +1063,7 @@ impl Lowering {
             }
             Statement::ForStatement(statement) => self.for_statement(statement),
             Statement::ForInStatement(statement) => self.for_in_statement(statement),
+            Statement::ForOfStatement(statement) => self.for_of_statement(statement),
             Statement::DoWhileStatement(statement) => {
                 let body = self.new_block();
                 let header = self.new_block();
@@ -1320,6 +1361,7 @@ impl Lowering {
                 self.read(slot)
             }
             Expression::UnaryExpression(unary) => self.unary(unary),
+            Expression::TemplateLiteral(template) => self.template(template),
             Expression::LogicalExpression(logical) => self.logical(logical),
             Expression::ConditionalExpression(conditional) => self.conditional(conditional),
             Expression::ArrayExpression(array) => {
@@ -1784,6 +1826,69 @@ impl Lowering {
         self.declare(&name)
     }
 
+    /// A template literal: `` `a${b}c` ``.
+    ///
+    /// Lowered as concatenation, which is what it is. **The first piece is always a string**,
+    /// even when the template starts with a substitution — `` `${1}${2}` `` is `"12"` and not
+    /// `3`, and starting from the empty string rather than the first substitution is the whole
+    /// of why.
+    ///
+    /// A template with no substitutions is a single constant, so `` `abc` `` costs nothing that
+    /// `"abc"` does not.
+    fn template(&mut self, template: &oxc_ast::ast::TemplateLiteral<'_>) -> ValueId {
+        let piece = |quasi: &oxc_ast::ast::TemplateElement<'_>| {
+            quasi
+                .value
+                .cooked
+                .as_ref()
+                .map_or_else(|| quasi.value.raw.to_string(), ToString::to_string)
+        };
+        let mut quasis = template.quasis.iter();
+        let first = quasis.next().map(piece).unwrap_or_default();
+        let mut result = self.emit(Type::String, Op::Const(Constant::String(first)));
+
+        for (expression, quasi) in template.expressions.iter().zip(quasis) {
+            let value = self.expression(expression);
+            result = self.emit(
+                Type::String,
+                Op::Binary {
+                    op: BinaryOp::Add,
+                    left: result,
+                    right: value,
+                },
+            );
+            let text = piece(quasi);
+            // An empty trailing piece adds nothing, so it is not emitted — `` `${a}${b}` ``
+            // should not cost two concatenations with `""`.
+            if !text.is_empty() {
+                let tail = self.emit(Type::String, Op::Const(Constant::String(text)));
+                result = self.emit(
+                    Type::String,
+                    Op::Binary {
+                        op: BinaryOp::Add,
+                        left: result,
+                        right: tail,
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    /// A property key that has to be evaluated: `{[expr]: v}` or `{1: v}`.
+    ///
+    /// `None` for a key this cannot evaluate, which the caller reports.
+    fn property_key_value(&mut self, key: &Key<'_>) -> Option<ValueId> {
+        match key {
+            Key::NumericLiteral(literal) => {
+                Some(self.emit(Type::Number, Op::Const(Constant::Number(literal.value))))
+            }
+            other => other
+                .as_expression()
+                .map(|expression| self.expression(expression)),
+        }
+    }
+
     fn object(&mut self, object: &oxc_ast::ast::ObjectExpression<'_>) -> ValueId {
         // The allocation starts from the empty shape, which is true: an object literal *is*
         // empty until its first property is stored.
@@ -1804,19 +1909,38 @@ impl Lowering {
             match property {
                 ObjectPropertyKind::ObjectProperty(property) => {
                     let name = match &property.key {
-                        Key::StaticIdentifier(identifier) => identifier.name.to_string(),
-                        Key::StringLiteral(literal) => literal.value.to_string(),
-                        _ => {
-                            self.note("computed property key", property.span.start);
-                            continue;
-                        }
+                        Key::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
+                        Key::StringLiteral(literal) => Some(literal.value.to_string()),
+                        // A computed or numeric key is not known here, so it is stored through
+                        // the computed path — which is also where the number-to-name rule
+                        // lives, so `{1: x}` and `o[1] = x` cannot disagree about the name.
+                        _ => None,
                     };
-                    let value = self.expression(&property.value);
-                    self.emit_effect(Op::PropertyStore {
-                        object: result,
-                        key: PropertyKey::new(&name),
-                        value,
-                    });
+                    match name {
+                        Some(name) => {
+                            let value = self.expression(&property.value);
+                            self.emit_effect(Op::PropertyStore {
+                                object: result,
+                                key: PropertyKey::new(&name),
+                                value,
+                            });
+                        }
+                        None => {
+                            let Some(key) = self.property_key_value(&property.key) else {
+                                self.note("property key", property.span.start);
+                                continue;
+                            };
+                            // **The key is evaluated before the value**, which is the order the
+                            // specification gives and is observable whenever either has an
+                            // effect.
+                            let value = self.expression(&property.value);
+                            self.emit_effect(Op::ComputedStore {
+                                object: result,
+                                key,
+                                value,
+                            });
+                        }
+                    }
                 }
                 ObjectPropertyKind::SpreadProperty(spread) => {
                     self.note("object spread", spread.span.start);
@@ -1830,7 +1954,6 @@ impl Lowering {
 /// A statement's kind, for the unsupported list.
 fn kind_of(statement: &Statement<'_>) -> &'static str {
     match statement {
-        Statement::ForOfStatement(_) => "for-of statement",
         Statement::FunctionDeclaration(_) => "function declaration",
         Statement::ClassDeclaration(_) => "class declaration",
         Statement::ImportDeclaration(_) => "import declaration",
@@ -1848,7 +1971,6 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         Expression::UpdateExpression(_) => "update expression",
         Expression::LogicalExpression(_) => "logical expression",
         Expression::ConditionalExpression(_) => "conditional expression",
-        Expression::TemplateLiteral(_) => "template literal",
         Expression::AwaitExpression(_) => "await expression",
         Expression::NewExpression(_) => "new expression",
         Expression::StringLiteral(_) => "string literal",

@@ -311,6 +311,14 @@ pub enum Op {
         /// What to enumerate.
         object: ValueId,
     },
+    /// What a `for-of` over `object` walks, as something indexable.
+    ///
+    /// An array is itself, indexed live; a string becomes an array of its code points. Anything
+    /// else raises, because without `Symbol.iterator` there is nothing to ask.
+    Iterate {
+        /// What to iterate.
+        object: ValueId,
+    },
     /// `delete object[key]`.
     ///
     /// One operation for both spellings, because `delete o.x` and `delete o["x"]` are the same
@@ -457,6 +465,7 @@ impl Op {
                 | Self::ComputedStore { .. }
                 | Self::Delete { .. }
                 | Self::Enumerate { .. }
+                | Self::Iterate { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -484,7 +493,9 @@ impl Op {
                 all.extend(args);
                 all
             }
-            Self::PropertyLoad { object, .. } | Self::Enumerate { object } => vec![*object],
+            Self::PropertyLoad { object, .. }
+            | Self::Enumerate { object }
+            | Self::Iterate { object } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
             Self::ComputedLoad { object, key } | Self::Delete { object, key } => {
                 vec![*object, *key]

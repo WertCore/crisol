@@ -184,6 +184,7 @@ const TRUTHY_SYMBOL: &str = "crisol_truthy";
 const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
 const DELETE_SYMBOL: &str = "crisol_delete";
 const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
+const ITERATE_SYMBOL: &str = "crisol_iterate";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -244,6 +245,8 @@ struct ObjectHelpers<T> {
     delete: T,
     /// `crisol_enumerate(object) -> array of names`
     enumerate: T,
+    /// `crisol_iterate(value) -> something indexable`
+    iterate: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -350,6 +353,10 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     enumerate.params.push(AbiParam::new(types::I64));
     enumerate.returns.push(AbiParam::new(types::I64));
 
+    let mut iterate = module.make_signature();
+    iterate.params.push(AbiParam::new(types::I64));
+    iterate.returns.push(AbiParam::new(types::I64));
+
     let mut unary_signature = module.make_signature();
     unary_signature.params.push(AbiParam::new(types::I64));
     unary_signature.returns.push(AbiParam::new(types::I64));
@@ -393,6 +400,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         global_load: declare(GLOBAL_LOAD_SYMBOL, &global_load)?,
         delete: declare(DELETE_SYMBOL, &delete)?,
         enumerate: declare(ENUMERATE_SYMBOL, &enumerate)?,
+        iterate: declare(ITERATE_SYMBOL, &iterate)?,
         unary,
     })
 }
@@ -911,6 +919,9 @@ impl Backend for Cranelift {
             enumerate: self
                 .module
                 .declare_func_in_func(self.objects.enumerate, &mut context.func),
+            iterate: self
+                .module
+                .declare_func_in_func(self.objects.iterate, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1527,6 +1538,11 @@ impl Lowering<'_> {
                 }
                 Some(array)
             }
+            Op::Iterate { object } => {
+                let object = self.value(*object);
+                let call = self.builder.ins().call(self.objects.iterate, &[object]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::Enumerate { object } => {
                 let object = self.value(*object);
                 let call = self.builder.ins().call(self.objects.enumerate, &[object]);
@@ -1971,6 +1987,9 @@ impl Jit {
             enumerate: self
                 .module
                 .declare_func_in_func(self.objects.enumerate, &mut context.func),
+            iterate: self
+                .module
+                .declare_func_in_func(self.objects.iterate, &mut context.func),
             unary: self
                 .objects
                 .unary

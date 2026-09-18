@@ -72,6 +72,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_global_load",
     "crisol_delete",
     "crisol_enumerate",
+    "crisol_iterate",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -3876,4 +3877,36 @@ pub extern "C" fn crisol_enumerate(object: u64) -> u64 {
         }
         names_as_array(&names)
     })
+}
+
+/// What a `for-of` over `value` walks, as something indexable.
+///
+/// **An array is returned as itself, not copied.** The loop re-reads `length` each step, so a
+/// `push` inside the body is seen — which is what the array iterator does, and is why
+/// `for (const x of a) a.push(x)` does not terminate here any more than in a real engine.
+/// Copying would have made it terminate, which is a quieter answer and the wrong one.
+///
+/// A string becomes an array of its **code points**, not its code units: `for (const c of "😀")`
+/// runs once where `"😀".length` is 2. The snapshot is indistinguishable from live indexing
+/// because a string cannot change.
+///
+/// Anything else raises a `TypeError`. That is the error the iterator protocol would raise for
+/// a non-iterable, reached for a different reason: there is no `Symbol`, so there is no
+/// `Symbol.iterator` to look up and a user-defined iterable cannot be recognised at all.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_iterate(value: u64) -> u64 {
+    if elements_of(value).is_some() {
+        return value;
+    }
+    if Value::from_bits(value).kind() == crisol_value::Kind::String {
+        let Some(text) = text_of(value) else {
+            return raise("cannot iterate this value", "TypeError");
+        };
+        return with_rooted(&[value], || {
+            let points: Vec<String> = text.chars().map(|point| point.to_string()).collect();
+            names_as_array(&points)
+        });
+    }
+    raise("value is not iterable", "TypeError")
 }
