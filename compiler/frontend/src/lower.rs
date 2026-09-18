@@ -27,8 +27,8 @@
 use std::collections::HashMap;
 
 use crisol_ir::{
-    BinaryOp, Block, BlockId, CompareOp, Constant, Function, Instruction, Op, Safepoint,
-    Terminator, Type, UnaryOp, ValueId,
+    BinaryOp, Block, BlockId, CompareOp, Constant, Function, FunctionId, Instruction, Op,
+    Safepoint, Terminator, Type, UnaryOp, ValueId,
 };
 use crisol_value::PropertyKey;
 use oxc_allocator::Allocator;
@@ -51,10 +51,20 @@ pub struct Unsupported {
 /// The result of lowering one program.
 #[derive(Debug)]
 pub struct Lowered {
-    /// The IR.
-    pub function: Function,
+    /// Every function, indexed by [`crisol_ir::FunctionId`]. **Index 0 is the program itself**
+    /// — a module body is a function, which is why `return` at top level is meaningful (the
+    /// parser is told so explicitly).
+    pub functions: Vec<Function>,
     /// Everything the lowering did not understand, in source order.
     pub unsupported: Vec<Unsupported>,
+}
+
+impl Lowered {
+    /// The top-level program.
+    #[must_use]
+    pub fn program(&self) -> &Function {
+        &self.functions[0]
+    }
 }
 
 impl Lowered {
@@ -104,37 +114,68 @@ pub fn lower(name: &str, source: &str) -> Result<Lowered, ParseFailed> {
     Ok(lowering.finish())
 }
 
-struct Lowering {
-    function: Function,
+/// One function being lowered.
+struct Scope {
+    /// Index into [`Lowering::functions`].
+    function: usize,
     current: BlockId,
     /// Whether `current` already has a real terminator, so trailing statements are dead.
     terminated: bool,
     slots: HashMap<String, u32>,
     next_slot: u32,
+    /// Names this function reads from an enclosing one, with the slot they land in here.
+    ///
+    /// Discovered during lowering rather than by a pre-pass: a name is a capture exactly when
+    /// resolving it walks out of this scope, so the resolution *is* the analysis.
+    captures: Vec<(String, u32)>,
+}
+
+struct Lowering {
+    functions: Vec<Function>,
+    /// Innermost last. A nested function pushes; finishing it pops.
+    scopes: Vec<Scope>,
     unsupported: Vec<Unsupported>,
 }
 
 impl Lowering {
     fn new(name: &str) -> Self {
         let function = Function::new(name);
+        let entry = function.entry;
         Self {
-            current: function.entry,
-            function,
-            terminated: false,
-            slots: HashMap::new(),
-            next_slot: 0,
+            functions: vec![function],
+            scopes: vec![Scope {
+                function: 0,
+                current: entry,
+                terminated: false,
+                slots: HashMap::new(),
+                next_slot: 0,
+                captures: Vec::new(),
+            }],
             unsupported: Vec::new(),
         }
     }
 
     fn finish(mut self) -> Lowered {
-        if !self.terminated {
+        if !self.scope().terminated {
             self.terminate(Terminator::Return(None));
         }
         Lowered {
-            function: self.function,
+            functions: self.functions,
             unsupported: self.unsupported,
         }
+    }
+
+    fn scope(&self) -> &Scope {
+        self.scopes.last().expect("a scope is always open")
+    }
+
+    fn scope_mut(&mut self) -> &mut Scope {
+        self.scopes.last_mut().expect("a scope is always open")
+    }
+
+    fn function_mut(&mut self) -> &mut Function {
+        let at = self.scope().function;
+        &mut self.functions[at]
     }
 
     fn program(&mut self, program: &Program<'_>) {
@@ -147,7 +188,7 @@ impl Lowering {
 
     /// A new empty block. Its terminator is a placeholder until [`Lowering::terminate`] runs.
     fn new_block(&mut self) -> BlockId {
-        self.function.block(Block {
+        self.function_mut().block(Block {
             params: Vec::new(),
             instructions: Vec::new(),
             terminator: Terminator::Return(None),
@@ -155,29 +196,32 @@ impl Lowering {
     }
 
     fn switch_to(&mut self, block: BlockId) {
-        self.current = block;
-        self.terminated = false;
+        let scope = self.scope_mut();
+        scope.current = block;
+        scope.terminated = false;
     }
 
     fn terminate(&mut self, terminator: Terminator) {
-        if self.terminated {
+        if self.scope().terminated {
             return;
         }
-        if let Some(block) = self.function.get_mut(self.current) {
+        let current = self.scope().current;
+        if let Some(block) = self.function_mut().get_mut(current) {
             block.terminator = terminator;
         }
-        self.terminated = true;
+        self.scope_mut().terminated = true;
     }
 
     fn emit(&mut self, ty: Type, op: Op) -> ValueId {
-        let result = self.function.value();
+        let result = self.function_mut().value();
         // The live set is empty because locals are in slots rather than in SSA values, so
         // nothing an allocation could invalidate is being held in one. When `mem2reg` lands
         // (M12) and values start living across allocations, this is where the live set gets
         // computed — and the verifier already refuses an allocation without a safepoint, so
         // the structure has to be here first.
         let safepoint = op.can_collect().then(Safepoint::default);
-        if let Some(block) = self.function.get_mut(self.current) {
+        let current = self.scope().current;
+        if let Some(block) = self.function_mut().get_mut(current) {
             block.instructions.push(Instruction {
                 result: Some(result),
                 ty,
@@ -190,7 +234,8 @@ impl Lowering {
 
     fn emit_effect(&mut self, op: Op) {
         let safepoint = op.can_collect().then(Safepoint::default);
-        if let Some(block) = self.function.get_mut(self.current) {
+        let current = self.scope().current;
+        if let Some(block) = self.function_mut().get_mut(current) {
             block.instructions.push(Instruction {
                 result: None,
                 ty: Type::Undefined,
@@ -201,12 +246,40 @@ impl Lowering {
     }
 
     fn slot(&mut self, name: &str) -> u32 {
-        if let Some(slot) = self.slots.get(name) {
+        if let Some(slot) = self.scope().slots.get(name) {
             return *slot;
         }
-        let slot = self.next_slot;
-        self.next_slot += 1;
-        self.slots.insert(name.to_owned(), slot);
+        // Not local. If an enclosing function has it, reading it here is a **capture** — and
+        // that is the whole analysis: a name is captured exactly when resolving it walks out
+        // of this scope, so no separate free-variable pass is needed.
+        let captured = self
+            .scopes
+            .iter()
+            .rev()
+            .skip(1)
+            .any(|outer| outer.slots.contains_key(name));
+
+        let slot = self.declare(name);
+        if captured {
+            self.scope_mut().captures.push((name.to_owned(), slot));
+        }
+        slot
+    }
+
+    /// Makes a name local to the current function, whatever it meant outside.
+    ///
+    /// Used for `let`/`const`/`var` and for parameters, where the declaration *shadows* an
+    /// outer binding rather than capturing it. Going through `slot` there would capture the
+    /// outer one and then immediately overwrite it, which is the difference between
+    /// `let x = 1` inside a closure and `x = 1`.
+    fn declare(&mut self, name: &str) -> u32 {
+        let scope = self.scope_mut();
+        if let Some(slot) = scope.slots.get(name) {
+            return *slot;
+        }
+        let slot = scope.next_slot;
+        scope.next_slot += 1;
+        scope.slots.insert(name.to_owned(), slot);
         slot
     }
 
@@ -228,7 +301,7 @@ impl Lowering {
     // ---- statements ---------------------------------------------------------------------
 
     fn statement(&mut self, statement: &Statement<'_>) {
-        if self.terminated {
+        if self.scope().terminated {
             // Everything after a `return` in the same block is unreachable. Lowering it would
             // produce instructions no path can execute, which the verifier would accept and a
             // reader of the dump would rightly find baffling.
@@ -248,7 +321,9 @@ impl Lowering {
                         Some(init) => self.expression(init),
                         None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
                     };
-                    let slot = self.slot(name.as_str());
+                    // `declare`, not `slot`: a `let` shadows an outer binding rather than
+                    // capturing it.
+                    let slot = self.declare(name.as_str());
                     self.emit_effect(Op::Store { slot, value });
                 }
             }
@@ -332,6 +407,28 @@ impl Lowering {
                 let value = self.expression(&statement.argument);
                 self.terminate(Terminator::Throw(value));
             }
+            Statement::FunctionDeclaration(declaration) => {
+                let name = declaration
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+                let (id, names) = self.lower_function(
+                    &name,
+                    &declaration.params,
+                    declaration.body.as_deref(),
+                    None,
+                );
+                let closure = self.close_over(id, &names);
+                // A declaration binds its name in the enclosing scope. Hoisting is not modelled
+                // — the binding appears where the declaration does, so a call before it reads
+                // an unset slot rather than working. Recorded rather than silently half-right.
+                self.note("function declaration hoisting", declaration.span.start);
+                let slot = self.declare(&name);
+                self.emit_effect(Op::Store {
+                    slot,
+                    value: closure,
+                });
+            }
             Statement::EmptyStatement(_) => {}
             other => {
                 self.note(kind_of(other), 0);
@@ -399,6 +496,43 @@ impl Lowering {
                 self.emit(Type::Unknown, Op::Call { callee, args })
             }
             Expression::ObjectExpression(object) => self.object(object),
+            Expression::FunctionExpression(function) => {
+                let name = function
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+                let (id, names) =
+                    self.lower_function(&name, &function.params, function.body.as_deref(), None);
+                self.close_over(id, &names)
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                // A concise body — `x => x + 1` — is parsed as a body holding one expression
+                // statement, which the parser flags rather than restructuring.
+                let concise = arrow.expression.then(|| {
+                    arrow
+                        .body
+                        .statements
+                        .first()
+                        .and_then(|statement| match statement {
+                            Statement::ExpressionStatement(statement) => {
+                                Some(&statement.expression)
+                            }
+                            _ => None,
+                        })
+                });
+                match concise.flatten() {
+                    Some(expression) => {
+                        let (id, names) =
+                            self.lower_function("arrow", &arrow.params, None, Some(expression));
+                        self.close_over(id, &names)
+                    }
+                    None => {
+                        let (id, names) =
+                            self.lower_function("arrow", &arrow.params, Some(&arrow.body), None);
+                        self.close_over(id, &names)
+                    }
+                }
+            }
             Expression::UnaryExpression(unary) => self.unary(unary),
             Expression::LogicalExpression(logical) => self.logical(logical),
             Expression::ConditionalExpression(conditional) => self.conditional(conditional),
@@ -625,13 +759,99 @@ impl Lowering {
         self.emit(Type::Unknown, Op::Load { slot })
     }
 
+    /// Lowers a nested function and returns its id plus the names it captured.
+    ///
+    /// The captures come back as *names* because they must be resolved again in the **enclosing**
+    /// scope — the inner function knows which slot a capture lands in, and the outer one knows
+    /// which value to put there. Pairing those two lists by position is the contract
+    /// [`Function::captures`] describes, and building them anywhere but together is how a
+    /// closure ends up reading an uninitialised slot.
+    fn lower_function(
+        &mut self,
+        name: &str,
+        params: &oxc_ast::ast::FormalParameters<'_>,
+        body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+        expression_body: Option<&Expression<'_>>,
+    ) -> (FunctionId, Vec<String>) {
+        let index = self.functions.len();
+        let function = Function::new(name);
+        let entry = function.entry;
+        self.functions.push(function);
+        self.scopes.push(Scope {
+            function: index,
+            current: entry,
+            terminated: false,
+            slots: HashMap::new(),
+            next_slot: 0,
+            captures: Vec::new(),
+        });
+
+        let mut parameter_slots = Vec::with_capacity(params.items.len());
+        for param in &params.items {
+            match param.pattern.get_identifier_name() {
+                // `declare`, not `slot`: a parameter shadows an outer binding of the same name.
+                Some(param_name) => parameter_slots.push(self.declare(param_name.as_str())),
+                None => {
+                    self.note("destructuring parameter", param.span.start);
+                    // Still consumes a position, or every later parameter would shift down one
+                    // and silently receive the wrong argument.
+                    let placeholder = self.temporary();
+                    parameter_slots.push(placeholder);
+                }
+            }
+        }
+
+        if let Some(body) = body {
+            for statement in &body.statements {
+                self.statement(statement);
+            }
+        } else if let Some(expression) = expression_body {
+            // A concise arrow body is an implicit return, not a statement.
+            let value = self.expression(expression);
+            self.terminate(Terminator::Return(Some(value)));
+        }
+        if !self.scope().terminated {
+            // A function that runs off the end returns `undefined`.
+            self.terminate(Terminator::Return(None));
+        }
+
+        let scope = self.scopes.pop().expect("just pushed");
+        let names: Vec<String> = scope
+            .captures
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let slots: Vec<u32> = scope.captures.iter().map(|(_, slot)| *slot).collect();
+        self.functions[index].parameters = parameter_slots;
+        self.functions[index].captures = slots;
+        (
+            FunctionId(u32::try_from(index).expect("functions fit in u32")),
+            names,
+        )
+    }
+
+    /// Emits the closure that binds a lowered function to its captured values.
+    fn close_over(&mut self, function: FunctionId, names: &[String]) -> ValueId {
+        let captures = names
+            .iter()
+            .map(|name| {
+                // Resolved in the *enclosing* scope, which may itself capture it — a variable
+                // read two functions down is captured at each level, which is what makes a
+                // chain of closures work.
+                let slot = self.slot(name);
+                self.emit(Type::Unknown, Op::Load { slot })
+            })
+            .collect();
+        self.emit(Type::Object(None), Op::Closure { function, captures })
+    }
+
     /// A slot no source name can collide with.
     ///
     /// Named with a character the grammar does not allow in an identifier, so a program cannot
     /// declare a variable that shadows a compiler temporary.
     fn temporary(&mut self) -> u32 {
-        let name = format!(" tmp{}", self.next_slot);
-        self.slot(&name)
+        let name = format!(" tmp{}", self.scope().next_slot);
+        self.declare(&name)
     }
 
     fn object(&mut self, object: &oxc_ast::ast::ObjectExpression<'_>) -> ValueId {

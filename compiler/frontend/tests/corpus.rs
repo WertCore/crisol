@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use crisol_frontend::lower;
-use crisol_ir::verify;
+use crisol_ir::verify_module;
 
 /// The programs. Order is fixed, because the snapshot is.
 const CORPUS: &[(&str, &str)] = &[
@@ -111,6 +111,37 @@ const CORPUS: &[(&str, &str)] = &[
     ("nested-arithmetic", "let a = 1 + 2 * 3;"),
     ("array-literal", "let a = [1, 2, 3];"),
     ("empty-array", "let a = [];"),
+    ("arrow-concise-body", "let f = (x) => x;"),
+    ("arrow-block-body", "let f = (x) => { return x; };"),
+    ("arrow-no-parameters", "let f = () => 1;"),
+    (
+        "function-expression",
+        "let f = function (a, b) { return a; };",
+    ),
+    (
+        "a-closure-captures-an-outer-local",
+        "let a = 1; let f = () => a;",
+    ),
+    (
+        "a-parameter-shadows-rather-than-captures",
+        "let a = 1; let f = (a) => a;",
+    ),
+    (
+        "a-local-shadows-rather-than-captures",
+        "let a = 1; let f = () => { let a = 2; return a; };",
+    ),
+    (
+        "two-captures-keep-their-order",
+        "let a = 1; let b = 2; let f = () => a + b;",
+    ),
+    (
+        "a-nested-closure-captures-through-each-level",
+        "let a = 1; let f = () => () => a;",
+    ),
+    (
+        "a-function-that-runs-off-the-end-returns-undefined",
+        "let f = () => { let a = 1; };",
+    ),
 ];
 
 fn snapshot_path() -> PathBuf {
@@ -131,11 +162,10 @@ fn render() -> String {
             "{name} lowered with gaps, so its dump would not be a translation of its source: {:?}",
             lowered.unsupported
         );
-        if let Err(errors) = verify(&lowered.function) {
-            panic!(
-                "{name} produced a malformed graph: {errors:?}\n{}",
-                lowered.function
-            );
+        // `verify_module`, not per-function `verify`: the capture-arity check pairs a
+        // closure with its callee and is invisible to a verifier that sees one function.
+        if let Err(errors) = verify_module(&lowered.functions) {
+            panic!("{name} produced a malformed module: {errors:?}");
         }
 
         out.push_str(&format!("=== {name} ===\n"));
@@ -145,7 +175,11 @@ fn render() -> String {
             out.push('\n');
         }
         out.push_str("--- ir\n");
-        out.push_str(&lowered.function.to_string());
+        // Every function, not just the program: a nested one that lowered wrongly would
+        // otherwise be invisible in the review.
+        for function in &lowered.functions {
+            out.push_str(&function.to_string());
+        }
         out.push('\n');
     }
     out
@@ -210,12 +244,7 @@ fn every_program_in_the_corpus_verifies() {
     // as a verifier regression rather than as a snapshot mismatch.
     for (name, source) in CORPUS {
         let lowered = lower(name, source).expect("parses");
-        assert_eq!(
-            verify(&lowered.function),
-            Ok(()),
-            "{name}\n{}",
-            lowered.function
-        );
+        assert_eq!(verify_module(&lowered.functions), Ok(()), "{name}");
     }
 }
 
@@ -236,8 +265,10 @@ fn unfaithful_programs_are_reported_not_guessed() {
     // program that runs and is wrong, which is worse than one that refuses.
     let cases = [
         ("for (;;) { }", "for statement"),
-        ("function f() { }", "function declaration"),
-        ("let a = () => 1;", "arrow function"),
+        // The function itself lowers now; what does not is **hoisting**. The binding appears
+        // where the declaration does, so calling it earlier in the source reads an unset slot
+        // rather than working. Recorded rather than left silently half-right.
+        ("function f() { }", "function declaration hoisting"),
         ("let o = {}; let a = o[1];", "computed member access"),
         ("try { } catch (e) { }", "try statement"),
         ("let [a] = [1];", "destructuring declaration"),
@@ -278,7 +309,7 @@ fn an_object_literal_does_not_claim_a_shape_it_will_not_keep() {
     // after two `PropertyStore`s claims the object is still empty, and a pass trusting that
     // would resolve `.a` to no slot at all.
     let lowered = lower("object", "let o = { a: 1, b: 2 };").expect("parses");
-    let dump = lowered.function.to_string();
+    let dump = lowered.program().to_string();
     assert!(
         dump.contains(": object ="),
         "the value should be typed `object`, shape unknown: {dump}"
@@ -302,7 +333,7 @@ fn the_short_circuiting_operators_are_lowered_as_control_flow() {
     ] {
         let lowered = lower("short-circuit", source).expect("parses");
         assert!(
-            lowered.function.blocks.len() > 1,
+            lowered.program().blocks.len() > 1,
             "{source:?} should branch, and lowered to a single block"
         );
     }
@@ -314,14 +345,14 @@ fn nullish_coalescing_tests_for_null_not_for_falsiness() {
     // worth adding to the language, so the lowering must compare against null and undefined
     // rather than branching on the value itself.
     let nullish = lower("nullish", "let a = 0; let b = a ?? 1;").expect("parses");
-    let dump = nullish.function.to_string();
+    let dump = nullish.program().to_string();
     assert!(
         dump.contains("const null") && dump.contains("const undefined"),
         "`??` should compare against both nullish values:\n{dump}"
     );
 
     let or = lower("or", "let a = 0; let b = a || 1;").expect("parses");
-    let or_dump = or.function.to_string();
+    let or_dump = or.program().to_string();
     assert!(
         !or_dump.contains("const null"),
         "`||` branches on truthiness and needs no null comparison:\n{or_dump}"
@@ -334,16 +365,16 @@ fn addition_is_not_typed_as_a_number() {
     // a string concatenation. Every other arithmetic operator coerces with `ToNumber`.
     let add = lower("add", "let a = 1 + 2;").expect("parses");
     assert!(
-        add.function.to_string().contains("unknown = + "),
+        add.program().to_string().contains("unknown = + "),
         "`+` is unknown until something proves otherwise:\n{}",
-        add.function
+        add.program()
     );
 
     let subtract = lower("subtract", "let a = 1 - 2;").expect("parses");
     assert!(
-        subtract.function.to_string().contains("number = - "),
+        subtract.program().to_string().contains("number = - "),
         "`-` always produces a number:\n{}",
-        subtract.function
+        subtract.program()
     );
 }
 
@@ -353,7 +384,73 @@ fn a_compiler_temporary_cannot_be_shadowed_by_a_source_name() {
     // does not allow in an identifier, so a program cannot declare one that collides.
     let lowered = lower("collide", "let a = 1; let b = false && a;").expect("parses");
     assert!(lowered.is_faithful());
-    assert!(lowered.function.blocks.len() > 1);
+    assert!(lowered.program().blocks.len() > 1);
+}
+
+#[test]
+fn a_closure_captures_an_outer_local_and_a_parameter_shadows_it() {
+    // The distinction the whole scope analysis exists for. `() => a` reads the outer `a` and
+    // must capture it; `(a) => a` declares its own and must not — capturing there would read
+    // the outer value and then immediately overwrite it with the argument.
+    let capturing = lower("capture", "let a = 1; let f = () => a;").expect("parses");
+    let inner = &capturing.functions[1];
+    assert_eq!(inner.captures.len(), 1, "the arrow captures `a`");
+    assert!(inner.parameters.is_empty());
+
+    let shadowing = lower("shadow", "let a = 1; let f = (a) => a;").expect("parses");
+    let inner = &shadowing.functions[1];
+    assert!(
+        inner.captures.is_empty(),
+        "a parameter shadows rather than captures"
+    );
+    assert_eq!(inner.parameters.len(), 1);
+}
+
+#[test]
+fn a_local_declaration_shadows_rather_than_captures() {
+    let lowered = lower(
+        "local",
+        "let a = 1; let f = () => { let a = 2; return a; };",
+    )
+    .expect("parses");
+    assert!(
+        lowered.functions[1].captures.is_empty(),
+        "the inner `let a` is a new binding, not a read of the outer one"
+    );
+}
+
+#[test]
+fn a_nested_closure_captures_at_each_level() {
+    // `a` has to travel down two functions, and each level captures it from the one above —
+    // which is what makes a chain of closures work at all.
+    let lowered = lower("nested", "let a = 1; let f = () => () => a;").expect("parses");
+    assert_eq!(
+        lowered.functions.len(),
+        3,
+        "program, outer arrow, inner arrow"
+    );
+    assert_eq!(lowered.functions[1].captures.len(), 1);
+    assert_eq!(lowered.functions[2].captures.len(), 1);
+}
+
+#[test]
+fn a_concise_arrow_body_is_an_implicit_return() {
+    let concise = lower("concise", "let f = (x) => x;").expect("parses");
+    let block = &concise.functions[1].blocks[0];
+    assert!(
+        matches!(block.terminator, crisol_ir::Terminator::Return(Some(_))),
+        "`x => x` returns x, it does not evaluate and discard it"
+    );
+}
+
+#[test]
+fn a_function_that_runs_off_the_end_returns_undefined() {
+    let lowered = lower("falls-off", "let f = () => { let a = 1; };").expect("parses");
+    let block = &lowered.functions[1].blocks[0];
+    assert!(matches!(
+        block.terminator,
+        crisol_ir::Terminator::Return(None)
+    ));
 }
 
 #[test]

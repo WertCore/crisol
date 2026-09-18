@@ -16,4 +16,4 @@ pub use function::{
     Safepoint, Terminator, UnaryOp, ValueId,
 };
 pub use types::Type;
-pub use verify::{VerifyError, verify};
+pub use verify::{VerifyError, verify, verify_module};
