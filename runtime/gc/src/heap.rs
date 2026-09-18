@@ -335,6 +335,37 @@ impl Heap {
         }
     }
 
+    /// Shortens an array to `length`, keeping the elements that remain.
+    ///
+    /// Distinct from `make_array`, which *replaces* the elements — calling that to shorten a
+    /// filled array silently discards everything in it, which is exactly what a `filter` that
+    /// sized its result afterwards did.
+    ///
+    /// Growing is not this operation's job and is refused, so a caller that meant to extend
+    /// cannot quietly get a shorter array instead.
+    pub fn truncate_elements(&self, handle: GcRef, length: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                let Some(elements) = object.elements.as_mut() else {
+                    return false;
+                };
+                if length > elements.len() {
+                    return false;
+                }
+                elements.truncate(length);
+                true
+            }
+            State::Free => false,
+        }
+    }
+
     /// How many elements `handle` has, or `None` if it is not an array.
     #[must_use]
     pub fn element_count(&self, handle: GcRef) -> Option<usize> {

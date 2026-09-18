@@ -3101,3 +3101,50 @@ included.
 once and runs it **twice**, the second time collecting on every allocation, requiring the same
 answer. Separate stress tests would not have caught this, because the programs that find these
 bugs are not the ones that look like collector tests. `[{v: 1}]` does not look like a GC test.
+
+## D-100
+
+**A built-in roots its receiver and arguments; a compiled function does not have to.**
+
+Status: Accepted
+
+Arguments arrive in `argv`, a buffer in the *caller's* frame that no stack map describes. That
+is safe for a compiled callee for a reason that is easy to state and easier to forget: its
+prologue copies them into stack-mapped variables, and nothing allocates in between, so the
+window where they are unreachable contains no collection.
+
+A built-in never runs that prologue. It reads `argv` directly and then allocates — and in that
+window its arguments are reachable from nowhere the collector looks.
+
+`[1, 2].map(f)` called `f` **zero times** under `CRISOL_GC_STRESS`: allocating the result array
+collected the callback, and the call landed on `crisol_not_a_function`, which returns
+`undefined` rather than failing. The receiver needs rooting for the same reason — `a.map(…)`
+leaves `a` dead at the call site, so the array being mapped is no better off than the callback.
+
+**Rejected — making `argv` itself a root.** Cranelift's user stack maps describe *values*, not
+explicit stack slots, so the buffer cannot be declared. Rooting at the boundary that actually
+needs it also keeps the cost off compiled calls, which are the common case.
+
+## D-101
+
+**Built-ins are closures carrying a negative function index.**
+
+Status: Accepted
+
+`Array.prototype.map` has to be callable exactly as a compiled function is, or every call site
+would need to know which kind it holds. So a built-in is an ordinary closure whose function
+index is negative: non-negative indexes the compiled function table, negative indexes the
+runtime's own list.
+
+The sign rather than a reserved range or a second internal slot, because the two tables are
+disjoint by construction and there is no boundary to pick wrongly.
+
+`Array.prototype` is built before the first array and rooted through a `Cell` that the root
+provider reads. A `Cell` rather than reaching through `with_runtime`, because the provider runs
+*during* a collection, which may have been triggered inside a borrow of the shape table.
+
+**Consequence:** `crisol_closure_code` is the single place that decides what a value is
+callable as, so a native and a compiled callee reach the same call site by construction. It is
+also where `crisol_not_a_function` comes from, which means a built-in that goes missing degrades
+to `undefined` rather than a jump through a null pointer — and, as D-100 records, that made a
+collector bug look like a callback that simply did nothing.

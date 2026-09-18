@@ -4,6 +4,11 @@
 //! phrased as "compiles to a standalone binary that runs and produces correct output" — a test
 //! that checked the binary existed would pass for a binary that printed nothing.
 //!
+//! **These link a prebuilt `libcrisol_abi.a`, which `cargo test -p crisol` does not rebuild.**
+//! Changing the runtime and re-running the tests therefore proves nothing until
+//! `cargo build -p crisol-abi` has run — a mutation to the runtime silently keeps passing
+//! otherwise, which is the shape of false negative this file is least able to notice.
+//!
 //! They skip when the runtime archive is absent rather than failing, because `cargo test`
 //! builds test binaries before it builds the `staticlib` a compiled program links against.
 //! `CRISOL_REQUIRE_BUILD=1` turns the absence into a failure, so CI cannot pass by finding
@@ -591,4 +596,104 @@ fn arrays_survive_a_collection_at_every_allocation() {
         .expect("run the binary");
     assert!(output.status.success(), "it must not crash under stress");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "6");
+}
+
+// ---- array methods (§M13's last acceptance item) ----------------------------------------
+
+#[test]
+fn map_builds_a_new_array_from_a_callback() {
+    check(
+        "array-map",
+        "let a = [1, 2, 3]; let b = a.map(function (x) { return x * 2; }); return b[1];",
+        "4",
+    );
+    check(
+        "array-map-length",
+        "let a = [1, 2, 3]; return a.map(function (x) { return x; }).length;",
+        "3",
+    );
+}
+
+/// The callback gets `(element, index, array)`. Code that passes a method as a callback
+/// depends on the extra arguments arriving.
+#[test]
+fn a_callback_receives_the_index() {
+    check(
+        "array-map-index",
+        "let a = [10, 20, 30]; let b = a.map(function (x, i) { return i; }); return b[2];",
+        "2",
+    );
+}
+
+#[test]
+fn filter_keeps_what_the_callback_accepts() {
+    check(
+        "array-filter",
+        "let a = [1, 2, 3, 4]; let b = a.filter(function (x) { return x > 2; }); return b.length;",
+        "2",
+    );
+    check(
+        "array-filter-values",
+        "let a = [1, 2, 3, 4]; let b = a.filter(function (x) { return x > 2; }); return b[0];",
+        "3",
+    );
+}
+
+#[test]
+fn for_each_runs_for_its_effects() {
+    check(
+        "array-foreach",
+        "let total = 0; [1, 2, 3].forEach(function (x) { total = total + x; }); return total;",
+        "6",
+    );
+}
+
+/// **Without an initial value the first element is the seed**, not `undefined` — otherwise
+/// `[1, 2].reduce(add)` is `NaN` rather than `3`.
+#[test]
+fn reduce_seeds_from_the_first_element_when_given_no_initial_value() {
+    check(
+        "array-reduce",
+        "return [1, 2, 3].reduce(function (a, b) { return a + b; });",
+        "6",
+    );
+    check(
+        "array-reduce-seed",
+        "return [1, 2, 3].reduce(function (a, b) { return a + b; }, 10);",
+        "16",
+    );
+}
+
+#[test]
+fn push_appends_and_answers_the_new_length() {
+    check("array-push", "let a = [1]; a.push(2); return a[1];", "2");
+    check(
+        "array-push-length",
+        "let a = [1]; return a.push(2, 3);",
+        "3",
+    );
+}
+
+#[test]
+fn index_of_finds_an_element_or_reports_minus_one() {
+    check("array-indexof", "return [5, 6, 7].indexOf(6);", "1");
+    check(
+        "array-indexof-missing",
+        "return [5, 6, 7].indexOf(9);",
+        "-1",
+    );
+}
+
+/// The chained case, which is what "array methods" means in practice — and every intermediate
+/// array is a temporary nothing else holds.
+#[test]
+fn methods_chain() {
+    check(
+        "array-chain",
+        "return [1, 2, 3, 4] \
+           .filter(function (x) { return x > 1; }) \
+           .map(function (x) { return x * 10; }) \
+           .reduce(function (a, b) { return a + b; });",
+        "90",
+    );
 }

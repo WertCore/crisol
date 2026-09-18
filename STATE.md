@@ -24,6 +24,14 @@ and a constructor returning an object replacing the instance. Heap objects carry
 the collector traces, and engine state lives beside the property slots rather than in them
 (D-96), which is what made every class constructor silently uncallable.
 
+**M13's acceptance is met.** `main.ts` containing arithmetic, closures, classes and array
+methods compiles to a standalone binary that runs and produces correct output, with GC stress
+enabled — every acceptance program is run twice, the second time collecting on every
+allocation. Four targets are built in CI; only the host is executed.
+
+`[1,2,3,4].filter(…).map(…).reduce(…)` compiles and prints `90`. Built-ins are closures with a
+negative function index (D-101), so a call site cannot tell a native from a compiled callee.
+
 **Arrays work** — literals, indexing, writing, growing past the end, `length`, and computed
 keys that are not indices falling back to ordinary properties. Elements live beside the
 property slots rather than in them, so a thousand-element array does not make a thousand
@@ -47,7 +55,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1041 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1049 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure
