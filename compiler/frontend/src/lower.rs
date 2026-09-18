@@ -947,7 +947,7 @@ impl Lowering {
     /// implementation that stored them on the instance would work until someone compared two
     /// objects' methods for identity, or counted `Object.keys`.
     fn class(&mut self, class: &oxc_ast::ast::Class<'_>, name: &str) -> ValueId {
-        if class.super_class.is_some() {
+        if class.heritage.is_some() {
             // `extends` needs the prototype chain wired through the parent *and* `super`
             // resolved inside methods. Half of that would produce a class that constructs and
             // then fails its first inherited call.

@@ -6,7 +6,7 @@ subset to object code for all four targets, and `crisol-abi` defines the symbols
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 948 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 958 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure
@@ -1693,6 +1693,21 @@ ABI defines them by name, and nothing connects the two until a linker runs — a
 through every compiler test, since the object file still builds with an undefined symbol in it.
 `SYMBOLS` is the defining list, `helper_symbols()` exposes what the backend emits, and a test
 compares them; verified by introducing a typo and watching it fail.
+
+### Running the generated code
+
+`Jit` compiles into this process's memory and hands back a callable address (D-88), because
+**every codegen test before it checked that a function compiled and none checked what it
+returned**. `6 / 3` compiling says nothing about whether it yields `2`.
+
+Three assertions can be made no other way: `1e10 | 0` returns `1410065408` (a saturating
+conversion gives `i32::MAX` — a number, and the wrong one, indistinguishable by inspecting the
+object file); `NaN === NaN` is false and `+0 === -0` is true; and a branch takes the right arm,
+with the other arm also returning a number so a wrong branch is plausible rather than a crash.
+
+Helpers are registered **by the caller** from `crisol-abi`, which keeps the backend free of a
+dependency on its own runtime and turns the symbol check from a list comparison into something
+that fails to *resolve* when a name is wrong.
 
 **Still ahead for M13's acceptance:** actually linking and running a binary, and GC stress.
 unary, logical, conditional and array literals. array *methods*, then the Cranelift backend.
