@@ -437,8 +437,8 @@ fn a_safepoint_reports_where_live_values_sit() {
     ];
     entry.terminator = Terminator::Return(Some(after));
 
-    let mut backend = crisol_codegen::Cranelift::new("aarch64-apple-darwin").expect("target");
-    let report = crisol_codegen::Backend::compile(&mut backend, &function).expect("compiles");
+    let mut backend = Cranelift::new("aarch64-apple-darwin").expect("target");
+    let report = backend.compile(&function).expect("compiles");
     assert_eq!(report.safepoints.len(), 1, "one call, one safepoint");
     let map = &report.safepoints[0];
     assert!(
@@ -446,4 +446,66 @@ fn a_safepoint_reports_where_live_values_sit() {
         "the live value needs a frame offset"
     );
     assert!(map.frame_size > 0, "and a frame to be in");
+}
+
+#[test]
+fn the_object_carries_a_stack_map_table() {
+    // The table a compiled program's collector reads. It is emitted as a data symbol with a
+    // relocation per row, because nothing here knows where the code will land — the same job
+    // Go's linker does for `pclntab`.
+    let mut function = Function::new("mapped");
+    let kept = function.value();
+    let called = function.value();
+    let after = function.value();
+    let entry = function.get_mut(BlockId::ENTRY).expect("entry");
+    entry.instructions = vec![
+        number(kept, 1.0),
+        Instruction {
+            result: Some(called),
+            ty: Type::Unknown,
+            op: Op::Binary {
+                op: BinaryOp::Add,
+                left: kept,
+                right: kept,
+            },
+            safepoint: Some(Safepoint { live: vec![kept] }),
+        },
+        Instruction {
+            result: Some(after),
+            ty: Type::Number,
+            op: Op::Binary {
+                op: BinaryOp::Multiply,
+                left: kept,
+                right: called,
+            },
+            safepoint: None,
+        },
+    ];
+    entry.terminator = Terminator::Return(Some(after));
+
+    let mut backend = host();
+    let report = backend.compile(&function).expect("compiles");
+    assert!(
+        !report.safepoints.is_empty(),
+        "the function has a safepoint"
+    );
+
+    let object = backend.finish().expect("emits");
+    let needle = crisol_codegen::STACK_MAP_SYMBOL.as_bytes();
+    assert!(
+        object.windows(needle.len()).any(|window| window == needle),
+        "the object should export {}",
+        crisol_codegen::STACK_MAP_SYMBOL
+    );
+}
+
+#[test]
+fn a_program_with_no_safepoints_still_emits_a_table() {
+    // An empty table rather than a missing symbol: the runtime looks the symbol up
+    // unconditionally, and "absent" and "empty" would need different handling for no reason.
+    let mut backend = host();
+    let _ = backend.compile(&returns_constant(1.0)).expect("compiles");
+    let object = backend.finish().expect("emits");
+    let needle = crisol_codegen::STACK_MAP_SYMBOL.as_bytes();
+    assert!(object.windows(needle.len()).any(|window| window == needle));
 }

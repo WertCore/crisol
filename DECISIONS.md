@@ -2726,3 +2726,53 @@ understand produces a binary that runs and is wrong.
 **One of the four.** The pipeline is real and the coverage is not there yet, and saying
 "M13's acceptance path works" without that table would be the more flattering sentence and the
 less true one.
+
+---
+
+## D-90 — The stack map table, and why it is flat
+
+**Status:** Accepted (M13) · **Affects:** M13, M9
+
+A precise collector needs to know, at the instant it runs, where every live reference is. Rust
+code says so by pushing onto a shadow stack; **compiled machine code cannot** — its values are
+in registers and frame slots, with no list anywhere. That is what a stack map is for, and
+without one a collection during compiled code would free values still in use: §3.1's exact
+failure.
+
+D-87 recorded that `cranelift-object` does not write stack maps into a section. That is true of
+the *writer* and not of the information: `MachBufferFinalized::user_stack_maps()` is public and
+yields `(code_offset, frame_size, map)`. Carrying it across is this crate's job — the same job
+Go's linker does for `pclntab`.
+
+**Cranelift spills every live value to the frame before a safepoint.** That is the detail that
+makes this tractable: the collector reads stack slots and nothing else, so no register maps are
+needed. Go needed those too, but only once it began preempting goroutines *mid-function*
+(1.14). Safepoints at calls and allocations stay in the simpler regime.
+
+### Flat, one row per live value
+
+`{ function address, code offset, frame offset }`, sixteen bytes, repeated. Not a nested
+structure with per-safepoint length prefixes.
+
+It costs a few bytes. What it buys is that **the runtime reading this table will be walking a
+stack while the heap is mid-collection**, which is the worst imaginable place for a
+length-prefix parser to be subtly wrong. A flat table needs no parsing at all.
+
+The function address is a **relocation** — nothing at compile time knows where the code will
+land, so the linker fills it in.
+
+**Little-endian is written explicitly** rather than using native byte order. The object is for
+the *target*, which need not be the host. All four targets are little-endian today, so this
+cannot currently be observed — which is precisely what would make it a miserable bug to find
+later.
+
+An empty table is emitted for a program with no safepoints, rather than omitting the symbol:
+the runtime looks it up unconditionally, and "absent" and "empty" would otherwise need
+different handling for no reason.
+
+### Still ahead
+
+The table exists in the linked binary — verified with `nm`, not assumed. What remains is the
+runtime side: walking native frames to find return addresses, matching them against the table,
+and reading the live slots. Until that lands, collection during compiled code is still unsafe,
+and §M13's GC stress requirement is not met.

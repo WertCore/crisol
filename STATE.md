@@ -1725,6 +1725,28 @@ control flow and locals work end to end; closures, classes and array methods do 
 `Op::Closure`, `Op::Construct` and `Op::CreateArray` are not lowered. One of four. The pipeline
 is real and the coverage is not there yet.
 
+### Stack maps: the table is emitted
+
+A precise collector must know where every live reference is. Rust code says so via a shadow
+stack; **compiled code cannot** — its values sit in registers and frame slots with no list
+anywhere (D-90). The maps are now read out of the compiled buffer and written into the object
+as `crisol_stack_maps`, with a relocation per row so the linker fills in each function's
+address — the same job Go's linker does for `pclntab`.
+
+D-87 said `cranelift-object` does not write stack maps into a section. True of the *writer*,
+not of the information: `user_stack_maps()` is public, and carrying it across is our job.
+
+**Cranelift spills every live value to the frame before a safepoint**, so the collector reads
+stack slots and nothing else — no register maps. Go needed those only once it began preempting
+goroutines mid-function.
+
+The table is **flat**, one row per live value: the runtime reads it while walking a stack
+mid-collection, which is the worst place for a length-prefix parser to be subtly wrong.
+
+**What remains:** walking native frames, matching return addresses against the table, and
+reading the live slots. Until then, collection during compiled code is unsafe and §M13's GC
+stress requirement is unmet.
+
 **Still ahead for M13's acceptance:** actually linking and running a binary, and GC stress.
 
 ### `this`, and a receiver the snapshot had been blessing

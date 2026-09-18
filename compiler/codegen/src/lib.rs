@@ -153,6 +153,9 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
     (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
 ];
 
+/// The symbol holding the stack map table a compiled program's collector reads.
+pub const STACK_MAP_SYMBOL: &str = "crisol_stack_maps";
+
 /// Reads the safepoint tables out of a compiled function.
 ///
 /// Read after compilation rather than from the IR, because the offsets only exist once
@@ -191,6 +194,9 @@ pub fn helper_symbols() -> Vec<&'static str> {
 /// machine code.
 pub struct Cranelift {
     triple: String,
+    /// One row per live value at one safepoint, accumulated until [`Backend::finish`] can
+    /// write them out with relocations.
+    rows: Vec<(cranelift_module::FuncId, u32, u32)>,
     module: ObjectModule,
     context: FunctionBuilderContext,
     /// The runtime helpers, one per operator that cannot be a native instruction.
@@ -274,10 +280,65 @@ impl Cranelift {
 
         Ok(Self {
             triple: triple.to_owned(),
+            rows: Vec::new(),
             module,
             context: FunctionBuilderContext::new(),
             helpers,
         })
+    }
+}
+
+impl Cranelift {
+    /// Writes the stack map table into the object as a data symbol.
+    ///
+    /// **One row per live value per safepoint**, flat, rather than a nested structure with
+    /// variable-length lists. A flat table costs a few bytes and needs no length-prefix parsing
+    /// in the runtime — and the runtime reading it will be walking a stack at a moment when the
+    /// heap is mid-collection, which is the worst possible place for a parser bug.
+    ///
+    /// The function address in each row is a **relocation**: the linker fills it in, because
+    /// nothing here knows where the code will land. That is the same job Go's linker does for
+    /// `pclntab`.
+    ///
+    /// Little-endian is written explicitly rather than using native byte order: the object is
+    /// for the *target*, which need not be the host. All four targets are little-endian today,
+    /// so this cannot currently be observed — which is exactly why it would be a difficult bug
+    /// to find later.
+    fn emit_stack_map_table(&mut self) -> Result<(), CodegenError> {
+        let mut description = cranelift_module::DataDescription::new();
+        let count = u64::try_from(self.rows.len()).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(8 + self.rows.len() * 16);
+        bytes.extend_from_slice(&count.to_le_bytes());
+
+        // The function addresses are written as zeroes and then relocated; the offsets are
+        // known now.
+        let mut relocations = Vec::with_capacity(self.rows.len());
+        for (index, (function, code_offset, frame_offset)) in self.rows.iter().enumerate() {
+            let at = 8 + index * 16;
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes.extend_from_slice(&code_offset.to_le_bytes());
+            bytes.extend_from_slice(&frame_offset.to_le_bytes());
+            relocations.push((u32::try_from(at).unwrap_or(u32::MAX), *function));
+        }
+
+        description.define(bytes.into_boxed_slice());
+        for (at, function) in relocations {
+            let reference = self.module.declare_func_in_data(function, &mut description);
+            description.write_function_addr(at, reference);
+        }
+
+        let id = self
+            .module
+            .declare_data(STACK_MAP_SYMBOL, Linkage::Export, false, false)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        self.module
+            .define_data(id, &description)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        Ok(())
     }
 }
 
@@ -343,13 +404,19 @@ impl Backend for Cranelift {
                 message: error.to_string(),
             })?;
         let safepoints = read_safepoints(&context);
+        for map in &safepoints {
+            for offset in &map.live_offsets {
+                self.rows.push((id, map.code_offset, *offset));
+            }
+        }
         Ok(Report {
             safepoints,
             stack_map_entries,
         })
     }
 
-    fn finish(self) -> Result<Vec<u8>, CodegenError> {
+    fn finish(mut self) -> Result<Vec<u8>, CodegenError> {
+        self.emit_stack_map_table()?;
         self.module
             .finish()
             .emit()
