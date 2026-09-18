@@ -3553,3 +3553,37 @@ from "there and not writable".
 
 **Not done: accessors.** A descriptor with `get` or `set` is ignored rather than refused, which
 is the one part of this that fails quietly. Recorded here rather than left to be found.
+
+## D-117
+
+**`delete` marks a tombstone rather than reshaping the object.**
+
+Status: Accepted
+
+Removing a property from a shape leaves an object whose layout no longer matches the chain
+describing it. A production engine answers that by abandoning shapes for a dictionary. This
+marks the slot instead: the shape still names it, and a tombstone says it is gone.
+
+The cost is that the slot stays allocated and every read of a once-deleted property pays a
+lookup. The benefit is one representation rather than two, and re-assigning a deleted property
+revives it — the shape already names the slot, so clearing the tombstone is the whole operation.
+The value is cleared when the tombstone is set, or the collector would keep whatever it pointed
+at alive for as long as the object lived.
+
+**`delete` asks whether the property is gone afterwards, not whether it removed anything.** A
+property that was never there answers `true`. Only a non-configurable one answers `false`, and
+it answers rather than throwing, which is sloppy mode — the only mode here. `delete` on
+something that is not a property access is `true` and does nothing.
+
+One operation covers `delete o.x` and `delete o[k]`: the frontend makes a string constant for
+the static form rather than the IR carrying two shapes of the same question.
+
+**This uncovered a bug older than itself.** `key_of` returned `None` for a **string** key,
+because it was written before strings existed and never revisited. So `o["a"]` silently did
+nothing — a computed read answered `undefined` and a computed write was discarded, neither
+saying a word. Only a number key worked, which is why every array test passed over it.
+
+**Consequence:** the two side tables are `Option<Box<…>>` rather than inline collections.
+Clippy objects to boxing a collection and is right in general; here the point is the *inline*
+size, which every cell in the heap pays for including the free ones — eight bytes against
+forty-eight, twice. The allocation happens only for an object that has attributes or deletions.

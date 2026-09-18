@@ -1752,3 +1752,109 @@ fn a_descriptor_for_a_missing_property_is_undefined() {
         "undefined",
     );
 }
+
+// ---- delete -----------------------------------------------------------------------------
+
+#[test]
+fn delete_removes_a_property() {
+    check(
+        "delete-prop",
+        "let o = {a: 1}; delete o.a; return o.a;",
+        "undefined",
+    );
+    check(
+        "delete-keys",
+        "let o = {a: 1, b: 2}; delete o.a; return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "delete-computed",
+        "let o = {a: 1}; delete o[\"a\"]; return o.a;",
+        "undefined",
+    );
+}
+
+/// **`delete` asks whether the property is gone afterwards, not whether it removed anything**,
+/// so one that was never there answers `true`.
+#[test]
+fn delete_answers_true_for_something_that_was_never_there() {
+    check("delete-absent", "let o = {}; return delete o.nope;", "true");
+    check(
+        "delete-present",
+        "let o = {a: 1}; return delete o.a;",
+        "true",
+    );
+}
+
+/// **A non-configurable property answers `false`** rather than throwing, outside strict mode.
+#[test]
+fn delete_refuses_a_non_configurable_property() {
+    check(
+        "delete-nonconfigurable",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); return delete o.x;",
+        "false",
+    );
+    check(
+        "delete-nonconfigurable-kept",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); delete o.x; return o.x;",
+        "1",
+    );
+    check(
+        "delete-configurable",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
+         return delete o.x;",
+        "true",
+    );
+}
+
+/// The shape still names the slot, so re-assigning must bring the property back.
+#[test]
+fn a_deleted_property_can_be_assigned_again() {
+    check(
+        "delete-revive",
+        "let o = {a: 1}; delete o.a; o.a = 2; return o.a;",
+        "2",
+    );
+    check(
+        "delete-revive-keys",
+        "let o = {a: 1}; delete o.a; o.a = 2; return Object.keys(o).length;",
+        "1",
+    );
+}
+
+/// **`delete` on anything that is not a property access is `true`** and does nothing.
+#[test]
+fn delete_of_a_non_property_is_true() {
+    check("delete-value", "return delete 1;", "true");
+}
+
+#[test]
+fn delete_on_an_array_element() {
+    check(
+        "delete-elem-last",
+        "let a = [1, 2]; delete a[1]; return a.length;",
+        "1",
+    );
+    check(
+        "delete-elem-middle",
+        "let a = [1, 2, 3]; delete a[1]; return a[1];",
+        "undefined",
+    );
+}
+
+/// A string key in computed access. This did nothing at all until strings could be spelled —
+/// a read answered `undefined` and a write was discarded, neither saying a word.
+#[test]
+fn a_string_key_reaches_the_same_property_a_name_does() {
+    check(
+        "string-key-write",
+        "let o = {}; o[\"a\"] = 5; return o.a;",
+        "5",
+    );
+    check("string-key-read", "let o = {a: 7}; return o[\"a\"];", "7");
+    check(
+        "string-key-computed",
+        "let o = {ab: 1}; let k = \"a\" + \"b\"; return o[k];",
+        "1",
+    );
+}

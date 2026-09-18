@@ -70,6 +70,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_report_uncaught",
     "crisol_truthy",
     "crisol_global_load",
+    "crisol_delete",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -1464,7 +1465,10 @@ fn own_keys(object: u64) -> Vec<String> {
             }
         }
         if let Some(shape) = runtime.heap.shape_of(handle) {
-            for (key, _) in runtime.shapes.borrow().properties(shape) {
+            for (key, slot) in runtime.shapes.borrow().properties(shape) {
+                if runtime.heap.is_deleted(handle, slot.index()) {
+                    continue;
+                }
                 names.push(key.as_str().to_owned());
             }
         }
@@ -2096,6 +2100,10 @@ pub unsafe extern "C" fn crisol_property_store(
         };
         if shape != current {
             runtime.heap.transition(handle, shape, width);
+        } else if runtime.heap.is_deleted(handle, slot.index()) {
+            // The shape still names the slot, so the tombstone is the only thing that made it
+            // absent — clearing it is what brings the property back.
+            runtime.heap.set_deleted(handle, slot.index(), false);
         } else if !runtime.heap.attributes_of(handle, slot.index()).writable {
             // **A write to a non-writable property is silently ignored**, not an error —
             // outside strict mode, which is the only mode there is here. Only an existing
@@ -2173,6 +2181,7 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
             };
             let found = runtime.shapes.borrow().lookup(shape, &key);
             if let Some(slot) = found
+                && !runtime.heap.is_deleted(object, slot.index())
                 && let Some(value) = runtime.heap.get(object, slot.index())
             {
                 return value.to_bits();
@@ -3306,6 +3315,12 @@ fn as_index(key: Value) -> Option<usize> {
 /// the same in the two languages and a property name that differs by a character is a
 /// different property.
 fn key_of(key: Value) -> Option<PropertyKey> {
+    // **A string key is the ordinary case.** This returned `None` for one until strings
+    // existed, which made `o["a"]` silently do nothing — a computed read answered `undefined`
+    // and a computed write was discarded, neither saying a word.
+    if key.kind() == crisol_value::Kind::String {
+        return text_of(key.to_bits()).map(|text| PropertyKey::new(&text));
+    }
     key.as_number().map_or_else(
         || match key.kind() {
             crisol_value::Kind::Undefined => Some(PropertyKey::new("undefined")),
@@ -3317,8 +3332,8 @@ fn key_of(key: Value) -> Option<PropertyKey> {
                     "false"
                 }))
             }
-            // A string or symbol key needs the runtime's string table, which does not exist.
-            // `None` reads as a missing property, which beats naming the wrong one.
+            // A symbol has no spelling, and `None` reads as a missing property — which beats
+            // naming the wrong one.
             _ => None,
         },
         |number| Some(PropertyKey::new(&number_text(number))),
@@ -3744,4 +3759,67 @@ fn raise(message: &str, kind: &str) -> u64 {
         with_runtime(|runtime| runtime.define(handle, "name", Value::from_bits(name)));
     });
     crisol_throw(error)
+}
+
+/// `delete object[key]`.
+///
+/// **Answers `true` for a property that was never there.** `delete` asks whether the property
+/// is gone afterwards, not whether it removed anything — so only a non-configurable property
+/// answers `false`.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
+    let Some(handle) = handle_of(object) else {
+        return nullish_access(object);
+    };
+    let key_value = Value::from_bits(key);
+
+    // An element is removed by shortening the array when it is the last one, and otherwise left
+    // as `undefined` — a hole and an `undefined` element differ (D-64) and nothing here can say
+    // which it is yet.
+    if let Some(index) = as_index(key_value) {
+        let handled = with_runtime(|runtime| {
+            let Some(count) = runtime.heap.element_count(handle) else {
+                return false;
+            };
+            if index >= count {
+                return true;
+            }
+            if index + 1 == count {
+                runtime.heap.truncate_elements(handle, index);
+            } else {
+                runtime.heap.set_element(handle, index, Value::UNDEFINED);
+            }
+            true
+        });
+        if handled {
+            return Value::TRUE.to_bits();
+        }
+    }
+
+    let Some(name) = key_of(key_value) else {
+        return Value::TRUE.to_bits();
+    };
+    with_runtime(|runtime| {
+        let Some(shape) = runtime.heap.shape_of(handle) else {
+            return Value::TRUE.to_bits();
+        };
+        let Some(slot) = runtime.shapes.borrow().lookup(shape, &name) else {
+            // Never there, so it is gone.
+            return Value::TRUE.to_bits();
+        };
+        if runtime.heap.is_deleted(handle, slot.index()) {
+            return Value::TRUE.to_bits();
+        }
+        if !runtime
+            .heap
+            .attributes_of(handle, slot.index())
+            .configurable
+        {
+            // **Non-configurable answers `false`** rather than throwing, outside strict mode.
+            return Value::FALSE.to_bits();
+        }
+        runtime.heap.set_deleted(handle, slot.index(), true);
+        Value::TRUE.to_bits()
+    })
 }

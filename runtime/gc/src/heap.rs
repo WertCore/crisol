@@ -80,8 +80,28 @@ struct Object {
     /// not describe.
     ///
     /// The cost is that attribute lookup is not shape-cached. The benefit is that an object
-    /// nobody calls `defineProperty` on carries an empty map and pays nothing.
-    attributes: std::collections::HashMap<u32, Attributes>,
+    /// nobody calls `defineProperty` on carries **nothing** — the map is absent, not empty,
+    /// which is eight bytes against the forty-eight an empty `HashMap` occupies inline. Every
+    /// cell in the heap pays for this field, including the free ones.
+    #[expect(
+        clippy::box_collection,
+        reason = "the point is the *inline* size: every cell in the heap carries this field, \
+                  free ones included, and `Option<Box<_>>` is eight bytes against a `HashMap`'s \
+                  forty-eight. The extra allocation happens only for an object that actually \
+                  has attributes."
+    )]
+    attributes: Option<Box<std::collections::HashMap<u32, Attributes>>>,
+    /// Slots a `delete` has removed, though the shape still names them.
+    ///
+    /// **A tombstone rather than a new shape.** Removing a property from a shape means an
+    /// object whose layout no longer matches the chain that describes it, which a real engine
+    /// answers by leaving the shape world entirely for a dictionary. Marking the slot keeps one
+    /// representation, at the price of a lookup on every read of a property that *was* deleted
+    /// — and of the slot staying allocated.
+    ///
+    /// Absent rather than empty, for the same reason as `attributes`.
+    #[expect(clippy::box_collection, reason = "as for `attributes` above")]
+    deleted: Option<Box<std::collections::HashSet<u32>>>,
 }
 
 #[derive(Debug)]
@@ -349,8 +369,8 @@ impl Heap {
         match &cell.state {
             State::Live { object, .. } => object
                 .attributes
-                .get(&slot)
-                .copied()
+                .as_ref()
+                .and_then(|map| map.get(&slot).copied())
                 .unwrap_or(Attributes::DATA),
             State::Free => Attributes::DATA,
         }
@@ -370,9 +390,63 @@ impl Heap {
                 if attributes == Attributes::DATA {
                     // The default is the absence of an entry, so an object returned to it stops
                     // carrying one.
-                    object.attributes.remove(&slot);
+                    if let Some(map) = object.attributes.as_mut() {
+                        map.remove(&slot);
+                    }
                 } else {
-                    object.attributes.insert(slot, attributes);
+                    object
+                        .attributes
+                        .get_or_insert_with(Box::default)
+                        .insert(slot, attributes);
+                }
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// Whether the property in `slot` has been deleted.
+    #[must_use]
+    pub fn is_deleted(&self, handle: GcRef, slot: u32) -> bool {
+        let cells = self.cells.borrow();
+        let Some(cell) = cells.get(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object
+                .deleted
+                .as_ref()
+                .is_some_and(|set| set.contains(&slot)),
+            State::Free => false,
+        }
+    }
+
+    /// Marks the property in `slot` deleted, or brings it back.
+    ///
+    /// Re-assigning a deleted property revives it: the shape still names the slot, so the
+    /// tombstone is the only thing that made it absent.
+    pub fn set_deleted(&self, handle: GcRef, slot: u32, deleted: bool) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                if deleted {
+                    object.deleted.get_or_insert_with(Box::default).insert(slot);
+                    // The value goes too, or the collector keeps whatever it pointed at alive
+                    // for as long as the object lives.
+                    if let Some(existing) = object.slots.get_mut(slot as usize) {
+                        *existing = Value::UNDEFINED;
+                    }
+                } else if let Some(set) = object.deleted.as_mut() {
+                    set.remove(&slot);
                 }
                 true
             }
@@ -734,7 +808,8 @@ impl Heap {
             internals: vec![Value::UNDEFINED; internals],
             elements: None,
             text: None,
-            attributes: std::collections::HashMap::new(),
+            attributes: None,
+            deleted: None,
         };
 
         let handle = match self.free.borrow_mut().pop() {

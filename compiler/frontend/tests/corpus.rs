@@ -334,7 +334,6 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // rather than working. Recorded rather than left silently half-right.
         ("let [a] = [1];", "destructuring declaration"),
         ("let o = { ...{} };", "object spread"),
-        ("let a = delete ({}).x;", "delete operator"),
         // A hole is not `undefined` (D-64) and the IR cannot yet say so, so it is recorded
         // rather than filled in with a value that reads the same and answers `in` differently.
         ("let a = [1, , 3];", "array hole or spread"),

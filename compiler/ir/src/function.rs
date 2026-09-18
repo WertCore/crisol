@@ -301,6 +301,17 @@ pub enum Op {
         /// The name.
         key: PropertyKey,
     },
+    /// `delete object[key]`.
+    ///
+    /// One operation for both spellings, because `delete o.x` and `delete o["x"]` are the same
+    /// thing — the frontend makes a string constant for the static form rather than the IR
+    /// carrying two shapes of the same question.
+    Delete {
+        /// The receiver.
+        object: ValueId,
+        /// The key, as a value.
+        key: ValueId,
+    },
     /// Reads a name that resolves to no binding: a global.
     ///
     /// Distinct from [`Op::Load`] because a global is not a slot — it is a property of an
@@ -434,6 +445,7 @@ impl Op {
                 | Self::PropertyStore { .. }
                 | Self::ComputedLoad { .. }
                 | Self::ComputedStore { .. }
+                | Self::Delete { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -463,7 +475,9 @@ impl Op {
             }
             Self::PropertyLoad { object, .. } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
-            Self::ComputedLoad { object, key } => vec![*object, *key],
+            Self::ComputedLoad { object, key } | Self::Delete { object, key } => {
+                vec![*object, *key]
+            }
             Self::ComputedStore { object, key, value } => vec![*object, *key, *value],
             Self::CreateArray { elements } => elements.clone(),
             Self::Construct { callee, args } => {

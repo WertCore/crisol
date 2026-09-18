@@ -182,6 +182,7 @@ const PENDING_EXCEPTION_SYMBOL: &str = "crisol_pending_exception";
 const CREATE_STRING_SYMBOL: &str = "crisol_create_string";
 const TRUTHY_SYMBOL: &str = "crisol_truthy";
 const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
+const DELETE_SYMBOL: &str = "crisol_delete";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -238,6 +239,8 @@ struct ObjectHelpers<T> {
     truthy: T,
     /// `crisol_global_load(name, length) -> value`
     global_load: T,
+    /// `crisol_delete(object, key) -> boolean`
+    delete: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -335,6 +338,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     global_load.params.push(AbiParam::new(types::I64));
     global_load.returns.push(AbiParam::new(types::I64));
 
+    let mut delete = module.make_signature();
+    delete.params.push(AbiParam::new(types::I64));
+    delete.params.push(AbiParam::new(types::I64));
+    delete.returns.push(AbiParam::new(types::I64));
+
     let mut unary_signature = module.make_signature();
     unary_signature.params.push(AbiParam::new(types::I64));
     unary_signature.returns.push(AbiParam::new(types::I64));
@@ -376,6 +384,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         create_string: declare(CREATE_STRING_SYMBOL, &create_string)?,
         truthy: declare(TRUTHY_SYMBOL, &truthy)?,
         global_load: declare(GLOBAL_LOAD_SYMBOL, &global_load)?,
+        delete: declare(DELETE_SYMBOL, &delete)?,
         unary,
     })
 }
@@ -888,6 +897,9 @@ impl Backend for Cranelift {
             global_load: self
                 .module
                 .declare_func_in_func(self.objects.global_load, &mut context.func),
+            delete: self
+                .module
+                .declare_func_in_func(self.objects.delete, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1504,6 +1516,12 @@ impl Lowering<'_> {
                 }
                 Some(array)
             }
+            Op::Delete { object, key } => {
+                let object = self.value(*object);
+                let key = self.value(*key);
+                let call = self.builder.ins().call(self.objects.delete, &[object, key]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::ComputedLoad { object, key } => {
                 let object = self.value(*object);
                 let key = self.value(*key);
@@ -1931,6 +1949,9 @@ impl Jit {
             global_load: self
                 .module
                 .declare_func_in_func(self.objects.global_load, &mut context.func),
+            delete: self
+                .module
+                .declare_func_in_func(self.objects.delete, &mut context.func),
             unary: self
                 .objects
                 .unary

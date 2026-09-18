@@ -225,6 +225,37 @@ impl Lowering {
         }
     }
 
+    /// `delete o.x` and `delete o[k]`.
+    ///
+    /// **`delete` on anything that is not a property access is `true`** and does nothing —
+    /// `delete 1` and `delete someVariable` are not errors outside strict mode, and answering
+    /// `false` for them would be as wrong as refusing to compile.
+    fn delete(&mut self, unary: &UnaryExpression<'_>) -> ValueId {
+        let (object, key) = match &unary.argument {
+            Expression::StaticMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                // The static name becomes a string constant, so one IR operation covers both
+                // spellings of the same question.
+                let key = self.emit(
+                    Type::String,
+                    Op::Const(Constant::String(member.property.name.to_string())),
+                );
+                (object, key)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                (object, key)
+            }
+            other => {
+                self.expression(other);
+                return self.emit(Type::Bool, Op::Const(Constant::Bool(true)));
+            }
+        };
+        let removed = self.emit(Type::Bool, Op::Delete { object, key });
+        self.propagate(removed)
+    }
+
     /// `i++`, `++i`, `i--`, `--i`.
     ///
     /// **Postfix yields the value from *before* the update and prefix the value after**, which
@@ -1253,10 +1284,7 @@ impl Lowering {
             // does not throw on an undeclared identifier.
             UnaryOperator::Typeof => (UnaryOp::TypeOf, Type::String),
             UnaryOperator::Void => (UnaryOp::Void, Type::Undefined),
-            UnaryOperator::Delete => {
-                self.note("delete operator", unary.span.start);
-                return self.placeholder();
-            }
+            UnaryOperator::Delete => return self.delete(unary),
         };
         let operand = self.expression(&unary.argument);
         self.emit(ty, Op::Unary { op, operand })
