@@ -358,6 +358,20 @@ fn a_function_without_safepoints_declares_none() {
 }
 
 #[test]
+fn every_symbol_the_backend_emits_is_one_the_runtime_defines() {
+    // The backend declares imports by name and `crisol-abi` defines them by name, and
+    // **nothing connects the two until link time**. A typo on either side is silent through
+    // every test in this file — the object file still builds, with an undefined symbol in it —
+    // and fails only when someone tries to produce a binary.
+    for symbol in crisol_codegen::helper_symbols() {
+        assert!(
+            crisol_abi::SYMBOLS.contains(&symbol),
+            "the backend emits {symbol}, which the runtime does not define"
+        );
+    }
+}
+
+#[test]
 fn an_unknown_target_is_refused() {
     let error = Cranelift::new("not-a-real-triple").expect_err("refused");
     assert!(

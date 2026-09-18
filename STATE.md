@@ -1014,7 +1014,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 934 tests passing — 932 plus 2 net in `crisol-codegen`; the `node_modules` and test262 cases skip without their suites
+**Totals:** 948 tests passing — 934 plus 14 in the new `crisol-abi`; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
@@ -1665,6 +1665,28 @@ Three things differed from what the plan implies:
 The stack-map test was first written against a value whose only use *was* the call argument. It
 reported 0 entries, and **the test was wrong, not the backend**: a value whose last use is the
 call argument does not need to survive the collection.
+
+### The runtime ABI, and a contract nothing checked until link time
+
+`crisol-abi` defines the symbols generated code calls (D-87). Until it existed, every object
+file the backend produced referenced **undefined symbols** — "compiles" and "links" were
+separated by a gap nothing measured.
+
+`ToInt32` is why the bitwise operators are calls: the specification wraps **modulo 2³²** and the
+hardware **saturates**, so `1e10 | 0` is `1410065408` in JavaScript and `i32::MAX` as an
+instruction. Both are numbers; only one is right, and there is a test asserting the saturating
+cast gives the other answer so the reason is visible rather than claimed.
+
+A non-numeric operand yields `NaN`, never `0` — returning `0` would make `"5" * 2` evaluate to
+`0` instead of `10`, which looks like arithmetic rather than a gap.
+
+**The symbol contract is checked from both sides.** The backend declares imports by name and the
+ABI defines them by name, and nothing connects the two until a linker runs — a typo is silent
+through every compiler test, since the object file still builds with an undefined symbol in it.
+`SYMBOLS` is the defining list, `helper_symbols()` exposes what the backend emits, and a test
+compares them; verified by introducing a typo and watching it fail.
+
+**Still ahead for M13's acceptance:** actually linking and running a binary, and GC stress.
 
 ### `this`, and a receiver the snapshot had been blessing
 

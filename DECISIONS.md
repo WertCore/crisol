@@ -2598,3 +2598,46 @@ That asymmetry is worth naming: every other kind of mistake in a test file shows
 failure, and this one shows up as a slightly smaller number that nobody is watching. Caught by
 reading the list of test names in the output rather than the pass count, and the count is now
 asserted alongside them.
+
+---
+
+## D-87 — The runtime ABI, and a contract nothing checked until link time
+
+**Status:** Accepted (M13) · **Affects:** M13
+
+`crisol-abi` defines the symbols generated code calls. Until it existed, every object file the
+backend produced referenced undefined symbols, so "compiles" and "links" were separated by a gap
+nothing measured.
+
+Every function takes and returns `u64` — a value NaN-boxed into 64 bits (D-53). No wrapper type
+at the boundary: the caller is machine code with no notion of Rust types, so a
+`#[repr(transparent)]` newtype would be a comment rather than a guarantee.
+
+### `ToInt32` is why the bitwise operators are calls
+
+The specification truncates toward zero and wraps **modulo 2³²**. The hardware's conversion
+**saturates**. So `1e10 | 0` is `1410065408` in JavaScript and `i32::MAX` if lowered as an
+instruction — *both are numbers*, and only one is right. There is a test asserting the correct
+value and asserting that the saturating cast gives a different one, so the reason these are
+calls is visible rather than asserted.
+
+Related, and each with a test: `%` takes the sign of the **dividend** (`-5 % 3` is `-2`, not
+`1`); the shift count is masked to five bits, so `1 << 32` is `1`; and `>>>` is the only shift
+whose result reads as unsigned, which is why `-1 >>> 0` is `4294967295` and it cannot be folded
+in with the other two.
+
+**A non-numeric operand yields `NaN`, never `0`.** Strings need the runtime's string table,
+which does not exist yet. Returning `0` would make `"5" * 2` evaluate to `0` instead of `10` —
+arithmetic that looks like arithmetic, rather than a gap that looks like a gap.
+
+### The symbol contract
+
+The backend declares imports **by name** and this crate defines them **by name**, and nothing
+connects the two until a linker runs. A typo on either side is silent through every compiler
+test — the object file still builds, with an undefined symbol in it — and fails only when
+someone first tries to produce a binary.
+
+So `crisol-abi::SYMBOLS` is the defining list, `crisol_codegen::helper_symbols()` exposes what
+the backend emits, and a test compares them. It was checked by introducing a typo and watching
+it fail, because a test that reads two lists and finds them equal is exactly the kind that can
+pass while comparing nothing.

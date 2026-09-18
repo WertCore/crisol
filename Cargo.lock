@@ -658,6 +658,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crisol-abi"
+version = "0.0.0"
+dependencies = [
+ "crisol-value",
+]
+
+[[package]]
 name = "crisol-async"
 version = "0.0.0"
 
@@ -677,6 +684,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-module",
  "cranelift-object",
+ "crisol-abi",
  "crisol-ir",
  "crisol-value",
  "target-lexicon",
