@@ -49,6 +49,10 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_property_store",
     "crisol_property_load",
     "crisol_closure_capture",
+    "crisol_create_closure",
+    "crisol_closure_set_capture",
+    "crisol_closure_code",
+    "crisol_not_a_function",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -717,8 +721,136 @@ pub extern "C" fn crisol_closure_capture(closure: u64, index: u64) -> u64 {
     with_runtime(|runtime| {
         runtime
             .heap
-            .get(handle, index)
+            .get(handle, index + CLOSURE_CAPTURES_AT)
             .unwrap_or(Value::UNDEFINED)
             .to_bits()
     })
+}
+
+/// Where a closure's captures begin, in slots.
+///
+/// Slot zero holds which function the closure runs, so captures start at one. The index is
+/// stored rather than the code address because a code address does not fit a NaN-boxed value's
+/// 48-bit payload on every platform, and a heap slot holds a `Value`.
+const CLOSURE_CAPTURES_AT: u32 = 1;
+
+/// Every compiled function's entry point, indexed by `FunctionId`.
+///
+/// Registered by the program at startup for the same reason the stack map table is: only the
+/// linker knows where the code landed, and an `extern` reference here would make this crate
+/// fail to link anywhere the symbol does not exist — including its own tests.
+static mut FUNCTIONS: &[*const u8] = &[];
+
+/// Hands the runtime the addresses of the program's compiled functions.
+///
+/// # Safety
+///
+/// `table` must point to `count` function addresses that outlive the program, indexed by
+/// `FunctionId`. Called once, before any compiled code runs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crisol_register_functions(table: *const *const u8, count: u64) {
+    let count = usize::try_from(count).unwrap_or(0);
+    let rows: &'static [*const u8] = if table.is_null() || count == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller promises `count` addresses at `table`, living as long as the
+        // program.
+        unsafe { std::slice::from_raw_parts(table, count) }
+    };
+    // SAFETY: written once before any compiled code runs, and read-only afterwards.
+    unsafe { FUNCTIONS = rows };
+    if std::env::var_os("CRISOL_DEBUG_STACK_MAPS").is_some() {
+        eprintln!("crisol: registered {} functions", rows.len());
+    }
+}
+
+/// Allocates a closure over `function`, with room for `captures` captured values.
+///
+/// The captures arrive afterwards through [`crisol_closure_set_capture`] rather than here,
+/// because a variadic C call would have to agree with the backend about how the arguments were
+/// passed — and the two only meet at link time, where a disagreement is silent.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_create_closure(function: u64, captures: u64) -> u64 {
+    let captures = usize::try_from(captures).unwrap_or(0);
+    with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        let scope = runtime.heap.scope();
+        let closure = scope.alloc(shape, captures + CLOSURE_CAPTURES_AT as usize);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a function index is far below 2^53"
+        )]
+        let index = Value::number(function as f64);
+        runtime.heap.set(closure.handle(), 0, index);
+        closure.to_value().to_bits()
+    })
+}
+
+/// Writes one of a closure's captured values.
+#[unsafe(no_mangle)]
+pub extern "C" fn crisol_closure_set_capture(closure: u64, index: u64, value: u64) {
+    let Some(handle) = handle_of(closure) else {
+        return;
+    };
+    let Ok(index) = u32::try_from(index) else {
+        return;
+    };
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .set(handle, index + CLOSURE_CAPTURES_AT, Value::from_bits(value));
+    });
+}
+
+/// Calling something that is not a function.
+///
+/// `let x = 5; x();` is a `TypeError`, and throwing needs the unwinding path M13 does not have
+/// yet. Until then this returns `undefined` — but the important part is that it *exists*: it
+/// gives [`crisol_closure_code`] a real address to hand back, so a bad callee costs a wasted
+/// call instead of a jump through a null pointer.
+///
+/// It takes the uniform convention's five operands because it stands in for a compiled
+/// function and is called exactly like one. When exceptions land, this is where the `TypeError`
+/// is raised, and no call site has to change.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_not_a_function(
+    _closure: u64,
+    _this: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    Value::UNDEFINED.to_bits()
+}
+
+/// The machine code a closure runs.
+///
+/// Never null. A value that is not a closure, or one naming a function outside the registered
+/// table, yields [`crisol_not_a_function`] — so the caller can jump to whatever this returns
+/// without checking, and a wrong callee is a defined outcome rather than a segmentation fault.
+/// Putting the check here rather than at every call site costs nothing at all on the hot path.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
+    let fallback: extern "C" fn(u64, u64, u64, u64, *const u64) -> u64 = crisol_not_a_function;
+    let fallback = fallback as *const u8;
+
+    let Some(handle) = handle_of(closure) else {
+        return fallback;
+    };
+    let index = with_runtime(|runtime| runtime.heap.get(handle, 0).and_then(|v| v.as_number()));
+    let Some(index) = index else {
+        return fallback;
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a function index is a small non-negative integer by construction"
+    )]
+    let index = index as usize;
+    // SAFETY: written once by `crisol_register_functions` before any compiled code runs.
+    let functions = unsafe { FUNCTIONS };
+    functions.get(index).copied().unwrap_or(fallback)
 }

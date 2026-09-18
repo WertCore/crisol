@@ -189,6 +189,8 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
             // The `undefined` bit pattern is interpolated from the Rust constant rather than
             // written out here, so the NaN-box layout stays in one place.
             "extern unsigned long long crisol_stack_maps[];\n\
+             extern unsigned long long crisol_functions[];\n\
+             extern void crisol_register_functions(const void *table, unsigned long long count);\n\
              extern void crisol_register_stack_maps(const void *rows, unsigned long long count);\n\
              extern unsigned long long crisol_program(unsigned long long closure,\n\
                  unsigned long long this_value, unsigned long long new_target,\n\
@@ -197,6 +199,7 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
              int main(void) {{\n\
                  unsigned long long argv[{slots}] = {{ {undefined}ULL }};\n\
                  crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
+                 crisol_register_functions(&crisol_functions[1], crisol_functions[0]);\n\
                  crisol_print(crisol_program(0ULL, {undefined}ULL, {undefined}ULL, 0ULL, argv));\n\
                  return 0;\n\
              }}\n",

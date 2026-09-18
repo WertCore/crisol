@@ -213,3 +213,98 @@ fn this_at_the_top_level_is_undefined() {
     // explicitly, so this checks the value actually arrives rather than defaulting.
     check("this-toplevel", "return this;", "undefined");
 }
+
+// ---- closures and calls ----------------------------------------------------------------
+
+#[test]
+fn a_function_can_be_called() {
+    check(
+        "call-simple",
+        "let f = function (a, b) { return a + b; }; return f(2, 3);",
+        "5",
+    );
+}
+
+#[test]
+fn a_closure_reads_what_it_captured() {
+    // The capture path end to end: `n` lives in the enclosing frame, is copied into the
+    // closure at creation, and is read back out through the callee's prologue.
+    check(
+        "call-capture",
+        "let n = 10; let add = function (x) { return x + n; }; return add(5);",
+        "15",
+    );
+}
+
+#[test]
+fn a_missing_argument_is_undefined_not_an_error() {
+    // The guarded load in the prologue. `b` was never passed, so `a + b` is `NaN` — which is
+    // the specification's answer, and is what distinguishes it from reading stack garbage.
+    check(
+        "call-missing-arg",
+        "let f = function (a, b) { return a + b; }; return f(1);",
+        "NaN",
+    );
+}
+
+#[test]
+fn extra_arguments_are_ignored() {
+    check(
+        "call-extra-args",
+        "let f = function (a) { return a; }; return f(7, 8, 9);",
+        "7",
+    );
+}
+
+#[test]
+fn calling_something_that_is_not_a_function_does_not_crash() {
+    // `5()` is a TypeError, which needs a throw path M13 does not have. What must not happen
+    // is a jump through a null pointer, so the runtime hands back a real fallback instead.
+    check("call-non-function", "let x = 5; return x();", "undefined");
+}
+
+#[test]
+fn a_callback_passed_as_a_value_is_reached_indirectly() {
+    // The case the whole convention exists for: `apply` has no idea which function it holds.
+    check(
+        "call-callback",
+        "let twice = function (f, v) { return f(f(v)); }; \
+         let inc = function (x) { return x + 1; }; return twice(inc, 5);",
+        "7",
+    );
+}
+
+/// Closures allocate, so every one of them is a collection under stress — and a closure is
+/// reachable only from a compiled frame and from its own captures. If the captures were not
+/// traced, or the closure itself were not rooted, this returns garbage or crashes.
+#[test]
+fn closures_and_captures_survive_a_collection_at_every_allocation() {
+    let source = "let n = 10; \
+                  let add = function (x) { return x + n; }; \
+                  let twice = function (f, v) { return f(f(v)); }; \
+                  return twice(add, 1);";
+    let Some(relaxed) = build_and_run("closure-stress-off", source) else {
+        return;
+    };
+    assert_eq!(relaxed, "21");
+
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-closure-stress-on");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("it should build");
+
+    let output = Command::new(&binary)
+        .env("CRISOL_GC_STRESS", "1")
+        .output()
+        .expect("run the binary");
+    assert!(output.status.success(), "it must not crash under stress");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "21",
+        "a captured value must survive collection"
+    );
+}

@@ -2954,3 +2954,39 @@ cannot say which slots can hold references. Narrowing that is the larger win.
 slot that is — depending on "slot zero by construction" would couple the two silently, so
 binding it needs a field on `Function`. Until then a program reading `this` will not compile,
 which is the honest failure rather than a wrong value.
+
+## D-95
+
+**A closure holds its function's *index*, and the program registers a table of addresses.**
+
+Status: Accepted
+
+A closure has to say which code it runs. The obvious thing is to store the code address, and it
+does not fit: a heap slot holds a `Value`, and a NaN-boxed value's payload is 48 bits, which is
+not a promise every platform's code addresses keep. So slot zero holds the `FunctionId` as an
+ordinary number and the captures follow it.
+
+Turning that index into an address needs a table, and only the linker knows where the code
+landed — the same problem the stack map table has, solved the same way (D-90): the object
+carries a data symbol of relocated function addresses, and the C entry point hands it to the
+runtime before anything runs.
+
+**`crisol_closure_code` never returns null.** A value that is not a closure, or an index outside
+the table, yields `crisol_not_a_function` — a real function with the uniform signature that
+returns `undefined`. `5()` is a `TypeError` and throwing needs a path M13 does not have, but
+the important part is that a bad callee costs a wasted call rather than a jump through a null
+pointer. Putting the check in the runtime rather than at every call site costs nothing on the
+hot path, and when exceptions land that helper is where the `TypeError` is raised, with no call
+site changing.
+
+**Symbols are named from the id, not the source name.** Source names are neither unique nor
+valid identifiers: two `function (x) {…}` expressions are both "anonymous", a method is
+"C.method", a temporary is " tmp0". Naming symbols after them made a two-anonymous-function
+program fail to link with a duplicate-symbol error — and two functions sharing a *source* name
+would have been worse, because one would have silently won. Function zero keeps the name the C
+entry point calls; the rest carry their source name only as a readable suffix.
+
+**Consequence:** captures are written one at a time after the allocation rather than passed to
+it. A variadic call would need the backend and the runtime to agree on argument layout, and
+those two meet only at link time, where a disagreement is silent. The cost is a call per
+capture at closure creation, which is not the hot path — calling the closure is.

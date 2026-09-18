@@ -13,6 +13,12 @@ call site does not need to know which function it is reaching — the prerequisi
 classes and array methods. `this` is bound to the slot the function names, and a function
 knows its own `FunctionId` so a closure can be resolved without relying on compile order.
 
+**Closures and calls work.** A function can be called, a closure reads what it captured, a
+missing argument is `undefined` and an extra one is ignored, and a callback passed as a value
+is reached indirectly — `twice(inc, 5)` compiles to a native binary and prints `7`. Calling a
+non-function returns `undefined` rather than crashing (D-95). All of it holds under
+`CRISOL_GC_STRESS=1`.
+
 `CRISOL_GC_STRESS=1` collects on every allocation and is the only thing that tests any of
 this: with the offsets read from the wrong end of the frame, every acceptance test still
 printed the right answer, because none of them allocated enough to collect at all. That is what unblocks allocation in compiled code — until the
@@ -22,7 +28,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1006 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1013 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

@@ -167,6 +167,12 @@ const CREATE_OBJECT_SYMBOL: &str = "crisol_create_object";
 const PROPERTY_STORE_SYMBOL: &str = "crisol_property_store";
 const PROPERTY_LOAD_SYMBOL: &str = "crisol_property_load";
 const CLOSURE_CAPTURE_SYMBOL: &str = "crisol_closure_capture";
+const CREATE_CLOSURE_SYMBOL: &str = "crisol_create_closure";
+const SET_CAPTURE_SYMBOL: &str = "crisol_closure_set_capture";
+const CLOSURE_CODE_SYMBOL: &str = "crisol_closure_code";
+
+/// The symbol holding the addresses of the program's compiled functions.
+pub const FUNCTION_TABLE_SYMBOL: &str = "crisol_functions";
 
 /// The runtime entry points objects and closures need, as declared in a module.
 #[derive(Clone, Copy, Debug)]
@@ -179,6 +185,12 @@ struct ObjectHelpers<T> {
     load: T,
     /// `crisol_closure_capture(closure, index) -> value`
     capture: T,
+    /// `crisol_create_closure(function, captures) -> closure`
+    create_closure: T,
+    /// `crisol_closure_set_capture(closure, index, value)`
+    set_capture: T,
+    /// `crisol_closure_code(closure) -> address`
+    code: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -211,6 +223,20 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     capture.params.push(AbiParam::new(types::I64));
     capture.returns.push(AbiParam::new(types::I64));
 
+    let mut create_closure = module.make_signature();
+    create_closure.params.push(AbiParam::new(types::I64));
+    create_closure.params.push(AbiParam::new(types::I64));
+    create_closure.returns.push(AbiParam::new(types::I64));
+
+    let mut set_capture = module.make_signature();
+    set_capture.params.push(AbiParam::new(types::I64));
+    set_capture.params.push(AbiParam::new(types::I64));
+    set_capture.params.push(AbiParam::new(types::I64));
+
+    let mut code = module.make_signature();
+    code.params.push(AbiParam::new(types::I64));
+    code.returns.push(AbiParam::new(pointer));
+
     let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
         module
             .declare_function(symbol, Linkage::Import, signature)
@@ -223,6 +249,9 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         store: declare(PROPERTY_STORE_SYMBOL, &store)?,
         load: declare(PROPERTY_LOAD_SYMBOL, &load)?,
         capture: declare(CLOSURE_CAPTURE_SYMBOL, &capture)?,
+        create_closure: declare(CREATE_CLOSURE_SYMBOL, &create_closure)?,
+        set_capture: declare(SET_CAPTURE_SYMBOL, &set_capture)?,
+        code: declare(CLOSURE_CODE_SYMBOL, &code)?,
     })
 }
 
@@ -238,6 +267,28 @@ fn push_fixed_params(signature: &mut cranelift_codegen::ir::Signature, pointer: 
     signature.params.push(AbiParam::new(types::I64)); // argc
     signature.params.push(AbiParam::new(pointer)); // argv
     debug_assert_eq!(signature.params.len(), FIXED_PARAMS);
+}
+
+/// The linker symbol for a function.
+///
+/// Derived from the id, not the name. Source names are neither unique nor valid identifiers:
+/// two `function (x) {...}` expressions are both "anonymous", a method is "C.method", and a
+/// compiler temporary is " tmp0". Naming symbols after them made a program with two anonymous
+/// functions fail to compile with a duplicate-symbol error — and a program with two functions
+/// of the *same* source name would have been worse, because one would silently win.
+///
+/// Function zero keeps the name the C entry point calls. The rest carry their source name only
+/// as a suffix, so a disassembly is still readable.
+fn symbol_name(function: &Function) -> String {
+    if function.id.index() == 0 {
+        return function.name.clone();
+    }
+    let readable: String = function
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("crisol_fn{}_{readable}", function.id.index())
 }
 
 /// Every property key a function names, in the order first seen.
@@ -376,6 +427,11 @@ pub struct Cranelift {
     objects: ObjectHelpers<cranelift_module::FuncId>,
     /// Property keys already emitted as data, so a key used twice is one constant.
     keys: HashMap<String, cranelift_module::DataId>,
+    /// Each compiled function against the `FunctionId` it answers to.
+    ///
+    /// Kept by id rather than by compile order: `finish` writes them into a table the runtime
+    /// indexes with the id a closure carries, so the two have to agree on more than sequence.
+    functions: Vec<(u32, cranelift_module::FuncId)>,
 }
 
 impl std::fmt::Debug for Cranelift {
@@ -467,6 +523,7 @@ impl Cranelift {
             helpers,
             objects,
             keys: HashMap::new(),
+            functions: Vec::new(),
         })
     }
 }
@@ -487,6 +544,50 @@ impl Cranelift {
     /// for the *target*, which need not be the host. All four targets are little-endian today,
     /// so this cannot currently be observed — which is exactly why it would be a difficult bug
     /// to find later.
+    /// Writes the addresses of the compiled functions into the object as a data symbol.
+    ///
+    /// Indexed by `FunctionId`, because that is what a closure carries. A gap — an id nothing
+    /// compiled — stays zero rather than being left out, so the index still lines up; the
+    /// runtime turns a zero entry into `crisol_not_a_function`, which makes a hole a defined
+    /// outcome rather than a jump to address zero.
+    ///
+    /// Same layout as the stack map table: element zero is the count, the rows follow.
+    fn emit_function_table(&mut self) -> Result<(), CodegenError> {
+        let width = self
+            .functions
+            .iter()
+            .map(|(index, _)| *index as usize + 1)
+            .max()
+            .unwrap_or(0);
+
+        let mut description = cranelift_module::DataDescription::new();
+        let mut bytes = Vec::with_capacity(8 + width * 8);
+        bytes.extend_from_slice(&(width as u64).to_le_bytes());
+        bytes.extend_from_slice(&vec![0u8; width * 8]);
+        description.define(bytes.into_boxed_slice());
+
+        for (index, function) in &self.functions {
+            let at = 8 + *index as usize * 8;
+            let reference = self
+                .module
+                .declare_func_in_data(*function, &mut description);
+            description.write_function_addr(u32::try_from(at).unwrap_or(u32::MAX), reference);
+        }
+
+        let id = self
+            .module
+            .declare_data(FUNCTION_TABLE_SYMBOL, Linkage::Export, false, false)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        self.module
+            .define_data(id, &description)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+
     fn emit_stack_map_table(&mut self) -> Result<(), CodegenError> {
         let mut description = cranelift_module::DataDescription::new();
         let count = u64::try_from(self.rows.len()).unwrap_or(0);
@@ -533,7 +634,7 @@ impl Backend for Cranelift {
 
         let id = self
             .module
-            .declare_function(&function.name, Linkage::Export, &signature)
+            .declare_function(&symbol_name(function), Linkage::Export, &signature)
             .map_err(|error| CodegenError::Backend {
                 message: error.to_string(),
             })?;
@@ -581,8 +682,24 @@ impl Backend for Cranelift {
             capture: self
                 .module
                 .declare_func_in_func(self.objects.capture, &mut context.func),
+            create_closure: self
+                .module
+                .declare_func_in_func(self.objects.create_closure, &mut context.func),
+            set_capture: self
+                .module
+                .declare_func_in_func(self.objects.set_capture, &mut context.func),
+            code: self
+                .module
+                .declare_func_in_func(self.objects.code, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
+        // Every indirect call goes through this one signature. That it is the *same* signature
+        // every compiled function is defined with is the whole point of the convention — the
+        // two are built by `push_fixed_params` so they cannot drift apart.
+        let mut uniform = self.module.make_signature();
+        push_fixed_params(&mut uniform, pointer);
+        uniform.returns.push(AbiParam::new(types::I64));
+        let uniform = context.func.import_signature(uniform);
         let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
         let mut lowering = Lowering {
             builder,
@@ -594,6 +711,7 @@ impl Backend for Cranelift {
             objects,
             keys,
             pointer,
+            uniform,
         };
         lowering.lower(function)?;
         // `finalize` needs the target's frontend config in this version — it is what decides
@@ -616,6 +734,7 @@ impl Backend for Cranelift {
             .map_err(|error| CodegenError::Backend {
                 message: error.to_string(),
             })?;
+        self.functions.push((function.id.index(), id));
         let safepoints = read_safepoints(&context);
         for map in &safepoints {
             for offset in &map.live_offsets {
@@ -630,6 +749,7 @@ impl Backend for Cranelift {
 
     fn finish(mut self) -> Result<Vec<u8>, CodegenError> {
         self.emit_stack_map_table()?;
+        self.emit_function_table()?;
         self.module
             .finish()
             .emit()
@@ -662,6 +782,8 @@ struct Lowering<'a> {
     keys: HashMap<String, cranelift_codegen::ir::GlobalValue>,
     /// The target's pointer type, for materialising those addresses.
     pointer: cranelift_codegen::ir::Type,
+    /// The signature every indirect call goes through.
+    uniform: cranelift_codegen::ir::SigRef,
 }
 
 impl Lowering<'_> {
@@ -1024,6 +1146,89 @@ impl Lowering<'_> {
                 };
                 Some(self.box_condition(condition))
             }
+            Op::Closure { function, captures } => {
+                // The captures are written one at a time rather than passed to the allocation.
+                // A variadic C call would need the backend and the runtime to agree on how the
+                // arguments were laid out, and those two only meet at link time — where a
+                // disagreement is silent.
+                let count = i64::try_from(captures.len()).unwrap_or(i64::MAX);
+                let index = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, i64::from(function.index()));
+                let count_value = self.builder.ins().iconst(types::I64, count);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.create_closure, &[index, count_value]);
+                let closure = self.builder.inst_results(call)[0];
+
+                for (position, capture) in captures.iter().enumerate() {
+                    let value = self.value(*capture);
+                    let position = i64::try_from(position).unwrap_or(i64::MAX);
+                    let position = self.builder.ins().iconst(types::I64, position);
+                    self.builder
+                        .ins()
+                        .call(self.objects.set_capture, &[closure, position, value]);
+                }
+                Some(closure)
+            }
+            Op::Call {
+                callee,
+                this_value,
+                args,
+            } => {
+                let callee = self.value(*callee);
+                let this_value = self.value(*this_value);
+
+                // The arguments go in a slot of this function's own frame. Not a heap list:
+                // that would allocate on the hottest path in the language, and the collector
+                // already reaches frame slots through the stack maps (D-94).
+                let slots = args.len().max(ARGV_MIN_SLOTS);
+                let size = u32::try_from(slots * 8).unwrap_or(u32::MAX);
+                let argv_slot = self.builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        size,
+                        3,
+                    ),
+                );
+                for (position, argument) in args.iter().enumerate() {
+                    let value = self.value(*argument);
+                    let offset = i32::try_from(position * 8).unwrap_or(i32::MAX);
+                    self.builder
+                        .ins()
+                        .stack_store(self.pointer, value, argv_slot, offset);
+                }
+                // Any slot past the last argument is filled with `undefined`. The callee never
+                // *uses* what it reads there — its guard discards it — but it does read it,
+                // and leaving stack garbage where a value belongs is how a later change that
+                // does trust it becomes very hard to debug.
+                let undefined = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, crisol_value::Value::UNDEFINED.to_bits() as i64);
+                for position in args.len()..slots {
+                    let offset = i32::try_from(position * 8).unwrap_or(i32::MAX);
+                    self.builder
+                        .ins()
+                        .stack_store(self.pointer, undefined, argv_slot, offset);
+                }
+                let argv = self.builder.ins().stack_addr(self.pointer, argv_slot, 0);
+                let argc = i64::try_from(args.len()).unwrap_or(i64::MAX);
+                let argc = self.builder.ins().iconst(types::I64, argc);
+
+                // `new.target` is `undefined` for an ordinary call. `Op::Construct` is what
+                // passes a constructor, and it is not lowered yet.
+                let code = self.builder.ins().call(self.objects.code, &[callee]);
+                let code = self.builder.inst_results(code)[0];
+                let call = self.builder.ins().call_indirect(
+                    self.uniform,
+                    code,
+                    &[callee, this_value, undefined, argc, argv],
+                );
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::CreateObject { .. } => {
                 // No shape argument: an object literal is empty until its first property is
                 // stored, and the lowering says so by allocating at the root shape and then
@@ -1235,7 +1440,7 @@ impl Jit {
 
         let id = self
             .module
-            .declare_function(&function.name, Linkage::Export, &signature)
+            .declare_function(&symbol_name(function), Linkage::Export, &signature)
             .map_err(|error| CodegenError::Backend {
                 message: error.to_string(),
             })?;
@@ -1283,8 +1488,24 @@ impl Jit {
             capture: self
                 .module
                 .declare_func_in_func(self.objects.capture, &mut context.func),
+            create_closure: self
+                .module
+                .declare_func_in_func(self.objects.create_closure, &mut context.func),
+            set_capture: self
+                .module
+                .declare_func_in_func(self.objects.set_capture, &mut context.func),
+            code: self
+                .module
+                .declare_func_in_func(self.objects.code, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
+        // Every indirect call goes through this one signature. That it is the *same* signature
+        // every compiled function is defined with is the whole point of the convention — the
+        // two are built by `push_fixed_params` so they cannot drift apart.
+        let mut uniform = self.module.make_signature();
+        push_fixed_params(&mut uniform, pointer);
+        uniform.returns.push(AbiParam::new(types::I64));
+        let uniform = context.func.import_signature(uniform);
         let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
         let mut lowering = Lowering {
             builder,
@@ -1296,6 +1517,7 @@ impl Jit {
             objects,
             keys,
             pointer,
+            uniform,
         };
         lowering.lower(function)?;
         lowering.builder.finalize(frontend_config);
