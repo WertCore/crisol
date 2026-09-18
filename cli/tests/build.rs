@@ -166,3 +166,43 @@ fn a_property_holding_an_object_can_be_reached_through_it() {
         "4",
     );
 }
+
+/// §M13 asks for a GC stress mode. This is what it is for.
+///
+/// `CRISOL_GC_STRESS` collects on **every** allocation, so an object that the collector cannot
+/// see is freed before the next line rather than surviving until memory runs low. Each `{...}`
+/// below is an allocation, so by the last one every earlier object has been through several
+/// collections while live only in a compiled frame.
+///
+/// If the stack map table were empty, or registered too late, or read at the wrong frame
+/// offset, this prints garbage or crashes. Without stress mode it would pass either way, which
+/// is exactly why the mode exists.
+#[test]
+fn objects_survive_a_collection_at_every_allocation() {
+    let source = "let inner = {v: 4}; let outer = {}; outer.i = inner; \
+                  let a = {x: 1}; let b = {y: 2}; return outer.i.v + a.x + b.y;";
+    let Some(relaxed) = build_and_run("gc-stress-off", source) else {
+        return;
+    };
+    assert_eq!(relaxed, "7", "the answer without stress mode");
+
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-gc-stress-on");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("it should build");
+
+    let output = Command::new(&binary)
+        .env("CRISOL_GC_STRESS", "1")
+        .output()
+        .expect("run the binary");
+    assert!(output.status.success(), "it must not crash under stress");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "7",
+        "an object held only by a compiled frame must survive collection"
+    );
+}

@@ -85,8 +85,14 @@ pub struct SafepointMap {
     /// The collector has a **return address**, so it looks up the instruction *after* the call.
     /// This is that offset.
     pub code_offset: u32,
-    /// How large the frame is, so the collector can find slot zero from the frame pointer.
-    pub frame_size: u32,
+    /// How many bytes of stack this map covers.
+    ///
+    /// **Not a frame size, and not the distance from the frame pointer to the stack pointer.**
+    /// Cranelift calls this a span and measures every live offset from **SP**, so this cannot
+    /// be used to reach a slot from a frame pointer — the collector finds SP from the frame
+    /// chain instead. It is carried because a map covering no bytes describes nothing, which
+    /// is worth being able to see.
+    pub span: u32,
     /// Byte offsets within the frame holding live values.
     pub live_offsets: Vec<u32>,
 }
@@ -282,9 +288,9 @@ fn read_safepoints(context: &cranelift_codegen::Context) -> Vec<SafepointMap> {
         .buffer
         .user_stack_maps()
         .iter()
-        .map(|(code_offset, frame_size, map)| SafepointMap {
+        .map(|(code_offset, span, map)| SafepointMap {
             code_offset: *code_offset,
-            frame_size: *frame_size,
+            span: *span,
             live_offsets: map.entries().map(|(_, offset)| offset).collect(),
         })
         .collect()

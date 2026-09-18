@@ -2874,3 +2874,37 @@ heap cannot check it, because it holds no `Shapes` table and deliberately does n
 `crisol-value`'s business. A caller that grows to a slot count disagreeing with the shape gets
 an object whose properties resolve to the wrong slots, which is why the only intended caller is
 the runtime's property-store path rather than embedder code.
+
+## D-93
+
+**Stack map offsets are measured from the stack pointer, and the frame walk reports one.**
+
+Status: Accepted
+
+Cranelift documents a user stack map entry as *"the offset from SP"* — given `(i64, 0x42)`,
+`SP + 0x42` holds the live reference. The collector was reading `FP - offset`: the wrong origin
+and the wrong direction, so every root it reported was whatever happened to sit that far the
+wrong way from the other end of the frame.
+
+Nothing failed. Every acceptance test built and ran a program that printed the right answer,
+because none of them allocated enough to trigger a collection — the roots were wrong and never
+consulted. `CRISOL_GC_STRESS=1` collects on every allocation, and under it the same programs
+printed `NaN`: a property read from an object that had already been freed. That is the whole
+argument for the stress mode ROADMAP §3.1 asks for, and it earned its place on the first run.
+
+The walk reports each frame's **stack pointer at the call**, not its frame pointer. Both
+aarch64 and x86-64 enter a function with the return address and the saved frame pointer at the
+top of the callee's frame, so the callee's `fp` points at those two words and the caller's
+stack pointer at the call is `fp + 16`. The walk already had that value; it was discarding it
+in favour of the caller's frame pointer.
+
+The `u32` alongside each map is a **span**, not a frame size. It had been named `frame_size`
+and documented as letting the collector find slot zero from the frame pointer, which is what
+made the wrong arithmetic look reasonable. It cannot: it is how many bytes the map covers, and
+no arithmetic on it converts a frame pointer into a stack pointer.
+
+**Consequence:** the walk now depends on the standard prologue on both architectures, which is
+already required for the chain itself and is why `preserve_frame_pointers` is set. A target
+that laid its frame out differently would need its own rule here, and there is nothing in the
+code that would catch it — the stress-mode acceptance test would, which is the argument for
+running it in CI on every target rather than only where it is convenient.

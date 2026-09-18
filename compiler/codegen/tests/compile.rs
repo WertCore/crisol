@@ -445,7 +445,7 @@ fn a_safepoint_reports_where_live_values_sit() {
         !map.live_offsets.is_empty(),
         "the live value needs a frame offset"
     );
-    assert!(map.frame_size > 0, "and a frame to be in");
+    assert!(map.span > 0, "and a frame to be in");
 }
 
 #[test]

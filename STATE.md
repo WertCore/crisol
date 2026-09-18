@@ -5,15 +5,19 @@ subset to object code for all four targets, and `crisol-abi` defines the symbols
 
 The stack map path is now connected end to end: the backend emits a table, the C entry point
 registers it before running anything, and the collector reads it through a root provider
-(D-91). A program with a value live across a call registers a non-empty table; one with no
-call registers an empty one. That is what unblocks allocation in compiled code — until the
+(D-91), reading each offset from the frame's **stack pointer**, which is what Cranelift
+measures them from (D-93). Object literals and property access compile.
+
+`CRISOL_GC_STRESS=1` collects on every allocation and is the only thing that tests any of
+this: with the offsets read from the wrong end of the frame, every acceptance test still
+printed the right answer, because none of them allocated enough to collect at all. That is what unblocks allocation in compiled code — until the
 collector could see compiled frames, anything `Op::CreateObject` allocated could be freed
 while still in use.
 
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1003 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1004 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

@@ -364,7 +364,13 @@ pub fn stack_maps() -> Option<&'static StackMaps> {
 pub struct Frame {
     /// Return address into the function that owns [`Frame::base`].
     pub return_address: *const u8,
-    /// Frame pointer of the function the return address is inside.
+    /// **Stack pointer** of that function at the call, which is what a stack map offset is
+    /// measured from.
+    ///
+    /// Not its frame pointer. Cranelift documents a stack map entry as *"the offset from SP"*
+    /// — `SP + 0x42` holds the reference — and a frame pointer is at the other end of the
+    /// frame. Using one for the other reads whatever sits that far the wrong way from the
+    /// wrong end, which is a plausible-looking reference pointing at nothing.
     pub base: *const usize,
 }
 
@@ -404,9 +410,14 @@ pub unsafe fn walk_frames(limit: usize) -> Vec<Frame> {
         }
         found.push(Frame {
             return_address: return_address as *const u8,
-            // The return address is *into the caller*, so the frame holding the live values
-            // for that safepoint is the caller's.
-            base: caller,
+            // The caller's stack pointer *at the call*, not its frame pointer.
+            //
+            // Both aarch64 and x86-64 enter a function with the return address and the saved
+            // frame pointer at the top of the callee's frame — `stp x29, x30, [sp, #-16]!`
+            // and `call` + `push rbp`. So this frame's `fp` points at those two words, and
+            // immediately above them is where the caller's stack pointer stood when it made
+            // the call. That is the origin every stack map offset is measured from.
+            base: frame.wrapping_add(2),
         });
         frame = caller;
     }
@@ -461,7 +472,7 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
     let mut roots = Vec::new();
     for frame in frames {
         for offset in maps.live_at(frame.return_address) {
-            let slot = frame.base.wrapping_byte_sub(offset as usize);
+            let slot = frame.base.wrapping_byte_add(offset as usize);
             if slot.is_null() || !slot.is_aligned() {
                 continue;
             }
@@ -526,6 +537,17 @@ pub struct Runtime {
 impl Runtime {
     fn new() -> Self {
         let heap = Heap::new();
+        // ROADMAP §3.1 asks for a stress mode, and for compiled code it is the only way to
+        // test rooting at all: a missing root normally shows up as a use-after-free under
+        // memory pressure, far from the code that caused it. Collecting on every allocation
+        // turns that into a failure on the very next line.
+        //
+        // An environment variable rather than a build feature, so the *shipped* binary can be
+        // run under it — a stress mode that needs a recompile tests a different program from
+        // the one that has the bug.
+        if std::env::var_os("CRISOL_GC_STRESS").is_some() {
+            heap.set_stress(true);
+        }
         // SAFETY: collections here are triggered by allocation, and an allocation site is a
         // safepoint — which is exactly what `install_compiled_roots` asks its caller to
         // promise. Installing at construction rather than leaving it to the entry point means
