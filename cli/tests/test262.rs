@@ -123,7 +123,18 @@ fn stage_of(error: &crisol::build::BuildError) -> String {
         ),
         crisol::build::BuildError::Parse { .. } => "parse".to_owned(),
         crisol::build::BuildError::Malformed { .. } => "malformed IR".to_owned(),
-        crisol::build::BuildError::Codegen { .. } => "codegen".to_owned(),
+        // The backend's own message, not just "codegen": it names the construct it could not
+        // lower, and that is the list worth reading. The function name prefix is stripped so
+        // the same refusal from different functions groups together.
+        crisol::build::BuildError::Codegen { message } => {
+            let reason = message.rsplit(": ").next().unwrap_or(message);
+            // Every distinct string literal would otherwise be its own row, which buries the
+            // one fact worth reading: string constants are unsupported, once.
+            if reason.starts_with("cannot compile Const(String(") {
+                return "codegen: string constant".to_owned();
+            }
+            format!("codegen: {reason}")
+        }
         crisol::build::BuildError::Link { .. } => "link".to_owned(),
         crisol::build::BuildError::Unreadable { .. } => "unreadable".to_owned(),
     }

@@ -25,6 +25,20 @@ use crisol_ir::{Op, verify_module};
 /// The programs. Order is fixed, because the snapshot is.
 const CORPUS: &[(&str, &str)] = &[
     ("empty", ""),
+    // Exceptions, as explicit propagation: every call is followed by a test and a branch.
+    (
+        "try-catch",
+        "let r = 0; try { throw 1; } catch (e) { r = e; }",
+    ),
+    (
+        "for-loop",
+        "let t = 0; for (let i = 0; i < 2; i = i + 1) { t = t + i; }",
+    ),
+    (
+        "for-continue-break",
+        "for (let i = 0; i < 4; i++) { if (i === 1) { continue; } if (i === 3) { break; } }",
+    ),
+    ("do-while", "let i = 0; do { i++; } while (i < 2);"),
     // A function declaration is usable above its own text, which the whole of test262's own
     // harness depends on.
     (
@@ -315,11 +329,9 @@ fn unfaithful_programs_are_reported_not_guessed() {
     // dump. A compiler that silently emits `undefined` for syntax it did not read produces a
     // program that runs and is wrong, which is worse than one that refuses.
     let cases = [
-        ("for (;;) { }", "for statement"),
         // The function itself lowers now; what does not is **hoisting**. The binding appears
         // where the declaration does, so calling it earlier in the source reads an unset slot
         // rather than working. Recorded rather than left silently half-right.
-        ("try { } catch (e) { }", "try statement"),
         ("let [a] = [1];", "destructuring declaration"),
         ("let o = { ...{} };", "object spread"),
         ("let a = delete ({}).x;", "delete operator"),
@@ -330,7 +342,6 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // here yet. Lowering it as a strict comparison would be wrong for every mixed-type
         // operand, which is the only case anyone writes `==` for.
         ("let a = 1 == 2;", "binary operator =="),
-        ("let a = 1 instanceof Object;", "binary operator instanceof"),
         // `extends` needs the prototype chain wired through the parent *and* `super` resolved
         // inside methods. Half of that produces a class that constructs and then fails its
         // first inherited call.

@@ -159,6 +159,12 @@ pub enum BinaryOp {
     ShiftRight,
     /// `>>>`, zero-filling, on **uint32** — the one operator whose result can exceed `i32::MAX`.
     UnsignedShiftRight,
+    /// `instanceof` — whether the right side's `prototype` is in the left side's chain.
+    ///
+    /// A binary operator rather than a comparison: it answers a question about the prototype
+    /// chain, not about ordering or equality, and it is not symmetric in any sense `CompareOp`
+    /// would suggest.
+    InstanceOf,
 }
 
 impl BinaryOp {
@@ -187,6 +193,7 @@ impl BinaryOp {
             Self::ShiftLeft => "<<",
             Self::ShiftRight => ">>",
             Self::UnsignedShiftRight => ">>>",
+            Self::InstanceOf => "instanceof",
         }
     }
 }
@@ -206,6 +213,19 @@ pub enum UnaryOp {
     TypeOf,
     /// `void` — evaluates its operand and gives `undefined`.
     Void,
+    /// `throw` — records the operand as the value in flight and yields the exception signal.
+    ///
+    /// An operation rather than a terminator, so that a `throw` inside a `try` is followed by
+    /// the same check every call is. One propagation path rather than two means a handler
+    /// cannot be reached by one and missed by the other.
+    Throw,
+    /// Whether the operand is the exception signal rather than a value.
+    ///
+    /// **This is how explicit propagation is written down.** A call returns the signal instead
+    /// of a result, and the frontend follows every call with this test and a branch — so the
+    /// unwinding is ordinary control flow the verifier already checks, rather than metadata a
+    /// backend has to honour.
+    IsException,
 }
 
 impl UnaryOp {
@@ -219,6 +239,8 @@ impl UnaryOp {
             Self::BitNot => "~",
             Self::TypeOf => "typeof",
             Self::Void => "void",
+            Self::Throw => "throw",
+            Self::IsException => "is-exception",
         }
     }
 }
@@ -279,6 +301,11 @@ pub enum Op {
         /// The name.
         key: PropertyKey,
     },
+    /// The value a `catch` binds — whatever the throw in flight is carrying.
+    ///
+    /// Nullary, because the value is not in any register the IR can name: it was recorded by
+    /// the `throw` and the frames between have already returned.
+    CaughtValue,
     /// Reads a property whose name is computed: `o[k]`.
     ///
     /// Separate from [`Op::PropertyLoad`] because the key is a *value*, not a name known when
@@ -409,7 +436,9 @@ impl Op {
     #[must_use]
     pub fn operands(&self) -> Vec<ValueId> {
         match self {
-            Self::Const(_) | Self::Load { .. } | Self::CreateObject { .. } => Vec::new(),
+            Self::Const(_) | Self::Load { .. } | Self::CreateObject { .. } | Self::CaughtValue => {
+                Vec::new()
+            }
             Self::Store { value, .. } | Self::Await { value } => vec![*value],
             Self::Call {
                 callee,

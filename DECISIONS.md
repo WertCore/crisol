@@ -3190,3 +3190,41 @@ is not equal to itself, `+0` and `-0` differ in bits and are equal. `crisol_stri
 compares as numbers when both are numbers, which gets both right because IEEE equality already
 says exactly that, and falls back to identity otherwise. Strings will need revisiting: two
 distinct string objects with the same characters are `===` and are not the same handle.
+
+## D-104
+
+**Exceptions propagate as an explicit value, and the propagation is written into the IR.**
+
+Status: Accepted
+
+M13's deliverable says to decide between unwinding and explicit result propagation and record
+it. This is the record: **explicit propagation**.
+
+A call returns `Value::EXCEPTION` — a reserved singleton that is not a JavaScript value —
+instead of a result, and the thrown value waits in the runtime. Putting the signal in the value
+space rather than a second return register means adding exceptions changed no function's
+signature: a call site that ignores it compiles exactly as before.
+
+**The propagation is ordinary control flow in the IR, not metadata a backend must honour.** The
+frontend follows every call with `UnaryOp::IsException` and a branch — into the enclosing
+`catch` if there is one, and out of the function otherwise. So the verifier checks it like any
+other graph, a dump shows it, and the backend needs no notion of a handler at all. The
+alternative — a handler recorded on the instruction for codegen to act on — puts the unwinding
+somewhere nothing else looks.
+
+`throw` is an *operation* followed by that same check, not a terminator of its own. A `throw`
+inside a `try` has to reach the handler, and a second path to there is how one of them ends up
+missing a case.
+
+**Rejected — unwinding.** Zero cost on the path that does not throw, which is nearly all of
+them. It needs different machinery per target (Windows differs from the rest), and it has to
+coexist with the frame-pointer walk the collector now depends on. Explicit propagation costs a
+compare and a branch after every call, which predicts perfectly, and is the same shape as
+Rust's `Result`.
+
+**Consequence:** `Value::kind` reports the signal as `Undefined` rather than giving it a kind of
+its own. It should never reach a program; if a propagation is ever missed the value behaves as
+`undefined` rather than aborting, because a wrong answer in a corner is recoverable and a crash
+inside a half-unwound call is not. The value in flight is also a **GC root** — the frame that
+made it has returned and no handler holds it yet, so without that, throwing an object and
+catching it after any allocation would catch a freed one.

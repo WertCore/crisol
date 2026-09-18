@@ -157,8 +157,10 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("a working directory");
     let file = directory.join("main.js");
-    // A `for` loop still lowers to a recorded gap rather than to nothing.
-    std::fs::write(&file, "for (;;) { } return 1;").expect("write");
+    // `for-of` still lowers to a recorded gap rather than to nothing. This case has to be
+    // replaced whenever the construct it names becomes supported — which is the point: the
+    // test is about *refusing*, so it must always name something actually refused.
+    std::fs::write(&file, "for (let x of [1]) { } return 1;").expect("write");
 
     let error =
         crisol::build::build(&file, &directory.join("main"), &runtime).expect_err("should refuse");
@@ -781,5 +783,177 @@ fn the_discriminant_is_evaluated_once() {
         "let calls = 0; let f = function () { calls = calls + 1; return 3; }; \
          switch (f()) { case 1: break; case 2: break; case 3: break; } return calls;",
         "1",
+    );
+}
+
+// ---- exceptions -------------------------------------------------------------------------
+
+#[test]
+fn a_thrown_value_is_caught() {
+    check(
+        "throw-catch",
+        "let r = 0; try { throw 5; } catch (e) { r = e; } return r;",
+        "5",
+    );
+}
+
+/// The point of propagation: a throw crosses a call boundary to reach the handler.
+#[test]
+fn a_throw_inside_a_call_reaches_the_callers_handler() {
+    check(
+        "throw-across-call",
+        "let f = function () { throw 7; }; let r = 0; try { f(); } catch (e) { r = e; } return r;",
+        "7",
+    );
+}
+
+#[test]
+fn a_throw_crosses_several_frames() {
+    check(
+        "throw-deep",
+        "let inner = function () { throw 3; }; \
+         let middle = function () { inner(); return 99; }; \
+         let outer = function () { middle(); return 98; }; \
+         let r = 0; try { outer(); } catch (e) { r = e; } return r;",
+        "3",
+    );
+}
+
+/// **Statements after a throwing call must not run.** A propagation that reached the handler
+/// but also continued would give the right caught value and the wrong everything else.
+#[test]
+fn nothing_after_a_throwing_call_runs() {
+    check(
+        "throw-skips-rest",
+        "let f = function () { throw 1; }; let r = 0; \
+         try { f(); r = 100; } catch (e) { r = r + 10; } return r;",
+        "10",
+    );
+}
+
+#[test]
+fn a_try_that_does_not_throw_skips_the_handler() {
+    check(
+        "try-no-throw",
+        "let r = 0; try { r = 1; } catch (e) { r = 2; } return r;",
+        "1",
+    );
+}
+
+#[test]
+fn a_caught_exception_can_be_an_object() {
+    check(
+        "throw-object",
+        "let r = 0; try { throw {code: 4}; } catch (e) { r = e.code; } return r;",
+        "4",
+    );
+}
+
+/// The handler is the *innermost* one, and an outer `try` is unaffected.
+#[test]
+fn nested_handlers_catch_at_the_innermost() {
+    check(
+        "throw-nested",
+        "let r = 0; \
+         try { try { throw 1; } catch (e) { r = r + 1; } r = r + 10; } catch (e) { r = r + 100; } \
+         return r;",
+        "11",
+    );
+}
+
+#[test]
+fn a_throw_from_a_catch_reaches_the_outer_handler() {
+    check(
+        "throw-rethrow",
+        "let r = 0; \
+         try { try { throw 1; } catch (e) { throw 2; } } catch (e) { r = e; } \
+         return r;",
+        "2",
+    );
+}
+
+// ---- loops ------------------------------------------------------------------------------
+
+#[test]
+fn a_for_loop_runs_its_body_and_updates() {
+    check(
+        "for-sum",
+        "let t = 0; for (let i = 0; i < 4; i = i + 1) { t = t + i; } return t;",
+        "6",
+    );
+}
+
+/// **`continue` goes to the update, not the test.** Sharing a block for them makes this hang
+/// rather than answer wrongly, and only when a `continue` is present.
+#[test]
+fn continue_still_runs_the_update() {
+    check(
+        "for-continue",
+        "let t = 0; for (let i = 0; i < 4; i = i + 1) { if (i === 2) { continue; } t = t + i; } return t;",
+        "4",
+    );
+}
+
+#[test]
+fn break_leaves_a_loop() {
+    check(
+        "for-break",
+        "let t = 0; for (let i = 0; i < 10; i = i + 1) { if (i === 3) { break; } t = t + 1; } return t;",
+        "3",
+    );
+}
+
+#[test]
+fn a_while_loop_can_break_and_continue() {
+    check(
+        "while-break",
+        "let i = 0; let t = 0; while (true) { i = i + 1; if (i > 5) { break; } t = t + i; } return t;",
+        "15",
+    );
+}
+
+/// `do … while` runs its body before testing anything, which is the whole difference.
+#[test]
+fn a_do_while_runs_once_even_when_the_test_is_false() {
+    check(
+        "do-while-once",
+        "let t = 0; do { t = t + 1; } while (false); return t;",
+        "1",
+    );
+}
+
+#[test]
+fn a_loop_can_throw_out_of_itself() {
+    check(
+        "loop-throw",
+        "let r = 0; try { for (let i = 0; i < 10; i = i + 1) { if (i === 2) { throw i; } } } \
+         catch (e) { r = e; } return r;",
+        "2",
+    );
+}
+
+/// `instanceof` walks the prototype chain for the constructor's `prototype`.
+#[test]
+fn instanceof_recognises_an_instance_of_its_class() {
+    check(
+        "instanceof-true",
+        "class C { constructor() {} } let c = new C(); return c instanceof C;",
+        "true",
+    );
+}
+
+#[test]
+fn instanceof_rejects_an_unrelated_object_and_a_primitive() {
+    check(
+        "instanceof-other",
+        "class C { constructor() {} } class D { constructor() {} } \
+         let d = new D(); return d instanceof C;",
+        "false",
+    );
+    // `1 instanceof C` is `false`, not an error — a primitive has no chain to walk.
+    check(
+        "instanceof-primitive",
+        "class C { constructor() {} } return 1 instanceof C;",
+        "false",
     );
 }

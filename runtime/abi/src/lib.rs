@@ -45,6 +45,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_shift_left",
     "crisol_shift_right",
     "crisol_unsigned_shift_right",
+    "crisol_instanceof",
     "crisol_create_object",
     "crisol_property_store",
     "crisol_property_load",
@@ -59,6 +60,8 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_computed_load",
     "crisol_computed_store",
     "crisol_strict_equal",
+    "crisol_throw",
+    "crisol_pending_exception",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -527,6 +530,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         // through `with_runtime` because this runs *during* a collection, which may have been
         // triggered inside a borrow of the runtime's shape table.
         roots.extend(ARRAY_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(pending_root());
         roots
     }));
 }
@@ -1543,4 +1547,90 @@ pub extern "C" fn crisol_strict_equal(left: u64, right: u64) -> u64 {
         _ => false,
     };
     if equal { Value::TRUE } else { Value::FALSE }.to_bits()
+}
+
+thread_local! {
+    /// The value a `throw` is carrying, while it propagates.
+    ///
+    /// Held here rather than returned alongside the signal because a call returns one word.
+    /// Exactly one throw is in flight at a time: propagation is immediate and synchronous, so
+    /// a second cannot begin before the first is caught or reaches the top.
+    static PENDING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The value a throw is carrying, as a root the collector must trace.
+///
+/// A thrown object is reachable from nowhere else while it propagates — the frame that made it
+/// has returned, and no handler holds it yet. Without this, throwing an object and catching it
+/// after any allocation would catch a freed one.
+fn pending_root() -> Option<GcRef> {
+    let bits = PENDING.with(std::cell::Cell::get);
+    Value::from_bits(bits).as_address().map(GcRef::from_address)
+}
+
+/// `throw value` — records it and answers the signal every caller checks for.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_throw(value: u64) -> u64 {
+    PENDING.with(|pending| pending.set(value));
+    Value::EXCEPTION.to_bits()
+}
+
+/// The value being thrown, for a `catch` to bind.
+///
+/// Clears it: the throw is over once a handler has it, and leaving it set would keep a caught
+/// object alive for as long as the program runs.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_pending_exception() -> u64 {
+    PENDING.with(|pending| {
+        let value = pending.get();
+        pending.set(Value::UNDEFINED.to_bits());
+        value
+    })
+}
+
+/// `left instanceof right`.
+///
+/// Walks `left`'s prototype chain looking for `right.prototype`. A non-object on the left is
+/// always `false` — `1 instanceof Object` is `false`, not an error — while a non-callable on
+/// the right is a `TypeError`, which needs a throw this cannot raise from here, so it answers
+/// `false` too and the difference is recorded rather than pretended away.
+///
+/// Bounded like every other chain walk: a cycle is illegal and an unbounded loop inside an
+/// operator is worse than a wrong answer.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_instanceof(left: u64, right: u64) -> u64 {
+    let Some(object) = handle_of(left) else {
+        return Value::FALSE.to_bits();
+    };
+    let Some(constructor) = handle_of(right) else {
+        return Value::FALSE.to_bits();
+    };
+
+    let key = PropertyKey::new("prototype");
+    let found = with_runtime(|runtime| {
+        let shape = runtime.heap.shape_of(constructor)?;
+        let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+        runtime.heap.get(constructor, slot.index())
+    });
+    let Some(prototype) = found
+        .and_then(|value| value.as_address())
+        .map(GcRef::from_address)
+    else {
+        return Value::FALSE.to_bits();
+    };
+
+    with_runtime(|runtime| {
+        let mut current = runtime.heap.prototype_of(object);
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let Some(link) = current else { break };
+            if link == prototype {
+                return Value::TRUE.to_bits();
+            }
+            current = runtime.heap.prototype_of(link);
+        }
+        Value::FALSE.to_bits()
+    })
 }

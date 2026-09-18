@@ -157,6 +157,7 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
     (BinaryOp::ShiftLeft, "crisol_shift_left"),
     (BinaryOp::ShiftRight, "crisol_shift_right"),
     (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
+    (BinaryOp::InstanceOf, "crisol_instanceof"),
 ];
 
 /// The runtime symbols an object operation calls.
@@ -176,6 +177,8 @@ const CREATE_ARRAY_SYMBOL: &str = "crisol_create_array";
 const COMPUTED_LOAD_SYMBOL: &str = "crisol_computed_load";
 const COMPUTED_STORE_SYMBOL: &str = "crisol_computed_store";
 const STRICT_EQUAL_SYMBOL: &str = "crisol_strict_equal";
+const THROW_SYMBOL: &str = "crisol_throw";
+const PENDING_EXCEPTION_SYMBOL: &str = "crisol_pending_exception";
 
 /// The symbol holding the addresses of the program's compiled functions.
 pub const FUNCTION_TABLE_SYMBOL: &str = "crisol_functions";
@@ -209,6 +212,10 @@ struct ObjectHelpers<T> {
     computed_store: T,
     /// `crisol_strict_equal(left, right) -> boolean`
     strict_equal: T,
+    /// `crisol_throw(value) -> exception signal`
+    throw: T,
+    /// `crisol_pending_exception() -> value`
+    pending: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -283,6 +290,13 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     strict_equal.params.push(AbiParam::new(types::I64));
     strict_equal.returns.push(AbiParam::new(types::I64));
 
+    let mut throw = module.make_signature();
+    throw.params.push(AbiParam::new(types::I64));
+    throw.returns.push(AbiParam::new(types::I64));
+
+    let mut pending = module.make_signature();
+    pending.returns.push(AbiParam::new(types::I64));
+
     let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
         module
             .declare_function(symbol, Linkage::Import, signature)
@@ -304,6 +318,8 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         computed_load: declare(COMPUTED_LOAD_SYMBOL, &computed_load)?,
         computed_store: declare(COMPUTED_STORE_SYMBOL, &computed_store)?,
         strict_equal: declare(STRICT_EQUAL_SYMBOL, &strict_equal)?,
+        throw: declare(THROW_SYMBOL, &throw)?,
+        pending: declare(PENDING_EXCEPTION_SYMBOL, &pending)?,
     })
 }
 
@@ -793,6 +809,12 @@ impl Backend for Cranelift {
             strict_equal: self
                 .module
                 .declare_func_in_func(self.objects.strict_equal, &mut context.func),
+            throw: self
+                .module
+                .declare_func_in_func(self.objects.throw, &mut context.func),
+            pending: self
+                .module
+                .declare_func_in_func(self.objects.pending, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature
@@ -1169,6 +1191,25 @@ impl Lowering<'_> {
                     crisol_ir::UnaryOp::ToNumber if self.is_number(*operand) => Some(value),
                     // `void x` evaluates its operand and gives `undefined`. The operand was
                     // already emitted above, so its side effects have happened.
+                    crisol_ir::UnaryOp::Throw => {
+                        let call = self.builder.ins().call(self.objects.throw, &[value]);
+                        Some(self.builder.inst_results(call)[0])
+                    }
+                    // A plain bit comparison, and correct because the signal is a singleton —
+                    // none of `===`'s difficulties apply, since it is not a number and there
+                    // is exactly one of it.
+                    crisol_ir::UnaryOp::IsException => {
+                        let sentinel = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, crisol_value::Value::EXCEPTION.to_bits() as i64);
+                        let is = self.builder.ins().icmp(
+                            cranelift_codegen::ir::condcodes::IntCC::Equal,
+                            value,
+                            sentinel,
+                        );
+                        Some(self.box_condition(is))
+                    }
                     crisol_ir::UnaryOp::Void => Some(
                         self.builder
                             .ins()
@@ -1374,6 +1415,10 @@ impl Lowering<'_> {
                     .ins()
                     .call(self.objects.computed_store, &[object, key, value]);
                 None
+            }
+            Op::CaughtValue => {
+                let call = self.builder.ins().call(self.objects.pending, &[]);
+                Some(self.builder.inst_results(call)[0])
             }
             Op::CreateObject { .. } => {
                 // No shape argument: an object literal is empty until its first property is
@@ -1738,6 +1783,12 @@ impl Jit {
             strict_equal: self
                 .module
                 .declare_func_in_func(self.objects.strict_equal, &mut context.func),
+            throw: self
+                .module
+                .declare_func_in_func(self.objects.throw, &mut context.func),
+            pending: self
+                .module
+                .declare_func_in_func(self.objects.pending, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature

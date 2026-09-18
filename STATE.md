@@ -29,10 +29,22 @@ cases and reports three numbers — refused, crashed, ran — and does not colla
 has no throw path, so a case that runs to completion may have reached an assertion it could not
 signal. `ran` is an upper bound on the pass rate, not the pass rate.
 
-The run is a single-blocker sequence so far, each fix revealing the next, every time on all
-379 sampled cases: function declaration hoisting (D-102), then `switch` (D-103), now `try`.
-The next one is the exception mechanism M13's deliverable says to *"decide and record"*, and it
-is still undecided.
+**The suite's own harness now compiles**, which ends the single-blocker chain — hoisting
+(D-102), `switch` (D-103), `try` (D-104), loops, `i++` and `instanceof`, each of which had been
+refusing all 379 sampled cases by itself. The refusals are now about the tests rather than the
+harness, and rank:
+
+| | |
+|---|---|
+| 163 | string constants |
+| 59 | `delete` |
+| 40 | unary `-` on a value of unknown type |
+| 26 | regular expression literals |
+| 21 | computed property keys |
+| 20 | template literals |
+
+**Strings are 43% of it** and are the next thing worth building. `ran to completion` is still
+0 — nothing has *passed*, and the number will not move until a case compiles end to end.
 
 **M13's acceptance is met.** `main.ts` containing arithmetic, closures, classes and array
 methods compiles to a standalone binary that runs and produces correct output, with GC stress
@@ -65,7 +77,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1063 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1086 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

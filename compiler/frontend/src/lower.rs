@@ -148,6 +148,11 @@ struct Lowering {
     shared: std::collections::HashSet<String>,
     /// Where an unlabelled `break` goes, innermost last.
     breaks: Vec<BlockId>,
+    /// Where a raised exception goes, innermost last. Empty means out of the function.
+    handlers: Vec<BlockId>,
+    /// Where `continue` goes, innermost last. Separate from `breaks` because a `switch` is a
+    /// `break` target and not a `continue` one.
+    continues: Vec<BlockId>,
 }
 
 /// The property a cell keeps its value in.
@@ -169,6 +174,8 @@ impl Lowering {
             functions: vec![function],
             shared: std::collections::HashSet::new(),
             breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
             scopes: vec![Scope {
                 function: 0,
                 current: entry,
@@ -216,6 +223,229 @@ impl Lowering {
         for statement in &program.body {
             self.statement(statement);
         }
+    }
+
+    /// `i++`, `++i`, `i--`, `--i`.
+    ///
+    /// **Postfix yields the value from *before* the update and prefix the value after**, which
+    /// is the entire difference between them and is invisible in a statement like `i++;`. The
+    /// distinction only shows where the result is used — `a[i++]` indexes with the old `i` —
+    /// so a lowering that got it backwards would pass every loop test.
+    ///
+    /// The operand goes through `+`, not a numeric add: `i` may not be a number, and `ToNumber`
+    /// is what the specification applies. That is the same helper `i + 1` uses, so the two
+    /// spellings cannot disagree.
+    fn update(&mut self, update: &oxc_ast::ast::UpdateExpression<'_>) -> ValueId {
+        let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) =
+            &update.argument
+        else {
+            self.note(
+                "update of something other than a variable",
+                update.span.start,
+            );
+            return self.placeholder();
+        };
+
+        let slot = self.slot(identifier.name.as_str());
+        let before = self.read(slot);
+        let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
+        let op = if matches!(update.operator, oxc_ast::ast::UpdateOperator::Increment) {
+            BinaryOp::Add
+        } else {
+            BinaryOp::Subtract
+        };
+        let after = self.emit(
+            Type::Unknown,
+            Op::Binary {
+                op,
+                left: before,
+                right: one,
+            },
+        );
+        self.write(slot, after);
+        if update.prefix { after } else { before }
+    }
+
+    /// `let`/`const`/`var`, which a `for` initialiser also uses.
+    fn variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'_>) {
+        for declarator in &declaration.declarations {
+            let Some(name) = declarator.id.get_identifier_name() else {
+                self.note("destructuring declaration", declarator.span.start);
+                continue;
+            };
+            let value = match &declarator.init {
+                Some(init) => self.expression(init),
+                None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+            };
+            // `declare`, not `slot`: a `let` shadows an outer binding rather than capturing it.
+            let slot = self.declare(name.as_str());
+            self.bind(name.as_str(), slot, value);
+        }
+    }
+
+    /// `for (init; test; update) body`.
+    ///
+    /// Four blocks rather than three, because **`continue` goes to the update, not the test**.
+    /// Sharing a block for them would make `for (i = 0; i < 3; i = i + 1) { continue; }` skip
+    /// the increment and loop forever — a hang rather than a wrong answer, and one that only
+    /// appears when a `continue` is present.
+    ///
+    /// An absent test means `true`: `for (;;)` is an infinite loop, not one that never runs.
+    fn for_statement(&mut self, statement: &oxc_ast::ast::ForStatement<'_>) {
+        if let Some(init) = &statement.init {
+            match init {
+                oxc_ast::ast::ForStatementInit::VariableDeclaration(declaration) => {
+                    self.variable_declaration(declaration);
+                }
+                other => {
+                    if let Some(expression) = other.as_expression() {
+                        self.expression(expression);
+                    } else {
+                        self.note("for initialiser", statement.span.start);
+                    }
+                }
+            }
+        }
+
+        let header = self.new_block();
+        let body = self.new_block();
+        let update = self.new_block();
+        let exit = self.new_block();
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(header);
+        match &statement.test {
+            Some(test) => {
+                let condition = self.expression(test);
+                self.terminate(Terminator::Branch {
+                    condition,
+                    then_block: body,
+                    then_args: Vec::new(),
+                    else_block: exit,
+                    else_args: Vec::new(),
+                });
+            }
+            None => self.terminate(Terminator::Jump {
+                target: body,
+                args: Vec::new(),
+            }),
+        }
+
+        self.switch_to(body);
+        self.breaks.push(exit);
+        self.continues.push(update);
+        self.statement(&statement.body);
+        self.breaks.pop();
+        self.continues.pop();
+        self.terminate(Terminator::Jump {
+            target: update,
+            args: Vec::new(),
+        });
+
+        self.switch_to(update);
+        if let Some(step) = &statement.update {
+            self.expression(step);
+        }
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(exit);
+    }
+
+    /// Follows a value that may be the exception signal with the branch that propagates it.
+    ///
+    /// **This is what "explicit result propagation" means, written down.** A call returns the
+    /// signal instead of a result, so every call is followed by a test and a branch: into the
+    /// enclosing `catch` if there is one, and out of the function otherwise. The unwinding is
+    /// ordinary control flow the verifier already checks, rather than metadata a backend has to
+    /// remember to honour.
+    ///
+    /// Returns the value, so a caller can use it where the call's result was expected — on the
+    /// path where it is not the signal, which is the only path that continues.
+    fn propagate(&mut self, value: ValueId) -> ValueId {
+        let raised = self.emit(
+            Type::Bool,
+            Op::Unary {
+                op: UnaryOp::IsException,
+                operand: value,
+            },
+        );
+        let unwind = self.new_block();
+        let normal = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition: raised,
+            then_block: unwind,
+            then_args: Vec::new(),
+            else_block: normal,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(unwind);
+        match self.handlers.last().copied() {
+            Some(handler) => self.terminate(Terminator::Jump {
+                target: handler,
+                args: Vec::new(),
+            }),
+            // Nothing here catches it, so it leaves as this function's result and the caller
+            // runs the same test.
+            None => self.terminate(Terminator::Return(Some(value))),
+        }
+
+        self.switch_to(normal);
+        value
+    }
+
+    /// `try { … } catch (e) { … }`.
+    fn try_statement(&mut self, statement: &oxc_ast::ast::TryStatement<'_>) {
+        if statement.finalizer.is_some() {
+            // `finally` runs on *both* paths, including the one that leaves by throwing, and
+            // half of that is worse than none — a `finally` that ran only when nothing threw
+            // would look right in every test that does not throw.
+            self.note("try with finally", statement.span.start);
+        }
+        let Some(catch) = &statement.handler else {
+            self.note("try without catch", statement.span.start);
+            return;
+        };
+
+        let handler = self.new_block();
+        let end = self.new_block();
+
+        self.handlers.push(handler);
+        for inner in &statement.block.body {
+            self.statement(inner);
+        }
+        self.handlers.pop();
+        self.terminate(Terminator::Jump {
+            target: end,
+            args: Vec::new(),
+        });
+
+        self.switch_to(handler);
+        let caught = self.emit(Type::Unknown, Op::CaughtValue);
+        if let Some(parameter) = &catch.param {
+            match parameter.pattern.get_identifier_name() {
+                Some(name) => {
+                    let slot = self.declare(name.as_str());
+                    self.bind(name.as_str(), slot, caught);
+                }
+                None => self.note("destructuring catch parameter", catch.span.start),
+            }
+        }
+        for inner in &catch.body.body {
+            self.statement(inner);
+        }
+        self.terminate(Terminator::Jump {
+            target: end,
+            args: Vec::new(),
+        });
+
+        self.switch_to(end);
     }
 
     /// `switch`, as a chain of strict comparisons and a run of fall-through blocks.
@@ -519,20 +749,7 @@ impl Lowering {
                 self.expression(&statement.expression);
             }
             Statement::VariableDeclaration(declaration) => {
-                for declarator in &declaration.declarations {
-                    let Some(name) = declarator.id.get_identifier_name() else {
-                        self.note("destructuring declaration", declarator.span.start);
-                        continue;
-                    };
-                    let value = match &declarator.init {
-                        Some(init) => self.expression(init),
-                        None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
-                    };
-                    // `declare`, not `slot`: a `let` shadows an outer binding rather than
-                    // capturing it.
-                    let slot = self.declare(name.as_str());
-                    self.bind(name.as_str(), slot, value);
-                }
+                self.variable_declaration(declaration);
             }
             Statement::ReturnStatement(statement) => {
                 let value = statement
@@ -594,13 +811,66 @@ impl Lowering {
                 });
 
                 self.switch_to(body);
+                self.breaks.push(exit);
+                self.continues.push(header);
                 self.statement(&statement.body);
+                self.breaks.pop();
+                self.continues.pop();
                 self.terminate(Terminator::Jump {
                     target: header,
                     args: Vec::new(),
                 });
 
                 self.switch_to(exit);
+            }
+            Statement::ForStatement(statement) => self.for_statement(statement),
+            Statement::DoWhileStatement(statement) => {
+                let body = self.new_block();
+                let header = self.new_block();
+                let exit = self.new_block();
+                // Straight into the body: `do … while` runs it once before testing anything,
+                // which is the whole difference from `while`.
+                self.terminate(Terminator::Jump {
+                    target: body,
+                    args: Vec::new(),
+                });
+
+                self.switch_to(body);
+                self.breaks.push(exit);
+                // `continue` goes to the *test*, not back to the top — it ends this iteration
+                // rather than skipping the condition.
+                self.continues.push(header);
+                self.statement(&statement.body);
+                self.breaks.pop();
+                self.continues.pop();
+                self.terminate(Terminator::Jump {
+                    target: header,
+                    args: Vec::new(),
+                });
+
+                self.switch_to(header);
+                let condition = self.expression(&statement.test);
+                self.terminate(Terminator::Branch {
+                    condition,
+                    then_block: body,
+                    then_args: Vec::new(),
+                    else_block: exit,
+                    else_args: Vec::new(),
+                });
+
+                self.switch_to(exit);
+            }
+            Statement::ContinueStatement(statement) => {
+                if statement.label.is_some() {
+                    self.note("labelled continue", statement.span.start);
+                } else if let Some(target) = self.continues.last().copied() {
+                    self.terminate(Terminator::Jump {
+                        target,
+                        args: Vec::new(),
+                    });
+                } else {
+                    self.note("continue outside a loop", statement.span.start);
+                }
             }
             Statement::BlockStatement(block) => {
                 // No scope of its own: locals are slots keyed by name, so a shadowing `let`
@@ -612,8 +882,19 @@ impl Lowering {
             }
             Statement::ThrowStatement(statement) => {
                 let value = self.expression(&statement.argument);
-                self.terminate(Terminator::Throw(value));
+                // An operation and then the ordinary propagation, rather than a terminator of
+                // its own. A `throw` inside a `try` has to reach the handler, and giving it a
+                // second path to there is how one of them ends up missing a case.
+                let signal = self.emit(
+                    Type::Unknown,
+                    Op::Unary {
+                        op: UnaryOp::Throw,
+                        operand: value,
+                    },
+                );
+                self.propagate(signal);
             }
+            Statement::TryStatement(statement) => self.try_statement(statement),
             // Already bound by `hoist`, before any statement in this list ran.
             Statement::FunctionDeclaration(_) => {}
             Statement::SwitchStatement(switch) => self.switch_statement(switch),
@@ -752,14 +1033,15 @@ impl Lowering {
                         }
                     }
                 }
-                self.emit(
+                let result = self.emit(
                     Type::Unknown,
                     Op::Call {
                         callee,
                         this_value,
                         args,
                     },
-                )
+                );
+                self.propagate(result)
             }
             Expression::ObjectExpression(object) => self.object(object),
             Expression::FunctionExpression(function) => {
@@ -807,7 +1089,8 @@ impl Lowering {
                         }
                     }
                 }
-                self.emit(Type::Object(None), Op::Construct { callee, args })
+                let result = self.emit(Type::Object(None), Op::Construct { callee, args });
+                self.propagate(result)
             }
             Expression::ClassExpression(class) => {
                 let name = class
@@ -846,6 +1129,7 @@ impl Lowering {
                 let key = self.expression(&member.expression);
                 self.emit(Type::Unknown, Op::ComputedLoad { object, key })
             }
+            Expression::UpdateExpression(update) => self.update(update),
             Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression),
             other => {
                 self.note(expression_kind(other), 0);
@@ -884,7 +1168,8 @@ impl Lowering {
             BinaryOperator::ShiftLeft => BinaryOp::ShiftLeft,
             BinaryOperator::ShiftRight => BinaryOp::ShiftRight,
             BinaryOperator::ShiftRightZeroFill => BinaryOp::UnsignedShiftRight,
-            // `==`, `!=`, `in`, `instanceof` — each needs machinery this does not have yet.
+            BinaryOperator::Instanceof => BinaryOp::InstanceOf,
+            // `==`, `!=`, `in` — each needs machinery this does not have yet.
             _ => {
                 self.note(
                     &format!("binary operator {}", operator.as_str()),
@@ -1331,13 +1616,10 @@ impl Lowering {
 /// A statement's kind, for the unsupported list.
 fn kind_of(statement: &Statement<'_>) -> &'static str {
     match statement {
-        Statement::ForStatement(_) => "for statement",
         Statement::ForInStatement(_) => "for-in statement",
         Statement::ForOfStatement(_) => "for-of statement",
         Statement::FunctionDeclaration(_) => "function declaration",
         Statement::ClassDeclaration(_) => "class declaration",
-        Statement::TryStatement(_) => "try statement",
-        Statement::ContinueStatement(_) => "continue statement",
         Statement::ImportDeclaration(_) => "import declaration",
         _ => "statement",
     }
@@ -1350,11 +1632,23 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         Expression::FunctionExpression(_) => "function expression",
         Expression::ArrayExpression(_) => "array literal",
         Expression::UnaryExpression(_) => "unary expression",
+        Expression::UpdateExpression(_) => "update expression",
         Expression::LogicalExpression(_) => "logical expression",
         Expression::ConditionalExpression(_) => "conditional expression",
         Expression::TemplateLiteral(_) => "template literal",
         Expression::AwaitExpression(_) => "await expression",
         Expression::NewExpression(_) => "new expression",
-        _ => "expression",
+        Expression::StringLiteral(_) => "string literal",
+        Expression::RegExpLiteral(_) => "regular expression literal",
+        Expression::BigIntLiteral(_) => "bigint literal",
+        Expression::SequenceExpression(_) => "comma expression",
+        Expression::TaggedTemplateExpression(_) => "tagged template",
+        Expression::PrivateFieldExpression(_) => "private field",
+        Expression::Super(_) => "super",
+        Expression::YieldExpression(_) => "yield expression",
+        Expression::ChainExpression(_) => "optional chain",
+        // A name rather than "expression": the unsupported list is read to decide what to
+        // implement next, and a bucket everything unrecognised falls into says nothing.
+        _ => "an expression this compiler does not name yet",
     }
 }

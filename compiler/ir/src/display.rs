@@ -106,6 +106,7 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::ComputedLoad { object, key } => write!(f, "get {object}[{key}]"),
         Op::ComputedStore { object, key, value } => write!(f, "set {object}[{key}] = {value}"),
         Op::CreateObject { shape } => write!(f, "object #{}", shape.index()),
+        Op::CaughtValue => write!(f, "caught"),
         Op::Construct { callee, args } => {
             let args: Vec<String> = args.iter().map(ToString::to_string).collect();
             write!(f, "new {callee}({})", args.join(", "))
