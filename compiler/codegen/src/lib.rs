@@ -175,6 +175,7 @@ const CONSTRUCT_RESULT_SYMBOL: &str = "crisol_construct_result";
 const CREATE_ARRAY_SYMBOL: &str = "crisol_create_array";
 const COMPUTED_LOAD_SYMBOL: &str = "crisol_computed_load";
 const COMPUTED_STORE_SYMBOL: &str = "crisol_computed_store";
+const STRICT_EQUAL_SYMBOL: &str = "crisol_strict_equal";
 
 /// The symbol holding the addresses of the program's compiled functions.
 pub const FUNCTION_TABLE_SYMBOL: &str = "crisol_functions";
@@ -206,6 +207,8 @@ struct ObjectHelpers<T> {
     computed_load: T,
     /// `crisol_computed_store(object, key, value)`
     computed_store: T,
+    /// `crisol_strict_equal(left, right) -> boolean`
+    strict_equal: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -275,6 +278,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     computed_store.params.push(AbiParam::new(types::I64));
     computed_store.params.push(AbiParam::new(types::I64));
 
+    let mut strict_equal = module.make_signature();
+    strict_equal.params.push(AbiParam::new(types::I64));
+    strict_equal.params.push(AbiParam::new(types::I64));
+    strict_equal.returns.push(AbiParam::new(types::I64));
+
     let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
         module
             .declare_function(symbol, Linkage::Import, signature)
@@ -295,6 +303,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         create_array: declare(CREATE_ARRAY_SYMBOL, &create_array)?,
         computed_load: declare(COMPUTED_LOAD_SYMBOL, &computed_load)?,
         computed_store: declare(COMPUTED_STORE_SYMBOL, &computed_store)?,
+        strict_equal: declare(STRICT_EQUAL_SYMBOL, &strict_equal)?,
     })
 }
 
@@ -781,6 +790,9 @@ impl Backend for Cranelift {
             computed_store: self
                 .module
                 .declare_func_in_func(self.objects.computed_store, &mut context.func),
+            strict_equal: self
+                .module
+                .declare_func_in_func(self.objects.strict_equal, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature
@@ -1228,10 +1240,25 @@ impl Lowering<'_> {
                         };
                         self.builder.ins().fcmp(cc, left, right)
                     }
+                    // On values of unknown type this is a call, for D-53's reasons: `NaN` has
+                    // identical bits to itself and is not equal to itself, and `+0` and `-0`
+                    // have different bits and are. A bit comparison gets both wrong.
                     CompareOp::StrictEqual | CompareOp::StrictNotEqual => {
-                        return Err(CodegenError::Unsupported {
-                            operation: "strict equality on values of unknown type".to_owned(),
-                        });
+                        let call = self
+                            .builder
+                            .ins()
+                            .call(self.objects.strict_equal, &[left, right]);
+                        let equal = self.builder.inst_results(call)[0];
+                        let boxed_true = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, crisol_value::Value::TRUE.to_bits() as i64);
+                        let condition = if matches!(op, CompareOp::StrictEqual) {
+                            cranelift_codegen::ir::condcodes::IntCC::Equal
+                        } else {
+                            cranelift_codegen::ir::condcodes::IntCC::NotEqual
+                        };
+                        self.builder.ins().icmp(condition, equal, boxed_true)
                     }
                 };
                 Some(self.box_condition(condition))
@@ -1708,6 +1735,9 @@ impl Jit {
             computed_store: self
                 .module
                 .declare_func_in_func(self.objects.computed_store, &mut context.func),
+            strict_equal: self
+                .module
+                .declare_func_in_func(self.objects.strict_equal, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         // Every indirect call goes through this one signature. That it is the *same* signature

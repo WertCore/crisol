@@ -24,6 +24,16 @@ and a constructor returning an object replacing the instance. Heap objects carry
 the collector traces, and engine state lives beside the property slots rather than in them
 (D-96), which is what made every class constructor silently uncallable.
 
+**test262 is now attempted rather than counted.** `cli/tests/test262.rs` compiles and runs
+cases and reports three numbers — refused, crashed, ran — and does not collapse them: crisol
+has no throw path, so a case that runs to completion may have reached an assertion it could not
+signal. `ran` is an upper bound on the pass rate, not the pass rate.
+
+The run is a single-blocker sequence so far, each fix revealing the next, every time on all
+379 sampled cases: function declaration hoisting (D-102), then `switch` (D-103), now `try`.
+The next one is the exception mechanism M13's deliverable says to *"decide and record"*, and it
+is still undecided.
+
 **M13's acceptance is met.** `main.ts` containing arithmetic, closures, classes and array
 methods compiles to a standalone binary that runs and produces correct output, with GC stress
 enabled — every acceptance program is run twice, the second time collecting on every
@@ -55,7 +65,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1049 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1063 tests passing; the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

@@ -3148,3 +3148,45 @@ callable as, so a native and a compiled callee reach the same call site by const
 also where `crisol_not_a_function` comes from, which means a built-in that goes missing degrades
 to `undefined` rather than a jump through a null pointer — and, as D-100 records, that made a
 collector bug look like a callback that simply did nothing.
+
+## D-102
+
+**Function declarations are bound before any statement in their list runs.**
+
+Status: Accepted
+
+A function declaration is usable above its own text — `f(); function f() {}` is ordinary
+JavaScript. The lowering bound the name where the declaration appeared, so a call above it read
+an unset slot. That was recorded as unsupported rather than miscompiled, which was the right
+call and made **every one of test262's 12,719 cases refuse to compile**: the suite's own
+`assert.js` defines its helpers below the code that uses them.
+
+Only the declarations at the top level of a statement list are hoisted. A function inside a
+block belongs to that block's scope, which needs block scoping the lowering does not model, so
+those stay where they are and are still refused — visibly, rather than bound in the wrong scope
+and shadowing something.
+
+## D-103
+
+**`switch` is a chain of comparisons and a run of fall-through blocks, not nested `if`s.**
+
+Status: Accepted
+
+Two behaviours rule out the obvious lowering, and both are observable:
+
+- **Cases fall through.** A body with no `break` continues into the next, so the bodies are a
+  chain rather than arms of a conditional.
+- **`default` is tested last but runs in its source position.** `switch (x) { default: a();
+  case 1: b(); }` runs only `b()` when `x === 1`, and `a()` *then* `b()` otherwise. Putting
+  `default` last is wrong for the second; treating it as a first-match arm is wrong for the
+  first.
+
+The discriminant is evaluated once into a temporary, so `switch (f())` does not call `f` per
+case.
+
+**Consequence: `===` on values of unknown type had to become a call.** Every case comparison is
+one, and the backend refused them for D-53's reasons — `NaN` has identical bits to itself and
+is not equal to itself, `+0` and `-0` differ in bits and are equal. `crisol_strict_equal`
+compares as numbers when both are numbers, which gets both right because IEEE equality already
+says exactly that, and falls back to identity otherwise. Strings will need revisiting: two
+distinct string objects with the same characters are `===` and are not the same handle.

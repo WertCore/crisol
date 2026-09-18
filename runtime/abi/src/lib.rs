@@ -58,6 +58,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_create_array",
     "crisol_computed_load",
     "crisol_computed_store",
+    "crisol_strict_equal",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -1516,4 +1517,30 @@ pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) {
     let text = name.as_str().to_owned();
     // SAFETY: as above.
     unsafe { crisol_property_store(object, text.as_ptr(), text.len() as u64, value) }
+}
+
+/// `left === right`, on values of any type.
+///
+/// **Three things make this not a bit comparison**, which is why D-53 had the backend refuse it
+/// rather than guess:
+///
+/// - `NaN === NaN` is **false**, and two `NaN`s have identical bits.
+/// - `+0 === -0` is **true**, and their bits differ.
+/// - Different types are never equal, whatever their payloads.
+///
+/// Comparing as numbers when both are numbers gets the first two right for free, because IEEE
+/// equality already says exactly that. Everything else is identity, which is correct for
+/// `undefined`, `null`, booleans and objects — and will need revisiting for strings, where two
+/// distinct objects with the same characters are `===` and are not the same handle.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_strict_equal(left: u64, right: u64) -> u64 {
+    let left = Value::from_bits(left);
+    let right = Value::from_bits(right);
+    let equal = match (left.as_number(), right.as_number()) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => left.kind() == right.kind() && left.to_bits() == right.to_bits(),
+        _ => false,
+    };
+    if equal { Value::TRUE } else { Value::FALSE }.to_bits()
 }

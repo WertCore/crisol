@@ -7,6 +7,87 @@ bb0:  ; entry
     return
 }
 
+=== hoisted-function ===
+--- source
+let r = f(); function f() { return 1; }
+--- ir
+function hoisted-function {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $1, v0
+    v1: unknown = load $1
+    v2: undefined = const undefined
+    v3: unknown = call v1(this=v2)  ; safepoint []
+    store $2, v3
+    return
+}
+function f {
+bb0:  ; entry
+    v0: number = const 1.0
+    return v0
+}
+
+=== switch-fallthrough ===
+--- source
+let r = 0; switch (1) { case 1: r = 1; case 2: r = 2; }
+--- ir
+function switch-fallthrough {
+bb0:  ; entry
+    v0: number = const 0.0
+    store $1, v0
+    v1: number = const 1.0
+    store $2, v1
+    v2: unknown = load $2
+    v3: number = const 1.0
+    v4: bool = eq v2, v3
+    branch v4 -> bb1, bb4
+bb1:
+    v8: number = const 1.0
+    store $1, v8
+    jump bb2
+bb2:
+    v9: number = const 2.0
+    store $1, v9
+    jump bb3
+bb3:
+    return
+bb4:
+    v5: unknown = load $2
+    v6: number = const 2.0
+    v7: bool = eq v5, v6
+    branch v7 -> bb2, bb5
+bb5:
+    jump bb3
+}
+
+=== switch-break-default ===
+--- source
+let r = 0; switch (9) { case 1: r = 1; break; default: r = 5; }
+--- ir
+function switch-break-default {
+bb0:  ; entry
+    v0: number = const 0.0
+    store $1, v0
+    v1: number = const 9.0
+    store $2, v1
+    v2: unknown = load $2
+    v3: number = const 1.0
+    v4: bool = eq v2, v3
+    branch v4 -> bb1, bb4
+bb1:
+    v5: number = const 1.0
+    store $1, v5
+    jump bb3
+bb2:
+    v6: number = const 5.0
+    store $1, v6
+    jump bb3
+bb3:
+    return
+bb4:
+    jump bb2
+}
+
 === computed-read ===
 --- source
 let a = [1, 2]; let x = a[0];

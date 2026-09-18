@@ -697,3 +697,89 @@ fn methods_chain() {
         "90",
     );
 }
+
+// ---- hoisting and switch ----------------------------------------------------------------
+
+/// **A function declaration is usable above its own text.** Every test262 case depends on it —
+/// the suite's own `assert.js` defines helpers below the code that calls them.
+#[test]
+fn a_function_declaration_is_callable_before_it_appears() {
+    check(
+        "hoist-call-before",
+        "let r = f(); function f() { return 7; } return r;",
+        "7",
+    );
+}
+
+#[test]
+fn hoisting_works_inside_a_function_too() {
+    check(
+        "hoist-nested",
+        "function outer() { let r = inner(); function inner() { return 3; } return r; } return outer();",
+        "3",
+    );
+}
+
+#[test]
+fn a_switch_picks_the_matching_case() {
+    check(
+        "switch-match",
+        "let x = 2; let r = 0; switch (x) { case 1: r = 10; break; case 2: r = 20; break; } return r;",
+        "20",
+    );
+}
+
+/// **Cases fall through without `break`**, which is what makes a switch more than nested ifs.
+#[test]
+fn a_case_without_break_falls_through() {
+    check(
+        "switch-fallthrough",
+        "let r = 0; switch (1) { case 1: r = r + 1; case 2: r = r + 10; case 3: r = r + 100; } return r;",
+        "111",
+    );
+}
+
+#[test]
+fn break_stops_the_fall_through() {
+    check(
+        "switch-break",
+        "let r = 0; switch (1) { case 1: r = r + 1; break; case 2: r = r + 10; } return r;",
+        "1",
+    );
+}
+
+#[test]
+fn default_runs_when_nothing_matches() {
+    check(
+        "switch-default",
+        "let r = 0; switch (9) { case 1: r = 1; break; default: r = 5; } return r;",
+        "5",
+    );
+}
+
+/// **`default` is tested last but runs in its source position.** With a match it is skipped
+/// entirely; without one, control enters it and then falls through into what follows.
+#[test]
+fn default_before_a_case_still_falls_through_into_it() {
+    check(
+        "switch-default-first",
+        "let r = 0; switch (9) { default: r = r + 1; case 1: r = r + 10; } return r;",
+        "11",
+    );
+    check(
+        "switch-default-first-match",
+        "let r = 0; switch (1) { default: r = r + 1; case 1: r = r + 10; } return r;",
+        "10",
+    );
+}
+
+/// The discriminant is evaluated once, so `switch (f())` does not call `f` per case.
+#[test]
+fn the_discriminant_is_evaluated_once() {
+    check(
+        "switch-once",
+        "let calls = 0; let f = function () { calls = calls + 1; return 3; }; \
+         switch (f()) { case 1: break; case 2: break; case 3: break; } return calls;",
+        "1",
+    );
+}

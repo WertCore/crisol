@@ -146,6 +146,8 @@ struct Lowering {
     unsupported: Vec<Unsupported>,
     /// Names a closure must share rather than copy, from [`crate::escape`].
     shared: std::collections::HashSet<String>,
+    /// Where an unlabelled `break` goes, innermost last.
+    breaks: Vec<BlockId>,
 }
 
 /// The property a cell keeps its value in.
@@ -166,6 +168,7 @@ impl Lowering {
         let mut lowering = Self {
             functions: vec![function],
             shared: std::collections::HashSet::new(),
+            breaks: Vec::new(),
             scopes: vec![Scope {
                 function: 0,
                 current: entry,
@@ -209,8 +212,120 @@ impl Lowering {
     }
 
     fn program(&mut self, program: &Program<'_>) {
+        self.hoist(&program.body);
         for statement in &program.body {
             self.statement(statement);
+        }
+    }
+
+    /// `switch`, as a chain of strict comparisons and a run of fall-through blocks.
+    ///
+    /// Two things make it more than a nest of `if`s, and both are observable:
+    ///
+    /// - **Cases fall through.** A body with no `break` continues into the next one, which is
+    ///   why the bodies are a chain rather than branches of a conditional.
+    /// - **`default` is tested last but runs in its source position.** `switch (x) { default:
+    ///   a(); case 1: b(); }` with `x === 1` runs only `b()`, and with anything else runs
+    ///   `a()` *and then* `b()`. Lowering `default` as the final body would be wrong for the
+    ///   second, and treating it as a first-match arm wrong for the first.
+    ///
+    /// The discriminant is evaluated **once**, into a temporary, because the comparisons read
+    /// it repeatedly and `switch (f())` must not call `f` per case.
+    fn switch_statement(&mut self, statement: &oxc_ast::ast::SwitchStatement<'_>) {
+        let slot = self.temporary();
+        let discriminant = self.expression(&statement.discriminant);
+        self.emit_effect(Op::Store {
+            slot,
+            value: discriminant,
+        });
+
+        let bodies: Vec<BlockId> = statement.cases.iter().map(|_| self.new_block()).collect();
+        let end = self.new_block();
+        let default = statement
+            .cases
+            .iter()
+            .position(|case| case.test.is_none())
+            .map(|index| bodies[index]);
+
+        for (index, case) in statement.cases.iter().enumerate() {
+            let Some(test) = &case.test else {
+                // `default` takes no test here; it is where control goes once every test has
+                // failed, which is decided after this loop.
+                continue;
+            };
+            let next = self.new_block();
+            let left = self.emit(Type::Unknown, Op::Load { slot });
+            let right = self.expression(test);
+            let matched = self.emit(
+                Type::Bool,
+                Op::Compare {
+                    op: CompareOp::StrictEqual,
+                    left,
+                    right,
+                },
+            );
+            self.terminate(Terminator::Branch {
+                condition: matched,
+                then_block: bodies[index],
+                then_args: Vec::new(),
+                else_block: next,
+                else_args: Vec::new(),
+            });
+            self.switch_to(next);
+        }
+        // Every test failed.
+        self.terminate(Terminator::Jump {
+            target: default.unwrap_or(end),
+            args: Vec::new(),
+        });
+
+        self.breaks.push(end);
+        for (index, case) in statement.cases.iter().enumerate() {
+            self.switch_to(bodies[index]);
+            for inner in &case.consequent {
+                self.statement(inner);
+            }
+            // Falls into the next body, or out. A body that already returned or broke is
+            // terminated, and `terminate` leaves it alone.
+            self.terminate(Terminator::Jump {
+                target: bodies.get(index + 1).copied().unwrap_or(end),
+                args: Vec::new(),
+            });
+        }
+        self.breaks.pop();
+        self.switch_to(end);
+    }
+
+    /// Binds every function declared in `statements`, before any of them runs.
+    ///
+    /// **A function declaration is usable above its own text.** `f(); function f() {}` is
+    /// ordinary JavaScript and the whole of test262's own harness depends on it — `assert.js`
+    /// defines helpers below the code that calls them. Lowering declarations where they appear
+    /// left the name unbound until control reached it, so every one of the 12,719 cases was
+    /// refused for the same reason.
+    ///
+    /// Only the declarations at this level. A function inside a block is hoisted to that
+    /// block's scope, which needs block scoping the lowering does not model, so those are left
+    /// where they are and still refused — visibly, rather than bound in the wrong scope.
+    fn hoist(&mut self, statements: &[Statement<'_>]) {
+        for statement in statements {
+            let Statement::FunctionDeclaration(declaration) = statement else {
+                continue;
+            };
+            let name = declaration
+                .id
+                .as_ref()
+                .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+            let (id, names) = self.lower_function(
+                &name,
+                &declaration.params,
+                declaration.body.as_deref(),
+                None,
+                true,
+            );
+            let closure = self.close_over(id, &names);
+            let slot = self.declare(&name);
+            self.bind(&name, slot, closure);
         }
     }
 
@@ -499,25 +614,23 @@ impl Lowering {
                 let value = self.expression(&statement.argument);
                 self.terminate(Terminator::Throw(value));
             }
-            Statement::FunctionDeclaration(declaration) => {
-                let name = declaration
-                    .id
-                    .as_ref()
-                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                let (id, names) = self.lower_function(
-                    &name,
-                    &declaration.params,
-                    declaration.body.as_deref(),
-                    None,
-                    true,
-                );
-                let closure = self.close_over(id, &names);
-                // A declaration binds its name in the enclosing scope. Hoisting is not modelled
-                // — the binding appears where the declaration does, so a call before it reads
-                // an unset slot rather than working. Recorded rather than silently half-right.
-                self.note("function declaration hoisting", declaration.span.start);
-                let slot = self.declare(&name);
-                self.bind(&name, slot, closure);
+            // Already bound by `hoist`, before any statement in this list ran.
+            Statement::FunctionDeclaration(_) => {}
+            Statement::SwitchStatement(switch) => self.switch_statement(switch),
+            Statement::BreakStatement(statement) => {
+                if statement.label.is_some() {
+                    // A labelled break leaves a named construct, which needs the label to name
+                    // a block. Refused rather than treated as an unlabelled one, which would
+                    // leave the wrong construct.
+                    self.note("labelled break", statement.span.start);
+                } else if let Some(target) = self.breaks.last().copied() {
+                    self.terminate(Terminator::Jump {
+                        target,
+                        args: Vec::new(),
+                    });
+                } else {
+                    self.note("break outside a switch or loop", statement.span.start);
+                }
             }
             Statement::ClassDeclaration(class) => {
                 let name = class
@@ -1020,6 +1133,7 @@ impl Lowering {
         }
 
         if let Some(body) = body {
+            self.hoist(&body.statements);
             for statement in &body.statements {
                 self.statement(statement);
             }
@@ -1223,8 +1337,6 @@ fn kind_of(statement: &Statement<'_>) -> &'static str {
         Statement::FunctionDeclaration(_) => "function declaration",
         Statement::ClassDeclaration(_) => "class declaration",
         Statement::TryStatement(_) => "try statement",
-        Statement::SwitchStatement(_) => "switch statement",
-        Statement::BreakStatement(_) => "break statement",
         Statement::ContinueStatement(_) => "continue statement",
         Statement::ImportDeclaration(_) => "import declaration",
         _ => "statement",

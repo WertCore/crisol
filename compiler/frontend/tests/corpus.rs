@@ -25,6 +25,20 @@ use crisol_ir::{Op, verify_module};
 /// The programs. Order is fixed, because the snapshot is.
 const CORPUS: &[(&str, &str)] = &[
     ("empty", ""),
+    // A function declaration is usable above its own text, which the whole of test262's own
+    // harness depends on.
+    (
+        "hoisted-function",
+        "let r = f(); function f() { return 1; }",
+    ),
+    (
+        "switch-fallthrough",
+        "let r = 0; switch (1) { case 1: r = 1; case 2: r = 2; }",
+    ),
+    (
+        "switch-break-default",
+        "let r = 0; switch (9) { case 1: r = 1; break; default: r = 5; }",
+    ),
     // Computed access, which is how every element read reaches the IR. `a[0]` and `a["0"]`
     // are the same operation in JavaScript, so one op covers both.
     ("computed-read", "let a = [1, 2]; let x = a[0];"),
@@ -305,7 +319,6 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // The function itself lowers now; what does not is **hoisting**. The binding appears
         // where the declaration does, so calling it earlier in the source reads an unset slot
         // rather than working. Recorded rather than left silently half-right.
-        ("function f() { }", "function declaration hoisting"),
         ("try { } catch (e) { }", "try statement"),
         ("let [a] = [1];", "destructuring declaration"),
         ("let o = { ...{} };", "object spread"),
