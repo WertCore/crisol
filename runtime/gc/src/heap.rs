@@ -247,6 +247,45 @@ impl Heap {
         }
     }
 
+    /// Moves `handle` to `shape`, growing it to `slots` values.
+    ///
+    /// An object literal is lowered as an empty allocation followed by one `PropertyStore` per
+    /// property, and a shape names the properties an object has — so storing a *new* property
+    /// has to move the object to the shape that includes it. Without this, an object allocated
+    /// at the root shape could never gain a property, which is every object literal.
+    ///
+    /// Returns whether it happened. It refuses two things:
+    ///
+    /// - a stale handle, like every other accessor here;
+    /// - **any request that would shrink the object**, because the slots past the new end hold
+    ///   values, and dropping them would make the collector stop tracing references that the
+    ///   object still logically owns. A transition that removes a property has to be written as
+    ///   an explicit rebuild, so that the values being discarded are discarded *visibly*.
+    ///
+    /// New slots arrive as `undefined` rather than uninitialised: a slot holding a plausible
+    /// bit pattern is the worst case for a precise collector, which would read it as a
+    /// reference and follow it.
+    pub fn transition(&self, handle: GcRef, shape: ShapeId, slots: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                if slots < object.slots.len() {
+                    return false;
+                }
+                object.slots.resize(slots, Value::UNDEFINED);
+                object.shape = shape;
+                true
+            }
+            State::Free => false,
+        }
+    }
+
     /// Runs a collection.
     ///
     /// Mark from the roots, sweep what was not reached. Precise rather than conservative: the

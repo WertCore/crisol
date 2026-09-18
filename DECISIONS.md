@@ -2846,3 +2846,31 @@ compiled code. That makes "forgot to install" indistinguishable from "nothing to
 the API level, which is a real hazard: the symptom is a freed live value, far from the cause.
 `has_extra_roots` exists so a caller can assert it, and the compiled entry point installs
 before it runs anything.
+
+## D-92
+
+**`Heap::transition` refuses to shrink an object.**
+
+Status: Accepted
+
+An object literal is lowered as an empty allocation followed by one `PropertyStore` per
+property (see the comment in `lower.rs::object`), and a shape names the properties an object
+has. So storing a new property must move the object to the shape that includes it, and the
+heap had no way to do that — `alloc` fixed shape and slot count for the object's whole life.
+Every object literal in compiled code was blocked on this, not on codegen.
+
+Growing is the only direction allowed. Shrinking would drop the values in the slots past the
+new end, and any of those may be the last reference to a live object — so a shape transition
+that happened to narrow would silently turn into a collection bug, appearing later and
+somewhere else. Removing a property therefore has to be written as an explicit rebuild, where
+the values being discarded are discarded visibly.
+
+New slots arrive as `undefined` rather than uninitialised, for the same reason the collector is
+precise: an unwritten slot holding a plausible bit pattern is exactly what a precise marker
+would read as a reference and follow.
+
+**Consequence:** `transition` trusts its caller that the shape and the slot count agree. The
+heap cannot check it, because it holds no `Shapes` table and deliberately does not — shapes are
+`crisol-value`'s business. A caller that grows to a slot count disagreeing with the shape gets
+an object whose properties resolve to the wrong slots, which is why the only intended caller is
+the runtime's property-store path rather than embedder code.

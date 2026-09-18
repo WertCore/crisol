@@ -502,3 +502,84 @@ fn a_provider_root_keeps_what_it_points_at_alive_too() {
         "the provider's root is traced, not just marked"
     );
 }
+
+// ---- growing an object as properties are added -----------------------------------------
+
+#[test]
+fn a_transition_keeps_the_existing_values_and_leaves_the_new_slot_undefined() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let two = shapes.add(one, &PropertyKey::new("tail"));
+    let heap = Heap::new();
+
+    let scope = heap.scope();
+    let object = scope.alloc(one, 1);
+    let kept = scope.alloc(one, 1);
+    heap.set(object.handle(), 0, kept.to_value());
+
+    assert!(heap.transition(object.handle(), two, 2));
+    assert_eq!(heap.get(object.handle(), 0), Some(kept.to_value()));
+    assert_eq!(
+        heap.get(object.handle(), 1),
+        Some(Value::UNDEFINED),
+        "a new slot must not hold a plausible bit pattern"
+    );
+    assert_eq!(heap.shape_of(object.handle()), Some(two));
+}
+
+/// The claim that matters to the collector: a reference written into a slot that did not exist
+/// at allocation is still traced. A `transition` that grew the object without the marker
+/// knowing would free exactly the values an object literal's properties point at.
+#[test]
+fn a_reference_stored_in_a_grown_slot_is_traced() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let two = shapes.add(one, &PropertyKey::new("tail"));
+    let heap = Heap::new();
+
+    let holder = {
+        let scope = heap.scope();
+        let holder = scope.alloc(one, 1);
+        let target = scope.alloc(one, 1);
+        assert!(heap.transition(holder.handle(), two, 2));
+        heap.set(holder.handle(), 1, target.to_value());
+        holder.handle()
+    };
+    heap.set_extra_roots(Box::new(move || vec![holder]));
+
+    assert_eq!(heap.collect().swept, 0);
+    assert_eq!(heap.live(), 2, "the grown slot is traced like any other");
+}
+
+#[test]
+fn a_transition_that_would_shrink_is_refused() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let scope = heap.scope();
+    let object = scope.alloc(one, 2);
+    heap.set(object.handle(), 1, Value::TRUE);
+
+    // Shrinking would drop slot 1 silently, and with it any reference it held.
+    assert!(!heap.transition(object.handle(), shapes.root(), 1));
+    assert_eq!(heap.get(object.handle(), 1), Some(Value::TRUE));
+}
+
+#[test]
+fn a_transition_through_a_stale_handle_is_refused() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let stale = {
+        let scope = heap.scope();
+        scope.alloc(one, 1).handle()
+    };
+    heap.collect();
+    assert!(!heap.is_live(stale));
+    assert!(
+        !heap.transition(stale, one, 4),
+        "a freed slot must not be resurrected"
+    );
+}
