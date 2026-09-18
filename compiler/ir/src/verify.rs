@@ -81,6 +81,29 @@ pub enum VerifyError {
         /// Which instruction in the block.
         index: usize,
     },
+    /// A closure names a function that does not exist.
+    NoSuchFunction {
+        /// Where.
+        at: BlockId,
+        /// The bad id.
+        function: u32,
+    },
+    /// A closure passes the wrong number of captured values.
+    ///
+    /// [`crate::Function::captures`] and [`crate::Op::Closure`]'s `captures` pair **by
+    /// position**, so a mismatch means the callee reads a slot nobody filled — uninitialised,
+    /// and plausible. This is the one check that cannot be done on a single function, which is
+    /// why [`verify_module`] exists.
+    WrongCaptureCount {
+        /// Where.
+        at: BlockId,
+        /// Which function was closed over.
+        function: u32,
+        /// How many were passed.
+        passed: usize,
+        /// How many it expects.
+        expected: usize,
+    },
     /// An operation that cannot collect has a safepoint anyway.
     ///
     /// Rejected rather than ignored: a safepoint on a `Const` means whoever built this did not
@@ -127,6 +150,21 @@ impl fmt::Display for VerifyError {
             Self::MissingSafepoint { at, index } => write!(
                 f,
                 "{at}[{index}] can collect and has no safepoint, so the GC would not see its live values"
+            ),
+            Self::NoSuchFunction { at, function } => {
+                write!(
+                    f,
+                    "{at} closes over function @{function}, which does not exist"
+                )
+            }
+            Self::WrongCaptureCount {
+                at,
+                function,
+                passed,
+                expected,
+            } => write!(
+                f,
+                "{at} passes {passed} captures to function @{function}, which takes {expected}"
             ),
             Self::UnexpectedSafepoint { at, index } => {
                 write!(f, "{at}[{index}] cannot collect but carries a safepoint")
@@ -361,4 +399,59 @@ fn dominators(function: &Function) -> Vec<HashSet<u32>> {
         }
     }
     sets
+}
+
+/// Checks a whole module: every function, plus the relationships between them.
+///
+/// **One check here cannot be done on a single function**: [`crate::Op::Closure`]'s captures
+/// pair positionally with the target's [`crate::Function::captures`], and a mismatch means the
+/// callee reads a slot nobody filled. That value is uninitialised and plausible — the worst
+/// combination — and it is invisible to a verifier that only ever sees one function at a time.
+///
+/// # Errors
+///
+/// Every problem across every function, so one malformed closure does not hide the rest.
+pub fn verify_module(functions: &[Function]) -> Result<(), Vec<VerifyError>> {
+    let mut errors = Vec::new();
+    for function in functions {
+        if let Err(mut found) = verify(function) {
+            errors.append(&mut found);
+        }
+    }
+
+    for function in functions {
+        for (raw, block) in function.blocks.iter().enumerate() {
+            let id = BlockId::from_index(u32::try_from(raw).unwrap_or(u32::MAX));
+            for instruction in &block.instructions {
+                let crate::Op::Closure {
+                    function: target,
+                    captures,
+                } = &instruction.op
+                else {
+                    continue;
+                };
+                let Some(callee) = functions.get(target.0 as usize) else {
+                    errors.push(VerifyError::NoSuchFunction {
+                        at: id,
+                        function: target.0,
+                    });
+                    continue;
+                };
+                if captures.len() != callee.captures.len() {
+                    errors.push(VerifyError::WrongCaptureCount {
+                        at: id,
+                        function: target.0,
+                        passed: captures.len(),
+                        expected: callee.captures.len(),
+                    });
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }

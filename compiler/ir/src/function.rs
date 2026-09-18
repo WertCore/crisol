@@ -85,6 +85,14 @@ impl fmt::Display for BlockId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FunctionId(pub u32);
 
+impl FunctionId {
+    /// The index.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
 /// A literal.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
@@ -473,7 +481,25 @@ pub struct Block {
 pub struct Function {
     /// For the text dump.
     pub name: String,
-    /// Parameters, as the entry block's parameters.
+    /// Slots that receive the arguments, in declaration order.
+    ///
+    /// Slots rather than block parameters because locals live in slots until `mem2reg`
+    /// (D-59), and a parameter is a local that arrives pre-assigned. When that pass lands
+    /// these become entry-block parameters and this list goes away.
+    pub parameters: Vec<u32>,
+    /// Slots that receive the captured values, positionally matching [`Op::Closure`]'s
+    /// `captures`.
+    ///
+    /// **The pairing is by position**, so the two must be built together. A closure that passed
+    /// three values to a function expecting two would otherwise leave the third slot
+    /// uninitialised — and an uninitialised slot holds a plausible value, which is the worst
+    /// kind of wrong.
+    ///
+    /// [`crate::verify_module`] checks this, and it is the one rule that **cannot** be checked
+    /// by looking at a single function, which is why that entry point exists alongside
+    /// [`crate::verify`].
+    pub captures: Vec<u32>,
+    /// The first block.
     pub entry: BlockId,
     /// Every block. Index is [`BlockId`].
     pub blocks: Vec<Block>,
@@ -487,6 +513,8 @@ impl Function {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_owned(),
+            parameters: Vec::new(),
+            captures: Vec::new(),
             entry: BlockId(0),
             blocks: vec![Block {
                 params: Vec::new(),

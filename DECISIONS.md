@@ -2318,3 +2318,47 @@ The conditional operator is the same shape for the same reason.
 1, and a hole is not `undefined` (D-64) — the IR has no way to express one, so filling it with
 `undefined` would produce a value that reads the same and answers `in` differently. Recorded
 rather than guessed, per D-59.
+
+---
+
+## D-81 — A name is captured exactly when resolving it leaves the scope
+
+**Status:** Accepted (M13) · **Affects:** M11, M13
+
+Closures need to know which outer variables a nested function reads. That is usually a
+free-variable pre-pass over the AST. Here it falls out of resolution: **a name is a capture
+exactly when looking it up walks out of the current function's scope**, so the lookup *is* the
+analysis and there is no second traversal to keep in step with the first.
+
+The distinction that makes it work is between two operations that look alike:
+
+- `slot(name)` — *read* a name. Walks outward, and records a capture if it finds one.
+- `declare(name)` — *bind* a name. Always local, and shadows whatever is outside.
+
+`let`, `const`, `var` and **parameters** all declare. Using `slot` for a parameter would capture
+the outer binding of the same name and then immediately overwrite it with the argument, so
+`let a = 1; (a) => a` would close over a value it never reads. Both directions are
+mutation-tested.
+
+**Captures come back from `lower_function` as names, not slots.** The inner function knows which
+slot a capture lands in; the *enclosing* one knows which value to put there. Resolving the name
+again in the enclosing scope is what makes a chain work — `() => () => a` captures `a` at each
+level, because the middle function's read of `a` is itself a capture.
+
+### The check that needs more than one function
+
+[`Function::captures`] and `Op::Closure`'s `captures` pair **by position**. A mismatch leaves a
+slot uninitialised, and an uninitialised slot holds a *plausible* value — the worst kind of
+wrong.
+
+That cannot be checked by a verifier that sees one function at a time, which is why
+`verify_module` exists alongside `verify`. It was added because a doc comment claimed "nothing
+checks it but the verifier" and that was **false** when written — the honest repair was to make
+the claim true rather than soften it, since the check is worth having.
+
+### Not modelled
+
+**Function declaration hoisting.** The binding appears where the declaration does, so calling a
+function before its declaration reads an unset slot rather than working. Recorded in
+`unsupported` rather than left silently half-right — a hoisting bug looks like a scoping bug and
+is very hard to find from the symptom.

@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 903 tests passing — 899 at the last full-workspace run plus 4 measured new corpus cases; the `node_modules` and test262 cases skip without their suites
+**Totals:** 912 tests passing — 903 at the last measured point plus 9 new in `crisol-ir` and `crisol-frontend`; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
@@ -1612,8 +1612,26 @@ four were in M11's recorded `unsupported` list**. That is a gap in the plan, not
 implementation: the roadmap reads as though M13 begins where M11 stopped, and it does not.
 
 `Op::Binary` and `Op::Unary` are now in the IR, and the lowering covers arithmetic, bitwise,
-unary, logical, conditional and array literals. **Still missing for M13's acceptance:**
-functions/closures, classes, and array *methods* — the last needs calls to resolve.
+unary, logical, conditional and array literals. classes and array *methods* — the latter needs calls to resolve.
+
+### Closures, and where the capture analysis lives
+
+**A name is a capture exactly when resolving it walks out of the current function's scope**
+(D-81), so the lookup *is* the analysis — no free-variable pre-pass to keep in step. The whole
+thing rests on separating two operations that look alike: `slot` *reads* a name and may capture;
+`declare` *binds* one and always shadows. `let` and parameters declare, so
+`let a = 1; (a) => a` captures nothing. Both directions mutation-tested.
+
+Captures come back as **names**, because the inner function knows which slot they land in and
+the enclosing one knows which value to put there — and resolving the name again outside is what
+makes `() => () => a` capture at each level.
+
+`verify_module` was added because a doc comment claimed the verifier checked closure arity and
+that was **false**: the pairing is positional, a mismatch leaves a slot uninitialised, and no
+single-function verifier can see it. The repair was to make the claim true.
+
+**Hoisting is not modelled** — a call before a declaration reads an unset slot, recorded in
+`unsupported` rather than left half-right, because a hoisting bug looks like a scoping bug.
 
 **`Add` is typed `Unknown`, everything else `Number`.** `+` concatenates when either operand is
 a string, so typing it `Number` would let codegen emit a float add for a string concatenation —

@@ -974,3 +974,190 @@ bb0:  ; entry
     return
 }
 
+=== arrow-concise-body ===
+--- source
+let f = (x) => x;
+--- ir
+function arrow-concise-body {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $0, v0
+    return
+}
+function arrow($0) {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== arrow-block-body ===
+--- source
+let f = (x) => { return x; };
+--- ir
+function arrow-block-body {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $0, v0
+    return
+}
+function arrow($0) {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== arrow-no-parameters ===
+--- source
+let f = () => 1;
+--- ir
+function arrow-no-parameters {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $0, v0
+    return
+}
+function arrow {
+bb0:  ; entry
+    v0: number = const 1.0
+    return v0
+}
+
+=== function-expression ===
+--- source
+let f = function (a, b) { return a; };
+--- ir
+function function-expression {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $0, v0
+    return
+}
+function anonymous($0, $1) {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== a-closure-captures-an-outer-local ===
+--- source
+let a = 1; let f = () => a;
+--- ir
+function a-closure-captures-an-outer-local {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    v2: object = closure @1 [v1]  ; safepoint []
+    store $1, v2
+    return
+}
+function arrow captures [$0] {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== a-parameter-shadows-rather-than-captures ===
+--- source
+let a = 1; let f = (a) => a;
+--- ir
+function a-parameter-shadows-rather-than-captures {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: object = closure @1 []  ; safepoint []
+    store $1, v1
+    return
+}
+function arrow($0) {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== a-local-shadows-rather-than-captures ===
+--- source
+let a = 1; let f = () => { let a = 2; return a; };
+--- ir
+function a-local-shadows-rather-than-captures {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: object = closure @1 []  ; safepoint []
+    store $1, v1
+    return
+}
+function arrow {
+bb0:  ; entry
+    v0: number = const 2.0
+    store $0, v0
+    v1: unknown = load $0
+    return v1
+}
+
+=== two-captures-keep-their-order ===
+--- source
+let a = 1; let b = 2; let f = () => a + b;
+--- ir
+function two-captures-keep-their-order {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: number = const 2.0
+    store $1, v1
+    v2: unknown = load $0
+    v3: unknown = load $1
+    v4: object = closure @1 [v2, v3]  ; safepoint []
+    store $2, v4
+    return
+}
+function arrow captures [$0, $1] {
+bb0:  ; entry
+    v0: unknown = load $0
+    v1: unknown = load $1
+    v2: unknown = + v0, v1  ; safepoint []
+    return v2
+}
+
+=== a-nested-closure-captures-through-each-level ===
+--- source
+let a = 1; let f = () => () => a;
+--- ir
+function a-nested-closure-captures-through-each-level {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    v1: unknown = load $0
+    v2: object = closure @1 [v1]  ; safepoint []
+    store $1, v2
+    return
+}
+function arrow captures [$0] {
+bb0:  ; entry
+    v0: unknown = load $0
+    v1: object = closure @2 [v0]  ; safepoint []
+    return v1
+}
+function arrow captures [$0] {
+bb0:  ; entry
+    v0: unknown = load $0
+    return v0
+}
+
+=== a-function-that-runs-off-the-end-returns-undefined ===
+--- source
+let f = () => { let a = 1; };
+--- ir
+function a-function-that-runs-off-the-end-returns-undefined {
+bb0:  ; entry
+    v0: object = closure @1 []  ; safepoint []
+    store $0, v0
+    return
+}
+function arrow {
+bb0:  ; entry
+    v0: number = const 1.0
+    store $0, v0
+    return
+}
+

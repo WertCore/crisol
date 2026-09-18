@@ -7,8 +7,8 @@
 //! Those are not missing tests; they are things the type system already refuses.
 
 use crisol_ir::{
-    Block, BlockId, CompareOp, Constant, Function, Instruction, Op, Safepoint, Terminator, Type,
-    ValueId, VerifyError, verify,
+    Block, BlockId, CompareOp, Constant, Function, FunctionId, Instruction, Op, Safepoint,
+    Terminator, Type, ValueId, VerifyError, verify, verify_module,
 };
 use crisol_value::{PropertyKey, Shapes};
 
@@ -379,4 +379,101 @@ fn every_problem_is_reported_not_just_the_first() {
     };
     let found = errors(&function);
     assert!(found.len() >= 2, "expected several problems, got {found:?}");
+}
+
+// ---- the check that needs more than one function ------------------------------------------
+
+/// A function taking `count` captured values.
+fn callee(count: usize) -> Function {
+    let mut function = Function::new("callee");
+    function.captures = (0..u32::try_from(count).expect("small")).collect();
+    function
+}
+
+/// A program whose entry block closes over `@1` with `count` values.
+fn caller(count: usize) -> Function {
+    let mut function = Function::new("caller");
+    let mut captures = Vec::new();
+    for value in 0..count {
+        let id = function.value();
+        #[expect(clippy::cast_precision_loss, reason = "test values are tiny")]
+        let literal = Constant::Number(value as f64);
+        function
+            .get_mut(BlockId::ENTRY)
+            .expect("entry")
+            .instructions
+            .push(Instruction {
+                result: Some(id),
+                ty: Type::Number,
+                op: Op::Const(literal),
+                safepoint: None,
+            });
+        captures.push(id);
+    }
+    let result = function.value();
+    function
+        .get_mut(BlockId::ENTRY)
+        .expect("entry")
+        .instructions
+        .push(Instruction {
+            result: Some(result),
+            ty: Type::Object(None),
+            op: Op::Closure {
+                function: FunctionId(1),
+                captures,
+            },
+            safepoint: Some(Safepoint::default()),
+        });
+    function
+}
+
+#[test]
+fn a_matching_closure_verifies() {
+    assert_eq!(verify_module(&[caller(2), callee(2)]), Ok(()));
+    assert_eq!(verify_module(&[caller(0), callee(0)]), Ok(()));
+}
+
+#[test]
+fn passing_the_wrong_number_of_captures_is_refused() {
+    // The pairing is positional, so a mismatch means the callee reads a slot nobody filled —
+    // uninitialised, and plausible. Invisible to a verifier that sees one function at a time,
+    // which is why `verify_module` exists.
+    let errors = verify_module(&[caller(1), callee(2)]).expect_err("refused");
+    assert!(
+        errors.contains(&VerifyError::WrongCaptureCount {
+            at: BlockId::ENTRY,
+            function: 1,
+            passed: 1,
+            expected: 2,
+        }),
+        "{errors:?}"
+    );
+
+    let too_many = verify_module(&[caller(3), callee(2)]).expect_err("refused");
+    assert!(!too_many.is_empty(), "too many is as wrong as too few");
+}
+
+#[test]
+fn closing_over_a_function_that_does_not_exist_is_refused() {
+    let errors = verify_module(&[caller(0)]).expect_err("refused");
+    assert!(
+        errors.contains(&VerifyError::NoSuchFunction {
+            at: BlockId::ENTRY,
+            function: 1,
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn a_module_reports_problems_from_every_function() {
+    // One malformed closure must not hide a malformed body elsewhere.
+    let mut broken = Function::new("broken");
+    let ghost = broken.value();
+    broken.get_mut(BlockId::ENTRY).expect("entry").terminator = Terminator::Return(Some(ghost));
+    let errors = verify_module(&[caller(1), callee(2), broken]).expect_err("refused");
+    assert!(
+        errors.len() >= 2,
+        "both the arity mismatch and the undefined value: {errors:?}"
+    );
 }

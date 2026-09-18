@@ -16,7 +16,18 @@ use crate::{Block, BlockId, Constant, Function, Instruction, Op, Terminator, Typ
 
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "function {} {{", self.name)?;
+        write!(f, "function {}", self.name)?;
+        if !self.parameters.is_empty() {
+            let slots: Vec<String> = self.parameters.iter().map(|s| format!("${s}")).collect();
+            write!(f, "({})", slots.join(", "))?;
+        }
+        if !self.captures.is_empty() {
+            // Printed separately from the parameters because they arrive by a different route
+            // — a parameter comes from the call site, a capture from the closure.
+            let slots: Vec<String> = self.captures.iter().map(|s| format!("${s}")).collect();
+            write!(f, " captures [{}]", slots.join(", "))?;
+        }
+        writeln!(f, " {{")?;
         for (raw, block) in self.blocks.iter().enumerate() {
             let id = BlockId(u32::try_from(raw).unwrap_or(u32::MAX));
             write_block(f, id, block, id == self.entry)?;
