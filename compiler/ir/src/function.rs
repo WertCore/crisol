@@ -305,6 +305,23 @@ pub enum Op {
         /// The values it captures.
         captures: Vec<ValueId>,
     },
+    /// `new callee(args)`.
+    ///
+    /// One op rather than the sequence it stands for, because that sequence has a rule no
+    /// caller should have to remember: **a constructor that returns an object replaces the
+    /// newly created `this`**, while one returning a primitive does not. Spelling `new` out as
+    /// allocate-then-call would put that rule at every call site, and the first lowering to
+    /// forget it would produce a constructor whose explicit `return` is silently ignored.
+    ///
+    /// It also covers `OrdinaryCreateFromConstructor`, which reads `callee.prototype` — so the
+    /// prototype link is established here rather than needing a separate op that could be
+    /// omitted.
+    Construct {
+        /// The constructor.
+        callee: ValueId,
+        /// Its arguments.
+        args: Vec<ValueId>,
+    },
     /// Suspends until a promise settles.
     Await {
         /// What is awaited.
@@ -357,6 +374,7 @@ impl Op {
                 | Self::Binary { op: BinaryOp::Add, .. }
                 | Self::PropertyLoad { .. }
                 | Self::PropertyStore { .. }
+                | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
                 | Self::Closure { .. }
@@ -382,6 +400,11 @@ impl Op {
             Self::PropertyLoad { object, .. } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
             Self::CreateArray { elements } => elements.clone(),
+            Self::Construct { callee, args } => {
+                let mut all = vec![*callee];
+                all.extend(args);
+                all
+            }
             Self::Closure { captures, .. } => captures.clone(),
             Self::Compare { left, right, .. } | Self::Binary { left, right, .. } => {
                 vec![*left, *right]
