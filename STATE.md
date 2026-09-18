@@ -1014,7 +1014,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 932 tests passing, unchanged across the oxc and Cranelift upgrades; the `node_modules` and test262 cases skip without their suites
+**Totals:** 934 tests passing — 932 plus 2 net in `crisol-codegen`; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
@@ -1651,10 +1651,16 @@ Three things differed from what the plan implies:
   live set §M11 made explicit, so the two line up without translation. `Report` counts what was
   handed over, and says plainly that **`cranelift-object` does not write maps into a section**
   — M13's GC integration must carry them out of band.
-- **`+` lowers to a call**, which is D-79 arriving in the machine code. Everything typed
-  `Number` becomes a native `f64` instruction; `%`, `**`, the bitwise operators and `===` are
-  **refused**, because guessing would emit code that runs and is wrong — invisible to the
-  compiler's own tests.
+- **`+` lowers to a call**, which is D-79 arriving in the machine code. `-`, `*` and `/` are
+  native `f64` instructions; `%`, `**` and the bitwise family are calls too — the bitwise ones
+  because `ToInt32` wraps **modulo 2^32** and Cranelift's float-to-int conversion *saturates*,
+  so `1e10 | 0` would come out clamped rather than wrapped. A wrong number, not a slow one.
+- **`===` lowers natively when the lattice proved both operands are numbers** (D-86), and is
+  refused otherwise. On numbers it is exactly `f64` equality — NaN compares false, ±0 compares
+  true — and the hard cases are hard only because the operands are boxed. The first backend
+  refused it outright, which was over-cautious for the case the IR had already proved. This is
+  the first place the type lattice has paid for itself in emitted code, and it bought a
+  **correct** lowering rather than a fast one.
 
 The stack-map test was first written against a value whose only use *was* the call argument. It
 reported 0 entries, and **the test was wrong, not the backend**: a value whose last use is the

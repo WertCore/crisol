@@ -199,33 +199,11 @@ fn slots_become_variables() {
 // ---- what it refuses ---------------------------------------------------------------------
 
 #[test]
-fn an_operator_needing_int32_coercion_is_refused_not_approximated() {
-    // `%`, `**` and the bitwise operators need int32 coercion or a libm call. Guessing at
-    // either would produce plausible wrong numbers, which is worse than a refusal because the
-    // compiler's own tests cannot see it.
-    for op in [
-        BinaryOp::Remainder,
-        BinaryOp::Exponent,
-        BinaryOp::BitAnd,
-        BinaryOp::ShiftLeft,
-        BinaryOp::UnsignedShiftRight,
-    ] {
-        let mut backend = host();
-        let error = backend
-            .compile(&arithmetic(op))
-            .expect_err("should be refused");
-        assert!(
-            matches!(error, CodegenError::Unsupported { .. }),
-            "{}: {error:?}",
-            op.symbol()
-        );
-    }
-}
-
-#[test]
-fn strict_equality_is_refused_because_nan_and_negative_zero_are_the_point() {
-    // `===` on boxed values is a bit comparison *except* for NaN and ±0, and getting that
-    // wrong is D-53's whole subject. Refused rather than approximated.
+fn strict_equality_on_numbers_is_float_equality() {
+    // On numbers `===` is exactly `f64` equality: `NaN === NaN` is false and `fcmp eq` on NaN
+    // is false; `+0 === -0` is true and `fcmp eq` on the two zeroes is true. The IR's type
+    // lattice is what makes that reachable — the first version of this backend refused `===`
+    // outright, which was over-cautious for the case the lattice had already proved.
     let mut function = Function::new("eq");
     let left = function.value();
     let right = function.value();
@@ -248,6 +226,46 @@ fn strict_equality_is_refused_because_nan_and_negative_zero_are_the_point() {
     entry.terminator = Terminator::Return(Some(result));
 
     let mut backend = host();
+    let _ = backend.compile(&function).expect("compiles");
+    assert!(backend.finish().expect("emits").len() > 64);
+}
+
+#[test]
+fn strict_equality_on_unknown_values_is_still_refused() {
+    // On boxed values of unknown type a bit comparison gets NaN and ±0 wrong, which is D-53's
+    // whole subject. The lattice has proved nothing here, so the backend refuses.
+    let mut function = Function::new("eq_unknown");
+    let left = function.value();
+    let right = function.value();
+    let result = function.value();
+    let entry = function.get_mut(BlockId::ENTRY).expect("entry");
+    entry.instructions = vec![
+        Instruction {
+            result: Some(left),
+            ty: Type::Unknown,
+            op: Op::Load { slot: 0 },
+            safepoint: None,
+        },
+        Instruction {
+            result: Some(right),
+            ty: Type::Unknown,
+            op: Op::Load { slot: 1 },
+            safepoint: None,
+        },
+        Instruction {
+            result: Some(result),
+            ty: Type::Bool,
+            op: Op::Compare {
+                op: CompareOp::StrictEqual,
+                left,
+                right,
+            },
+            safepoint: None,
+        },
+    ];
+    entry.terminator = Terminator::Return(Some(result));
+
+    let mut backend = host();
     assert!(matches!(
         backend.compile(&function).expect_err("refused"),
         CodegenError::Unsupported { .. }
@@ -255,12 +273,39 @@ fn strict_equality_is_refused_because_nan_and_negative_zero_are_the_point() {
 }
 
 #[test]
+fn the_operators_without_a_native_instruction_become_calls() {
+    // `%` and `**` are libm calls. The bitwise family needs `ToInt32`, which wraps **modulo
+    // 2^32** — Cranelift's float-to-int conversion saturates, so `1e10 | 0` would come out
+    // clamped rather than wrapped. A wrong number, not a slow one.
+    for (op, symbol) in [
+        (BinaryOp::Remainder, "crisol_remainder"),
+        (BinaryOp::Exponent, "crisol_exponent"),
+        (BinaryOp::BitAnd, "crisol_bit_and"),
+        (BinaryOp::BitOr, "crisol_bit_or"),
+        (BinaryOp::BitXor, "crisol_bit_xor"),
+        (BinaryOp::ShiftLeft, "crisol_shift_left"),
+        (BinaryOp::ShiftRight, "crisol_shift_right"),
+        (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
+    ] {
+        let mut backend = host();
+        let _ = backend
+            .compile(&arithmetic(op))
+            .unwrap_or_else(|error| panic!("{} should compile: {error}", op.symbol()));
+        let object = backend.finish().expect("emits");
+        let needle = symbol.as_bytes();
+        assert!(
+            object.windows(needle.len()).any(|window| window == needle),
+            "{} should reference {symbol}",
+            op.symbol()
+        );
+    }
+}
+
+#[test]
 fn a_safepoint_produces_stack_map_entries() {
     // §M13's deliverable is "stack map emission at safepoints", and a test that only checks
     // the function compiled verifies nothing about emission. §M11 made safepoints carry an
-    // explicit live set precisely so this step had something to hand over — without it there
-    // would be nothing to declare, and a collection during an allocation would miss live
-    // references (§3.1).
+    // explicit live set precisely so this step had something to hand over.
     let mut function = Function::new("with_safepoint");
     let kept = function.value();
     let allocated = function.value();
@@ -276,14 +321,12 @@ fn a_safepoint_produces_stack_map_entries() {
                 left: kept,
                 right: kept,
             },
-            // `kept` must survive the call, so it is live across the safepoint.
             safepoint: Some(Safepoint { live: vec![kept] }),
         },
         // **`kept` has to be used *after* the call**, or it is not live across it and
-        // Cranelift is right to record nothing. The first version of this test returned
-        // `allocated` and asserted one entry: the count was 0, and the test was wrong rather
-        // than the backend — a value whose last use *is* the call argument does not need to
-        // survive the collection.
+        // Cranelift is right to record nothing. An earlier version of this test returned the
+        // call's own result and asserted one entry: the count was 0, and the test was wrong
+        // rather than the backend.
         Instruction {
             result: Some(after),
             ty: Type::Number,
