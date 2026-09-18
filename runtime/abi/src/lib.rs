@@ -20,8 +20,10 @@
 
 #![doc(html_root_url = "https://docs.rs/crisol-abi/0.0.0")]
 
+use std::cell::RefCell;
+
 use crisol_gc::{GcRef, Heap};
-use crisol_value::Value;
+use crisol_value::{PropertyKey, Shapes, Value};
 
 /// Every symbol this crate provides to generated code.
 ///
@@ -43,6 +45,9 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_shift_left",
     "crisol_shift_right",
     "crisol_unsigned_shift_right",
+    "crisol_create_object",
+    "crisol_property_store",
+    "crisol_property_load",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -500,4 +505,168 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
             .filter_map(|value| value.as_address().map(GcRef::from_address))
             .collect()
     }));
+}
+
+/// The heap and shape table a compiled program allocates into.
+///
+/// Compiled code cannot be handed a `Heap` to carry around — its calls into the runtime are C
+/// functions taking machine words — so the two have to be reachable from a fixed place.
+///
+/// Thread-local rather than a global: `Heap` uses interior mutability and is deliberately not
+/// `Sync`, and a shared heap would need a lock on every allocation. A per-thread heap is also
+/// what the eventual design wants, since JavaScript's agents do not share objects.
+#[derive(Debug)]
+pub struct Runtime {
+    /// Where objects live.
+    pub heap: Heap,
+    /// The shape tree every object's layout is drawn from.
+    pub shapes: RefCell<Shapes>,
+}
+
+impl Runtime {
+    fn new() -> Self {
+        let heap = Heap::new();
+        // SAFETY: collections here are triggered by allocation, and an allocation site is a
+        // safepoint — which is exactly what `install_compiled_roots` asks its caller to
+        // promise. Installing at construction rather than leaving it to the entry point means
+        // there is no window in which the heap exists but cannot see compiled frames.
+        unsafe { install_compiled_roots(&heap) };
+        Self {
+            heap,
+            shapes: RefCell::new(Shapes::new()),
+        }
+    }
+}
+
+thread_local! {
+    static RUNTIME: Runtime = Runtime::new();
+}
+
+/// Runs `f` against this thread's runtime.
+pub fn with_runtime<R>(f: impl FnOnce(&Runtime) -> R) -> R {
+    RUNTIME.with(f)
+}
+
+/// The handle a boxed value names, if it names one.
+fn handle_of(bits: u64) -> Option<GcRef> {
+    Value::from_bits(bits).as_address().map(GcRef::from_address)
+}
+
+/// Allocates `{}` — an object at the root shape, with no properties.
+///
+/// Properties arrive through [`crisol_property_store`], which moves the object to the shape
+/// that includes each one. That is why this takes no shape argument: an object literal *is*
+/// empty until its first property is stored, and the lowering says so (D-92).
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_create_object() -> u64 {
+    with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        // Rooted only for the allocation itself. What keeps it alive afterwards is the caller's
+        // frame: the value is about to land in a slot the stack map describes, and the next
+        // collection cannot happen before then, because only an allocation triggers one.
+        let scope = runtime.heap.scope();
+        scope.alloc(shape, 0).to_value().to_bits()
+    })
+}
+
+/// `object[key] = value`.
+///
+/// Storing a property the object does not have moves it to the shape that includes it and
+/// grows it by a slot; storing one it already has is an assignment and leaves the shape alone.
+/// `Shapes::add` draws that distinction, which is what stops a loop assigning the same property
+/// from growing the shape tree once per iteration.
+///
+/// A store through a value that is not an object is ignored rather than faulted. That is not
+/// the specification — `null.x = 1` is a `TypeError` — but throwing needs the unwinding path
+/// M13 does not have yet, and ignoring is the one behaviour that cannot corrupt the heap.
+///
+/// # Safety
+///
+/// `key` must point to `length` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crisol_property_store(
+    object: u64,
+    key: *const u8,
+    length: u64,
+    value: u64,
+) {
+    let Some(handle) = handle_of(object) else {
+        return;
+    };
+    // SAFETY: the caller promises `key` names `length` readable bytes of UTF-8.
+    let Some(name) = (unsafe { key_text(key, length) }) else {
+        return;
+    };
+    let key = PropertyKey::new(&name);
+
+    with_runtime(|runtime| {
+        let Some(current) = runtime.heap.shape_of(handle) else {
+            return;
+        };
+        let (shape, slot, width) = {
+            let mut shapes = runtime.shapes.borrow_mut();
+            let shape = shapes.add(current, &key);
+            let Some(slot) = shapes.lookup(shape, &key) else {
+                return;
+            };
+            (shape, slot, shapes.len(shape) as usize)
+        };
+        if shape != current {
+            runtime.heap.transition(handle, shape, width);
+        }
+        runtime
+            .heap
+            .set(handle, slot.index(), Value::from_bits(value));
+    });
+}
+
+/// `object[key]`, or `undefined` if it has no such property.
+///
+/// Missing is `undefined` rather than an error, which is the specification's behaviour and not
+/// a shortcut — but note it makes a *misspelled* property indistinguishable from an absent one,
+/// so a lookup that silently yields `undefined` is not evidence the object is wrong.
+///
+/// # Safety
+///
+/// `key` must point to `length` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, length: u64) -> u64 {
+    let Some(handle) = handle_of(object) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: as above.
+    let Some(name) = (unsafe { key_text(key, length) }) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let key = PropertyKey::new(&name);
+
+    with_runtime(|runtime| {
+        let Some(shape) = runtime.heap.shape_of(handle) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        let slot = runtime.shapes.borrow().lookup(shape, &key);
+        slot.and_then(|slot| runtime.heap.get(handle, slot.index()))
+            .unwrap_or(Value::UNDEFINED)
+            .to_bits()
+    })
+}
+
+/// Reads a key passed as a pointer and a length.
+///
+/// Returns `None` for a null pointer or bytes that are not UTF-8, so a malformed call yields a
+/// missing property rather than reading past the end of whatever was passed.
+///
+/// # Safety
+///
+/// `key` must point to `length` readable bytes when it is not null.
+unsafe fn key_text(key: *const u8, length: u64) -> Option<String> {
+    if key.is_null() {
+        return None;
+    }
+    let length = usize::try_from(length).ok()?;
+    // SAFETY: the caller promises `length` readable bytes at `key`.
+    let bytes = unsafe { std::slice::from_raw_parts(key, length) };
+    std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
 }

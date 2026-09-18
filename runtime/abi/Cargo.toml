@@ -18,6 +18,3 @@ workspace = true
 [dependencies]
 crisol-gc.workspace = true
 crisol-value.workspace = true
-
-[dev-dependencies]
-crisol-value.workspace = true
