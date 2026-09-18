@@ -1013,7 +1013,7 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 915 tests passing — 912 at the last measured point plus 3 new; the `node_modules` and test262 cases skip without their suites
+**Totals:** 921 tests passing — 915 at the last measured point plus 6 new; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
