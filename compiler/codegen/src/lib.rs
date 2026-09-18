@@ -242,6 +242,15 @@ impl Cranelift {
             .map_err(|error| CodegenError::Backend {
                 message: error.to_string(),
             })?;
+        // Frame pointers, because the collector walks native frames to find return addresses
+        // and there is no other portable way to do it. Off by default — a frame pointer costs
+        // a register, which matters for code that is never unwound and does not matter at all
+        // for code that must be.
+        flags
+            .set("preserve_frame_pointers", "true")
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
         let isa = cranelift_codegen::isa::lookup(parsed.clone())
             .map_err(|_| CodegenError::UnknownTarget {
                 triple: triple.to_owned(),

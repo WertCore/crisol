@@ -237,3 +237,224 @@ pub extern "C" fn crisol_print(bits: u64) {
         }
     }
 }
+
+/// One row of a compiled program's stack map table.
+///
+/// Laid out to match exactly what the backend emits (D-90): a function address the linker
+/// filled in, the offset of a safepoint within that function, and the frame offset of one live
+/// value. `#[repr(C)]` because the producer is a code generator, not rustc — a Rust layout
+/// would be free to reorder these and the two sides would disagree silently.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct StackMapRow {
+    /// Where the function starts, once linked.
+    pub function: *const u8,
+    /// Offset of the safepoint within it.
+    pub code_offset: u32,
+    /// Offset within the frame of one live value.
+    pub frame_offset: u32,
+}
+
+/// The table a compiled program registers before it runs.
+///
+/// **The program hands its table to the runtime rather than the runtime looking up a symbol.**
+/// An `extern "C" { static crisol_stack_maps }` here would make this crate fail to link
+/// anywhere the symbol does not exist — including its own test binary, which has no compiled
+/// program in it. Passing the address keeps the dependency pointing the way it actually runs.
+pub struct StackMaps {
+    rows: &'static [StackMapRow],
+}
+
+impl StackMaps {
+    /// The rows, in the order the compiler emitted them.
+    #[must_use]
+    pub const fn rows(&self) -> &'static [StackMapRow] {
+        self.rows
+    }
+
+    /// Every frame offset live at `return_address`, if it is a safepoint.
+    #[must_use]
+    pub fn live_at(&self, return_address: *const u8) -> Vec<u32> {
+        live_at(self.rows, return_address)
+    }
+}
+
+/// Every frame offset live at `return_address`, given a table.
+///
+/// The lookup is an **exact match** on `function + code_offset`, because a return address
+/// points at the instruction after a call and that is where the safepoint sits. An address
+/// matching nothing is not an error: it is a frame that was not at a safepoint, which is every
+/// frame except those at a call into the runtime.
+///
+/// A free function taking the rows, rather than only a method on the registered table, so it
+/// can be tested against a hand-built table — a lookup reachable only through a process-global
+/// registered by generated code is a lookup nothing can check.
+#[must_use]
+pub fn live_at(rows: &[StackMapRow], return_address: *const u8) -> Vec<u32> {
+    rows.iter()
+        .filter(|row| {
+            // `wrapping_add` rather than `add`: the function pointer comes from a linker, and
+            // arithmetic on it must not be undefined behaviour if the table is malformed.
+            row.function.wrapping_add(row.code_offset as usize) == return_address
+        })
+        .map(|row| row.frame_offset)
+        .collect()
+}
+
+/// The registered table, if a compiled program has registered one.
+static mut STACK_MAPS: Option<StackMaps> = None;
+
+/// Registers a compiled program's stack map table.
+///
+/// Called once from the program's entry point before anything else runs.
+///
+/// # Safety
+///
+/// `table` must point at `count` rows emitted by this toolchain's backend, valid for the life
+/// of the process — which is true of a symbol in the program's own data section and of nothing
+/// else.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crisol_register_stack_maps(table: *const StackMapRow, count: u64) {
+    if table.is_null() || count == 0 {
+        return;
+    }
+    let Ok(len) = usize::try_from(count) else {
+        return;
+    };
+    // SAFETY: the caller promises `table` points at `count` valid rows living as long as the
+    // process, which is what a data symbol in the program does.
+    let rows = unsafe { std::slice::from_raw_parts(table, len) };
+    // SAFETY: called once, from the entry point, before any other thread exists.
+    unsafe {
+        STACK_MAPS = Some(StackMaps { rows });
+    }
+}
+
+/// The registered table.
+#[must_use]
+pub fn stack_maps() -> Option<&'static StackMaps> {
+    // SAFETY: only written once by `crisol_register_stack_maps` before the program runs.
+    unsafe { (*std::ptr::addr_of!(STACK_MAPS)).as_ref() }
+}
+
+/// One native frame: where it returns to, and where its locals live.
+///
+/// The pairing is the part worth getting right. A frame pointer `fp` holds the **caller's**
+/// frame pointer at `[fp]` and the return address **into the caller** at `[fp + 8]`. So a
+/// return address and the frame its live values sit in come from *different* links of the
+/// chain — reading offsets from the wrong one yields whatever happened to be at that spot,
+/// which is a plausible-looking reference pointing at nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    /// Return address into the function that owns [`Frame::base`].
+    pub return_address: *const u8,
+    /// Frame pointer of the function the return address is inside.
+    pub base: *const usize,
+}
+
+/// Walks native frames from the caller outwards.
+///
+/// Relies on the frame-pointer chain, which the backend enables explicitly
+/// (`preserve_frame_pointers`). On both aarch64 and x86-64 a frame laid out that way holds the
+/// caller's frame pointer at `[fp]` and the return address at `[fp + 8]`.
+///
+/// **It stops at the first frame that does not look like one.** A null, unaligned, or
+/// non-increasing frame pointer ends the walk rather than being followed: the chain leaves
+/// compiled code eventually — into the C entry point, then into libc — and following a pointer
+/// out of a frame built by something else is how a stack walker reads unmapped memory.
+///
+/// # Safety
+///
+/// Must be called with the program stopped at a safepoint. Walking a stack that is being
+/// modified reads frames mid-construction.
+#[must_use]
+pub unsafe fn walk_frames(limit: usize) -> Vec<Frame> {
+    let mut found = Vec::new();
+    let mut frame: *const usize = current_frame_pointer();
+
+    for _ in 0..limit {
+        if frame.is_null() || !frame.is_aligned() {
+            break;
+        }
+        // SAFETY: `frame` is non-null and aligned and points at a frame built by
+        // frame-pointer-preserving code, so `[fp]` is the caller's frame pointer and
+        // `[fp + 8]` the return address. The loop stops as soon as either stops looking like
+        // one.
+        let (caller, return_address) = unsafe { (*frame as *const usize, *frame.add(1)) };
+        if return_address == 0 || caller.is_null() || caller <= frame {
+            // Stacks grow downwards, so a caller's frame is always at a higher address. A
+            // chain that does not move outwards is not a chain.
+            break;
+        }
+        found.push(Frame {
+            return_address: return_address as *const u8,
+            // The return address is *into the caller*, so the frame holding the live values
+            // for that safepoint is the caller's.
+            base: caller,
+        });
+        frame = caller;
+    }
+    found
+}
+
+/// Reads the frame pointer register.
+#[must_use]
+fn current_frame_pointer() -> *const usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let fp: *const usize;
+        // SAFETY: reads a register; no memory is touched.
+        unsafe {
+            std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags));
+        }
+        fp
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fp: *const usize;
+        // SAFETY: reads a register; no memory is touched.
+        unsafe {
+            std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags));
+        }
+        fp
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        // Walking without a known frame layout would be guessing. Returning null yields no
+        // roots, which makes collection refuse rather than collect wrongly.
+        std::ptr::null()
+    }
+}
+
+/// Every live value the compiled frames on this stack are holding.
+///
+/// This is what the collector needs and could not previously obtain: the roots that exist only
+/// in machine code. A frame whose return address matches no safepoint contributes nothing,
+/// which is the normal case for every frame except those at a call into the runtime.
+///
+/// # Safety
+///
+/// Must be called with the program stopped at a safepoint, for the reason in [`walk_frames`].
+#[must_use]
+pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
+    let Some(maps) = stack_maps() else {
+        return Vec::new();
+    };
+    // SAFETY: the caller promises the program is stopped at a safepoint.
+    let frames = unsafe { walk_frames(limit) };
+    let mut roots = Vec::new();
+    for frame in frames {
+        for offset in maps.live_at(frame.return_address) {
+            let slot = frame.base.wrapping_byte_sub(offset as usize);
+            if slot.is_null() || !slot.is_aligned() {
+                continue;
+            }
+            // SAFETY: `offset` came from a stack map the compiler emitted for this exact
+            // return address, so it names a slot inside this frame. The alignment check above
+            // rejects a malformed table rather than dereferencing whatever it named.
+            let bits = unsafe { *slot } as u64;
+            roots.push(Value::from_bits(bits));
+        }
+    }
+    roots
+}
