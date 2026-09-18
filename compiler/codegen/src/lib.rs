@@ -153,6 +153,119 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
     (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
 ];
 
+/// The runtime symbols an object operation calls.
+///
+/// Separate from [`HELPER_SYMBOLS`] because these do not share the two-in-one-out shape of a
+/// binary operator: allocation takes nothing, a store takes four words and returns nothing.
+const CREATE_OBJECT_SYMBOL: &str = "crisol_create_object";
+const PROPERTY_STORE_SYMBOL: &str = "crisol_property_store";
+const PROPERTY_LOAD_SYMBOL: &str = "crisol_property_load";
+
+/// The three runtime entry points objects need, as declared in a module.
+#[derive(Clone, Copy, Debug)]
+struct ObjectHelpers<T> {
+    /// `crisol_create_object() -> value`
+    create: T,
+    /// `crisol_property_store(object, key, length, value)`
+    store: T,
+    /// `crisol_property_load(object, key, length) -> value`
+    load: T,
+}
+
+/// Declares the object helpers as imports in `module`.
+///
+/// Shared by both backends rather than written twice: the two lists drifting apart would mean
+/// a program that compiles to an object file and one that runs in-process disagree about what
+/// the runtime provides, and only one of them would be tested.
+fn declare_object_helpers<M: cranelift_module::Module>(
+    module: &mut M,
+) -> Result<ObjectHelpers<cranelift_module::FuncId>, CodegenError> {
+    let pointer = module.target_config().pointer_type();
+
+    let mut create = module.make_signature();
+    create.returns.push(AbiParam::new(types::I64));
+
+    let mut store = module.make_signature();
+    store.params.push(AbiParam::new(types::I64));
+    store.params.push(AbiParam::new(pointer));
+    store.params.push(AbiParam::new(types::I64));
+    store.params.push(AbiParam::new(types::I64));
+
+    let mut load = module.make_signature();
+    load.params.push(AbiParam::new(types::I64));
+    load.params.push(AbiParam::new(pointer));
+    load.params.push(AbiParam::new(types::I64));
+    load.returns.push(AbiParam::new(types::I64));
+
+    let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
+        module
+            .declare_function(symbol, Linkage::Import, signature)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })
+    };
+    Ok(ObjectHelpers {
+        create: declare(CREATE_OBJECT_SYMBOL, &create)?,
+        store: declare(PROPERTY_STORE_SYMBOL, &store)?,
+        load: declare(PROPERTY_LOAD_SYMBOL, &load)?,
+    })
+}
+
+/// Every property key a function names, in the order first seen.
+///
+/// Collected before lowering because a key becomes a constant in the object's data section,
+/// and defining data needs the module — which the lowering deliberately does not hold.
+fn keys_of(function: &Function) -> Vec<String> {
+    let mut keys = Vec::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let key = match &instruction.op {
+                Op::PropertyLoad { key, .. } | Op::PropertyStore { key, .. } => key.as_str(),
+                _ => continue,
+            };
+            if !keys.iter().any(|seen: &String| seen == key) {
+                keys.push(key.to_owned());
+            }
+        }
+    }
+    keys
+}
+
+/// Emits a constant for every key `function` names that has not been emitted already.
+///
+/// The keys are `Local`, so two modules can each define their own `"length"` without the
+/// linker having to pick one. They are not NUL-terminated: the runtime takes a pointer *and* a
+/// length, which is what lets a key contain a NUL at all — `obj["a\0b"]` is a legal property
+/// name, and a C string could not express it.
+fn intern_keys<M: cranelift_module::Module>(
+    module: &mut M,
+    interned: &mut HashMap<String, cranelift_module::DataId>,
+    function: &Function,
+) -> Result<(), CodegenError> {
+    for text in keys_of(function) {
+        if interned.contains_key(&text) {
+            continue;
+        }
+        let mut description = cranelift_module::DataDescription::new();
+        description.define(text.as_bytes().to_vec().into_boxed_slice());
+        // Numbered rather than named after the key: a property name is any UTF-16 string, and
+        // most of them are not legal symbol names.
+        let symbol = format!("crisol_key_{}", interned.len());
+        let id = module
+            .declare_data(&symbol, Linkage::Local, false, false)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        module
+            .define_data(id, &description)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        interned.insert(text, id);
+    }
+    Ok(())
+}
+
 /// The symbol holding the stack map table a compiled program's collector reads.
 pub const STACK_MAP_SYMBOL: &str = "crisol_stack_maps";
 
@@ -205,6 +318,10 @@ pub struct Cranelift {
     /// runtime would be a branch the linker cannot see through, and a separate symbol is what
     /// lets a later pass replace an individual operator without touching the others.
     helpers: HashMap<BinaryOp, cranelift_module::FuncId>,
+    /// The object helpers, declared once for the module.
+    objects: ObjectHelpers<cranelift_module::FuncId>,
+    /// Property keys already emitted as data, so a key used twice is one constant.
+    keys: HashMap<String, cranelift_module::DataId>,
 }
 
 impl std::fmt::Debug for Cranelift {
@@ -286,6 +403,7 @@ impl Cranelift {
                 })?;
             helpers.insert(*op, id);
         }
+        let objects = declare_object_helpers(&mut module)?;
 
         Ok(Self {
             triple: triple.to_owned(),
@@ -293,6 +411,8 @@ impl Cranelift {
             module,
             context: FunctionBuilderContext::new(),
             helpers,
+            objects,
+            keys: HashMap::new(),
         })
     }
 }
@@ -382,6 +502,35 @@ impl Backend for Cranelift {
                 )
             })
             .collect();
+        intern_keys(&mut self.module, &mut self.keys, function)?;
+        let interned: Vec<(String, cranelift_module::DataId)> = keys_of(function)
+            .into_iter()
+            .map(|text| {
+                let id = self.keys[&text];
+                (text, id)
+            })
+            .collect();
+        let keys: HashMap<String, cranelift_codegen::ir::GlobalValue> = interned
+            .into_iter()
+            .map(|(text, id)| {
+                (
+                    text,
+                    self.module.declare_data_in_func(id, &mut context.func),
+                )
+            })
+            .collect();
+        let objects = ObjectHelpers {
+            create: self
+                .module
+                .declare_func_in_func(self.objects.create, &mut context.func),
+            store: self
+                .module
+                .declare_func_in_func(self.objects.store, &mut context.func),
+            load: self
+                .module
+                .declare_func_in_func(self.objects.load, &mut context.func),
+        };
+        let pointer = frontend_config.pointer_type();
         let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
         let mut lowering = Lowering {
             builder,
@@ -390,6 +539,9 @@ impl Backend for Cranelift {
             types: HashMap::new(),
             blocks: HashMap::new(),
             helpers,
+            objects,
+            keys,
+            pointer,
         };
         lowering.lower(function)?;
         // `finalize` needs the target's frontend config in this version — it is what decides
@@ -452,6 +604,12 @@ struct Lowering<'a> {
     blocks: HashMap<u32, cranelift_codegen::ir::Block>,
     /// The declared helpers, resolved into this function.
     helpers: HashMap<BinaryOp, cranelift_codegen::ir::FuncRef>,
+    /// The object helpers, resolved into this function.
+    objects: ObjectHelpers<cranelift_codegen::ir::FuncRef>,
+    /// Each property key this function names, as the address of its constant.
+    keys: HashMap<String, cranelift_codegen::ir::GlobalValue>,
+    /// The target's pointer type, for materialising those addresses.
+    pointer: cranelift_codegen::ir::Type,
 }
 
 impl Lowering<'_> {
@@ -755,6 +913,32 @@ impl Lowering<'_> {
                 };
                 Some(self.box_condition(condition))
             }
+            Op::CreateObject { .. } => {
+                // No shape argument: an object literal is empty until its first property is
+                // stored, and the lowering says so by allocating at the root shape and then
+                // emitting a `PropertyStore` per property (D-92). The `shape` the IR carries
+                // is the root of a throwaway table, so passing it would mean nothing.
+                let call = self.builder.ins().call(self.objects.create, &[]);
+                Some(self.builder.inst_results(call)[0])
+            }
+            Op::PropertyStore { object, key, value } => {
+                let object = self.value(*object);
+                let value = self.value(*value);
+                let (pointer, length) = self.key_operands(key)?;
+                self.builder
+                    .ins()
+                    .call(self.objects.store, &[object, pointer, length, value]);
+                None
+            }
+            Op::PropertyLoad { object, key } => {
+                let object = self.value(*object);
+                let (pointer, length) = self.key_operands(key)?;
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.load, &[object, pointer, length]);
+                Some(self.builder.inst_results(call)[0])
+            }
             other => {
                 return Err(CodegenError::Unsupported {
                     operation: format!("{other:?}")
@@ -771,6 +955,27 @@ impl Lowering<'_> {
             self.types.insert(id.index(), instruction.ty);
         }
         Ok(())
+    }
+
+    /// A property key as the pair the runtime takes: where the constant is, and how long.
+    ///
+    /// The length is a separate operand rather than a NUL terminator because a property name
+    /// may contain a NUL — `obj["a\0b"]` is legal — and scanning for one would truncate it.
+    fn key_operands(
+        &mut self,
+        key: &crisol_value::PropertyKey,
+    ) -> Result<(ClifValue, ClifValue), CodegenError> {
+        let Some(global) = self.keys.get(key.as_str()).copied() else {
+            // Unreachable unless `keys_of` and the lowering disagree about which operations
+            // name a key, which is exactly the kind of drift worth failing loudly on.
+            return Err(CodegenError::Backend {
+                message: format!("the property key {:?} was never interned", key.as_str()),
+            });
+        };
+        let address = self.builder.ins().symbol_value(self.pointer, global);
+        let length = i64::try_from(key.as_str().len()).unwrap_or(i64::MAX);
+        let length = self.builder.ins().iconst(types::I64, length);
+        Ok((address, length))
     }
 
     fn terminator(&mut self, terminator: &Terminator) -> Result<(), CodegenError> {
@@ -847,6 +1052,8 @@ pub struct Jit {
     module: cranelift_jit::JITModule,
     context: FunctionBuilderContext,
     helpers: HashMap<BinaryOp, cranelift_module::FuncId>,
+    objects: ObjectHelpers<cranelift_module::FuncId>,
+    keys: HashMap<String, cranelift_module::DataId>,
     compiled: HashMap<String, *const u8>,
 }
 
@@ -893,11 +1100,14 @@ impl Jit {
                 })?;
             helpers.insert(*op, id);
         }
+        let objects = declare_object_helpers(&mut module)?;
 
         Ok(Self {
             module,
             context: FunctionBuilderContext::new(),
             helpers,
+            objects,
+            keys: HashMap::new(),
             compiled: HashMap::new(),
         })
     }
@@ -934,6 +1144,35 @@ impl Jit {
                 )
             })
             .collect();
+        intern_keys(&mut self.module, &mut self.keys, function)?;
+        let interned: Vec<(String, cranelift_module::DataId)> = keys_of(function)
+            .into_iter()
+            .map(|text| {
+                let id = self.keys[&text];
+                (text, id)
+            })
+            .collect();
+        let keys: HashMap<String, cranelift_codegen::ir::GlobalValue> = interned
+            .into_iter()
+            .map(|(text, id)| {
+                (
+                    text,
+                    self.module.declare_data_in_func(id, &mut context.func),
+                )
+            })
+            .collect();
+        let objects = ObjectHelpers {
+            create: self
+                .module
+                .declare_func_in_func(self.objects.create, &mut context.func),
+            store: self
+                .module
+                .declare_func_in_func(self.objects.store, &mut context.func),
+            load: self
+                .module
+                .declare_func_in_func(self.objects.load, &mut context.func),
+        };
+        let pointer = frontend_config.pointer_type();
         let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
         let mut lowering = Lowering {
             builder,
@@ -942,6 +1181,9 @@ impl Jit {
             types: HashMap::new(),
             blocks: HashMap::new(),
             helpers,
+            objects,
+            keys,
+            pointer,
         };
         lowering.lower(function)?;
         lowering.builder.finalize(frontend_config);

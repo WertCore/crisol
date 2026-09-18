@@ -129,3 +129,40 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
         "{error:?}"
     );
 }
+
+// ---- objects ---------------------------------------------------------------------------
+
+#[test]
+fn an_object_literal_allocates_and_its_property_reads_back() {
+    check("object-property", "let o = {a: 7}; return o.a;", "7");
+}
+
+#[test]
+fn a_property_added_after_allocation_reads_back() {
+    // The path `Heap::alloc` alone could not express: the object is allocated empty and gains
+    // a slot when the property is stored (D-92).
+    check("object-grow", "let o = {}; o.a = 5; return o.a;", "5");
+}
+
+#[test]
+fn several_properties_do_not_share_a_slot() {
+    check(
+        "object-several",
+        "let o = {}; o.a = 1; o.b = 2; o.c = 3; return o.a + o.b + o.c;",
+        "6",
+    );
+}
+
+#[test]
+fn a_missing_property_is_undefined() {
+    check("object-missing", "let o = {a: 1}; return o.b;", "undefined");
+}
+
+#[test]
+fn a_property_holding_an_object_can_be_reached_through_it() {
+    check(
+        "object-nested",
+        "let inner = {v: 4}; let outer = {}; outer.i = inner; return outer.i.v;",
+        "4",
+    );
+}
