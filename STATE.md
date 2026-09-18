@@ -1,8 +1,17 @@
 # Crisol — State
 
-**Current milestone:** M13 — codegen (lowering complete; the backend compiles a numeric subset to object code for all four targets)
-**Current milestone:** M13 — codegen (lowering complete; backend compiles a numeric subset for all four targets; oxc and Cranelift are current, floor 1.96 and checked)
-**Last finished:** M8 — platform polish, **acceptance met at ~10.5 MiB against a 60 MB budget**
+**Current milestone:** M13 — codegen. Lowering is complete; the backend compiles a numeric
+subset to object code for all four targets, and `crisol-abi` defines the symbols it calls.
+
+**Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
+is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
+
+**Totals:** 948 tests passing; the `node_modules` and test262 cases skip without their suites.
+
+> The live total lives **here**, beside the milestone, not at the end of the newest section.
+> Four separate merges duplicated or misplaced it there — twice putting a current figure
+> inside a *historical* milestone's section, where it read as true and was false. The other
+> `**Totals:**` lines below are frozen historical records and must not be edited.
 
 Read this before `ROADMAP.md`. The roadmap is the destination; this is where the work
 actually is.
@@ -1014,7 +1023,6 @@ exists rather than the first alone.
 The cost worry in the issue turned out not to apply: the field comparison does not replace the
 pointer comparison, it runs *after* it, so it is paid only for nodes that genuinely restyled.
 
-**Totals:** 948 tests passing — 934 plus 14 in the new `crisol-abi`; the `node_modules` and test262 cases skip without their suites
 
 ## Open questions
 
