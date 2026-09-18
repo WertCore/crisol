@@ -2908,3 +2908,49 @@ already required for the chain itself and is why `preserve_frame_pointers` is se
 that laid its frame out differently would need its own rule here, and there is nothing in the
 code that would catch it — the stress-mode acceptance test would, which is the argument for
 running it in CI on every target rather than only where it is convenient.
+
+## D-94
+
+**Every compiled function takes `(closure, this, new.target, argc, argv)`.**
+
+Status: Accepted
+
+A function used to compile to a machine function with its JavaScript arity baked into the
+signature, so a call site had to know exactly which function it was reaching. A first-class
+function value has no statically known arity — a callback handed to `arr.map` could take any
+number of parameters — so that convention cannot express a callback at all, and with it go
+closures, class methods and every array method. M13's acceptance asks for all three.
+
+The five operands are the same for every function whatever its source arity. They land in
+registers on all four targets by being the first parameters; that is the platform's own
+calling convention doing the work rather than a choice made here.
+
+`argv` points into the **caller's stack frame**, not a heap list. Two reasons, and the second
+is the one that matters: there is no allocation per call, and arguments are already traced,
+because the collector reads frame slots through the stack maps (D-93). A heap list would need
+its own rooting and would allocate on the hottest path in the language.
+
+`new.target` is in the signature although nothing reads it until classes. Adding a parameter
+later rewrites every call site, and the slot costs a register that is free anyway.
+
+A parameter the caller did not pass reads as `undefined`, which is what the specification says
+rather than a convenience. It is read under a *select* rather than a branch: the index is
+clamped to zero so the load is in bounds at any arity, the load always happens, and the result
+is discarded when the parameter was not passed. `ARGV_MIN_SLOTS` is what makes the clamped load
+safe, so a call with no arguments still reserves one slot — eight bytes of stack to remove a
+branch from every parameter of every function.
+
+**Rejected — a direct fast path now (the other half of the answer to "why not both").** When
+the callee is statically known the uniform path is pure overhead, and that path is worth
+having. It is not built first because nothing can be measured until calls work at all, and two
+call paths from the start are two chances to miscompile in a way that shows up on only one of
+them. It is recorded in ROADMAP M13 as the next step rather than deferred to M20, to be built
+as soon as there is a number saying it is needed. Note the first fix for slow calls may not be
+this: every live variable is currently spilled to the frame at every safepoint, because the IR
+cannot say which slots can hold references. Narrowing that is the larger win.
+
+**Consequence:** `this` and `new.target` arrive but are not yet bound. The frontend models
+`this` as a slot it declares ahead of the parameters, and nothing in `Function` records which
+slot that is — depending on "slot zero by construction" would couple the two silently, so
+binding it needs a field on `Function`. Until then a program reading `this` will not compile,
+which is the honest failure rather than a wrong value.

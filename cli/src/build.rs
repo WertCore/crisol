@@ -176,15 +176,33 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
         // Element 0 is the row count and the rows begin at element 1 — the layout the backend
         // writes (D-90). Registering *before* `crisol_program` runs is the whole point: a
         // collection can happen on the first allocation.
-        "extern unsigned long long crisol_stack_maps[];\n\
-         extern void crisol_register_stack_maps(const void *rows, unsigned long long count);\n\
-         extern unsigned long long crisol_program(void);\n\
-         extern void crisol_print(unsigned long long);\n\
-         int main(void) {\n\
-             crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
-             crisol_print(crisol_program());\n\
-             return 0;\n\
-         }\n",
+        &format!(
+            // `crisol_program` takes the five operands every compiled function takes
+            // (closure, this, new.target, argc, argv), because a call site cannot know which
+            // function it is reaching. The program itself is called with none: no closure, no
+            // `this` yet, no `new.target`, no arguments.
+            //
+            // `argv` still points at a real slot. A parameter is read under a select rather
+            // than a branch, so the load happens even for an argument that was not passed and
+            // has to be in bounds — `ARGV_MIN_SLOTS` is that guarantee, and this honours it.
+            //
+            // The `undefined` bit pattern is interpolated from the Rust constant rather than
+            // written out here, so the NaN-box layout stays in one place.
+            "extern unsigned long long crisol_stack_maps[];\n\
+             extern void crisol_register_stack_maps(const void *rows, unsigned long long count);\n\
+             extern unsigned long long crisol_program(unsigned long long closure,\n\
+                 unsigned long long this_value, unsigned long long new_target,\n\
+                 unsigned long long argc, unsigned long long *argv);\n\
+             extern void crisol_print(unsigned long long);\n\
+             int main(void) {{\n\
+                 unsigned long long argv[{slots}] = {{ {undefined}ULL }};\n\
+                 crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
+                 crisol_print(crisol_program(0ULL, {undefined}ULL, {undefined}ULL, 0ULL, argv));\n\
+                 return 0;\n\
+             }}\n",
+            undefined = crisol_value::Value::UNDEFINED.to_bits(),
+            slots = crisol_codegen::ARGV_MIN_SLOTS,
+        ),
     )
     .map_err(|error| BuildError::Link {
         message: format!("cannot write the entry point: {error}"),

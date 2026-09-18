@@ -560,6 +560,24 @@ Windows x86_64.
 to a standalone binary that runs and produces correct output on all four targets, with
 GC stress mode enabled.
 
+**Calling convention — uniform now, direct fast path next.** Every compiled function takes
+`(closure, this, new.target, argc, argv)`, so a call site never needs to know which function
+it is reaching. That is not a preference: a callback passed to `arr.map` has no statically
+known arity, so a convention with the arity baked in cannot express one at all. `argv` points
+into the **caller's stack frame** rather than a heap list — no allocation per call, and the
+collector already traces frame slots, so arguments are rooted for free. `new.target` is in the
+signature from the start even though nothing reads it until classes, because adding a
+parameter later rewrites every call site.
+
+**To do — the direct fast path.** When the callee *is* statically known, the uniform path is
+pure overhead: the arguments can go straight into registers and the call can be direct. This
+is deliberately not built first, because there is nothing to measure until calls work at all,
+and two call paths from day one are two chances to miscompile in a way that shows up on only
+one of them. It is **not deferred to M20** — measure against QuickJS as soon as calls run, and
+build it inside M13 if the number says so. Note that the first fix for slow calls may not be
+this at all: every live variable is currently spilled to the frame at every safepoint, because
+the IR cannot yet say which slots can hold references. Narrowing that is the bigger win.
+
 ---
 
 #### M14 — Differential testing
@@ -655,7 +673,8 @@ JS object graph unless the program asks for it.
 
 **Deliverable:** Inlining, constant folding, DCE, escape analysis, allocation elimination,
 type specialization on TS types, shape-based property access with per-site monomorphic
-caches, devirtualization, LTO.
+caches, devirtualization, LTO. Narrowing stack maps to reference-typed slots, so a call stops
+spilling every live variable. The direct-call fast path from M13, if it was not needed sooner.
 
 **Accept:** benchmark suite showing measured improvement over M13 baseline. Publish
 honest numbers per §2.7 — startup, memory, binary size — not throughput comparisons

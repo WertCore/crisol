@@ -8,6 +8,10 @@ registers it before running anything, and the collector reads it through a root 
 (D-91), reading each offset from the frame's **stack pointer**, which is what Cranelift
 measures them from (D-93). Object literals and property access compile.
 
+Every compiled function now takes `(closure, this, new.target, argc, argv)` (D-94), so a
+call site does not need to know which function it is reaching — the prerequisite for closures,
+classes and array methods. `this` arrives but is not yet bound to its slot.
+
 `CRISOL_GC_STRESS=1` collects on every allocation and is the only thing that tests any of
 this: with the offsets read from the wrong end of the frame, every acceptance test still
 printed the right answer, because none of them allocated enough to collect at all. That is what unblocks allocation in compiled code — until the

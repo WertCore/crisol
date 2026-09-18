@@ -48,6 +48,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_create_object",
     "crisol_property_store",
     "crisol_property_load",
+    "crisol_closure_capture",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -691,4 +692,33 @@ unsafe fn key_text(key: *const u8, length: u64) -> Option<String> {
     // SAFETY: the caller promises `length` readable bytes at `key`.
     let bytes = unsafe { std::slice::from_raw_parts(key, length) };
     std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+}
+
+/// The value a closure captured at `index`.
+///
+/// Captures are positional: the `index`-th slot of the closure pairs with the `index`-th entry
+/// of `Op::Closure`'s capture list and with the `index`-th entry of the callee's `captures`.
+/// `crisol_ir::verify_module` checks that pairing, because it is the one rule that cannot be
+/// checked by looking at a single function — and a mismatch would leave a slot holding a
+/// plausible value rather than failing.
+///
+/// A missing capture reads as `undefined` rather than faulting: an out-of-range index means
+/// the compiler and the runtime disagree about the closure's width, and returning a value the
+/// program can see beats reading past the end of the object.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_closure_capture(closure: u64, index: u64) -> u64 {
+    let Some(handle) = handle_of(closure) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let Ok(index) = u32::try_from(index) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .get(handle, index)
+            .unwrap_or(Value::UNDEFINED)
+            .to_bits()
+    })
 }

@@ -681,6 +681,7 @@ dependencies = [
  "crisol-frontend",
  "crisol-ir",
  "crisol-render-wgpu",
+ "crisol-value",
  "wgpu",
 ]
 

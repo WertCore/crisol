@@ -166,8 +166,9 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
 const CREATE_OBJECT_SYMBOL: &str = "crisol_create_object";
 const PROPERTY_STORE_SYMBOL: &str = "crisol_property_store";
 const PROPERTY_LOAD_SYMBOL: &str = "crisol_property_load";
+const CLOSURE_CAPTURE_SYMBOL: &str = "crisol_closure_capture";
 
-/// The three runtime entry points objects need, as declared in a module.
+/// The runtime entry points objects and closures need, as declared in a module.
 #[derive(Clone, Copy, Debug)]
 struct ObjectHelpers<T> {
     /// `crisol_create_object() -> value`
@@ -176,6 +177,8 @@ struct ObjectHelpers<T> {
     store: T,
     /// `crisol_property_load(object, key, length) -> value`
     load: T,
+    /// `crisol_closure_capture(closure, index) -> value`
+    capture: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -203,6 +206,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     load.params.push(AbiParam::new(types::I64));
     load.returns.push(AbiParam::new(types::I64));
 
+    let mut capture = module.make_signature();
+    capture.params.push(AbiParam::new(types::I64));
+    capture.params.push(AbiParam::new(types::I64));
+    capture.returns.push(AbiParam::new(types::I64));
+
     let mut declare = |symbol: &str, signature: &cranelift_codegen::ir::Signature| {
         module
             .declare_function(symbol, Linkage::Import, signature)
@@ -214,7 +222,22 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         create: declare(CREATE_OBJECT_SYMBOL, &create)?,
         store: declare(PROPERTY_STORE_SYMBOL, &store)?,
         load: declare(PROPERTY_LOAD_SYMBOL, &load)?,
+        capture: declare(CLOSURE_CAPTURE_SYMBOL, &capture)?,
     })
+}
+
+/// Appends the five operands every compiled function takes.
+///
+/// One function rather than written out at each backend, because the two must agree exactly:
+/// a mismatch would be a call frame read with the wrong layout, which is not a crash but a
+/// wrong value.
+fn push_fixed_params(signature: &mut cranelift_codegen::ir::Signature, pointer: types::Type) {
+    signature.params.push(AbiParam::new(types::I64)); // closure
+    signature.params.push(AbiParam::new(types::I64)); // this
+    signature.params.push(AbiParam::new(types::I64)); // new.target
+    signature.params.push(AbiParam::new(types::I64)); // argc
+    signature.params.push(AbiParam::new(pointer)); // argv
+    debug_assert_eq!(signature.params.len(), FIXED_PARAMS);
 }
 
 /// Every property key a function names, in the order first seen.
@@ -271,6 +294,31 @@ fn intern_keys<M: cranelift_module::Module>(
     }
     Ok(())
 }
+
+/// How many operands every compiled function takes before its JavaScript arguments.
+///
+/// `(closure, this, new.target, argc, argv)`. **Every** function takes exactly these, whatever
+/// its source arity, so a call site never has to know which function it is reaching — which it
+/// cannot know for a callback passed to `arr.map`. A convention with the arity baked into the
+/// signature cannot express a first-class function at all.
+///
+/// These five land in registers on all four targets simply by being the first parameters; that
+/// is the platform's own convention doing the work, not a choice made here.
+const FIXED_PARAMS: usize = 5;
+
+/// The smallest `argv` a caller may pass, in slots.
+///
+/// Public because the C entry point has to honour it, and it lives in another crate — a second
+/// copy of the number is a second thing to keep in step.
+///
+/// One, and it matters. A parameter is read as `argv[min(i, argc - 1 ... )]` guarded by
+/// `i < argc`, and the guard is a *select* rather than a branch — so the load happens either
+/// way and has to be in bounds even when the answer is discarded. Clamping the index to zero
+/// makes it in bounds for every arity, provided there is always a slot zero to read.
+///
+/// So a call passing no arguments still reserves one slot. That costs eight bytes of stack and
+/// removes a branch from every parameter of every function.
+pub const ARGV_MIN_SLOTS: usize = 1;
 
 /// The symbol holding the stack map table a compiled program's collector reads.
 pub const STACK_MAP_SYMBOL: &str = "crisol_stack_maps";
@@ -480,12 +528,7 @@ impl Cranelift {
 impl Backend for Cranelift {
     fn compile(&mut self, function: &Function) -> Result<Report, CodegenError> {
         let mut signature = self.module.make_signature();
-        for _ in &function.parameters {
-            signature.params.push(AbiParam::new(types::I64));
-        }
-        for _ in &function.captures {
-            signature.params.push(AbiParam::new(types::I64));
-        }
+        push_fixed_params(&mut signature, self.module.target_config().pointer_type());
         signature.returns.push(AbiParam::new(types::I64));
 
         let id = self
@@ -535,6 +578,9 @@ impl Backend for Cranelift {
             load: self
                 .module
                 .declare_func_in_func(self.objects.load, &mut context.func),
+            capture: self
+                .module
+                .declare_func_in_func(self.objects.capture, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
@@ -628,22 +674,77 @@ impl Lowering<'_> {
                 .insert(u32::try_from(index).unwrap_or(u32::MAX), block);
         }
 
-        let entry = self.block(function.entry.index());
-        self.builder.append_block_params_for_function_params(entry);
-        self.builder.switch_to_block(entry);
+        // The prologue gets a block of its own, ahead of the IR's entry block.
+        //
+        // It cannot share one. Unpacking arguments emits real instructions, and the loop below
+        // walks the IR's blocks in index order — which need not start at the entry — so it
+        // would switch away from a half-filled block. Cranelift rejects that, and it is right
+        // to: the instructions would be stranded in a block nothing branches to.
+        let prologue = self.builder.create_block();
+        self.builder
+            .append_block_params_for_function_params(prologue);
+        self.builder.switch_to_block(prologue);
 
-        // Parameters then captures, matching the signature and `Function`'s own ordering.
-        let incoming: Vec<ClifValue> = self.builder.block_params(entry).to_vec();
-        let arriving: Vec<u32> = function
-            .parameters
-            .iter()
-            .chain(function.captures.iter())
-            .copied()
-            .collect();
-        for (slot, value) in arriving.iter().zip(incoming) {
+        // The five fixed operands arrive as block parameters; everything else is unpacked.
+        let incoming: Vec<ClifValue> = self.builder.block_params(prologue).to_vec();
+        let closure = incoming[0];
+        let argc = incoming[3];
+        let argv = incoming[4];
+        // `incoming[1]` and `incoming[2]` are `this` and `new.target`. They are not bound yet:
+        // the frontend models `this` as a *slot* it declares ahead of the parameters, and
+        // nothing in `Function` says which slot that is — relying on "slot zero by
+        // construction" would couple the two silently. That needs a field on `Function`.
+
+        let undefined = self
+            .builder
+            .ins()
+            .iconst(types::I64, crisol_value::Value::UNDEFINED.to_bits() as i64);
+
+        // A parameter the caller did not pass is `undefined` — `f(1)` on `function f(a, b)`
+        // binds `b` to `undefined`, it is not an error. So each one is read under a guard.
+        //
+        // The guard is a pair of selects rather than a branch: the index is clamped to zero so
+        // the load is in bounds whatever the arity, the load always happens, and its result is
+        // then discarded if the parameter was never passed. `ARGV_MIN_SLOTS` is what makes the
+        // clamped load safe.
+        for (index, slot) in function.parameters.iter().enumerate() {
+            let position = i64::try_from(index).unwrap_or(i64::MAX);
+            let position = self.builder.ins().iconst(types::I64, position);
+            let passed = self.builder.ins().icmp(
+                cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+                position,
+                argc,
+            );
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            let safe = self.builder.ins().select(passed, position, zero);
+            let byte_offset = self.builder.ins().imul_imm_u(safe, 8);
+            let address = self.builder.ins().iadd(argv, byte_offset);
+            let loaded = self
+                .builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), address, 0);
+            let value = self.builder.ins().select(passed, loaded, undefined);
             let variable = self.variable(*slot);
             self.builder.def_var(variable, value);
         }
+
+        // Captures come out of the closure, not off the argument list. They are positional and
+        // the pairing with `Op::Closure`'s `captures` is by index, which `verify_module` checks
+        // — it is the one rule that cannot be checked from a single function.
+        for (index, slot) in function.captures.iter().enumerate() {
+            let position = i64::try_from(index).unwrap_or(i64::MAX);
+            let position = self.builder.ins().iconst(types::I64, position);
+            let call = self
+                .builder
+                .ins()
+                .call(self.objects.capture, &[closure, position]);
+            let value = self.builder.inst_results(call)[0];
+            let variable = self.variable(*slot);
+            self.builder.def_var(variable, value);
+        }
+
+        let entry = self.block(function.entry.index());
+        self.builder.ins().jump(entry, &[]);
 
         for (index, block) in function.blocks.iter().enumerate() {
             let clif = self.block(u32::try_from(index).unwrap_or(u32::MAX));
@@ -1125,9 +1226,7 @@ impl Jit {
     /// [`CodegenError`] naming what it refused.
     pub fn compile(&mut self, function: &Function) -> Result<Report, CodegenError> {
         let mut signature = self.module.make_signature();
-        for _ in function.parameters.iter().chain(function.captures.iter()) {
-            signature.params.push(AbiParam::new(types::I64));
-        }
+        push_fixed_params(&mut signature, self.module.target_config().pointer_type());
         signature.returns.push(AbiParam::new(types::I64));
 
         let id = self
@@ -1177,6 +1276,9 @@ impl Jit {
             load: self
                 .module
                 .declare_func_in_func(self.objects.load, &mut context.func),
+            capture: self
+                .module
+                .declare_func_in_func(self.objects.capture, &mut context.func),
         };
         let pointer = frontend_config.pointer_type();
         let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
