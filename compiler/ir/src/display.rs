@@ -83,9 +83,20 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::Const(constant) => write!(f, "const {}", Literal(constant)),
         Op::Load { slot } => write!(f, "load ${slot}"),
         Op::Store { slot, value } => write!(f, "store ${slot}, {value}"),
-        Op::Call { callee, args } => {
+        Op::Call {
+            callee,
+            this_value,
+            args,
+        } => {
             let args: Vec<String> = args.iter().map(ToString::to_string).collect();
-            write!(f, "call {callee}({})", args.join(", "))
+            // The receiver is printed first and marked, so a call that lost one is visible in
+            // a diff rather than needing to be counted out of the argument list.
+            write!(
+                f,
+                "call {callee}(this={this_value}{}{})",
+                if args.is_empty() { "" } else { ", " },
+                args.join(", ")
+            )
         }
         // Quoted, because a property name is an arbitrary string: `obj[""]` and
         // `obj["a b"]` are both legal, and an unquoted dump of either is ambiguous exactly

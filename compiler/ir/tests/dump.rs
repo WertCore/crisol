@@ -150,6 +150,7 @@ fn every_operation_prints() {
         Op::Store { slot: 3, value },
         Op::Call {
             callee: value,
+            this_value: value,
             args: vec![value],
         },
         Op::PropertyLoad {

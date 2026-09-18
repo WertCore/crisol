@@ -1612,7 +1612,22 @@ four were in M11's recorded `unsupported` list**. That is a gap in the plan, not
 implementation: the roadmap reads as though M13 begins where M11 stopped, and it does not.
 
 `Op::Binary` and `Op::Unary` are now in the IR, and the lowering covers arithmetic, bitwise,
-unary, logical, conditional and array literals. classes and array *methods* — the latter needs calls to resolve.
+unary, logical, conditional and array literals. classes, and array *methods*.
+
+### `this`, and a receiver the snapshot had been blessing
+
+`Op::Call` now carries a `this_value` (D-82). **It had been missing, and the corpus snapshot had
+been recording the wrong IR as correct since M11** — `o.a()` lowered to a property load and a
+call with no receiver, so `this` inside would be wrong. A reviewed snapshot only catches what a
+reader thinks to look for, and nobody looks for a field that does not exist yet. The failure is
+silent: the call still happens and still returns something.
+
+**`this`-binding is one flag.** A non-arrow *declares* `this` so it shadows; an arrow does not,
+so `this` inside it resolves outward and becomes an ordinary capture. That is the whole rule,
+and it is the payoff for `slot` and `declare` being different operations (D-81).
+
+A test written as a substring match on `call v4(this=v1` passed for the wrong reason the moment
+`this` became slot 0 and shifted everything. It is structural now.
 
 ### Closures, and where the capture analysis lives
 

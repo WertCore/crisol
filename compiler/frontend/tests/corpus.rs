@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use crisol_frontend::lower;
-use crisol_ir::verify_module;
+use crisol_ir::{Op, verify_module};
 
 /// The programs. Order is fixed, because the snapshot is.
 const CORPUS: &[(&str, &str)] = &[
@@ -142,6 +142,23 @@ const CORPUS: &[(&str, &str)] = &[
         "a-function-that-runs-off-the-end-returns-undefined",
         "let f = () => { let a = 1; };",
     ),
+    (
+        "a-method-call-passes-its-receiver",
+        "let o = { a: 1 }; let v = o.a();",
+    ),
+    (
+        "a-plain-call-passes-undefined",
+        "let f = null; let v = f();",
+    ),
+    (
+        "an-arrow-captures-this",
+        "let f = function () { return () => this; };",
+    ),
+    (
+        "a-function-binds-its-own-this",
+        "let f = function () { return this; };",
+    ),
+    ("this-at-top-level", "let t = this;"),
 ];
 
 fn snapshot_path() -> PathBuf {
@@ -451,6 +468,90 @@ fn a_function_that_runs_off_the_end_returns_undefined() {
         block.terminator,
         crisol_ir::Terminator::Return(None)
     ));
+}
+
+#[test]
+fn a_method_call_keeps_its_receiver_and_a_plain_call_does_not_invent_one() {
+    // `o.m()` has `this === o` inside `m`. Losing that is **silent**: the call still happens
+    // and still returns something, and only `this` is wrong.
+    // Checked structurally rather than against value numbers in the text: the property is
+    // that the call's receiver *is* the object the method was loaded from, and an assertion
+    // on `v4`/`v1` would pass for the wrong reason as soon as an earlier instruction moved.
+    let method = lower("method", "let o = { a: 1 }; let v = o.a();").expect("parses");
+    let block = &method.program().blocks[0];
+    let mut loaded_from = None;
+    let mut checked = false;
+    for instruction in &block.instructions {
+        match &instruction.op {
+            Op::PropertyLoad { object, .. } => loaded_from = Some((instruction.result, *object)),
+            Op::Call {
+                callee, this_value, ..
+            } => {
+                let (method_value, object) = loaded_from.expect("a property load came first");
+                assert_eq!(
+                    Some(*callee),
+                    method_value,
+                    "the callee is the loaded method"
+                );
+                assert_eq!(*this_value, object, "and the receiver is the object");
+                checked = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(checked, "no call found:\n{}", method.program());
+
+    let plain = lower("plain", "let f = null; let v = f();").expect("parses");
+    assert!(
+        plain
+            .program()
+            .to_string()
+            .contains("undefined = const undefined"),
+        "a plain call passes undefined explicitly:\n{}",
+        plain.program()
+    );
+}
+
+#[test]
+fn an_arrow_captures_this_and_a_function_binds_its_own() {
+    // The whole of `this`-binding semantics, and it falls out of the scope machinery rather
+    // than needing a rule of its own: a non-arrow *declares* `this` so it shadows; an arrow
+    // does not, so `this` inside it resolves outward and becomes an ordinary capture.
+    let arrow = lower("arrow-this", "let f = function () { return () => this; };").expect("parses");
+    let inner = arrow
+        .functions
+        .iter()
+        .find(|function| function.name == "arrow")
+        .expect("the arrow");
+    assert_eq!(
+        inner.captures.len(),
+        1,
+        "the arrow captures `this` from the function around it"
+    );
+
+    let plain = lower("own-this", "let f = function () { return this; };").expect("parses");
+    let inner = plain
+        .functions
+        .iter()
+        .find(|function| function.name == "anonymous")
+        .expect("the function");
+    assert!(
+        inner.captures.is_empty(),
+        "a non-arrow binds its own `this` and captures nothing"
+    );
+}
+
+#[test]
+fn a_method_calls_object_is_evaluated_once() {
+    // `f().m()` must not call `f` twice — the receiver and the property load share one
+    // evaluation of the object.
+    let lowered = lower("once", "let f = null; let v = f().m();").expect("parses");
+    let dump = lowered.program().to_string();
+    assert_eq!(
+        dump.matches("call ").count(),
+        2,
+        "one call for `f()` and one for `.m()`:\n{dump}"
+    );
 }
 
 #[test]
