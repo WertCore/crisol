@@ -633,3 +633,155 @@ impl Lowering<'_> {
         Ok(())
     }
 }
+
+/// A backend that compiles into this process's memory and hands back callable addresses.
+///
+/// The object emitter proves a function *compiles*. This proves it **computes the right
+/// answer**, which is a different claim and the one that was missing: `6 / 3` compiling says
+/// nothing about whether it yields `2`.
+///
+/// §2.3's "no interpreter in shipped artifacts" is about the *application* binary.
+/// `crisol-codegen` is a build-time crate, and M14's differential testing needs this same
+/// ability — a design with only an object emitter cannot compare two backends' results without
+/// a linker in the loop.
+///
+/// # Symbols are supplied by the caller
+///
+/// The helpers are **not** resolved from the host process automatically. A caller passes them
+/// in, which keeps `crisol-codegen` free of a dependency on the runtime it generates calls to —
+/// and makes the contract explicit at the point of use rather than implicit in a link order.
+pub struct Jit {
+    module: cranelift_jit::JITModule,
+    context: FunctionBuilderContext,
+    helpers: HashMap<BinaryOp, cranelift_module::FuncId>,
+    compiled: HashMap<String, *const u8>,
+}
+
+impl std::fmt::Debug for Jit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Jit")
+            .field("compiled", &self.compiled.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Jit {
+    /// A JIT for the host, with `symbols` registered for the generated code to call.
+    ///
+    /// # Errors
+    ///
+    /// [`CodegenError`] when the host ISA cannot be determined or a symbol cannot be declared.
+    pub fn new(symbols: &[(&str, *const u8)]) -> Result<Self, CodegenError> {
+        let isa = cranelift_native::builder()
+            .map_err(|message| CodegenError::UnknownTarget {
+                triple: message.to_owned(),
+            })?
+            .finish(settings::Flags::new(settings::builder()))
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        let mut builder =
+            cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        for (name, address) in symbols {
+            builder.symbol(*name, *address);
+        }
+        let mut module = cranelift_jit::JITModule::new(builder);
+
+        let mut signature = module.make_signature();
+        signature.params.push(AbiParam::new(types::I64));
+        signature.params.push(AbiParam::new(types::I64));
+        signature.returns.push(AbiParam::new(types::I64));
+        let mut helpers = HashMap::new();
+        for (op, symbol) in HELPER_SYMBOLS {
+            let id = module
+                .declare_function(symbol, Linkage::Import, &signature)
+                .map_err(|error| CodegenError::Backend {
+                    message: error.to_string(),
+                })?;
+            helpers.insert(*op, id);
+        }
+
+        Ok(Self {
+            module,
+            context: FunctionBuilderContext::new(),
+            helpers,
+            compiled: HashMap::new(),
+        })
+    }
+
+    /// Compiles a function and makes it callable.
+    ///
+    /// # Errors
+    ///
+    /// [`CodegenError`] naming what it refused.
+    pub fn compile(&mut self, function: &Function) -> Result<Report, CodegenError> {
+        let mut signature = self.module.make_signature();
+        for _ in function.parameters.iter().chain(function.captures.iter()) {
+            signature.params.push(AbiParam::new(types::I64));
+        }
+        signature.returns.push(AbiParam::new(types::I64));
+
+        let id = self
+            .module
+            .declare_function(&function.name, Linkage::Export, &signature)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+
+        let mut context = cranelift_codegen::Context::new();
+        context.func.signature = signature;
+        let frontend_config = self.module.target_config();
+        let helpers: HashMap<BinaryOp, cranelift_codegen::ir::FuncRef> = self
+            .helpers
+            .iter()
+            .map(|(op, id)| {
+                (
+                    *op,
+                    self.module.declare_func_in_func(*id, &mut context.func),
+                )
+            })
+            .collect();
+        let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
+        let mut lowering = Lowering {
+            builder,
+            slots: HashMap::new(),
+            values: HashMap::new(),
+            types: HashMap::new(),
+            blocks: HashMap::new(),
+            helpers,
+        };
+        lowering.lower(function)?;
+        lowering.builder.finalize(frontend_config);
+
+        let stack_map_entries: usize = context
+            .func
+            .layout
+            .blocks()
+            .flat_map(|block| context.func.layout.block_insts(block))
+            .filter_map(|inst| context.func.dfg.user_stack_map_entries(inst))
+            .map(<[_]>::len)
+            .sum();
+
+        self.module
+            .define_function(id, &mut context)
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        self.module
+            .finalize_definitions()
+            .map_err(|error| CodegenError::Backend {
+                message: error.to_string(),
+            })?;
+        self.compiled.insert(
+            function.name.clone(),
+            self.module.get_finalized_function(id),
+        );
+        Ok(Report { stack_map_entries })
+    }
+
+    /// The address of a compiled function, if it was compiled.
+    #[must_use]
+    pub fn address(&self, name: &str) -> Option<*const u8> {
+        self.compiled.get(name).copied()
+    }
+}
