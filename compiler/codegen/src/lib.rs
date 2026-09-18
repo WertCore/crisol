@@ -119,8 +119,12 @@ pub struct Cranelift {
     triple: String,
     module: ObjectModule,
     context: FunctionBuilderContext,
-    /// The runtime helper `+` calls. Declared once and reused.
-    add_helper: cranelift_module::FuncId,
+    /// The runtime helpers, one per operator that cannot be a native instruction.
+    ///
+    /// One symbol each rather than a single `crisol_binary(op, a, b)`: an opcode passed at
+    /// runtime would be a branch the linker cannot see through, and a separate symbol is what
+    /// lets a later pass replace an individual operator without touching the others.
+    helpers: HashMap<BinaryOp, cranelift_module::FuncId>,
 }
 
 impl std::fmt::Debug for Cranelift {
@@ -164,23 +168,42 @@ impl Cranelift {
             })?;
         let mut module = ObjectModule::new(builder);
 
-        // `+` is a call, for the reason in the module docs. Declared as an import so the
-        // runtime supplies it at link time.
+        // Every operator that is not a native instruction is a call, declared as an import so
+        // the runtime supplies it at link time.
+        //
+        // `+` because it may concatenate (D-79). `%` and `**` because they are libm calls.
+        // The bitwise operators because `ToInt32` wraps **modulo 2^32** — Cranelift's
+        // float-to-int conversion saturates, so `1e10 | 0` would come out clamped rather than
+        // wrapped, which is a wrong number rather than a slow one.
         let mut signature = module.make_signature();
         signature.params.push(AbiParam::new(types::I64));
         signature.params.push(AbiParam::new(types::I64));
         signature.returns.push(AbiParam::new(types::I64));
-        let add_helper = module
-            .declare_function("crisol_add", Linkage::Import, &signature)
-            .map_err(|error| CodegenError::Backend {
-                message: error.to_string(),
-            })?;
+        let mut helpers = HashMap::new();
+        for (op, symbol) in [
+            (BinaryOp::Add, "crisol_add"),
+            (BinaryOp::Remainder, "crisol_remainder"),
+            (BinaryOp::Exponent, "crisol_exponent"),
+            (BinaryOp::BitAnd, "crisol_bit_and"),
+            (BinaryOp::BitOr, "crisol_bit_or"),
+            (BinaryOp::BitXor, "crisol_bit_xor"),
+            (BinaryOp::ShiftLeft, "crisol_shift_left"),
+            (BinaryOp::ShiftRight, "crisol_shift_right"),
+            (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
+        ] {
+            let id = module
+                .declare_function(symbol, Linkage::Import, &signature)
+                .map_err(|error| CodegenError::Backend {
+                    message: error.to_string(),
+                })?;
+            helpers.insert(op, id);
+        }
 
         Ok(Self {
             triple: triple.to_owned(),
             module,
             context: FunctionBuilderContext::new(),
-            add_helper,
+            helpers,
         })
     }
 }
@@ -206,16 +229,24 @@ impl Backend for Cranelift {
         let mut context = cranelift_codegen::Context::new();
         context.func.signature = signature;
         let frontend_config = self.module.target_config();
-        let add = self
-            .module
-            .declare_func_in_func(self.add_helper, &mut context.func);
+        let helpers: HashMap<BinaryOp, cranelift_codegen::ir::FuncRef> = self
+            .helpers
+            .iter()
+            .map(|(op, id)| {
+                (
+                    *op,
+                    self.module.declare_func_in_func(*id, &mut context.func),
+                )
+            })
+            .collect();
         let builder = FunctionBuilder::new(&mut context.func, &mut self.context);
         let mut lowering = Lowering {
             builder,
             slots: HashMap::new(),
             values: HashMap::new(),
+            types: HashMap::new(),
             blocks: HashMap::new(),
-            add,
+            helpers,
         };
         lowering.lower(function)?;
         // `finalize` needs the target's frontend config in this version — it is what decides
@@ -258,10 +289,16 @@ struct Lowering<'a> {
     slots: HashMap<u32, Variable>,
     /// IR value to Cranelift value.
     values: HashMap<u32, ClifValue>,
+    /// IR value to the type the IR gave it.
+    ///
+    /// Carried because several lowerings are only correct for a *known* type. `===` is the
+    /// clearest case: on two numbers it is `f64` equality, and on boxed values of unknown type
+    /// it is not. Without this the backend would have to refuse both.
+    types: HashMap<u32, crisol_ir::Type>,
     /// IR block to Cranelift block.
     blocks: HashMap<u32, cranelift_codegen::ir::Block>,
-    /// The declared `+` helper, resolved into this function.
-    add: cranelift_codegen::ir::FuncRef,
+    /// The declared helpers, resolved into this function.
+    helpers: HashMap<BinaryOp, cranelift_codegen::ir::FuncRef>,
 }
 
 impl Lowering<'_> {
@@ -320,6 +357,14 @@ impl Lowering<'_> {
         let variable = self.builder.declare_var(types::I64);
         self.slots.insert(slot, variable);
         variable
+    }
+
+    /// Whether the IR proved this value is a number.
+    ///
+    /// `Type::Number` and nothing weaker: `Unknown` may be a string, and lowering a float
+    /// instruction for one would be a miscompilation rather than a slow path.
+    fn is_number(&self, id: crisol_ir::ValueId) -> bool {
+        self.types.get(&id.index()) == Some(&crisol_ir::Type::Number)
     }
 
     fn value(&self, id: crisol_ir::ValueId) -> ClifValue {
@@ -416,7 +461,12 @@ impl Lowering<'_> {
                 self.builder.def_var(variable, value);
                 None
             }
-            Op::Binary { op, left, right } if op.is_always_numeric() => {
+            Op::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+                ) =>
+            {
                 let left = self.value(*left);
                 let right = self.value(*right);
                 let left = self.as_f64(left);
@@ -425,32 +475,32 @@ impl Lowering<'_> {
                     BinaryOp::Subtract => self.builder.ins().fsub(left, right),
                     BinaryOp::Multiply => self.builder.ins().fmul(left, right),
                     BinaryOp::Divide => self.builder.ins().fdiv(left, right),
-                    // `%`, `**` and the bitwise operators need int32 coercion or a libm call,
-                    // and guessing at either would produce plausible wrong numbers.
-                    other => {
-                        return Err(CodegenError::Unsupported {
-                            operation: format!("binary operator {}", other.symbol()),
-                        });
-                    }
+                    // Unreachable: the guard above admits exactly these three.
+                    _ => unreachable!("guarded to the three with native instructions"),
                 };
                 Some(self.box_f64(result))
             }
-            Op::Binary {
-                op: BinaryOp::Add,
-                left,
-                right,
-            } => {
-                // D-79 in the machine code: `+` may concatenate, so the IR types it `Unknown`
-                // and an `Unknown` cannot become a float add. A call is the correct lowering,
-                // not a fallback.
+            Op::Binary { op, left, right } => {
+                // Everything not handled above is a call. D-79 in the machine code for `+`;
+                // a libm call for `%` and `**`; and modular `ToInt32` for the bitwise family,
+                // which Cranelift's saturating conversion cannot express.
+                let Some(helper) = self.helpers.get(op).copied() else {
+                    return Err(CodegenError::Unsupported {
+                        operation: format!("binary operator {}", op.symbol()),
+                    });
+                };
                 let left = self.value(*left);
                 let right = self.value(*right);
-                let call = self.builder.ins().call(self.add, &[left, right]);
+                let call = self.builder.ins().call(helper, &[left, right]);
                 Some(self.builder.inst_results(call)[0])
             }
-            Op::Compare { op, left, right } => {
-                let left = self.value(*left);
-                let right = self.value(*right);
+            Op::Compare {
+                op,
+                left: left_id,
+                right: right_id,
+            } => {
+                let left = self.value(*left_id);
+                let right = self.value(*right_id);
                 let condition = match op {
                     CompareOp::Less
                     | CompareOp::LessEqual
@@ -470,12 +520,26 @@ impl Lowering<'_> {
                         };
                         self.builder.ins().fcmp(cc, left, right)
                     }
-                    // `===` on boxed values is a bit comparison *except* for NaN and ±0, and
-                    // getting that wrong is D-53's whole subject. Refused rather than
-                    // approximated.
+                    // On **numbers**, `===` is exactly `f64` equality: `NaN === NaN` is false
+                    // and `fcmp eq` on NaN is false; `+0 === -0` is true and `fcmp eq` on the
+                    // two zeroes is true. The IR's type lattice is what makes that reachable —
+                    // on boxed values of unknown type a bit comparison gets both of those
+                    // wrong, which is D-53's whole subject, so that case is still refused.
+                    CompareOp::StrictEqual | CompareOp::StrictNotEqual
+                        if self.is_number(*left_id) && self.is_number(*right_id) =>
+                    {
+                        let left = self.as_f64(left);
+                        let right = self.as_f64(right);
+                        let cc = if matches!(op, CompareOp::StrictEqual) {
+                            cranelift_codegen::ir::condcodes::FloatCC::Equal
+                        } else {
+                            cranelift_codegen::ir::condcodes::FloatCC::NotEqual
+                        };
+                        self.builder.ins().fcmp(cc, left, right)
+                    }
                     CompareOp::StrictEqual | CompareOp::StrictNotEqual => {
                         return Err(CodegenError::Unsupported {
-                            operation: "strict equality".to_owned(),
+                            operation: "strict equality on values of unknown type".to_owned(),
                         });
                     }
                 };
@@ -494,6 +558,7 @@ impl Lowering<'_> {
 
         if let (Some(result), Some(id)) = (produced, instruction.result) {
             self.values.insert(id.index(), result);
+            self.types.insert(id.index(), instruction.ty);
         }
         Ok(())
     }

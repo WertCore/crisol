@@ -2551,3 +2551,50 @@ is closeable: `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` were alrea
 So the local gate now includes a cross-target clippy pass for the two non-host desktop targets.
 Earlier in the project three CI failures were attributed to "what local runs structurally
 cannot catch" — for *this* class of failure that was not true, only unattempted.
+
+---
+
+## D-86 — The type lattice makes `===` cheap, and deleting a test cannot fail a test run
+
+**Status:** Accepted (M13) · **Affects:** M13, M20
+
+The first backend refused `===` outright, reasoning that "`===` on boxed values is a bit
+comparison *except* for NaN and ±0". That is true, and it was **over-cautious for the case the
+IR had already proved**.
+
+On two values the lattice typed `Number`, `===` is exactly `f64` equality: `NaN === NaN` is
+false and `fcmp eq` on NaN is false; `+0 === -0` is true and `fcmp eq` on the two zeroes is
+true. The hard cases are hard *because the operands are boxed*, and the lattice says when they
+are not. So `===` now lowers to a native comparison when both operands are `Type::Number`, and
+is still refused otherwise.
+
+This is the first place the type lattice (D-58) has paid for itself in emitted code, and it is
+worth noting the shape: the lattice did not make a *fast* path possible, it made a **correct**
+one possible that had been refused for want of the information.
+
+### The operators that are calls, and why each one
+
+| operator | why not an instruction |
+|---|---|
+| `+` | may concatenate — the IR types it `Unknown` (D-79) |
+| `%`, `**` | libm calls |
+| `&`, `\|`, `^`, `<<`, `>>`, `>>>` | `ToInt32` wraps **modulo 2^32** |
+
+The bitwise row is the one worth stating: Cranelift's float-to-int conversion **saturates**, so
+lowering `1e10 \| 0` with it would clamp rather than wrap. That is a *wrong number*, not a slow
+one, and it would look entirely plausible.
+
+One symbol per operator rather than a single `crisol_binary(op, a, b)`: an opcode passed at
+runtime is a branch the linker cannot see through, and separate symbols are what let a later
+pass replace one operator without touching the others.
+
+### Deleting a test cannot fail a test run
+
+While replacing two superseded tests, a slice-based edit also removed the two **stack map**
+tests — the ones verifying §M13's own deliverable. The suite went green, because removing a
+test never fails.
+
+That asymmetry is worth naming: every other kind of mistake in a test file shows up as a
+failure, and this one shows up as a slightly smaller number that nobody is watching. Caught by
+reading the list of test names in the output rather than the pass count, and the count is now
+asserted alongside them.
