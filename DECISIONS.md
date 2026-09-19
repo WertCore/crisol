@@ -3970,3 +3970,32 @@ operator has to be classified rather than inheriting the answer for arithmetic.
 **The corpus snapshot is what caught it.** The dump prints each value's type, so `v4: number =
 == v2, v3` was visible in the diff the test asked to be reviewed. No assertion anywhere
 mentioned operator result types; the snapshot showed one and made it obvious.
+
+## D-133
+
+**Array spread, separated from array holes.**
+
+Status: Accepted; holes remain refused
+
+The two shared one note, `array hole or spread`, so `[...a]` looked like a gap it had not been
+for any good reason — they are unrelated problems that happened to arrive at the same match arm.
+
+**A hole is still refused**, and D-64's reasoning is unchanged: a hole is not `undefined`, the
+IR has no way to say "absent", and filling one in with `undefined` produces a value that reads
+the same and answers `in` differently. That is a wrong answer, not a missing feature.
+
+Spread has no such obstacle. **The leading run is built in one `CreateArray` and only what
+follows a spread is appended piece by piece**, so an array with no spread costs exactly what it
+did before.
+
+`spread` is one bit on one operation because that is the whole difference at the call site:
+with it, every element of the operand is appended; without it, the operand itself is. `[...a]`
+and `[a]` differ in that and nothing else.
+
+Spreading uses the same rule `for-of` does (D-120) — an array or a string, `TypeError`
+otherwise — so `[...5]` and `for (x of 5)` fail the same way. A separate rule here would have
+let one of them quietly produce a one-element array.
+
+**The corpus snapshot is the review**, and this is what it is for: the dump shows the leading
+`array [v2]`, the `extend v3, ...v4` with its exception branch, and the trailing `extend v3,
+v7`. Reading that is how the lowering was checked, not by trusting that it compiled.

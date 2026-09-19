@@ -77,6 +77,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_loose_equal",
     "crisol_loose_not_equal",
     "crisol_in",
+    "crisol_array_extend",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -5704,4 +5705,49 @@ pub extern "C" fn crisol_in(key: u64, object: u64) -> u64 {
         }
     }
     Value::FALSE.to_bits()
+}
+
+/// Appends to an array a literal is building.
+///
+/// **`spread` is the whole difference between `[...a]` and `[a]`.** Without it the operand is
+/// appended as one element; with it, each of the operand's elements is.
+///
+/// Spreading uses the same rule `for-of` does (D-120) — an array or a string, and a `TypeError`
+/// for anything else — so `[...5]` and `for (x of 5)` fail the same way rather than one of them
+/// quietly producing a one-element array.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_array_extend(array: u64, value: u64, spread: u64) -> u64 {
+    let Some(handle) = handle_of(array) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    if spread == 0 {
+        let at = with_runtime(|runtime| runtime.heap.element_count(handle).unwrap_or(0));
+        with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(handle, at, Value::from_bits(value));
+        });
+        return Value::UNDEFINED.to_bits();
+    }
+
+    let source = crisol_iterate(value);
+    if Value::from_bits(source).is_exception() {
+        return source;
+    }
+    with_rooted(&[array, source], || {
+        let Some((from, length)) = elements_of(source) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        for index in 0..length {
+            let element = element_at(from, index);
+            let at = with_runtime(|runtime| runtime.heap.element_count(handle).unwrap_or(0));
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(handle, at, Value::from_bits(element));
+            });
+        }
+        Value::UNDEFINED.to_bits()
+    })
 }

@@ -368,6 +368,19 @@ pub enum Op {
         /// The flag letters.
         flags: String,
     },
+    /// Appends to an array being built by a literal.
+    ///
+    /// **Two jobs in one operation because they differ by one bit at the call site.** With
+    /// `spread`, every element of the operand is appended; without it, the operand itself is.
+    /// `[...a]` and `[a]` differ in exactly that and nothing else.
+    ArrayExtend {
+        /// The array under construction.
+        array: ValueId,
+        /// What to append, or to append the elements of.
+        value: ValueId,
+        /// Whether `value` is spread.
+        spread: bool,
+    },
     /// `delete object[key]`.
     ///
     /// One operation for both spellings, because `delete o.x` and `delete o["x"]` are the same
@@ -516,6 +529,7 @@ impl Op {
                 | Self::Enumerate { .. }
                 | Self::Iterate { .. }
                 | Self::CreateRegExp { .. }
+                | Self::ArrayExtend { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -551,6 +565,7 @@ impl Op {
             Self::ComputedLoad { object, key } | Self::Delete { object, key } => {
                 vec![*object, *key]
             }
+            Self::ArrayExtend { array, value, .. } => vec![*array, *value],
             Self::ComputedStore { object, key, value } => vec![*object, *key, *value],
             Self::CreateArray { elements } => elements.clone(),
             Self::Construct { callee, args } => {

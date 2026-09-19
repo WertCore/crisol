@@ -34,18 +34,15 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**54 passed, 309 failed, 0 crashed, 16 refused.** `==`, `!=` and `in` (D-131). `===` was never
-the gap — it has been lowered since the comparison operators landed, strings-by-characters
-included; the refusal was loose equality.
+**54 passed, 311 failed, 0 crashed, 14 refused.** Array spread (D-133), which had been sharing
+a refusal note with array holes and so looked like a gap for longer than it was one.
 
-The corpus snapshot caught a bug older than that change: `instanceof` has been typed `number`
-in the IR since it was added, because `is_always_numeric` was written as "everything except
-`+`" (D-132).
+Holes stay refused on D-64's reasoning: a hole is not `undefined`, and filling one in gives a
+value that reads the same and answers `in` differently.
 
 Still unshipped from `crisol-builtins` (D-122): `Symbol` (21), `Proxy` (13), `Map` and `Set`
-(3 each).
-
-Refusals are 16, nearly all array holes (11).
+(3 each). Spread in a **call** — `f(...args)` — is still refused; it needs a dynamic argument
+count, which the fixed `argc`/`argv` at a call site does not have.
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -81,7 +78,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1199 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1204 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

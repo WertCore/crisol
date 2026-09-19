@@ -76,6 +76,7 @@ const CORPUS: &[(&str, &str)] = &[
     ("loose-equal", "let a = 1; let b = 2; let c = a == b;"),
     ("loose-not-equal", "let a = 1; let b = 2; let c = a != b;"),
     ("in-operator", "let o = {a: 1}; let c = \"a\" in o;"),
+    ("array-spread", "let a = [1]; let b = [0, ...a, 2];"),
     ("less", "let a = 1; let b = 2; let c = a < b;"),
     ("less-equal", "let a = 1; let b = 2; let c = a <= b;"),
     ("greater", "let a = 1; let b = 2; let c = a > b;"),
@@ -339,7 +340,9 @@ fn unfaithful_programs_are_reported_not_guessed() {
         ("let o = { ...{} };", "object spread"),
         // A hole is not `undefined` (D-64) and the IR cannot yet say so, so it is recorded
         // rather than filled in with a value that reads the same and answers `in` differently.
-        ("let a = [1, , 3];", "array hole or spread"),
+        // A hole is still refused; a spread is not. The two used to share a note, which made
+        // `[...a]` look like a gap it had not been for some time.
+        ("let a = [1, , 3];", "array hole"),
         // `==` is not `===`: it coerces, and the coercion table needs machinery that is not
         // here yet. Lowering it as a strict comparison would be wrong for every mixed-type
         // operand, which is the only case anyone writes `==` for.

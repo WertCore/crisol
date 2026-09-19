@@ -535,6 +535,30 @@ bb2:
     return
 }
 
+=== array-spread ===
+--- source
+let a = [1]; let b = [0, ...a, 2];
+--- ir
+function array-spread {
+bb0:  ; entry
+    v0: number = const 1.0
+    v1: object = array [v0]  ; safepoint []
+    store $1, v1
+    v2: number = const 0.0
+    v3: object = array [v2]  ; safepoint []
+    v4: unknown = load $1
+    v5: undefined = extend v3, ...v4  ; safepoint []
+    v6: bool = is-exception v5
+    branch v6 -> bb1, bb2
+bb1:
+    return v5
+bb2:
+    v7: number = const 2.0
+    extend v3, v7  ; safepoint []
+    store $2, v3
+    return
+}
+
 === less ===
 --- source
 let a = 1; let b = 2; let c = a < b;

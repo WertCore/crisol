@@ -107,6 +107,17 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::Delete { object, key } => write!(f, "delete {object}[{key}]"),
         Op::Enumerate { object } => write!(f, "enumerate {object}"),
         Op::Iterate { object } => write!(f, "iterate {object}"),
+        Op::ArrayExtend {
+            array,
+            value,
+            spread,
+        } => {
+            if *spread {
+                write!(f, "extend {array}, ...{value}")
+            } else {
+                write!(f, "extend {array}, {value}")
+            }
+        }
         Op::CreateRegExp { source, flags } => write!(f, "regexp /{source}/{flags}"),
         Op::ComputedStore { object, key, value } => write!(f, "set {object}[{key}] = {value}"),
         Op::CreateObject { shape } => write!(f, "object #{}", shape.index()),

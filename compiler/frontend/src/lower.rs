@@ -33,8 +33,9 @@ use crisol_ir::{
 use crisol_value::PropertyKey;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BinaryExpression, BinaryOperator, Expression, LogicalExpression, LogicalOperator,
-    ObjectPropertyKind, Program, PropertyKey as Key, Statement, UnaryExpression, UnaryOperator,
+    ArrayExpressionElement, BinaryExpression, BinaryOperator, Expression, LogicalExpression,
+    LogicalOperator, ObjectPropertyKind, Program, PropertyKey as Key, Statement, UnaryExpression,
+    UnaryOperator,
 };
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
@@ -1378,21 +1379,71 @@ impl Lowering {
             Expression::ConditionalExpression(conditional) => self.conditional(conditional),
             Expression::ArrayExpression(array) => {
                 let mut elements = Vec::with_capacity(array.elements.len());
+                // **The leading run is built in one go and the rest is appended.** An array
+                // with no spread costs exactly what it did before — one `CreateArray` — and
+                // only what follows a spread pays for being appended one piece at a time.
+                let mut spreading = false;
+                let mut result = None;
                 for element in &array.elements {
-                    match element.as_expression() {
-                        Some(expression) => elements.push(self.expression(expression)),
-                        None => {
-                            // A hole in `[1, , 3]`, or a spread. Holes are not `undefined`
-                            // (D-64) and the IR has no way to say so yet, so this is recorded
-                            // rather than filled in with a value that would read the same and
-                            // answer `in` differently.
-                            self.note("array hole or spread", array.span.start);
+                    match element {
+                        ArrayExpressionElement::SpreadElement(spread) => {
+                            let array = *result.get_or_insert_with(|| {
+                                self.emit(
+                                    Type::Object(None),
+                                    Op::CreateArray {
+                                        elements: std::mem::take(&mut elements),
+                                    },
+                                )
+                            });
+                            let value = self.expression(&spread.argument);
+                            let extended = self.emit(
+                                Type::Undefined,
+                                Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: true,
+                                },
+                            );
+                            self.propagate(extended);
+                            spreading = true;
+                        }
+                        // A hole in `[1, , 3]`. **Not a spread and not `undefined`** (D-64):
+                        // the IR still has no way to say "absent", so this is recorded rather
+                        // than filled in with a value that reads the same and answers `in`
+                        // differently.
+                        ArrayExpressionElement::Elision(_) => {
+                            self.note("array hole", array.span.start);
                             let placeholder = self.placeholder();
-                            elements.push(placeholder);
+                            if spreading {
+                                let array = result.unwrap_or(placeholder);
+                                self.emit_effect(Op::ArrayExtend {
+                                    array,
+                                    value: placeholder,
+                                    spread: false,
+                                });
+                            } else {
+                                elements.push(placeholder);
+                            }
+                        }
+                        other => {
+                            let Some(expression) = other.as_expression() else {
+                                continue;
+                            };
+                            let value = self.expression(expression);
+                            if let Some(array) = result {
+                                self.emit_effect(Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: false,
+                                });
+                            } else {
+                                elements.push(value);
+                            }
                         }
                     }
                 }
-                self.emit(Type::Object(None), Op::CreateArray { elements })
+                result
+                    .unwrap_or_else(|| self.emit(Type::Object(None), Op::CreateArray { elements }))
             }
             Expression::ComputedMemberExpression(member) => {
                 let object = self.expression(&member.object);

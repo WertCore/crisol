@@ -3000,3 +3000,74 @@ fn instanceof_answers_a_boolean() {
     check("loose-equal-typeof", "return typeof (1 == 1);", "boolean");
     check("in-typeof", "return typeof (\"a\" in {a: 1});", "boolean");
 }
+
+// ---- array spread --------------------------------------------------------------------------
+
+/// **`spread` is the whole difference between `[...a]` and `[a]`.**
+#[test]
+fn spread_appends_the_elements_and_not_the_array() {
+    check("spread-alone", "return [...[1, 2]].length;", "2");
+    check("spread-nested", "return [[1, 2]].length;", "1");
+    check("spread-values", "return [...[1, 2]].join(\",\");", "1,2");
+}
+
+/// An array with no spread is still one `CreateArray`; only what follows a spread is appended
+/// piece by piece.
+#[test]
+fn spread_composes_with_ordinary_elements() {
+    check(
+        "spread-leading",
+        "return [0, ...[1, 2]].join(\",\");",
+        "0,1,2",
+    );
+    check(
+        "spread-trailing",
+        "return [...[1, 2], 3].join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "spread-middle",
+        "return [0, ...[1], 2].join(\",\");",
+        "0,1,2",
+    );
+    check(
+        "spread-twice",
+        "return [...[1], ...[2, 3]].join(\",\");",
+        "1,2,3",
+    );
+    check("spread-empty", "return [...[]].length;", "0");
+    check("spread-only-plain", "return [1, 2, 3].length;", "3");
+}
+
+/// A copy, not an alias — the point of `[...a]`.
+#[test]
+fn spread_copies_rather_than_aliases() {
+    check(
+        "spread-copy",
+        "let a = [1, 2]; let b = [...a]; b.push(3); return a.length;",
+        "2",
+    );
+}
+
+/// A string spreads into its code points, by the same rule `for-of` follows.
+#[test]
+fn spread_of_a_string_gives_its_code_points() {
+    check("spread-string", "return [...\"abc\"].length;", "3");
+    check(
+        "spread-string-join",
+        "return [...\"abc\"].join(\"-\");",
+        "a-b-c",
+    );
+    check("spread-emoji", "return [...\"😀\"].length;", "1");
+}
+
+/// **Spreading a non-iterable fails the way `for-of` does**, rather than quietly producing a
+/// one-element array.
+#[test]
+fn spreading_a_non_iterable_raises() {
+    check(
+        "spread-number",
+        "let r = \"\"; try { let a = [...5]; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}

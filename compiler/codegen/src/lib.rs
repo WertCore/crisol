@@ -189,6 +189,7 @@ const DELETE_SYMBOL: &str = "crisol_delete";
 const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
 const ITERATE_SYMBOL: &str = "crisol_iterate";
 const CREATE_REGEXP_SYMBOL: &str = "crisol_create_regexp";
+const ARRAY_EXTEND_SYMBOL: &str = "crisol_array_extend";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -253,6 +254,8 @@ struct ObjectHelpers<T> {
     iterate: T,
     /// `crisol_create_regexp(source, source_len, flags, flags_len) -> object`
     create_regexp: T,
+    /// `crisol_array_extend(array, value, spread) -> exception or undefined`
+    array_extend: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -363,6 +366,12 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     iterate.params.push(AbiParam::new(types::I64));
     iterate.returns.push(AbiParam::new(types::I64));
 
+    let mut array_extend = module.make_signature();
+    array_extend.params.push(AbiParam::new(types::I64));
+    array_extend.params.push(AbiParam::new(types::I64));
+    array_extend.params.push(AbiParam::new(types::I64));
+    array_extend.returns.push(AbiParam::new(types::I64));
+
     let mut create_regexp = module.make_signature();
     create_regexp.params.push(AbiParam::new(pointer));
     create_regexp.params.push(AbiParam::new(types::I64));
@@ -415,6 +424,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         enumerate: declare(ENUMERATE_SYMBOL, &enumerate)?,
         iterate: declare(ITERATE_SYMBOL, &iterate)?,
         create_regexp: declare(CREATE_REGEXP_SYMBOL, &create_regexp)?,
+        array_extend: declare(ARRAY_EXTEND_SYMBOL, &array_extend)?,
         unary,
     })
 }
@@ -949,6 +959,9 @@ impl Backend for Cranelift {
             create_regexp: self
                 .module
                 .declare_func_in_func(self.objects.create_regexp, &mut context.func),
+            array_extend: self
+                .module
+                .declare_func_in_func(self.objects.array_extend, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1576,6 +1589,20 @@ impl Lowering<'_> {
                 );
                 Some(self.builder.inst_results(call)[0])
             }
+            Op::ArrayExtend {
+                array,
+                value,
+                spread,
+            } => {
+                let array = self.value(*array);
+                let value = self.value(*value);
+                let spread = self.builder.ins().iconst(types::I64, i64::from(*spread));
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.array_extend, &[array, value, spread]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::Iterate { object } => {
                 let object = self.value(*object);
                 let call = self.builder.ins().call(self.objects.iterate, &[object]);
@@ -2031,6 +2058,9 @@ impl Jit {
             create_regexp: self
                 .module
                 .declare_func_in_func(self.objects.create_regexp, &mut context.func),
+            array_extend: self
+                .module
+                .declare_func_in_func(self.objects.array_extend, &mut context.func),
             unary: self
                 .objects
                 .unary
