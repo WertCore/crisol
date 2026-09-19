@@ -159,16 +159,58 @@ pub enum BinaryOp {
     ShiftRight,
     /// `>>>`, zero-filling, on **uint32** — the one operator whose result can exceed `i32::MAX`.
     UnsignedShiftRight,
+    /// `instanceof` — whether the right side's `prototype` is in the left side's chain.
+    ///
+    /// A binary operator rather than a comparison: it answers a question about the prototype
+    /// chain, not about ordering or equality, and it is not symmetric in any sense `CompareOp`
+    /// would suggest.
+    InstanceOf,
+    /// `==` — equality **after** coercion.
+    ///
+    /// A binary operator rather than a [`CompareOp`] on purpose. Every `CompareOp` has a
+    /// machine instruction behind it when both sides are numbers; `==` never does, because
+    /// deciding what to compare means reading both types first. Putting it here keeps the
+    /// comparison lattice honest about which comparisons can be lowered to a `fcmp`.
+    LooseEqual,
+    /// `!=`.
+    LooseNotEqual,
+    /// `in` — whether a property is on the object or anywhere up its chain.
+    In,
 }
 
 impl BinaryOp {
     /// Whether the result is always a number.
     ///
-    /// True for everything except [`BinaryOp::Add`], which may concatenate. This is the
-    /// distinction codegen needs before it can emit a float instruction.
+    /// This is the distinction codegen needs before it can emit a float instruction, so it is
+    /// **listed rather than negated**. It was `!matches!(self, Self::Add)`, which is true of
+    /// the arithmetic and also of `instanceof` — an operator that answers a boolean and was
+    /// therefore typed `number` from the day it was added. Writing the true cases out means a
+    /// new operator has to be classified rather than inheriting the answer for arithmetic.
     #[must_use]
     pub const fn is_always_numeric(self) -> bool {
-        !matches!(self, Self::Add)
+        matches!(
+            self,
+            Self::Subtract
+                | Self::Multiply
+                | Self::Divide
+                | Self::Remainder
+                | Self::Exponent
+                | Self::BitAnd
+                | Self::BitOr
+                | Self::BitXor
+                | Self::ShiftLeft
+                | Self::ShiftRight
+                | Self::UnsignedShiftRight
+        )
+    }
+
+    /// Whether the result is always a boolean.
+    #[must_use]
+    pub const fn is_always_boolean(self) -> bool {
+        matches!(
+            self,
+            Self::InstanceOf | Self::LooseEqual | Self::LooseNotEqual | Self::In
+        )
     }
 
     /// The symbol, for the text dump.
@@ -187,6 +229,10 @@ impl BinaryOp {
             Self::ShiftLeft => "<<",
             Self::ShiftRight => ">>",
             Self::UnsignedShiftRight => ">>>",
+            Self::InstanceOf => "instanceof",
+            Self::LooseEqual => "==",
+            Self::LooseNotEqual => "!=",
+            Self::In => "in",
         }
     }
 }
@@ -206,6 +252,19 @@ pub enum UnaryOp {
     TypeOf,
     /// `void` — evaluates its operand and gives `undefined`.
     Void,
+    /// `throw` — records the operand as the value in flight and yields the exception signal.
+    ///
+    /// An operation rather than a terminator, so that a `throw` inside a `try` is followed by
+    /// the same check every call is. One propagation path rather than two means a handler
+    /// cannot be reached by one and missed by the other.
+    Throw,
+    /// Whether the operand is the exception signal rather than a value.
+    ///
+    /// **This is how explicit propagation is written down.** A call returns the signal instead
+    /// of a result, and the frontend follows every call with this test and a branch — so the
+    /// unwinding is ordinary control flow the verifier already checks, rather than metadata a
+    /// backend has to honour.
+    IsException,
 }
 
 impl UnaryOp {
@@ -219,6 +278,8 @@ impl UnaryOp {
             Self::BitNot => "~",
             Self::TypeOf => "typeof",
             Self::Void => "void",
+            Self::Throw => "throw",
+            Self::IsException => "is-exception",
         }
     }
 }
@@ -278,6 +339,94 @@ pub enum Op {
         object: ValueId,
         /// The name.
         key: PropertyKey,
+    },
+    /// The names a `for-in` over `object` visits, as an array.
+    ///
+    /// Computed once, before the loop runs. The specification allows a property deleted during
+    /// the loop to be skipped and one added not to be visited; taking the list up front is
+    /// within that, and it means the loop cannot be affected by its own body in a way that
+    /// depends on enumeration order.
+    Enumerate {
+        /// What to enumerate.
+        object: ValueId,
+    },
+    /// What a `for-of` over `object` walks, as something indexable.
+    ///
+    /// An array is itself, indexed live; a string becomes an array of its code points. Anything
+    /// else raises, because without `Symbol.iterator` there is nothing to ask.
+    Iterate {
+        /// What to iterate.
+        object: ValueId,
+    },
+    /// `/source/flags` — a regular expression object.
+    ///
+    /// The pattern and flags are constants, so they ride in the operation rather than as
+    /// operands: a literal's pattern cannot be computed.
+    CreateRegExp {
+        /// The pattern, without its delimiters.
+        source: String,
+        /// The flag letters.
+        flags: String,
+    },
+    /// Appends to an array being built by a literal.
+    ///
+    /// **Two jobs in one operation because they differ by one bit at the call site.** With
+    /// `spread`, every element of the operand is appended; without it, the operand itself is.
+    /// `[...a]` and `[a]` differ in exactly that and nothing else.
+    ArrayExtend {
+        /// The array under construction.
+        array: ValueId,
+        /// What to append, or to append the elements of.
+        value: ValueId,
+        /// Whether `value` is spread.
+        spread: bool,
+    },
+    /// `delete object[key]`.
+    ///
+    /// One operation for both spellings, because `delete o.x` and `delete o["x"]` are the same
+    /// thing — the frontend makes a string constant for the static form rather than the IR
+    /// carrying two shapes of the same question.
+    Delete {
+        /// The receiver.
+        object: ValueId,
+        /// The key, as a value.
+        key: ValueId,
+    },
+    /// Reads a name that resolves to no binding: a global.
+    ///
+    /// Distinct from [`Op::Load`] because a global is not a slot — it is a property of an
+    /// object the runtime owns, and it may not exist, which is a `ReferenceError` rather than
+    /// `undefined`. Making it look like a local read is what turned `Object` into a fresh
+    /// empty variable.
+    GlobalLoad {
+        /// The name.
+        name: PropertyKey,
+    },
+    /// The value a `catch` binds — whatever the throw in flight is carrying.
+    ///
+    /// Nullary, because the value is not in any register the IR can name: it was recorded by
+    /// the `throw` and the frames between have already returned.
+    CaughtValue,
+    /// Reads a property whose name is computed: `o[k]`.
+    ///
+    /// Separate from [`Op::PropertyLoad`] because the key is a *value*, not a name known when
+    /// the IR is built. JavaScript makes no distinction between `a[0]` and `a["0"]` — element
+    /// access **is** property access with a computed key — so one operation covers both, and
+    /// the runtime decides whether the key names an element or a property.
+    ComputedLoad {
+        /// The receiver.
+        object: ValueId,
+        /// The key, as a value.
+        key: ValueId,
+    },
+    /// Writes a property whose name is computed: `o[k] = v`.
+    ComputedStore {
+        /// The receiver.
+        object: ValueId,
+        /// The key, as a value.
+        key: ValueId,
+        /// What to store.
+        value: ValueId,
     },
     /// Writes a property.
     PropertyStore {
@@ -374,6 +523,13 @@ impl Op {
                 | Self::Binary { op: BinaryOp::Add, .. }
                 | Self::PropertyLoad { .. }
                 | Self::PropertyStore { .. }
+                | Self::ComputedLoad { .. }
+                | Self::ComputedStore { .. }
+                | Self::Delete { .. }
+                | Self::Enumerate { .. }
+                | Self::Iterate { .. }
+                | Self::CreateRegExp { .. }
+                | Self::ArrayExtend { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -386,7 +542,12 @@ impl Op {
     #[must_use]
     pub fn operands(&self) -> Vec<ValueId> {
         match self {
-            Self::Const(_) | Self::Load { .. } | Self::CreateObject { .. } => Vec::new(),
+            Self::Const(_)
+            | Self::Load { .. }
+            | Self::CreateObject { .. }
+            | Self::CreateRegExp { .. }
+            | Self::CaughtValue
+            | Self::GlobalLoad { .. } => Vec::new(),
             Self::Store { value, .. } | Self::Await { value } => vec![*value],
             Self::Call {
                 callee,
@@ -397,8 +558,15 @@ impl Op {
                 all.extend(args);
                 all
             }
-            Self::PropertyLoad { object, .. } => vec![*object],
+            Self::PropertyLoad { object, .. }
+            | Self::Enumerate { object }
+            | Self::Iterate { object } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
+            Self::ComputedLoad { object, key } | Self::Delete { object, key } => {
+                vec![*object, *key]
+            }
+            Self::ArrayExtend { array, value, .. } => vec![*array, *value],
+            Self::ComputedStore { object, key, value } => vec![*object, *key, *value],
             Self::CreateArray { elements } => elements.clone(),
             Self::Construct { callee, args } => {
                 let mut all = vec![*callee];
@@ -522,6 +690,37 @@ pub struct Function {
     /// (D-59), and a parameter is a local that arrives pre-assigned. When that pass lands
     /// these become entry-block parameters and this list goes away.
     pub parameters: Vec<u32>,
+    /// Its own index in the module's function list.
+    ///
+    /// [`Op::Closure`] names a callee by [`FunctionId`], and a backend has to turn that into
+    /// the right compiled function. It could instead rely on compiling them in order and
+    /// counting — which is true today and is exactly the kind of coupling that breaks quietly
+    /// the first time anything compiles them in a different order or skips one.
+    ///
+    /// [`crate::verify_module`] checks `functions[i].id == i`, so the field cannot drift from
+    /// the position it claims.
+    pub id: FunctionId,
+    /// The slot holding `this`, when the function binds one.
+    ///
+    /// `None` for an arrow function, which does not bind its own `this` but captures the
+    /// enclosing one — so for an arrow, `this` arrives as a capture like any other value.
+    ///
+    /// Recorded rather than left implicit. The frontend declares `this` ahead of the
+    /// parameters, so it is slot zero in every ordinary function, and the backend could simply
+    /// assume that. It would be right today and wrong the first time anything is declared
+    /// earlier, and the failure would be a `this` bound to some other local — a plausible
+    /// value, not a crash.
+    pub this_slot: Option<u32>,
+    /// The slot holding `arguments`, for a function whose body names it.
+    ///
+    /// `None` when the body never mentions it, which is almost every function — **building the
+    /// array unconditionally would put an allocation in the prologue of every call**, and the
+    /// collector would have to trace it, for a binding nothing reads.
+    ///
+    /// On the function rather than inferred from position, for the same reason `this_slot` is:
+    /// the backend has to know which slot to fill, and guessing would bind a plausible wrong
+    /// value rather than fail.
+    pub arguments_slot: Option<u32>,
     /// Slots that receive the captured values, positionally matching [`Op::Closure`]'s
     /// `captures`.
     ///
@@ -547,8 +746,11 @@ impl Function {
     #[must_use]
     pub fn new(name: &str) -> Self {
         Self {
+            id: FunctionId(0),
             name: name.to_owned(),
             parameters: Vec::new(),
+            this_slot: None,
+            arguments_slot: None,
             captures: Vec::new(),
             entry: BlockId(0),
             blocks: vec![Block {

@@ -2768,3 +2768,1298 @@ understand produces a binary that runs and is wrong.
 **One of the four.** The pipeline is real and the coverage is not there yet, and saying
 "M13's acceptance path works" without that table would be the more flattering sentence and the
 less true one.
+
+---
+
+## D-90 — The stack map table, and why it is flat
+
+**Status:** Accepted (M13) · **Affects:** M13, M9
+
+A precise collector needs to know, at the instant it runs, where every live reference is. Rust
+code says so by pushing onto a shadow stack; **compiled machine code cannot** — its values are
+in registers and frame slots, with no list anywhere. That is what a stack map is for, and
+without one a collection during compiled code would free values still in use: §3.1's exact
+failure.
+
+D-87 recorded that `cranelift-object` does not write stack maps into a section. That is true of
+the *writer* and not of the information: `MachBufferFinalized::user_stack_maps()` is public and
+yields `(code_offset, frame_size, map)`. Carrying it across is this crate's job — the same job
+Go's linker does for `pclntab`.
+
+**Cranelift spills every live value to the frame before a safepoint.** That is the detail that
+makes this tractable: the collector reads stack slots and nothing else, so no register maps are
+needed. Go needed those too, but only once it began preempting goroutines *mid-function*
+(1.14). Safepoints at calls and allocations stay in the simpler regime.
+
+### Flat, one row per live value
+
+`{ function address, code offset, frame offset }`, sixteen bytes, repeated. Not a nested
+structure with per-safepoint length prefixes.
+
+It costs a few bytes. What it buys is that **the runtime reading this table will be walking a
+stack while the heap is mid-collection**, which is the worst imaginable place for a
+length-prefix parser to be subtly wrong. A flat table needs no parsing at all.
+
+The function address is a **relocation** — nothing at compile time knows where the code will
+land, so the linker fills it in.
+
+**Little-endian is written explicitly** rather than using native byte order. The object is for
+the *target*, which need not be the host. All four targets are little-endian today, so this
+cannot currently be observed — which is precisely what would make it a miserable bug to find
+later.
+
+An empty table is emitted for a program with no safepoints, rather than omitting the symbol:
+the runtime looks it up unconditionally, and "absent" and "empty" would otherwise need
+different handling for no reason.
+
+### Still ahead
+
+The table exists in the linked binary — verified with `nm`, not assumed. What remains is the
+runtime side: walking native frames to find return addresses, matching them against the table,
+and reading the live slots. Until that lands, collection during compiled code is still unsafe,
+and §M13's GC stress requirement is not met.
+
+## D-91
+
+**The collector asks for compiled roots through a callback, rather than calling the runtime.**
+
+Status: Accepted
+
+`mark` started from the shadow stack alone, which is every root a Rust embedder has and none
+of the ones compiled code holds. Compiled code keeps values in registers and frame slots and
+pushes nothing, so without this a collection frees values a running program is still using —
+the use-after-free ROADMAP §3.1 calls the worst failure mode of this milestone to debug.
+
+The obvious wiring is for `Heap::mark` to call `crisol_abi::compiled_roots` directly. That
+inverts the dependency: `crisol-abi` needs `crisol-gc` to allocate, so `crisol-gc` cannot
+depend on `crisol-abi`. Instead the collector declares the hole — `set_extra_roots`, taking a
+closure — and `crisol-abi::install_compiled_roots` fills it, because walking a native stack is
+the ABI's business and the bit layout of a frame is not something the collector should know.
+
+The seam is worth having for its own sake: the tests can install a provider that returns a
+known handle, so the "a root only compiled code holds survives" behaviour is checked without
+generating and running machine code. Both halves are tested — the paired case where nothing
+reports the object and it is correctly swept is what makes the surviving case evidence.
+
+**Consequence:** a heap with no provider installed is not wrong, it is an embedder running no
+compiled code. That makes "forgot to install" indistinguishable from "nothing to install" at
+the API level, which is a real hazard: the symptom is a freed live value, far from the cause.
+`has_extra_roots` exists so a caller can assert it, and the compiled entry point installs
+before it runs anything.
+
+## D-92
+
+**`Heap::transition` refuses to shrink an object.**
+
+Status: Accepted
+
+An object literal is lowered as an empty allocation followed by one `PropertyStore` per
+property (see the comment in `lower.rs::object`), and a shape names the properties an object
+has. So storing a new property must move the object to the shape that includes it, and the
+heap had no way to do that — `alloc` fixed shape and slot count for the object's whole life.
+Every object literal in compiled code was blocked on this, not on codegen.
+
+Growing is the only direction allowed. Shrinking would drop the values in the slots past the
+new end, and any of those may be the last reference to a live object — so a shape transition
+that happened to narrow would silently turn into a collection bug, appearing later and
+somewhere else. Removing a property therefore has to be written as an explicit rebuild, where
+the values being discarded are discarded visibly.
+
+New slots arrive as `undefined` rather than uninitialised, for the same reason the collector is
+precise: an unwritten slot holding a plausible bit pattern is exactly what a precise marker
+would read as a reference and follow.
+
+**Consequence:** `transition` trusts its caller that the shape and the slot count agree. The
+heap cannot check it, because it holds no `Shapes` table and deliberately does not — shapes are
+`crisol-value`'s business. A caller that grows to a slot count disagreeing with the shape gets
+an object whose properties resolve to the wrong slots, which is why the only intended caller is
+the runtime's property-store path rather than embedder code.
+
+## D-93
+
+**Stack map offsets are measured from the stack pointer, and the frame walk reports one.**
+
+Status: Accepted
+
+Cranelift documents a user stack map entry as *"the offset from SP"* — given `(i64, 0x42)`,
+`SP + 0x42` holds the live reference. The collector was reading `FP - offset`: the wrong origin
+and the wrong direction, so every root it reported was whatever happened to sit that far the
+wrong way from the other end of the frame.
+
+Nothing failed. Every acceptance test built and ran a program that printed the right answer,
+because none of them allocated enough to trigger a collection — the roots were wrong and never
+consulted. `CRISOL_GC_STRESS=1` collects on every allocation, and under it the same programs
+printed `NaN`: a property read from an object that had already been freed. That is the whole
+argument for the stress mode ROADMAP §3.1 asks for, and it earned its place on the first run.
+
+The walk reports each frame's **stack pointer at the call**, not its frame pointer. Both
+aarch64 and x86-64 enter a function with the return address and the saved frame pointer at the
+top of the callee's frame, so the callee's `fp` points at those two words and the caller's
+stack pointer at the call is `fp + 16`. The walk already had that value; it was discarding it
+in favour of the caller's frame pointer.
+
+The `u32` alongside each map is a **span**, not a frame size. It had been named `frame_size`
+and documented as letting the collector find slot zero from the frame pointer, which is what
+made the wrong arithmetic look reasonable. It cannot: it is how many bytes the map covers, and
+no arithmetic on it converts a frame pointer into a stack pointer.
+
+**Consequence:** the walk now depends on the standard prologue on both architectures, which is
+already required for the chain itself and is why `preserve_frame_pointers` is set. A target
+that laid its frame out differently would need its own rule here, and there is nothing in the
+code that would catch it — the stress-mode acceptance test would, which is the argument for
+running it in CI on every target rather than only where it is convenient.
+
+## D-94
+
+**Every compiled function takes `(closure, this, new.target, argc, argv)`.**
+
+Status: Accepted
+
+A function used to compile to a machine function with its JavaScript arity baked into the
+signature, so a call site had to know exactly which function it was reaching. A first-class
+function value has no statically known arity — a callback handed to `arr.map` could take any
+number of parameters — so that convention cannot express a callback at all, and with it go
+closures, class methods and every array method. M13's acceptance asks for all three.
+
+The five operands are the same for every function whatever its source arity. They land in
+registers on all four targets by being the first parameters; that is the platform's own
+calling convention doing the work rather than a choice made here.
+
+`argv` points into the **caller's stack frame**, not a heap list. Two reasons, and the second
+is the one that matters: there is no allocation per call, and arguments are already traced,
+because the collector reads frame slots through the stack maps (D-93). A heap list would need
+its own rooting and would allocate on the hottest path in the language.
+
+`new.target` is in the signature although nothing reads it until classes. Adding a parameter
+later rewrites every call site, and the slot costs a register that is free anyway.
+
+A parameter the caller did not pass reads as `undefined`, which is what the specification says
+rather than a convenience. It is read under a *select* rather than a branch: the index is
+clamped to zero so the load is in bounds at any arity, the load always happens, and the result
+is discarded when the parameter was not passed. `ARGV_MIN_SLOTS` is what makes the clamped load
+safe, so a call with no arguments still reserves one slot — eight bytes of stack to remove a
+branch from every parameter of every function.
+
+**Rejected — a direct fast path now (the other half of the answer to "why not both").** When
+the callee is statically known the uniform path is pure overhead, and that path is worth
+having. It is not built first because nothing can be measured until calls work at all, and two
+call paths from the start are two chances to miscompile in a way that shows up on only one of
+them. It is recorded in ROADMAP M13 as the next step rather than deferred to M20, to be built
+as soon as there is a number saying it is needed. Note the first fix for slow calls may not be
+this: every live variable is currently spilled to the frame at every safepoint, because the IR
+cannot say which slots can hold references. Narrowing that is the larger win.
+
+**Consequence:** `this` and `new.target` arrive but are not yet bound. The frontend models
+`this` as a slot it declares ahead of the parameters, and nothing in `Function` records which
+slot that is — depending on "slot zero by construction" would couple the two silently, so
+binding it needs a field on `Function`. Until then a program reading `this` will not compile,
+which is the honest failure rather than a wrong value.
+
+## D-95
+
+**A closure holds its function's *index*, and the program registers a table of addresses.**
+
+Status: Accepted
+
+A closure has to say which code it runs. The obvious thing is to store the code address, and it
+does not fit: a heap slot holds a `Value`, and a NaN-boxed value's payload is 48 bits, which is
+not a promise every platform's code addresses keep. So slot zero holds the `FunctionId` as an
+ordinary number and the captures follow it.
+
+Turning that index into an address needs a table, and only the linker knows where the code
+landed — the same problem the stack map table has, solved the same way (D-90): the object
+carries a data symbol of relocated function addresses, and the C entry point hands it to the
+runtime before anything runs.
+
+**`crisol_closure_code` never returns null.** A value that is not a closure, or an index outside
+the table, yields `crisol_not_a_function` — a real function with the uniform signature that
+returns `undefined`. `5()` is a `TypeError` and throwing needs a path M13 does not have, but
+the important part is that a bad callee costs a wasted call rather than a jump through a null
+pointer. Putting the check in the runtime rather than at every call site costs nothing on the
+hot path, and when exceptions land that helper is where the `TypeError` is raised, with no call
+site changing.
+
+**Symbols are named from the id, not the source name.** Source names are neither unique nor
+valid identifiers: two `function (x) {…}` expressions are both "anonymous", a method is
+"C.method", a temporary is " tmp0". Naming symbols after them made a two-anonymous-function
+program fail to link with a duplicate-symbol error — and two functions sharing a *source* name
+would have been worse, because one would have silently won. Function zero keeps the name the C
+entry point calls; the rest carry their source name only as a readable suffix.
+
+**Consequence:** captures are written one at a time after the allocation rather than passed to
+it. A variadic call would need the backend and the runtime to agree on argument layout, and
+those two meet only at link time, where a disagreement is silent. The cost is a call per
+capture at closure creation, which is not the hot path — calling the closure is.
+
+## D-96
+
+**A closure's function index and captures are engine-private, not property slots.**
+
+Status: Accepted
+
+They were property slots, and it was silently wrong. A shape numbers properties from zero, so
+the first property stored on a function took slot zero — where the function index lived. The
+function then named whatever that property held, `crisol_closure_code` found no number, and
+the call landed on `crisol_not_a_function`.
+
+`class C {}` does exactly that to its own constructor: the class lowering stores `prototype` on
+it. So **every class constructor was uncallable**, and the failure was invisible — `new C()`
+still returned a correctly prototyped object, because `crisol_construct_this` runs before the
+constructor. Only the constructor's *body* never ran, so instances came back with no fields and
+`p.x` was `undefined`. Nothing crashed and no test caught it until one ran a class end to end.
+
+Heap objects now carry an `internals` array beside their slots: engine state that no property
+access can reach, traced by the collector like anything else, since captures are values the
+program can still get at.
+
+**Consequence:** the two kinds of state can no longer collide by construction, rather than by
+everyone remembering to leave slot zero alone. It also means a function has no property slots
+at all until something stores one, which is what an object literal already does.
+
+## D-97
+
+**A variable that is both captured and assigned lives in a heap cell, shared rather than copied.**
+
+Status: Accepted — the defect below is fixed
+
+`Op::Closure` copies each captured value into the closure when it is created. JavaScript
+captures the *binding*, not the value, so two programs give the wrong answer today:
+
+```js
+let n = 0; let f = function () { n = 1; }; f(); n;   // gives 0, should be 1
+let n = 1; let f = function () { return n; }; n = 2; f();  // gives 1, should be 2
+```
+
+Both compile, run, and print a plausible number. That is the failure mode D-59 argues is worse
+than not building at all, so it is written down here rather than left to be discovered.
+
+The fix is the standard one. Such a variable lives in a heap cell; the closure and the
+enclosing scope hold the same cell, so a write through either is seen by both.
+
+**The decision has to be made before lowering, which is why it is a separate pass.** The
+lowering discovers a capture *when it happens* — a name is captured exactly when resolving it
+walks out of the current scope — and by then the enclosing function's code is already emitted.
+Whether a variable is a cell changes every read and write of it, so the question cannot be
+answered late. `escape::shared_variables` walks the AST first and answers it for the program.
+
+**It over-approximates by name, on purpose.** A name assigned anywhere and mentioned inside any
+function anywhere is shared, so `let n = 1; function f() { let n = 2; n = 3; }` gives both `n`s
+a cell although neither is shared. Being too eager costs a cell and an indirection; being too
+clever costs correctness, and that failure reads a stale value rather than stopping. Real scope
+resolution is worth having later — guessing at it is not.
+
+A cell is an ordinary one-property object, so this needed no new IR operation and no new runtime
+call. That is slower than a dedicated representation and is the right first version: correct
+now, and a measurement before inventing machinery to make it faster.
+
+**Consequence:** a shared *parameter* has no cell to arrive in, because the caller passes a
+plain value. The callee wraps it at entry, reading the argument before `make_cell` overwrites
+the slot. Captures are the opposite and must **not** be wrapped: the value arriving is already
+the enclosing scope's cell, and making a second one there would hand the closure a private copy
+— which is the bug, reintroduced at the use site.
+
+## D-98
+
+**The emitted tables declare an alignment.**
+
+Status: Accepted
+
+Cranelift gives a data object no declared alignment unless asked, so `crisol_stack_maps` and
+`crisol_functions` were emitted with alignment 1. The runtime reads both as arrays of 8-byte
+values, and `slice::from_raw_parts` asserts alignment — **including for a zero-length slice**.
+
+For every program written until now the symbol happened to land on an 8-byte boundary. Then one
+did not: `let a = []; return a.length;` put the table at an odd address and the program aborted
+before running a line. Nothing about the program was unusual; the array work merely changed the
+data section enough to move it.
+
+That is the worst shape a latent bug can have — correct by luck, and the thing that breaks it
+is unrelated to the thing that is wrong. Both tables now set an alignment, and the runtime
+asserts it on registration rather than relying on `from_raw_parts` to notice, so a future
+regression names its cause.
+
+## D-99
+
+**A value that may hold a reference is in the stack map, not only the slots.**
+
+Status: Accepted
+
+Every *slot* was declared as needing a stack map. SSA values were not, and a temporary never
+stored into a slot is invisible to the collector. `[{v: 1}]` is exactly that: the object is an
+SSA value used directly as an element, so allocating the array collected it.
+
+Under `CRISOL_GC_STRESS=1` every array of objects came back holding stale handles. Without
+stress nothing failed at all — and three class tests that had been passing were also wrong,
+because a method closure and a receiver are the same kind of temporary.
+
+The slots are declared unconditionally because nothing there knows what they hold. Values are
+declared by their IR type, which is a real narrowing rather than a guess: a `Number` or a `Bool`
+cannot be a reference by the lattice's own statement, and `Unknown` means exactly that and is
+included.
+
+**Consequence, and the more important half:** the acceptance harness now builds each program
+once and runs it **twice**, the second time collecting on every allocation, requiring the same
+answer. Separate stress tests would not have caught this, because the programs that find these
+bugs are not the ones that look like collector tests. `[{v: 1}]` does not look like a GC test.
+
+## D-100
+
+**A built-in roots its receiver and arguments; a compiled function does not have to.**
+
+Status: Accepted
+
+Arguments arrive in `argv`, a buffer in the *caller's* frame that no stack map describes. That
+is safe for a compiled callee for a reason that is easy to state and easier to forget: its
+prologue copies them into stack-mapped variables, and nothing allocates in between, so the
+window where they are unreachable contains no collection.
+
+A built-in never runs that prologue. It reads `argv` directly and then allocates — and in that
+window its arguments are reachable from nowhere the collector looks.
+
+`[1, 2].map(f)` called `f` **zero times** under `CRISOL_GC_STRESS`: allocating the result array
+collected the callback, and the call landed on `crisol_not_a_function`, which returns
+`undefined` rather than failing. The receiver needs rooting for the same reason — `a.map(…)`
+leaves `a` dead at the call site, so the array being mapped is no better off than the callback.
+
+**Rejected — making `argv` itself a root.** Cranelift's user stack maps describe *values*, not
+explicit stack slots, so the buffer cannot be declared. Rooting at the boundary that actually
+needs it also keeps the cost off compiled calls, which are the common case.
+
+## D-101
+
+**Built-ins are closures carrying a negative function index.**
+
+Status: Accepted
+
+`Array.prototype.map` has to be callable exactly as a compiled function is, or every call site
+would need to know which kind it holds. So a built-in is an ordinary closure whose function
+index is negative: non-negative indexes the compiled function table, negative indexes the
+runtime's own list.
+
+The sign rather than a reserved range or a second internal slot, because the two tables are
+disjoint by construction and there is no boundary to pick wrongly.
+
+`Array.prototype` is built before the first array and rooted through a `Cell` that the root
+provider reads. A `Cell` rather than reaching through `with_runtime`, because the provider runs
+*during* a collection, which may have been triggered inside a borrow of the shape table.
+
+**Consequence:** `crisol_closure_code` is the single place that decides what a value is
+callable as, so a native and a compiled callee reach the same call site by construction. It is
+also where `crisol_not_a_function` comes from, which means a built-in that goes missing degrades
+to `undefined` rather than a jump through a null pointer — and, as D-100 records, that made a
+collector bug look like a callback that simply did nothing.
+
+## D-102
+
+**Function declarations are bound before any statement in their list runs.**
+
+Status: Accepted
+
+A function declaration is usable above its own text — `f(); function f() {}` is ordinary
+JavaScript. The lowering bound the name where the declaration appeared, so a call above it read
+an unset slot. That was recorded as unsupported rather than miscompiled, which was the right
+call and made **every one of test262's 12,719 cases refuse to compile**: the suite's own
+`assert.js` defines its helpers below the code that uses them.
+
+Only the declarations at the top level of a statement list are hoisted. A function inside a
+block belongs to that block's scope, which needs block scoping the lowering does not model, so
+those stay where they are and are still refused — visibly, rather than bound in the wrong scope
+and shadowing something.
+
+## D-103
+
+**`switch` is a chain of comparisons and a run of fall-through blocks, not nested `if`s.**
+
+Status: Accepted
+
+Two behaviours rule out the obvious lowering, and both are observable:
+
+- **Cases fall through.** A body with no `break` continues into the next, so the bodies are a
+  chain rather than arms of a conditional.
+- **`default` is tested last but runs in its source position.** `switch (x) { default: a();
+  case 1: b(); }` runs only `b()` when `x === 1`, and `a()` *then* `b()` otherwise. Putting
+  `default` last is wrong for the second; treating it as a first-match arm is wrong for the
+  first.
+
+The discriminant is evaluated once into a temporary, so `switch (f())` does not call `f` per
+case.
+
+**Consequence: `===` on values of unknown type had to become a call.** Every case comparison is
+one, and the backend refused them for D-53's reasons — `NaN` has identical bits to itself and
+is not equal to itself, `+0` and `-0` differ in bits and are equal. `crisol_strict_equal`
+compares as numbers when both are numbers, which gets both right because IEEE equality already
+says exactly that, and falls back to identity otherwise. Strings will need revisiting: two
+distinct string objects with the same characters are `===` and are not the same handle.
+
+## D-104
+
+**Exceptions propagate as an explicit value, and the propagation is written into the IR.**
+
+Status: Accepted
+
+M13's deliverable says to decide between unwinding and explicit result propagation and record
+it. This is the record: **explicit propagation**.
+
+A call returns `Value::EXCEPTION` — a reserved singleton that is not a JavaScript value —
+instead of a result, and the thrown value waits in the runtime. Putting the signal in the value
+space rather than a second return register means adding exceptions changed no function's
+signature: a call site that ignores it compiles exactly as before.
+
+**The propagation is ordinary control flow in the IR, not metadata a backend must honour.** The
+frontend follows every call with `UnaryOp::IsException` and a branch — into the enclosing
+`catch` if there is one, and out of the function otherwise. So the verifier checks it like any
+other graph, a dump shows it, and the backend needs no notion of a handler at all. The
+alternative — a handler recorded on the instruction for codegen to act on — puts the unwinding
+somewhere nothing else looks.
+
+`throw` is an *operation* followed by that same check, not a terminator of its own. A `throw`
+inside a `try` has to reach the handler, and a second path to there is how one of them ends up
+missing a case.
+
+**Rejected — unwinding.** Zero cost on the path that does not throw, which is nearly all of
+them. It needs different machinery per target (Windows differs from the rest), and it has to
+coexist with the frame-pointer walk the collector now depends on. Explicit propagation costs a
+compare and a branch after every call, which predicts perfectly, and is the same shape as
+Rust's `Result`.
+
+**Consequence:** `Value::kind` reports the signal as `Undefined` rather than giving it a kind of
+its own. It should never reach a program; if a propagation is ever missed the value behaves as
+`undefined` rather than aborting, because a wrong answer in a corner is recoverable and a crash
+inside a half-unwound call is not. The value in flight is also a **GC root** — the frame that
+made it has returned and no handler holds it yet, so without that, throwing an object and
+catching it after any allocation would catch a freed one.
+
+## D-105
+
+**Strings are heap cells, and `===` on them compares characters.**
+
+Status: Accepted
+
+A `Value` carries 48 bits and text does not fit, so a string is a cell the collector owns —
+like an object, though it has no properties and no shape that matters. A literal allocates a
+fresh cell **on every evaluation**, which is correct because strings are primitives and `===`
+compares characters, and wasteful because `"a"` in a loop allocates each time. Interning
+constants is the obvious fix and wants a table that is a permanent GC root; correctness first.
+
+`+` concatenates when *either* operand is a string, which is why the test is on the operands
+rather than on both being numbers: `1 + "2"` is `"12"` and not `3`. An object operand still
+gives `NaN`, because `ToPrimitive` calls user code.
+
+`ToNumber` had been "the number, or `NaN`". It now follows the specification for the types that
+exist: a string parses, **an empty or all-whitespace one is `0` rather than `NaN`** — the one
+case a plain `parse` gets wrong, since Rust rejects an empty string — a boolean is `1` or `0`,
+and `null` is `0` while `undefined` is `NaN`.
+
+**Known wrong:** `.length` counts **bytes**, and JavaScript counts UTF-16 code units. It reads
+correctly for every ASCII test, which is exactly why it is written down here.
+
+## D-106
+
+**An uncaught throw exits non-zero, and that is what made a pass rate possible.**
+
+Status: Accepted
+
+test262 reports failure **by throwing**. Once exceptions existed, 221 of 379 sampled cases
+"ran to completion" — and reporting that as a pass rate would have claimed 58%, because a case
+whose assertion fired threw, propagated out of `crisol_program`, and the entry point printed the
+signal as `undefined` and exited successfully.
+
+The entry point now checks for the signal, reports what was thrown, and exits 1. The runner
+reads exit 1 as a *failed test* and anything else — a signal, a panic — as a bug here. The real
+figures are **16 passed, 205 failed, 0 crashed, 158 refused**.
+
+That the number fell from 221 to 16 is the whole argument for the harness having reported
+three numbers separately from the start, rather than collapsing "it finished" into "it passed".
+
+## D-107
+
+**A branch on a value of unknown type is `ToBoolean`, not a bit comparison.**
+
+Status: Accepted
+
+The backend lowered every branch as "does this equal boxed `true`", with a comment saying that
+was sound because the IR had typed the condition `Bool`. It had not: the frontend emits a
+branch on whatever `if`, `while`, `&&` and `||` are given.
+
+So **every truthy value that was not literally `true` took the false path** — a non-empty
+string, a non-zero number, any object. The shape that exposed it is test262's own error class:
+
+```js
+this.message = message || "";
+```
+
+which assigned `""` whatever it was handed, so every failing case reported an error with no
+message. The condition now goes through `crisol_truthy` unless the lattice has proved it a
+boolean, in which case the comparison is still right and still free.
+
+An empty string is falsy and every other string is truthy — the one case where a string's
+characters decide a branch, and the reason `is_truthy` needs the text rather than the kind.
+
+## D-108
+
+**Every function has a `prototype` object, and its name is bound before its body is lowered.**
+
+Status: Accepted
+
+Two bugs with one shape: a function that refers to itself.
+
+`new f()` links an instance to `f.prototype` and `x instanceof f` looks for it, and only the
+*class* lowering was creating one. So a plain constructor function produced objects that its own
+`instanceof` denied — and test262's error class guards on exactly that:
+
+```js
+if (!(this instanceof Test262Error)) return new Test262Error(message);
+```
+
+which recursed instead of initialising. Closures now get a `prototype` eagerly. That costs an
+allocation per closure that most never use; creating it on first read would avoid it, at the
+price of a property read that mutates the heap.
+
+The second: `hoist` built the closure and *then* bound the name, so a recursive function
+captured the slot's value from before it was bound — nothing. The binding and its cell are now
+made first, and the closure written into them afterwards. A function declaration's own name
+therefore counts as an assignment in the escape pass (D-97), because that is what gives it a
+cell, and a cell is what a closure can share with the scope that fills it in.
+
+**Consequence, and the reason the pass count fell from 16 to 13:** several cases had been
+passing because their checks never fired. A test whose guard took the wrong branch, or whose
+error carried no message, exits cleanly and scores as a pass. Making the semantics right makes
+those cases fail correctly. The harness now prints the passing cases by name so a fall can be
+read rather than trusted — and reading them shows they are tests of `Object.defineProperty`,
+`Promise` and `RegExp`, none of which exist here. The 13 are mostly accidents too.
+
+## D-109
+
+**A name that resolves to no binding is a global, and a missing global is a `ReferenceError`.**
+
+Status: Accepted
+
+The lowering resolved an unknown name by *declaring a local for it*. So `Object` became a fresh
+empty variable holding `undefined`, and a test comparing a builtin against an expected value saw
+a wrong value rather than a missing one — 101 of test262's failures read
+`Expected SameValue(«undefined», …)` for exactly that reason.
+
+A name that resolves nowhere now becomes `Op::GlobalLoad`, looked up in an object the runtime
+owns. Absent means **`ReferenceError`**, which is the specification and is also the difference
+between "this builtin is wrong" and "this builtin does not exist" — the failures now say which.
+
+Globals that are functions are built-ins numbered *after* the array methods in one negative
+index space (D-101), so `crisol_closure_code` needs no second rule. `Error` and its subclasses
+are one implementation: they differ only in `name`, which is read off the constructor rather
+than hard-coded, so adding another is a line in a table.
+
+**Consequence:** the pass count fell from 13 to 2. Those cases were passing because a missing
+builtin read as `undefined` and their checks happened not to fire; they now throw, correctly.
+The number is a truer 2 than it was a 13, and the harness lists passing cases by name (D-108)
+so that can be read rather than taken on trust.
+
+**Two bugs this shook out, both about when things are reachable.** The globals table is filled
+while the runtime is constructed, and the runtime is constructed lazily on first use — so
+reading the table before entering `with_runtime` found it empty whenever a global was the first
+thing a program touched, which is usually. And `raise` built two strings and then stored them,
+leaving the first reachable only from a Rust local while the second allocated; under stress that
+collected it, and the error came back with an unreadable message.
+
+## D-110
+
+**`Object` and `Array` are objects that are also callable, built from one negative index space.**
+
+Status: Accepted
+
+A global like `Object` is a function *and* a namespace: `Object({})` constructs and
+`Object.keys(o)` does not. Both are the same cell — a closure carrying a built-in index, with
+the methods hung on it as ordinary properties.
+
+The index space now spans four tables in order: the array methods, the named global functions,
+the namespace methods, and the ones reachable only as a namespace's own body. One space because
+`crisol_closure_code` decodes a single negative number; four tables because they are bound in
+different ways. **The first attempt pointed the namespace body at index 0 of the first table, so
+calling `Object()` ran `Array.prototype.map`** — which is what the separate table and the named
+constant exist to prevent.
+
+`Array.prototype` is the object arrays already inherit from rather than a fresh one, or
+`[].map === Array.prototype.map` would be false.
+
+`Object.keys` and `Object.getOwnPropertyNames` are the same function, which is wrong in general
+— the second includes non-enumerable properties — and right here, because nothing can make a
+property non-enumerable yet.
+
+## D-111
+
+**Hoisting declares every name before lowering any body.**
+
+Status: Accepted
+
+One pass over the statements lowered each function as it was reached, so a function could not
+call one declared further down: the name resolved to nothing and became a global, failing at
+run time with `ReferenceError`.
+
+test262 concatenates `assert.js` ahead of the `sta.js` that defines the error class it throws,
+so **24 sampled cases failed with `Test262Error is not defined`** — the suite's own class,
+reported missing by a compiler that had just compiled it.
+
+Declaring first also gives a function its cell before its body is lowered, which is what lets a
+recursive function capture itself (D-108). The two are the same requirement seen from different
+directions: a body must be lowered against the complete set of bindings, not a prefix of it.
+
+**Consequence:** this is hoisting of *bindings*, not of assignments. A call before the
+declaration still reads the slot's value at that moment, which is `undefined` until the
+declaration runs — right for `var`, wrong for a function declaration, whose closure the
+specification installs before any statement executes. That difference is now the only part of
+hoisting still missing.
+
+## D-112
+
+**Property access raises `TypeError` on `null` and `undefined`, and every access checks.**
+
+Status: Accepted
+
+Reading a property of nothing answered `undefined`. That is not a shortcut with a small cost:
+`x.y.z` on a missing `x` then fails *two lines later* carrying a value that looks like a
+legitimate absence, so the failure names the wrong place. 33 of test262's sampled cases were
+exactly this, reported as a wrong value rather than the error they expected.
+
+All four accesses now raise — static and computed, read and write — which means the two store
+helpers had to start returning a value for the caller to check. A store is no longer an
+effect-only operation in the IR; it produces the exception signal or `undefined`, and the
+frontend follows it with the same branch a call gets (D-104).
+
+Calling a non-function raises too. That needed no new machinery at all: `crisol_not_a_function`
+already existed as the fallback that kept a bad callee from jumping through a null pointer
+(D-95), and raising there is a one-line change no call site knew about.
+
+**Consequence: the sampled pass count fell from 12 to 6, and the failures got sharper.** 90 now
+read `TypeError: is not a function` and 33 `cannot read a property of undefined` — a method
+that does not exist, called. That is a truer description of what is missing than a comparison
+against `undefined`, and it is the list of builtins to write.
+
+The cost is a branch after every property access. The IR roughly doubles for property-heavy
+code, which is the price of the unwinding being visible in the graph rather than implied — and
+it is the shape a later pass can collapse once the IR can prove a receiver is an object.
+
+## D-113
+
+**Every function inherits from `Function.prototype`, so `call` and `apply` exist.**
+
+Status: Accepted
+
+A closure was an object with a `prototype` *property* and no `[[Prototype]]` *link*, so `f.call`
+resolved to nothing. That is not a small gap: test262 reaches a method through `call` whenever
+it wants to test what the method does to a receiver it was not written for —
+`Array.prototype.indexOf.call(true)` is a whole family of cases, and every one of them failed
+with `is not a function`.
+
+`this` inside `call` is the **function**, not the receiver; the receiver is the first argument.
+That inversion is the whole of what `call` does.
+
+`Function.prototype` is built first, before the array prototype and the globals, because every
+function made afterwards links to it — including the two that live on it.
+
+**Consequence:** built-in functions are now made in exactly one place. Four builders had each
+been allocating a cell, writing the index and defining properties in their own way, and only
+one of them would have gained the prototype link. A function made here and one made by
+`crisol_create_closure` now agree on what a function *is*: a cell whose internal zero says which
+code it runs, inheriting from `Function.prototype`.
+
+## D-114
+
+**The array methods, and what their edge cases are for.**
+
+Status: Accepted
+
+Fourteen more, chosen by what test262 was calling. The ones worth recording are the pairs that
+differ only at an edge, because a single implementation covering both is how the edge gets lost:
+
+- **`includes` finds `NaN` and `indexOf` does not.** The first uses SameValueZero and the second
+  `===`, so `[NaN].includes(NaN)` is `true` and `[NaN].indexOf(NaN)` is `-1`.
+- **`find` answers `undefined` and `findIndex` answers `-1`** when nothing matches. They share an
+  implementation, which is safe only because that difference is the parameter.
+- **Empty is `true` for `every` and `false` for `some`.** Both stop on the opposite answer, and
+  on an empty array neither stops — so the answer is whichever the loop falls through to.
+- **`concat` spreads an array argument and appends anything else whole**, which is what makes
+  `[1].concat([2, 3])` three elements and `[1].concat(2)` two.
+- **A negative index counts from the end** and past either end clamps, so `slice(-1)` is the last
+  element and `slice(5)` on a short array is empty rather than an error.
+- **`null` and `undefined` join as empty**, not as their names.
+
+`unshift` grows the array before moving anything, so no element is overwritten before it has
+moved — the same reason `reverse` reads both ends before writing either.
+
+## D-115
+
+**A string is measured and indexed in UTF-16 code units.**
+
+Status: Accepted, correcting D-105
+
+`length` counted bytes. That reads correctly for every ASCII test and wrongly for everything
+else, which is the worst way to be wrong — `"é".length` was 2 and `"😀".length` was 4.
+JavaScript counts UTF-16 code units, so those are 1 and 2. Every index a string method takes or
+returns is in the same space, or `indexOf` and `charAt` would disagree about where something is.
+
+Strings now inherit from `String.prototype`, which is where the methods live, so they are
+reached by the same prototype walk an object's methods are.
+
+The pairs worth recording, again because one implementation covering both is how the difference
+is lost:
+
+- **`charAt` answers `""` out of range and `charCodeAt` answers `NaN`.**
+- **`substring` clamps a negative index to zero and swaps its arguments if they are reversed;
+  `slice` counts a negative index from the end and does not swap.** `"hello".substring(3, 1)` is
+  `"el"` and `"hello".slice(3, 1)` is `""`.
+- **An empty separator splits into characters, and no separator at all gives a one-element
+  array** holding the whole string rather than an empty one.
+
+`repeat` with a negative or infinite count raises a `RangeError` rather than answering with an
+empty string, which would read like a legitimate result.
+
+**Consequence:** the receiver is read with `to_text`, not a string-only accessor, because
+`String.prototype.slice.call(5)` coerces — which is exactly how test262 reaches these methods.
+
+## D-116
+
+**Property attributes live on the object, not in the shape.**
+
+Status: Accepted
+
+A production engine puts them in the shape, so every object sharing it answers without a
+lookup. This does not, for a reason specific to what attributes *are*: they do not affect
+layout. Putting them in the shape would mean rebuilding the chain whenever `defineProperty`
+changes an existing property's writability — rebuilding a description of where values live
+because something that is not where values live has changed.
+
+The cost is real and worth stating: attribute lookup is not shape-cached, so a hot property
+access that had to consult them would pay per object. Nothing does yet, because only assignment
+consults `writable` and only enumeration consults `enumerable`. An object nobody calls
+`defineProperty` on carries an empty map and pays nothing.
+
+**Assignment and `defineProperty` default to opposite ends.** `o.x = 1` creates a property that
+is writable, enumerable and configurable; `Object.defineProperty(o, "x", {})` creates one that
+is none of those. An implementation reusing the assignment default passes every test that does
+not check the difference — which is most of them, and none of the ones that matter.
+
+Three consequences, each of which was previously wrong:
+
+- **`Object.keys` and `getOwnPropertyNames` are no longer the same function.** D-110 recorded
+  that as wrong-in-general and right-then, because nothing could make a property
+  non-enumerable. Something can now.
+- **A write to a non-writable property is silently ignored**, not an error. That is sloppy mode,
+  which is the only mode there is here.
+- **`defineProperty` writes past a non-writable property** where assignment does not, because it
+  redefines rather than assigns. Sharing the write path would make a property defined
+  non-writable impossible to redefine.
+
+An absent property's descriptor is `undefined`, which is how a caller distinguishes "not there"
+from "there and not writable".
+
+**Not done: accessors.** A descriptor with `get` or `set` is ignored rather than refused, which
+is the one part of this that fails quietly. Recorded here rather than left to be found.
+
+## D-117
+
+**`delete` marks a tombstone rather than reshaping the object.**
+
+Status: Accepted
+
+Removing a property from a shape leaves an object whose layout no longer matches the chain
+describing it. A production engine answers that by abandoning shapes for a dictionary. This
+marks the slot instead: the shape still names it, and a tombstone says it is gone.
+
+The cost is that the slot stays allocated and every read of a once-deleted property pays a
+lookup. The benefit is one representation rather than two, and re-assigning a deleted property
+revives it — the shape already names the slot, so clearing the tombstone is the whole operation.
+The value is cleared when the tombstone is set, or the collector would keep whatever it pointed
+at alive for as long as the object lived.
+
+**`delete` asks whether the property is gone afterwards, not whether it removed anything.** A
+property that was never there answers `true`. Only a non-configurable one answers `false`, and
+it answers rather than throwing, which is sloppy mode — the only mode here. `delete` on
+something that is not a property access is `true` and does nothing.
+
+One operation covers `delete o.x` and `delete o[k]`: the frontend makes a string constant for
+the static form rather than the IR carrying two shapes of the same question.
+
+**This uncovered a bug older than itself.** `key_of` returned `None` for a **string** key,
+because it was written before strings existed and never revisited. So `o["a"]` silently did
+nothing — a computed read answered `undefined` and a computed write was discarded, neither
+saying a word. Only a number key worked, which is why every array test passed over it.
+
+**Consequence:** the two side tables are `Option<Box<…>>` rather than inline collections.
+Clippy objects to boxing a collection and is right in general; here the point is the *inline*
+size, which every cell in the heap pays for including the free ones — eight bytes against
+forty-eight, twice. The allocation happens only for an object that has attributes or deletions.
+
+## D-118
+
+**`for-in` takes its list of names before the body runs, and built-in methods are not
+enumerable.**
+
+Status: Accepted
+
+Lowered as an ordinary counted loop over a list computed once. The specification allows a
+property deleted during the loop to be skipped and one added not to be visited, so taking the
+list up front is within it — and it keeps the loop from depending on an enumeration order its
+own body is changing.
+
+**Inherited enumerable properties are visited**, which is what separates `for-in` from
+`Object.keys`, so the enumeration walks the prototype chain. A name found on an object shadows
+the same name further up and is visited once, at the first place it appears.
+
+`for (let k in o)` declares `k`; `for (k in o)` assigns to whatever `k` already names. Treating
+the second as a declaration would shadow the outer binding, so the loop would run correctly and
+leave nothing behind — a failure with no symptom inside the loop at all.
+
+**The test for it caught that every built-in method was enumerable.** `for (k in [])` visited
+`map`, `filter` and the rest: the loop was right and the properties were wrong. Every method the
+specification puts on a prototype is `{ writable: true, enumerable: false, configurable: true }`,
+which descriptors (D-116) had just made expressible — the feature and the bug it exposed landed
+one after the other.
+
+**Consequence:** built-in methods are now defined through one function that sets those
+attributes. Four builders had been defining them four ways; the one that mattered was the one
+nobody had thought about, because nothing could observe enumerability until `for-in` existed.
+
+## D-119
+
+**Computed property keys and template literals.**
+
+Status: Accepted
+
+A computed key `{[k]: v}` and a numeric key `{1: v}` both go through the computed store rather
+than a static name. The numeric case could have been converted to text in the frontend, but the
+number-to-name rule already lives in the runtime — putting a second copy in the compiler is how
+`{1: x}` and `o[1] = x` come to disagree about what the property is called.
+
+**The key is evaluated before the value**, which is the order the specification gives and is
+observable whenever either has an effect.
+
+A template literal is lowered as concatenation, because that is what it is. **The first piece is
+always a string** even when the template opens with a substitution: starting from the empty
+string is the whole reason `` `${1}${2}` `` is `"12"` and not `3`. An empty trailing piece emits
+nothing, so `` `${a}${b}` `` does not pay for two concatenations with `""`.
+
+## D-120
+
+**`for-of` covers arrays and strings, and is not the iterator protocol.**
+
+Status: Accepted, and deliberately partial
+
+There is no `Symbol`, so there is no `Symbol.iterator` to look up and a user-defined iterable
+cannot be recognised at all. What this covers is an array or a string; anything else raises a
+`TypeError` — the error the protocol would raise for a non-iterable, reached for a different
+reason. Recorded as partial rather than presented as done, because the failure for a custom
+iterable is indistinguishable from the failure for a number.
+
+**An array is indexed live, not copied.** `length` is read in the loop header each step, so a
+`push` inside the body is seen and `for (const x of a) a.push(x)` does not terminate — which is
+what a real engine does. Copying the elements up front would have made it terminate, which is
+the quieter answer and the wrong one.
+
+**A string is walked by code point, not code unit**: `for (const c of "😀")` runs once where
+`"😀".length` is 2 (D-115). The snapshot is indistinguishable from live indexing because a
+string cannot change.
+
+**Consequence:** `for-in` and `for-of` are one loop. They differ only in what produces the list —
+`Enumerate` gives names, `Iterate` gives something indexable — and sharing the lowering is what
+makes `break`, `continue` and the declare-versus-assign rule identical in both without being
+written twice.
+
+## D-121
+
+**The test count in STATE.md is measured, not incremented.**
+
+Status: Accepted, correcting several earlier entries
+
+The recorded total had been carried forward by hand — 1146, then 1175, 1183, 1188, 1200, 1207 —
+each step adding the tests a commit introduced to the previous line. The measured workspace
+total is **1146**, and every figure above it was arithmetic on a number nobody re-read.
+
+The same narrowing had turned the gate green while it was red. Running `cargo clippy` on the
+packages a change touched, rather than `--workspace`, hid a lint failure in `cli/src/build.rs`
+from the commit that introduced it (`3f182a4`) until now — six commits. A per-package gate is
+not a smaller version of the workspace gate; it is a different gate that happens to agree most
+of the time.
+
+Both failures have the same shape: a number or a check that was true once, reused as though it
+were still being taken.
+
+## D-122
+
+**`crisol-builtins` exists, is tested, and nothing ships it.**
+
+Status: Recorded, partly acted on
+
+The crate holds seventeen modules and **230 passing tests**: an object model with `Realm`,
+descriptors, `Proxy`, `Reflect`, `Promise`, `RegExp` over `regress`, `Date`, `JSON`, `Map` and
+`Set`, `Symbol`, the iterator protocol, and the conversion algorithms. No production code
+depends on it. `crisol-abi` — the runtime compiled programs actually call — depends only on
+`crisol-gc` and `crisol-value`, and reimplements a smaller version of the same ground.
+
+So 230 of the workspace's passing tests cover code no compiled program can reach, and
+`Object.defineProperty` was written twice: once in `descriptor.rs` with `validate_and_apply`,
+and once again in D-116 by someone who had not looked.
+
+The two halves are not interchangeable. `crisol-builtins` has its own object model —
+`ObjectId` indexes a `Realm`, not the collector's heap — so adopting it wholesale means moving
+compiled code off `crisol-gc`, which is not a refactor.
+
+What *is* reachable is everything that does not touch `Realm`, which is most of it:
+`regexp`, `date`, `json`, `convert`, `collections`, `string`, `symbol`, `array`, `error`,
+`iterator`, `promise` and `proxy` are all free of it. Those are pure algorithms over Rust types
+and can be called directly.
+
+`RegExp` is the first one taken (D-123). `Date`, `JSON`, `Map` and `Set` are the same shape of
+work and are the obvious next ones — each is currently "not defined" at runtime while sitting
+finished and tested in the tree.
+
+## D-123
+
+**`RegExp` is `crisol-builtins::JsRegExp`, and `lastIndex` lives on the object.**
+
+Status: Accepted
+
+The pattern is compiled when the literal is **evaluated**, not at first use, so an invalid one
+raises a `SyntaxError` where it is written rather than inside whatever later called `test`.
+
+`JsRegExp` owns a cursor, and so does the JavaScript object — `lastIndex` is writable from a
+program, so it cannot live only in Rust. The property is authoritative: the compiled pattern is
+set from it before each use and read back after. Two owners of a value the program can change
+would disagree the first time it changed one.
+
+Compiled patterns are memoised by source and flags. That is a memo and not ownership, which is
+what makes it safe to share one compiled pattern between two objects with the same literal.
+
+**`exec` answers `null`, not `undefined`** — `while ((m = re.exec(s)) !== null)` is the idiom
+that depends on it. Its result is an array carrying `index` and `input` as properties, and
+**a group that did not participate is `undefined` rather than `""`**, which is the distinction
+`Captured` keeps by storing `Option` per group.
+
+**Consequence: a rooting bug, caught by the test that read the property back.** Both the source
+and the flags strings were built before either was stored, leaving the first unrooted while the
+second allocated — a collection in between freed a value the object was about to hold. It read
+back as `[unreadable string]`. The fix is the rule the array methods already follow: create and
+store one at a time. The bug is only reachable when a collection lands in that window, so the
+test that caught it was the one asserting `.source` rather than any test of matching.
+
+## D-124
+
+**`JSON` is `crisol-builtins::json`, and the two containers disagree about absence.**
+
+Status: Accepted
+
+The second of the unshipped builtins taken (D-122). `Json` is owned data with no `Realm` in it,
+so the work is two converters and nothing else.
+
+**An object drops a property JSON cannot spell; an array cannot.** `JSON.stringify({a:
+undefined})` is `"{}"` and `JSON.stringify([undefined])` is `"[null]"` — an array would have to
+change its length to drop an element, so the same absence has to be written two ways. A single
+"skip what you cannot spell" rule gets one of them wrong.
+
+**`undefined` for a value JSON cannot spell at the top level**, not the string `"undefined"`.
+**A non-finite number is `null`**, because JSON has no spelling for `NaN` or an infinity and
+refusing the whole document over one would be worse. A structure containing itself raises,
+rather than producing a document that silently stops describing the value.
+
+Not done, and recorded rather than left to be found: **the reviver and replacer arguments are
+ignored.** A program passing one gets the unchanged document, which is wrong quietly.
+
+## D-125
+
+**A constructor's `prototype` is the object its instances already inherit from.**
+
+Status: Accepted
+
+`Function`, `String` and `RegExp` were each missing that link, so `Function.prototype` existed
+and could not be named. Fifty test262 cases failed on `Function is not defined` while the
+object they wanted was built and rooted — the same failure as D-122, one level down: the thing
+existed and nothing pointed at it.
+
+Binding all four through one loop is what makes `[].map === Array.prototype.map` and
+`"".trim === String.prototype.trim` true for the same reason rather than by coincidence.
+
+**`Function` is bound so its prototype is reachable, not because `new Function(body)` works** —
+that compiles source at runtime, which this engine does not do. Calling it raises rather than
+answering something wrong.
+
+**Consequence: `property_text` returned `Some("undefined")` for an absent property**, because
+`to_text` spells every value out. A caller asking whether a property exists was told yes and
+handed the word — which is how `new RegExp("ab+")` came to compile the pattern `undefined`. The
+test that caught it was the plain one, `new RegExp("ab+").test("abb")`, not any of the ones
+written for the interesting cases.
+
+## D-126
+
+**`Date` is `crisol-builtins::date`, and its time value lives in a hidden property.**
+
+Status: Accepted
+
+The third of the unshipped builtins taken (D-122). The calendar arithmetic was already written
+and tested; what was missing was somewhere to keep the time value and a prototype to hang the
+readers on.
+
+**Internal slot zero already means "callable"** — [`is_callable`] reads it, and that is what
+makes `typeof f` answer `"function"`. A date borrowing it would become a function. So the time
+value is a property that enumeration does not see and `delete` cannot remove, which descriptors
+(D-116) made expressible. It is still readable by name, which a real internal slot would not
+be; that gap is the price of not having internal slots and is written down rather than hidden.
+
+**`getMonth` is 0-based and `getDate` is 1-based.** They disagree deliberately, and a single
+field reader parameterised on the wrong thing would get one of them wrong silently.
+
+**The local-time methods are the UTC ones.** There is no timezone database here, so `getHours`
+and `getUTCHours` are the same function — correct exactly where the offset is zero and wrong by
+the offset everywhere else. `getTimezoneOffset` answers `0` for the same reason, which at least
+makes the three consistent with each other rather than consistently wrong in different
+directions.
+
+**An invalid date raises from `toISOString` and prints from `toString`.** The first has no
+spelling for one; the second has `"Invalid Date"`. The field readers answer `NaN`. Three
+different right answers to the same broken input.
+
+`new Date()` reads the clock through `Date.now`, so there is one clock rather than two that
+could drift apart.
+
+## D-127
+
+**A built-in knows its own name, and naming it caught the rooting rule again.**
+
+Status: Accepted
+
+`Array.prototype.forEach.name` is `"forEach"`, and test262 checks it for every built-in it
+covers. The name was sitting in the table that created each function and had simply never been
+written onto it. It is not writable but is configurable — so `f.name = "x"` silently does
+nothing while `Object.defineProperty(f, "name", …)` works.
+
+**The change broke nearly every test, and only under GC stress.** `native_function` hands back
+an unrooted handle; the function becomes reachable when it is stored on the prototype.
+Allocating the name string *before* storing it left a window where a collection freed the
+function being named. The symptom was a method that was `undefined` under stress and fine
+without it.
+
+This is the third time this session the same rule has been the bug: **create, store, then
+allocate again** — `new RegExp` (D-123), `flatMap` below, and here. The rule is not "root
+carefully"; it is that a value between allocation and its first store is invisible, and every
+allocation in that gap is a chance to lose it.
+
+`flatMap` had it in a different shape: results accumulated in a Rust `Vec` while the callback
+allocated, so every result but the newest was unreachable. Fixed by mapping into a rooted array
+first and flattening afterwards, when no JavaScript runs and nothing can move.
+
+## D-128
+
+**More of `Array.prototype` and `String.prototype`, and the pairs that differ.**
+
+Status: Accepted
+
+- **`reduceRight` is not `reduce` over a reversed list.** The callback still receives each
+  element's real index, so reversing first would hand it the wrong ones — a wrong answer rather
+  than a slower one, for any callback that reads the index.
+- **`flat` goes one level by default**, not all of them; `flatMap` goes exactly one, always,
+  because it takes no depth.
+- **`at` counts a negative index from the end and answers `undefined` out of range**, where
+  `charAt` answers `""`. The two differ at exactly the place a caller conflates them.
+- **`replaceAll` with a non-global pattern is a `TypeError`**, not a quiet `replace`. The
+  pattern's own flags decide how many matches are replaced, so a method name that disagreed
+  with them would have to pick one to ignore.
+- **An empty pad filler pads nothing.** Answering the original rather than looping forever is
+  the whole reason that case is written down.
+
+**Consequence: a test expectation that could never pass.** `execute` trims the program's
+output, so `check(…, "  a")` compares against `"a"` however correct the code is. The test was
+wrong and `padStart` was right. Expectations now carry a sentinel where leading or trailing
+space is the point.
+
+## D-129
+
+**`Function.prototype.bind`, and `Object.prototype` existing at all.**
+
+Status: Accepted
+
+test262's own `propertyHelper.js` opens with
+`Function.prototype.call.bind(Object.prototype.hasOwnProperty)`. Neither `bind` nor
+`Object.prototype` existed, so the helper threw while loading and **every test that includes it
+failed** — whatever the test was about. That is why one commit moved `is not a function` from
+121 to 51.
+
+**A native can see its own object.** The calling convention passes the callee as the first
+operand, which is what lets a bound function find its target without the engine having closures
+a native could capture. The target, receiver and leading arguments are hidden properties, for
+the same reason a date's time value is (D-126): internal slot zero already means "callable",
+and a bound function is exactly a callable.
+
+**The bound arguments come first and the call's own follow**, which is what makes
+`f.bind(null, 1)(2)` the same as `f(1, 2)`.
+
+`Object.prototype` is now the end of every chain — plain objects, and the other prototypes too,
+so `[].hasOwnProperty` and `({}).hasOwnProperty` are one function rather than a copy each.
+**Own means own**: `hasOwnProperty` answers `false` for something found on the prototype, which
+is the whole reason it exists rather than `in`.
+
+**Consequence: an ordering bug that hid one property deep.** The object at the end of every
+chain has to exist before anything links to it, so it was built first — but its methods are
+*functions*, and functions made before `Function.prototype` exists do not get `call`. So
+`Object.prototype.toString` was fine and `Object.prototype.toString.call` was not. Allocating
+the object early and populating it after `Function.prototype` is the fix, and the split is now
+the documented point of having two functions.
+
+## D-130
+
+**An identity test between two absent things passes.**
+
+Status: Accepted
+
+`({}).hasOwnProperty === Object.prototype.hasOwnProperty` was green while **both sides were
+`undefined`**. It went green the moment it was written and stayed green through the bug it was
+supposed to catch.
+
+Every identity assertion in the acceptance suite is now preceded by a `typeof` check that there
+is something to identify. The pattern generalises past this case: an assertion whose two sides
+can both be missing is not testing what it appears to test, and `===` on `undefined` is the
+commonest way to get one.
+
+## D-131
+
+**`==`, `!=` and `in`. `===` was never the gap.**
+
+Status: Accepted
+
+`===` and `!==` have been lowered since the comparison operators landed, including the part that
+is easy to get wrong: **strings compare by their characters, not by identity**, so `"a" === "a"`
+holds however many separate cells the two came from. What the refusal list called "binary
+operator ==" was *loose* equality.
+
+`==` is a [`BinaryOp`] rather than a [`CompareOp`] on purpose. Every `CompareOp` has a machine
+instruction behind it when both sides are numbers; `==` never does, because deciding what to
+compare means reading both types first. Keeping it out of the comparison lattice keeps that
+lattice honest about which comparisons can become an `fcmp`.
+
+The rule is short and the consequences are not:
+
+- **`null` and `undefined` equal each other and nothing else** — not `0`, not `""`, not `false`.
+  Checked before any coercion, or `null == 0` would become `0 == 0`.
+- **A boolean becomes a number first**, on whichever side it is.
+- **A string meeting a number becomes a number**, never the reverse.
+- **An object becomes a primitive** through `valueOf` then `toString`.
+- Same type defers to `===`, so everything already right about `NaN` and the two zeroes is
+  inherited rather than restated.
+
+**Not transitive**, and the example is in the tests: `"" == 0` and `"0" == 0` are both true
+while `"" == "0"` is false.
+
+A round limit stops the recursion, because a `valueOf` returning another object would otherwise
+spin. The specification throws there; throwing from inside `==` would need an exception path the
+operator does not have, and that difference is recorded rather than papered over.
+
+**Only `in` can raise**, so only `in` pays for an exception check at the call site. `instanceof`
+and `+` answer for every input, and the rest coerce with `ToNumber`, which has no failing case
+over this engine's values.
+
+## D-132
+
+**A binary operator's result type is listed, not negated.**
+
+Status: Accepted, fixing a bug older than this change
+
+`is_always_numeric` was `!matches!(self, Self::Add)` — "everything except `+`". That is true of
+the arithmetic and also of **`instanceof`**, which answers a boolean and has therefore been
+typed `number` in the IR since the day it was added. Adding `==`, `!=` and `in` would have
+inherited the same wrong answer, which is how the negation compounds.
+
+The predicate now lists the numeric operators, and a companion lists the boolean ones, so a new
+operator has to be classified rather than inheriting the answer for arithmetic.
+
+**The corpus snapshot is what caught it.** The dump prints each value's type, so `v4: number =
+== v2, v3` was visible in the diff the test asked to be reviewed. No assertion anywhere
+mentioned operator result types; the snapshot showed one and made it obvious.
+
+## D-133
+
+**Array spread, separated from array holes.**
+
+Status: Accepted; holes remain refused
+
+The two shared one note, `array hole or spread`, so `[...a]` looked like a gap it had not been
+for any good reason — they are unrelated problems that happened to arrive at the same match arm.
+
+**A hole is still refused**, and D-64's reasoning is unchanged: a hole is not `undefined`, the
+IR has no way to say "absent", and filling one in with `undefined` produces a value that reads
+the same and answers `in` differently. That is a wrong answer, not a missing feature.
+
+Spread has no such obstacle. **The leading run is built in one `CreateArray` and only what
+follows a spread is appended piece by piece**, so an array with no spread costs exactly what it
+did before.
+
+`spread` is one bit on one operation because that is the whole difference at the call site:
+with it, every element of the operand is appended; without it, the operand itself is. `[...a]`
+and `[a]` differ in that and nothing else.
+
+Spreading uses the same rule `for-of` does (D-120) — an array or a string, `TypeError`
+otherwise — so `[...5]` and `for (x of 5)` fail the same way. A separate rule here would have
+let one of them quietly produce a one-element array.
+
+**The corpus snapshot is the review**, and this is what it is for: the dump shows the leading
+`array [v2]`, the `extend v3, ...v4` with its exception branch, and the trailing `extend v3,
+v7`. Reading that is how the lowering was checked, not by trusting that it compiled.
+
+## D-134
+
+**`Math`, and the three places its functions are not their Rust namesakes.**
+
+Status: Accepted
+
+Forty-nine test262 failures were `Math is not defined`. The functions are pure `f64` work with
+nothing to root, so most of them are a one-line macro. The three that are not are the whole
+value of writing this down:
+
+- **`Math.round` is not `f64::round`.** JavaScript rounds a half *upward*, toward positive
+  infinity; Rust rounds it *away from zero*. They agree on `0.5` and disagree on `-0.5`, which
+  is `-0` in JavaScript and `-1` in Rust. `floor(x + 0.5)` is the rule, with the non-finite
+  cases passed through because adding to an infinity would not survive it.
+- **`Math.sign` is not `f64::signum`**, which answers `1.0` for a zero and never `NaN`.
+  JavaScript gives back `0`, `-0` and `NaN` as themselves.
+- **`Math.min`/`max` are not `f64::min`/`max`**, which return the *other* operand when one is
+  `NaN`. In JavaScript one `NaN` anywhere wins. With no arguments each returns the opposite
+  infinity, because each has to lose to the first real argument.
+
+Each of those would have passed a casual reading and failed a specific test, which is why each
+has one.
+
+**`Math.random` is a xorshift generator seeded from the clock, and is not suitable for anything
+needing unpredictability.** The specification asks only for an implementation-dependent value
+in `[0, 1)`, which is what it delivers — said plainly because the name reads like a guarantee
+it is not making.
+
+The constants are defined separately from the functions: they are properties, so they have no
+table entry, and the object they hang on exists only because naming a method created it.
+
+## D-135
+
+**`arguments` is bound lazily, and is an array.**
+
+Status: Accepted, with two differences from the specification recorded
+
+The slot is created the first time a body names `arguments`, not when the function is lowered.
+That is not an optimisation — the first attempt declared it in every function that binds `this`,
+which **shifted every parameter down by one slot** and broke closures. It broke them only under
+GC stress, because the damage was to the frame the collector reads rather than to any value a
+test printed. Binding lazily means a function that never mentions `arguments` has exactly the
+numbering it had before the feature existed.
+
+**An arrow inherits the enclosing function's `arguments`**, which is the rule `this` follows and
+falls out of the lookup: arrows are absent from the stack of functions that bind it, so
+resolution walks past them and the ordinary capture machinery does the rest. Not a special case.
+
+Two differences from the specification, both of which read as correct until something looks
+straight at them:
+
+- **It is an array, not an array-*like*.** Everything array-shaped works at once — `length`,
+  indexing, `for-of`, spread — and `Array.isArray(arguments)` answers `true` where a real engine
+  says `false`.
+- **It is a copy, so it does not alias the named parameters.** Outside strict mode a real
+  engine makes `arguments[0] = 1` change `a`. Here it does not, and there is a test asserting
+  the difference rather than a comment hoping nobody notices.
+
+**Consequence: the fifth rooting bug of this shape.** `crisol_create_arguments` runs in the
+callee's prologue, before any of its slots exist, so the only thing describing the argument
+values is the caller's frame — and the array's own allocation could collect one it was about to
+hold. The rule has not changed since D-127: a value between allocation and its first store is
+invisible, and every allocation in that gap is a chance to lose it.

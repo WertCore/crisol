@@ -55,6 +55,8 @@ const SINGLETON_UNDEFINED: u64 = 0;
 const SINGLETON_NULL: u64 = 1;
 const SINGLETON_FALSE: u64 = 2;
 const SINGLETON_TRUE: u64 = 3;
+/// Not a JavaScript value: the signal that a call threw. See [`Value::EXCEPTION`].
+const SINGLETON_EXCEPTION: u64 = 4;
 
 /// The NaN every value that is not a number canonicalises to.
 ///
@@ -137,6 +139,19 @@ impl Value {
     pub const TRUE: Self = Self::singleton(SINGLETON_TRUE);
     /// `false`.
     pub const FALSE: Self = Self::singleton(SINGLETON_FALSE);
+
+    /// **Not a JavaScript value.** The signal that a call threw.
+    ///
+    /// A call returns this instead of a result, and the thrown value waits in the runtime. It
+    /// lives in the value space rather than in a second return register so that adding
+    /// exceptions changes no function's signature — a call site that ignores it compiles
+    /// exactly as before.
+    ///
+    /// [`Value::kind`] deliberately reports this as `Undefined`. It should never reach a
+    /// program, and if a propagation is ever missed the value behaves as `undefined` rather
+    /// than aborting — a wrong answer in a corner is recoverable, and a crash inside a
+    /// half-unwound call is not.
+    pub const EXCEPTION: Self = Self::singleton(SINGLETON_EXCEPTION);
 
     const fn singleton(which: u64) -> Self {
         Self {
@@ -222,6 +237,12 @@ impl Value {
                 _ => Kind::Undefined,
             },
         }
+    }
+
+    /// Whether this is the [`Value::EXCEPTION`] signal rather than a value.
+    #[must_use]
+    pub const fn is_exception(self) -> bool {
+        self.bits == Self::EXCEPTION.bits
     }
 
     /// The number, if this is one.

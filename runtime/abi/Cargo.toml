@@ -16,4 +16,6 @@ crate-type = ["lib", "staticlib"]
 workspace = true
 
 [dependencies]
+crisol-builtins.workspace = true
+crisol-gc.workspace = true
 crisol-value.workspace = true

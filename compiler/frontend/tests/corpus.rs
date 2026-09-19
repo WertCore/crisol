@@ -25,6 +25,39 @@ use crisol_ir::{Op, verify_module};
 /// The programs. Order is fixed, because the snapshot is.
 const CORPUS: &[(&str, &str)] = &[
     ("empty", ""),
+    // Exceptions, as explicit propagation: every call is followed by a test and a branch.
+    (
+        "try-catch",
+        "let r = 0; try { throw 1; } catch (e) { r = e; }",
+    ),
+    (
+        "for-loop",
+        "let t = 0; for (let i = 0; i < 2; i = i + 1) { t = t + i; }",
+    ),
+    (
+        "for-continue-break",
+        "for (let i = 0; i < 4; i++) { if (i === 1) { continue; } if (i === 3) { break; } }",
+    ),
+    ("do-while", "let i = 0; do { i++; } while (i < 2);"),
+    // A function declaration is usable above its own text, which the whole of test262's own
+    // harness depends on.
+    (
+        "hoisted-function",
+        "let r = f(); function f() { return 1; }",
+    ),
+    (
+        "switch-fallthrough",
+        "let r = 0; switch (1) { case 1: r = 1; case 2: r = 2; }",
+    ),
+    (
+        "switch-break-default",
+        "let r = 0; switch (9) { case 1: r = 1; break; default: r = 5; }",
+    ),
+    // Computed access, which is how every element read reaches the IR. `a[0]` and `a["0"]`
+    // are the same operation in JavaScript, so one op covers both.
+    ("computed-read", "let a = [1, 2]; let x = a[0];"),
+    ("computed-write", "let a = [1]; a[0] = 2;"),
+    ("computed-on-object", "let o = {}; o[1] = 5; let x = o[1];"),
     ("number", "let x = 1;"),
     ("negative-is-not-arithmetic-here", "let x = 0;"),
     ("float", "let x = 1.5;"),
@@ -40,6 +73,10 @@ const CORPUS: &[(&str, &str)] = &[
     ("assign-is-an-expression", "let a = 1; let b = (a = 2);"),
     ("strict-equal", "let a = 1; let b = 2; let c = a === b;"),
     ("strict-not-equal", "let a = 1; let b = 2; let c = a !== b;"),
+    ("loose-equal", "let a = 1; let b = 2; let c = a == b;"),
+    ("loose-not-equal", "let a = 1; let b = 2; let c = a != b;"),
+    ("in-operator", "let o = {a: 1}; let c = \"a\" in o;"),
+    ("array-spread", "let a = [1]; let b = [0, ...a, 2];"),
     ("less", "let a = 1; let b = 2; let c = a < b;"),
     ("less-equal", "let a = 1; let b = 2; let c = a <= b;"),
     ("greater", "let a = 1; let b = 2; let c = a > b;"),
@@ -296,24 +333,19 @@ fn unfaithful_programs_are_reported_not_guessed() {
     // dump. A compiler that silently emits `undefined` for syntax it did not read produces a
     // program that runs and is wrong, which is worse than one that refuses.
     let cases = [
-        ("for (;;) { }", "for statement"),
         // The function itself lowers now; what does not is **hoisting**. The binding appears
         // where the declaration does, so calling it earlier in the source reads an unset slot
         // rather than working. Recorded rather than left silently half-right.
-        ("function f() { }", "function declaration hoisting"),
-        ("let o = {}; let a = o[1];", "computed member access"),
-        ("try { } catch (e) { }", "try statement"),
         ("let [a] = [1];", "destructuring declaration"),
         ("let o = { ...{} };", "object spread"),
-        ("let a = delete ({}).x;", "delete operator"),
         // A hole is not `undefined` (D-64) and the IR cannot yet say so, so it is recorded
         // rather than filled in with a value that reads the same and answers `in` differently.
-        ("let a = [1, , 3];", "array hole or spread"),
+        // A hole is still refused; a spread is not. The two used to share a note, which made
+        // `[...a]` look like a gap it had not been for some time.
+        ("let a = [1, , 3];", "array hole"),
         // `==` is not `===`: it coerces, and the coercion table needs machinery that is not
         // here yet. Lowering it as a strict comparison would be wrong for every mixed-type
         // operand, which is the only case anyone writes `==` for.
-        ("let a = 1 == 2;", "binary operator =="),
-        ("let a = 1 instanceof Object;", "binary operator instanceof"),
         // `extends` needs the prototype chain wired through the parent *and* `super` resolved
         // inside methods. Half of that produces a class that constructs and then fails its
         // first inherited call.

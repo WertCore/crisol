@@ -33,8 +33,9 @@ use crisol_ir::{
 use crisol_value::PropertyKey;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BinaryExpression, BinaryOperator, Expression, LogicalExpression, LogicalOperator,
-    ObjectPropertyKind, Program, PropertyKey as Key, Statement, UnaryExpression, UnaryOperator,
+    ArrayExpressionElement, BinaryExpression, BinaryOperator, Expression, LogicalExpression,
+    LogicalOperator, ObjectPropertyKind, Program, PropertyKey as Key, Statement, UnaryExpression,
+    UnaryOperator,
 };
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
@@ -110,6 +111,10 @@ pub fn lower(name: &str, source: &str) -> Result<Lowered, ParseFailed> {
         });
     }
     let mut lowering = Lowering::new(name);
+    // Answered before lowering, because whether a variable is a cell changes every read and
+    // write of it — and the lowering only discovers a capture once it has already emitted the
+    // enclosing function's code.
+    lowering.shared = crate::escape::shared_variables(&parsed.program);
     lowering.program(&parsed.program);
     Ok(lowering.finish())
 }
@@ -128,6 +133,11 @@ struct Scope {
     /// Discovered during lowering rather than by a pre-pass: a name is a capture exactly when
     /// resolving it walks out of this scope, so the resolution *is* the analysis.
     captures: Vec<(String, u32)>,
+    /// Slots holding a cell rather than the value itself.
+    ///
+    /// Per scope, because slot numbers restart in every function — slot zero is a different
+    /// variable in each one, so a single set would confuse them.
+    cells: std::collections::HashSet<u32>,
 }
 
 struct Lowering {
@@ -135,14 +145,44 @@ struct Lowering {
     /// Innermost last. A nested function pushes; finishing it pops.
     scopes: Vec<Scope>,
     unsupported: Vec<Unsupported>,
+    /// Names a closure must share rather than copy, from [`crate::escape`].
+    shared: std::collections::HashSet<String>,
+    /// Functions that would bind `arguments` if something asked for it, innermost last.
+    ///
+    /// An arrow is absent from this, which is what makes it inherit the enclosing function's —
+    /// the same rule `this` follows, and it falls out of the lookup rather than being a case.
+    binds_arguments: Vec<usize>,
+    /// Where an unlabelled `break` goes, innermost last.
+    breaks: Vec<BlockId>,
+    /// Where a raised exception goes, innermost last. Empty means out of the function.
+    handlers: Vec<BlockId>,
+    /// Where `continue` goes, innermost last. Separate from `breaks` because a `switch` is a
+    /// `break` target and not a `continue` one.
+    continues: Vec<BlockId>,
 }
+
+/// The property a cell keeps its value in.
+///
+/// A cell is an ordinary one-property object, so it needs no new IR operation and no new
+/// runtime call — it allocates, stores and loads exactly like an object literal. That is
+/// slower than a dedicated representation and is the right first version: correctness now,
+/// and a measurement before inventing machinery to make it faster.
+const CELL_KEY: &str = "value";
 
 impl Lowering {
     fn new(name: &str) -> Self {
-        let function = Function::new(name);
+        // Function zero is the program itself. Stamped rather than left to the default, so
+        // every producer of a `Function` reads the same way.
+        let mut function = Function::new(name);
+        function.id = FunctionId(0);
         let entry = function.entry;
         let mut lowering = Self {
             functions: vec![function],
+            shared: std::collections::HashSet::new(),
+            binds_arguments: Vec::new(),
+            breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
             scopes: vec![Scope {
                 function: 0,
                 current: entry,
@@ -150,13 +190,15 @@ impl Lowering {
                 slots: HashMap::new(),
                 next_slot: 0,
                 captures: Vec::new(),
+                cells: std::collections::HashSet::new(),
             }],
             unsupported: Vec::new(),
         };
         // The program is a function body, so it has a `this` — `undefined` in a module, the
         // global object in a script. Binding it here means a top-level arrow captures it
         // rather than inventing one.
-        lowering.declare("this");
+        let this_slot = lowering.declare("this");
+        lowering.functions[0].this_slot = Some(this_slot);
         lowering
     }
 
@@ -184,8 +226,570 @@ impl Lowering {
     }
 
     fn program(&mut self, program: &Program<'_>) {
+        self.hoist(&program.body);
         for statement in &program.body {
             self.statement(statement);
+        }
+    }
+
+    /// `delete o.x` and `delete o[k]`.
+    ///
+    /// **`delete` on anything that is not a property access is `true`** and does nothing —
+    /// `delete 1` and `delete someVariable` are not errors outside strict mode, and answering
+    /// `false` for them would be as wrong as refusing to compile.
+    fn delete(&mut self, unary: &UnaryExpression<'_>) -> ValueId {
+        let (object, key) = match &unary.argument {
+            Expression::StaticMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                // The static name becomes a string constant, so one IR operation covers both
+                // spellings of the same question.
+                let key = self.emit(
+                    Type::String,
+                    Op::Const(Constant::String(member.property.name.to_string())),
+                );
+                (object, key)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                (object, key)
+            }
+            other => {
+                self.expression(other);
+                return self.emit(Type::Bool, Op::Const(Constant::Bool(true)));
+            }
+        };
+        let removed = self.emit(Type::Bool, Op::Delete { object, key });
+        self.propagate(removed)
+    }
+
+    /// `i++`, `++i`, `i--`, `--i`.
+    ///
+    /// **Postfix yields the value from *before* the update and prefix the value after**, which
+    /// is the entire difference between them and is invisible in a statement like `i++;`. The
+    /// distinction only shows where the result is used — `a[i++]` indexes with the old `i` —
+    /// so a lowering that got it backwards would pass every loop test.
+    ///
+    /// The operand goes through `+`, not a numeric add: `i` may not be a number, and `ToNumber`
+    /// is what the specification applies. That is the same helper `i + 1` uses, so the two
+    /// spellings cannot disagree.
+    fn update(&mut self, update: &oxc_ast::ast::UpdateExpression<'_>) -> ValueId {
+        let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) =
+            &update.argument
+        else {
+            self.note(
+                "update of something other than a variable",
+                update.span.start,
+            );
+            return self.placeholder();
+        };
+
+        let slot = self.slot(identifier.name.as_str());
+        let before = self.read(slot);
+        let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
+        let op = if matches!(update.operator, oxc_ast::ast::UpdateOperator::Increment) {
+            BinaryOp::Add
+        } else {
+            BinaryOp::Subtract
+        };
+        let after = self.emit(
+            Type::Unknown,
+            Op::Binary {
+                op,
+                left: before,
+                right: one,
+            },
+        );
+        self.write(slot, after);
+        if update.prefix { after } else { before }
+    }
+
+    /// `let`/`const`/`var`, which a `for` initialiser also uses.
+    fn variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'_>) {
+        for declarator in &declaration.declarations {
+            let Some(name) = declarator.id.get_identifier_name() else {
+                self.note("destructuring declaration", declarator.span.start);
+                continue;
+            };
+            let value = match &declarator.init {
+                Some(init) => self.expression(init),
+                None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+            };
+            // `declare`, not `slot`: a `let` shadows an outer binding rather than capturing it.
+            let slot = self.declare(name.as_str());
+            self.bind(name.as_str(), slot, value);
+        }
+    }
+
+    /// `for (name in object) body`.
+    ///
+    /// Lowered as an ordinary counted loop over a list of names taken **before** the body runs.
+    /// The specification allows a property deleted during the loop to be skipped and one added
+    /// not to be visited, so taking the list up front is within it — and it keeps the loop from
+    /// depending on an enumeration order that its own body is changing.
+    ///
+    /// `continue` goes to the increment and not the test, for the same reason it does in a
+    /// `for` loop: skipping the increment is a hang rather than a wrong answer.
+    fn for_in_statement(&mut self, statement: &oxc_ast::ast::ForInStatement<'_>) {
+        let subject = self.expression(&statement.right);
+        let names = self.emit(Type::Object(None), Op::Enumerate { object: subject });
+        self.indexed_loop(names, &statement.left, &statement.body);
+    }
+
+    /// `for (name of iterable) body`.
+    ///
+    /// **This is not the iterator protocol.** There is no `Symbol`, so there is no
+    /// `Symbol.iterator` to look up and a user-defined iterable cannot work. What this does
+    /// cover is an array or a string, which `crisol_iterate` turns into something indexable and
+    /// anything else rejects with a `TypeError` — the same error the protocol would raise, for
+    /// a different reason.
+    ///
+    /// An array is indexed **live**, not copied, so its `length` is re-read each step and a
+    /// `push` inside the loop is seen. That matches the array iterator, which is also why
+    /// `for (const x of a) a.push(x)` does not terminate here any more than it does in a real
+    /// engine.
+    fn for_of_statement(&mut self, statement: &oxc_ast::ast::ForOfStatement<'_>) {
+        if statement.r#await {
+            self.note("for-await-of statement", statement.span.start);
+            return;
+        }
+        let subject = self.expression(&statement.right);
+        let values = self.emit(Type::Object(None), Op::Iterate { object: subject });
+        // `crisol_iterate` raises on a non-iterable, so the signal has to be honoured here or
+        // the loop would run over the signal itself.
+        let values = self.propagate(values);
+        self.indexed_loop(values, &statement.left, &statement.body);
+    }
+
+    /// The loop both `for-in` and `for-of` are: walk `list` by index, binding each element.
+    ///
+    /// `length` is read in the header rather than once before it, so a list that grows or
+    /// shrinks during the body is followed rather than snapshotted.
+    ///
+    /// `continue` goes to the increment and not the test, for the same reason it does in a
+    /// `for` loop: skipping the increment is a hang rather than a wrong answer.
+    fn indexed_loop(
+        &mut self,
+        subject: ValueId,
+        left: &oxc_ast::ast::ForStatementLeft<'_>,
+        body_statement: &Statement<'_>,
+    ) {
+        let list = self.temporary();
+        self.emit_effect(Op::Store {
+            slot: list,
+            value: subject,
+        });
+        let position = self.temporary();
+        let zero = self.emit(Type::Number, Op::Const(Constant::Number(0.0)));
+        self.emit_effect(Op::Store {
+            slot: position,
+            value: zero,
+        });
+
+        let header = self.new_block();
+        let body = self.new_block();
+        let step = self.new_block();
+        let exit = self.new_block();
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(header);
+        let held = self.emit(Type::Unknown, Op::Load { slot: list });
+        let length = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: held,
+                key: PropertyKey::new("length"),
+            },
+        );
+        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let more = self.emit(
+            Type::Bool,
+            Op::Compare {
+                op: CompareOp::Less,
+                left: at,
+                right: length,
+            },
+        );
+        self.terminate(Terminator::Branch {
+            condition: more,
+            then_block: body,
+            then_args: Vec::new(),
+            else_block: exit,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(body);
+        let held = self.emit(Type::Unknown, Op::Load { slot: list });
+        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let name = self.emit(
+            Type::Unknown,
+            Op::ComputedLoad {
+                object: held,
+                key: at,
+            },
+        );
+        self.bind_loop_variable(left, name);
+
+        self.breaks.push(exit);
+        self.continues.push(step);
+        self.statement(body_statement);
+        self.breaks.pop();
+        self.continues.pop();
+        self.terminate(Terminator::Jump {
+            target: step,
+            args: Vec::new(),
+        });
+
+        self.switch_to(step);
+        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
+        let next = self.emit(
+            Type::Unknown,
+            Op::Binary {
+                op: BinaryOp::Add,
+                left: at,
+                right: one,
+            },
+        );
+        self.emit_effect(Op::Store {
+            slot: position,
+            value: next,
+        });
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(exit);
+    }
+
+    /// Binds the name or value the loop is currently visiting.
+    ///
+    /// `for (let k in o)` declares `k`; `for (k in o)` assigns to whatever `k` already names.
+    /// Treating the second as a declaration would shadow the outer binding, so the loop would
+    /// run correctly and leave nothing behind.
+    fn bind_loop_variable(&mut self, left: &oxc_ast::ast::ForStatementLeft<'_>, value: ValueId) {
+        match left {
+            oxc_ast::ast::ForStatementLeft::VariableDeclaration(declaration) => {
+                let Some(first) = declaration.declarations.first() else {
+                    return;
+                };
+                let Some(name) = first.id.get_identifier_name() else {
+                    self.note("destructuring for-in binding", declaration.span.start);
+                    return;
+                };
+                let slot = self.declare(name.as_str());
+                self.bind(name.as_str(), slot, value);
+            }
+            oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(identifier) => {
+                let slot = self.slot(identifier.name.as_str());
+                self.write(slot, value);
+            }
+            // A member expression or a pattern. Reported without a position, because a
+            // `ForStatementLeft` does not carry one without the span trait in scope and the
+            // construct is named precisely enough to find.
+            _ => self.note("for-in binding that is not a plain name", 0),
+        }
+    }
+
+    /// `for (init; test; update) body`.
+    ///
+    /// Four blocks rather than three, because **`continue` goes to the update, not the test**.
+    /// Sharing a block for them would make `for (i = 0; i < 3; i = i + 1) { continue; }` skip
+    /// the increment and loop forever — a hang rather than a wrong answer, and one that only
+    /// appears when a `continue` is present.
+    ///
+    /// An absent test means `true`: `for (;;)` is an infinite loop, not one that never runs.
+    fn for_statement(&mut self, statement: &oxc_ast::ast::ForStatement<'_>) {
+        if let Some(init) = &statement.init {
+            match init {
+                oxc_ast::ast::ForStatementInit::VariableDeclaration(declaration) => {
+                    self.variable_declaration(declaration);
+                }
+                other => {
+                    if let Some(expression) = other.as_expression() {
+                        self.expression(expression);
+                    } else {
+                        self.note("for initialiser", statement.span.start);
+                    }
+                }
+            }
+        }
+
+        let header = self.new_block();
+        let body = self.new_block();
+        let update = self.new_block();
+        let exit = self.new_block();
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(header);
+        match &statement.test {
+            Some(test) => {
+                let condition = self.expression(test);
+                self.terminate(Terminator::Branch {
+                    condition,
+                    then_block: body,
+                    then_args: Vec::new(),
+                    else_block: exit,
+                    else_args: Vec::new(),
+                });
+            }
+            None => self.terminate(Terminator::Jump {
+                target: body,
+                args: Vec::new(),
+            }),
+        }
+
+        self.switch_to(body);
+        self.breaks.push(exit);
+        self.continues.push(update);
+        self.statement(&statement.body);
+        self.breaks.pop();
+        self.continues.pop();
+        self.terminate(Terminator::Jump {
+            target: update,
+            args: Vec::new(),
+        });
+
+        self.switch_to(update);
+        if let Some(step) = &statement.update {
+            self.expression(step);
+        }
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(exit);
+    }
+
+    /// Follows a value that may be the exception signal with the branch that propagates it.
+    ///
+    /// **This is what "explicit result propagation" means, written down.** A call returns the
+    /// signal instead of a result, so every call is followed by a test and a branch: into the
+    /// enclosing `catch` if there is one, and out of the function otherwise. The unwinding is
+    /// ordinary control flow the verifier already checks, rather than metadata a backend has to
+    /// remember to honour.
+    ///
+    /// Returns the value, so a caller can use it where the call's result was expected — on the
+    /// path where it is not the signal, which is the only path that continues.
+    fn propagate(&mut self, value: ValueId) -> ValueId {
+        let raised = self.emit(
+            Type::Bool,
+            Op::Unary {
+                op: UnaryOp::IsException,
+                operand: value,
+            },
+        );
+        let unwind = self.new_block();
+        let normal = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition: raised,
+            then_block: unwind,
+            then_args: Vec::new(),
+            else_block: normal,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(unwind);
+        match self.handlers.last().copied() {
+            Some(handler) => self.terminate(Terminator::Jump {
+                target: handler,
+                args: Vec::new(),
+            }),
+            // Nothing here catches it, so it leaves as this function's result and the caller
+            // runs the same test.
+            None => self.terminate(Terminator::Return(Some(value))),
+        }
+
+        self.switch_to(normal);
+        value
+    }
+
+    /// `try { … } catch (e) { … }`.
+    fn try_statement(&mut self, statement: &oxc_ast::ast::TryStatement<'_>) {
+        if statement.finalizer.is_some() {
+            // `finally` runs on *both* paths, including the one that leaves by throwing, and
+            // half of that is worse than none — a `finally` that ran only when nothing threw
+            // would look right in every test that does not throw.
+            self.note("try with finally", statement.span.start);
+        }
+        let Some(catch) = &statement.handler else {
+            self.note("try without catch", statement.span.start);
+            return;
+        };
+
+        let handler = self.new_block();
+        let end = self.new_block();
+
+        self.handlers.push(handler);
+        for inner in &statement.block.body {
+            self.statement(inner);
+        }
+        self.handlers.pop();
+        self.terminate(Terminator::Jump {
+            target: end,
+            args: Vec::new(),
+        });
+
+        self.switch_to(handler);
+        let caught = self.emit(Type::Unknown, Op::CaughtValue);
+        if let Some(parameter) = &catch.param {
+            match parameter.pattern.get_identifier_name() {
+                Some(name) => {
+                    let slot = self.declare(name.as_str());
+                    self.bind(name.as_str(), slot, caught);
+                }
+                None => self.note("destructuring catch parameter", catch.span.start),
+            }
+        }
+        for inner in &catch.body.body {
+            self.statement(inner);
+        }
+        self.terminate(Terminator::Jump {
+            target: end,
+            args: Vec::new(),
+        });
+
+        self.switch_to(end);
+    }
+
+    /// `switch`, as a chain of strict comparisons and a run of fall-through blocks.
+    ///
+    /// Two things make it more than a nest of `if`s, and both are observable:
+    ///
+    /// - **Cases fall through.** A body with no `break` continues into the next one, which is
+    ///   why the bodies are a chain rather than branches of a conditional.
+    /// - **`default` is tested last but runs in its source position.** `switch (x) { default:
+    ///   a(); case 1: b(); }` with `x === 1` runs only `b()`, and with anything else runs
+    ///   `a()` *and then* `b()`. Lowering `default` as the final body would be wrong for the
+    ///   second, and treating it as a first-match arm wrong for the first.
+    ///
+    /// The discriminant is evaluated **once**, into a temporary, because the comparisons read
+    /// it repeatedly and `switch (f())` must not call `f` per case.
+    fn switch_statement(&mut self, statement: &oxc_ast::ast::SwitchStatement<'_>) {
+        let slot = self.temporary();
+        let discriminant = self.expression(&statement.discriminant);
+        self.emit_effect(Op::Store {
+            slot,
+            value: discriminant,
+        });
+
+        let bodies: Vec<BlockId> = statement.cases.iter().map(|_| self.new_block()).collect();
+        let end = self.new_block();
+        let default = statement
+            .cases
+            .iter()
+            .position(|case| case.test.is_none())
+            .map(|index| bodies[index]);
+
+        for (index, case) in statement.cases.iter().enumerate() {
+            let Some(test) = &case.test else {
+                // `default` takes no test here; it is where control goes once every test has
+                // failed, which is decided after this loop.
+                continue;
+            };
+            let next = self.new_block();
+            let left = self.emit(Type::Unknown, Op::Load { slot });
+            let right = self.expression(test);
+            let matched = self.emit(
+                Type::Bool,
+                Op::Compare {
+                    op: CompareOp::StrictEqual,
+                    left,
+                    right,
+                },
+            );
+            self.terminate(Terminator::Branch {
+                condition: matched,
+                then_block: bodies[index],
+                then_args: Vec::new(),
+                else_block: next,
+                else_args: Vec::new(),
+            });
+            self.switch_to(next);
+        }
+        // Every test failed.
+        self.terminate(Terminator::Jump {
+            target: default.unwrap_or(end),
+            args: Vec::new(),
+        });
+
+        self.breaks.push(end);
+        for (index, case) in statement.cases.iter().enumerate() {
+            self.switch_to(bodies[index]);
+            for inner in &case.consequent {
+                self.statement(inner);
+            }
+            // Falls into the next body, or out. A body that already returned or broke is
+            // terminated, and `terminate` leaves it alone.
+            self.terminate(Terminator::Jump {
+                target: bodies.get(index + 1).copied().unwrap_or(end),
+                args: Vec::new(),
+            });
+        }
+        self.breaks.pop();
+        self.switch_to(end);
+    }
+
+    /// Binds every function declared in `statements`, before any of them runs.
+    ///
+    /// **A function declaration is usable above its own text.** `f(); function f() {}` is
+    /// ordinary JavaScript and the whole of test262's own harness depends on it — `assert.js`
+    /// defines helpers below the code that calls them. Lowering declarations where they appear
+    /// left the name unbound until control reached it, so every one of the 12,719 cases was
+    /// refused for the same reason.
+    ///
+    /// Only the declarations at this level. A function inside a block is hoisted to that
+    /// block's scope, which needs block scoping the lowering does not model, so those are left
+    /// where they are and still refused — visibly, rather than bound in the wrong scope.
+    fn hoist(&mut self, statements: &[Statement<'_>]) {
+        let named: Vec<(String, &oxc_ast::ast::Function<'_>)> = statements
+            .iter()
+            .filter_map(|statement| {
+                let Statement::FunctionDeclaration(declaration) = statement else {
+                    return None;
+                };
+                let name = declaration
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+                Some((name, declaration.as_ref()))
+            })
+            .collect();
+
+        // **Every name first, then every body.** One pass would lower a function before a
+        // declaration further down the list had been declared, so a reference to it would
+        // resolve to nothing and become a global — which is exactly what happened when
+        // test262's `assert.js` was concatenated ahead of the `sta.js` that defines
+        // `Test262Error`.
+        //
+        // Binding before lowering is also what lets a function refer to *itself*: the closure
+        // captures the cell rather than the empty slot that preceded it.
+        for (name, _) in &named {
+            let slot = self.declare(name);
+            if self.shared.contains(name) {
+                self.make_cell(slot);
+            }
+        }
+
+        for (name, declaration) in &named {
+            let (id, captures) = self.lower_function(
+                name,
+                &declaration.params,
+                declaration.body.as_deref(),
+                None,
+                true,
+            );
+            let closure = self.close_over(id, &captures);
+            let slot = self.declare(name);
+            self.write(slot, closure);
         }
     }
 
@@ -250,7 +854,109 @@ impl Lowering {
         }
     }
 
+    /// Reads a variable, going through its cell when it has one.
+    ///
+    /// Every read of a local goes through here, so a shared variable cannot be read directly by
+    /// some path that forgot — which would produce a stale value rather than a failure.
+    fn read(&mut self, slot: u32) -> ValueId {
+        let held = self.emit(Type::Unknown, Op::Load { slot });
+        if self.scope().cells.contains(&slot) {
+            return self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object: held,
+                    key: PropertyKey::new(CELL_KEY),
+                },
+            );
+        }
+        held
+    }
+
+    /// Writes a variable, through its cell when it has one.
+    fn write(&mut self, slot: u32, value: ValueId) {
+        if self.scope().cells.contains(&slot) {
+            let cell = self.emit(Type::Unknown, Op::Load { slot });
+            self.emit_effect(Op::PropertyStore {
+                object: cell,
+                key: PropertyKey::new(CELL_KEY),
+                value,
+            });
+            return;
+        }
+        self.emit_effect(Op::Store { slot, value });
+    }
+
+    /// Binds a freshly declared variable to its first value.
+    ///
+    /// A variable closures must share gets its cell here, at the declaration — not where it is
+    /// later resolved. A captured name already holds the cell the enclosing scope made, and
+    /// making a second one at the use site would hand the closure a private copy, which is
+    /// precisely the bug cells exist to fix.
+    fn bind(&mut self, name: &str, slot: u32, value: ValueId) {
+        if self.shared.contains(name) {
+            self.make_cell(slot);
+        }
+        self.write(slot, value);
+    }
+
+    /// Gives `slot` a fresh cell, for a variable closures must share rather than copy.
+    ///
+    /// Called where the variable is *declared*, not where it is resolved: a captured name
+    /// already holds the cell the enclosing scope made, and making a second one there would
+    /// give the closure a private copy — exactly the bug this exists to fix.
+    fn make_cell(&mut self, slot: u32) {
+        let shape = crisol_value::Shapes::new().root();
+        let cell = self.emit(Type::Object(None), Op::CreateObject { shape });
+        self.emit_effect(Op::Store { slot, value: cell });
+        self.scope_mut().cells.insert(slot);
+    }
+
+    /// Whether `name` names a binding anywhere in scope.
+    ///
+    /// A name that resolves nowhere is a **global**, not a new local. Treating it as a local is
+    /// what made `Object` a fresh empty variable rather than something the runtime provides,
+    /// so every test that used a builtin compared against `undefined`.
+    /// Binds `arguments` in the nearest enclosing function that has one, on first mention.
+    ///
+    /// **Lazily, and that is the point.** A function that never names `arguments` keeps the
+    /// slot numbering it had before the feature existed, and its prologue builds nothing.
+    /// Declaring the slot in every function shifted every parameter down by one and broke
+    /// closures — visibly only under GC stress, because the damage was to the frame the
+    /// collector reads rather than to any value a test printed.
+    ///
+    /// Returns the slot in the *current* scope, which for an arrow is the capture the ordinary
+    /// machinery just created.
+    fn bind_arguments(&mut self) -> Option<u32> {
+        let owner = *self.binds_arguments.last()?;
+        // Declared in the owning scope, which is the innermost one belonging to that function.
+        let depth = self
+            .scopes
+            .iter()
+            .rposition(|scope| scope.function == owner)?;
+        let next = self.scopes[depth].next_slot;
+        self.scopes[depth].next_slot += 1;
+        self.scopes[depth]
+            .slots
+            .insert("arguments".to_owned(), next);
+        self.functions[owner].arguments_slot = Some(next);
+        // Now resolve it from here: inside the owner that is the slot just made, and inside an
+        // arrow it walks out and becomes a capture, exactly as `this` does.
+        Some(self.slot("arguments"))
+    }
+
+    fn resolves(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope.slots.contains_key(name))
+    }
+
     fn slot(&mut self, name: &str) -> u32 {
+        if name == "arguments"
+            && !self.resolves(name)
+            && let Some(slot) = self.bind_arguments()
+        {
+            return slot;
+        }
         if let Some(slot) = self.scope().slots.get(name) {
             return *slot;
         }
@@ -267,6 +973,11 @@ impl Lowering {
         let slot = self.declare(name);
         if captured {
             self.scope_mut().captures.push((name.to_owned(), slot));
+            if self.shared.contains(name) {
+                // The value arriving is the *cell* the enclosing scope made, not a copy of
+                // what was in it — which is what makes a write here visible out there.
+                self.scope_mut().cells.insert(slot);
+            }
         }
         slot
     }
@@ -317,20 +1028,7 @@ impl Lowering {
                 self.expression(&statement.expression);
             }
             Statement::VariableDeclaration(declaration) => {
-                for declarator in &declaration.declarations {
-                    let Some(name) = declarator.id.get_identifier_name() else {
-                        self.note("destructuring declaration", declarator.span.start);
-                        continue;
-                    };
-                    let value = match &declarator.init {
-                        Some(init) => self.expression(init),
-                        None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
-                    };
-                    // `declare`, not `slot`: a `let` shadows an outer binding rather than
-                    // capturing it.
-                    let slot = self.declare(name.as_str());
-                    self.emit_effect(Op::Store { slot, value });
-                }
+                self.variable_declaration(declaration);
             }
             Statement::ReturnStatement(statement) => {
                 let value = statement
@@ -392,13 +1090,68 @@ impl Lowering {
                 });
 
                 self.switch_to(body);
+                self.breaks.push(exit);
+                self.continues.push(header);
                 self.statement(&statement.body);
+                self.breaks.pop();
+                self.continues.pop();
                 self.terminate(Terminator::Jump {
                     target: header,
                     args: Vec::new(),
                 });
 
                 self.switch_to(exit);
+            }
+            Statement::ForStatement(statement) => self.for_statement(statement),
+            Statement::ForInStatement(statement) => self.for_in_statement(statement),
+            Statement::ForOfStatement(statement) => self.for_of_statement(statement),
+            Statement::DoWhileStatement(statement) => {
+                let body = self.new_block();
+                let header = self.new_block();
+                let exit = self.new_block();
+                // Straight into the body: `do … while` runs it once before testing anything,
+                // which is the whole difference from `while`.
+                self.terminate(Terminator::Jump {
+                    target: body,
+                    args: Vec::new(),
+                });
+
+                self.switch_to(body);
+                self.breaks.push(exit);
+                // `continue` goes to the *test*, not back to the top — it ends this iteration
+                // rather than skipping the condition.
+                self.continues.push(header);
+                self.statement(&statement.body);
+                self.breaks.pop();
+                self.continues.pop();
+                self.terminate(Terminator::Jump {
+                    target: header,
+                    args: Vec::new(),
+                });
+
+                self.switch_to(header);
+                let condition = self.expression(&statement.test);
+                self.terminate(Terminator::Branch {
+                    condition,
+                    then_block: body,
+                    then_args: Vec::new(),
+                    else_block: exit,
+                    else_args: Vec::new(),
+                });
+
+                self.switch_to(exit);
+            }
+            Statement::ContinueStatement(statement) => {
+                if statement.label.is_some() {
+                    self.note("labelled continue", statement.span.start);
+                } else if let Some(target) = self.continues.last().copied() {
+                    self.terminate(Terminator::Jump {
+                        target,
+                        args: Vec::new(),
+                    });
+                } else {
+                    self.note("continue outside a loop", statement.span.start);
+                }
             }
             Statement::BlockStatement(block) => {
                 // No scope of its own: locals are slots keyed by name, so a shadowing `let`
@@ -410,30 +1163,36 @@ impl Lowering {
             }
             Statement::ThrowStatement(statement) => {
                 let value = self.expression(&statement.argument);
-                self.terminate(Terminator::Throw(value));
-            }
-            Statement::FunctionDeclaration(declaration) => {
-                let name = declaration
-                    .id
-                    .as_ref()
-                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                let (id, names) = self.lower_function(
-                    &name,
-                    &declaration.params,
-                    declaration.body.as_deref(),
-                    None,
-                    true,
+                // An operation and then the ordinary propagation, rather than a terminator of
+                // its own. A `throw` inside a `try` has to reach the handler, and giving it a
+                // second path to there is how one of them ends up missing a case.
+                let signal = self.emit(
+                    Type::Unknown,
+                    Op::Unary {
+                        op: UnaryOp::Throw,
+                        operand: value,
+                    },
                 );
-                let closure = self.close_over(id, &names);
-                // A declaration binds its name in the enclosing scope. Hoisting is not modelled
-                // — the binding appears where the declaration does, so a call before it reads
-                // an unset slot rather than working. Recorded rather than silently half-right.
-                self.note("function declaration hoisting", declaration.span.start);
-                let slot = self.declare(&name);
-                self.emit_effect(Op::Store {
-                    slot,
-                    value: closure,
-                });
+                self.propagate(signal);
+            }
+            Statement::TryStatement(statement) => self.try_statement(statement),
+            // Already bound by `hoist`, before any statement in this list ran.
+            Statement::FunctionDeclaration(_) => {}
+            Statement::SwitchStatement(switch) => self.switch_statement(switch),
+            Statement::BreakStatement(statement) => {
+                if statement.label.is_some() {
+                    // A labelled break leaves a named construct, which needs the label to name
+                    // a block. Refused rather than treated as an unlabelled one, which would
+                    // leave the wrong construct.
+                    self.note("labelled break", statement.span.start);
+                } else if let Some(target) = self.breaks.last().copied() {
+                    self.terminate(Terminator::Jump {
+                        target,
+                        args: Vec::new(),
+                    });
+                } else {
+                    self.note("break outside a switch or loop", statement.span.start);
+                }
             }
             Statement::ClassDeclaration(class) => {
                 let name = class
@@ -442,7 +1201,7 @@ impl Lowering {
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
                 let value = self.class(class, &name);
                 let slot = self.declare(&name);
-                self.emit_effect(Op::Store { slot, value });
+                self.bind(&name, slot, value);
             }
             Statement::EmptyStatement(_) => {}
             other => {
@@ -470,8 +1229,21 @@ impl Lowering {
                 if identifier.name == "undefined" {
                     return self.emit(Type::Undefined, Op::Const(Constant::Undefined));
                 }
-                let slot = self.slot(identifier.name.as_str());
-                self.emit(Type::Unknown, Op::Load { slot })
+                // `arguments` resolves to a binding that does not exist until it is asked
+                // for, so the check has to admit it — otherwise the first mention falls
+                // through to a global load and reports the binding missing that it was about
+                // to create.
+                if self.resolves(identifier.name.as_str())
+                    || (identifier.name == "arguments" && !self.binds_arguments.is_empty())
+                {
+                    let slot = self.slot(identifier.name.as_str());
+                    return self.read(slot);
+                }
+                let name = PropertyKey::new(identifier.name.as_str());
+                let value = self.emit(Type::Unknown, Op::GlobalLoad { name });
+                // A missing global is a `ReferenceError`, so the read can throw and has to be
+                // followed by the same check a call is.
+                self.propagate(value)
             }
             Expression::BinaryExpression(binary) => self.binary(binary),
             Expression::AssignmentExpression(assignment) => {
@@ -483,15 +1255,31 @@ impl Lowering {
                 match &assignment.left {
                     oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
                         let slot = self.slot(identifier.name.as_str());
-                        self.emit_effect(Op::Store { slot, value });
+                        self.write(slot, value);
                     }
                     oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) => {
                         let object = self.expression(&member.object);
-                        self.emit_effect(Op::PropertyStore {
-                            object,
-                            key: PropertyKey::new(member.property.name.as_str()),
-                            value,
-                        });
+                        let outcome = self.emit(
+                            Type::Unknown,
+                            Op::PropertyStore {
+                                object,
+                                key: PropertyKey::new(member.property.name.as_str()),
+                                value,
+                            },
+                        );
+                        self.propagate(outcome);
+                    }
+                    oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) => {
+                        // Evaluation order matters and is observable: the object, then the
+                        // key, then the value — which is already in hand, because the right
+                        // side was evaluated above. That is wrong for `a[f()] = g()` if `f`
+                        // and `g` both have effects, and is recorded rather than reordered
+                        // silently.
+                        let object = self.expression(&member.object);
+                        let key = self.expression(&member.expression);
+                        let outcome =
+                            self.emit(Type::Unknown, Op::ComputedStore { object, key, value });
+                        self.propagate(outcome);
                     }
                     _ => self.note("assignment target", assignment.span.start),
                 }
@@ -499,13 +1287,17 @@ impl Lowering {
             }
             Expression::StaticMemberExpression(member) => {
                 let object = self.expression(&member.object);
-                self.emit(
+                let value = self.emit(
                     Type::Unknown,
                     Op::PropertyLoad {
                         object,
                         key: PropertyKey::new(member.property.name.as_str()),
                     },
-                )
+                );
+                // Reading a property of `null` throws, so this is followed by the same check a
+                // call is. Every operation that can raise gets one — that is what makes the
+                // unwinding visible in the graph rather than implied (D-104).
+                self.propagate(value)
             }
             Expression::CallExpression(call) => {
                 // A method call must pass its receiver. `o.m()` has `this === o` inside `m`,
@@ -545,14 +1337,15 @@ impl Lowering {
                         }
                     }
                 }
-                self.emit(
+                let result = self.emit(
                     Type::Unknown,
                     Op::Call {
                         callee,
                         this_value,
                         args,
                     },
-                )
+                );
+                self.propagate(result)
             }
             Expression::ObjectExpression(object) => self.object(object),
             Expression::FunctionExpression(function) => {
@@ -600,7 +1393,8 @@ impl Lowering {
                         }
                     }
                 }
-                self.emit(Type::Object(None), Op::Construct { callee, args })
+                let result = self.emit(Type::Object(None), Op::Construct { callee, args });
+                self.propagate(result)
             }
             Expression::ClassExpression(class) => {
                 let name = class
@@ -611,29 +1405,99 @@ impl Lowering {
             }
             Expression::ThisExpression(_) => {
                 let slot = self.slot("this");
-                self.emit(Type::Unknown, Op::Load { slot })
+                self.read(slot)
             }
             Expression::UnaryExpression(unary) => self.unary(unary),
+            Expression::TemplateLiteral(template) => self.template(template),
+            Expression::RegExpLiteral(literal) => {
+                // The pattern is compiled when the literal is evaluated, so an invalid one
+                // raises a `SyntaxError` there rather than inside whatever later called `test`.
+                let regexp = self.emit(
+                    Type::Object(None),
+                    Op::CreateRegExp {
+                        source: literal.regex.pattern.text.to_string(),
+                        flags: literal.regex.flags.to_string(),
+                    },
+                );
+                self.propagate(regexp)
+            }
             Expression::LogicalExpression(logical) => self.logical(logical),
             Expression::ConditionalExpression(conditional) => self.conditional(conditional),
             Expression::ArrayExpression(array) => {
                 let mut elements = Vec::with_capacity(array.elements.len());
+                // **The leading run is built in one go and the rest is appended.** An array
+                // with no spread costs exactly what it did before — one `CreateArray` — and
+                // only what follows a spread pays for being appended one piece at a time.
+                let mut spreading = false;
+                let mut result = None;
                 for element in &array.elements {
-                    match element.as_expression() {
-                        Some(expression) => elements.push(self.expression(expression)),
-                        None => {
-                            // A hole in `[1, , 3]`, or a spread. Holes are not `undefined`
-                            // (D-64) and the IR has no way to say so yet, so this is recorded
-                            // rather than filled in with a value that would read the same and
-                            // answer `in` differently.
-                            self.note("array hole or spread", array.span.start);
+                    match element {
+                        ArrayExpressionElement::SpreadElement(spread) => {
+                            let array = *result.get_or_insert_with(|| {
+                                self.emit(
+                                    Type::Object(None),
+                                    Op::CreateArray {
+                                        elements: std::mem::take(&mut elements),
+                                    },
+                                )
+                            });
+                            let value = self.expression(&spread.argument);
+                            let extended = self.emit(
+                                Type::Undefined,
+                                Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: true,
+                                },
+                            );
+                            self.propagate(extended);
+                            spreading = true;
+                        }
+                        // A hole in `[1, , 3]`. **Not a spread and not `undefined`** (D-64):
+                        // the IR still has no way to say "absent", so this is recorded rather
+                        // than filled in with a value that reads the same and answers `in`
+                        // differently.
+                        ArrayExpressionElement::Elision(_) => {
+                            self.note("array hole", array.span.start);
                             let placeholder = self.placeholder();
-                            elements.push(placeholder);
+                            if spreading {
+                                let array = result.unwrap_or(placeholder);
+                                self.emit_effect(Op::ArrayExtend {
+                                    array,
+                                    value: placeholder,
+                                    spread: false,
+                                });
+                            } else {
+                                elements.push(placeholder);
+                            }
+                        }
+                        other => {
+                            let Some(expression) = other.as_expression() else {
+                                continue;
+                            };
+                            let value = self.expression(expression);
+                            if let Some(array) = result {
+                                self.emit_effect(Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: false,
+                                });
+                            } else {
+                                elements.push(value);
+                            }
                         }
                     }
                 }
-                self.emit(Type::Object(None), Op::CreateArray { elements })
+                result
+                    .unwrap_or_else(|| self.emit(Type::Object(None), Op::CreateArray { elements }))
             }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                let value = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+                self.propagate(value)
+            }
+            Expression::UpdateExpression(update) => self.update(update),
             Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression),
             other => {
                 self.note(expression_kind(other), 0);
@@ -672,7 +1536,10 @@ impl Lowering {
             BinaryOperator::ShiftLeft => BinaryOp::ShiftLeft,
             BinaryOperator::ShiftRight => BinaryOp::ShiftRight,
             BinaryOperator::ShiftRightZeroFill => BinaryOp::UnsignedShiftRight,
-            // `==`, `!=`, `in`, `instanceof` — each needs machinery this does not have yet.
+            BinaryOperator::Instanceof => BinaryOp::InstanceOf,
+            BinaryOperator::Equality => BinaryOp::LooseEqual,
+            BinaryOperator::Inequality => BinaryOp::LooseNotEqual,
+            BinaryOperator::In => BinaryOp::In,
             _ => {
                 self.note(
                     &format!("binary operator {}", operator.as_str()),
@@ -688,10 +1555,21 @@ impl Lowering {
         // typing it `Number` would let codegen emit a float add for a string concatenation.
         let ty = if op.is_always_numeric() {
             Type::Number
+        } else if op.is_always_boolean() {
+            Type::Bool
         } else {
+            // `+` alone, which may concatenate — typing it `Number` would let codegen emit a
+            // float add for a string concatenation.
             Type::Unknown
         };
-        self.emit(ty, Op::Binary { op, left, right })
+        let result = self.emit(ty, Op::Binary { op, left, right });
+        // **Only `in` can raise**, so only `in` pays for the check. `instanceof` and `+` answer
+        // for every input they are given, and the other operators coerce with `ToNumber`, which
+        // has no failing case over the values this engine has.
+        if matches!(op, BinaryOp::In) {
+            return self.propagate(result);
+        }
+        result
     }
 
     fn unary(&mut self, unary: &UnaryExpression<'_>) -> ValueId {
@@ -705,10 +1583,7 @@ impl Lowering {
             // does not throw on an undeclared identifier.
             UnaryOperator::Typeof => (UnaryOp::TypeOf, Type::String),
             UnaryOperator::Void => (UnaryOp::Void, Type::Undefined),
-            UnaryOperator::Delete => {
-                self.note("delete operator", unary.span.start);
-                return self.placeholder();
-            }
+            UnaryOperator::Delete => return self.delete(unary),
         };
         let operand = self.expression(&unary.argument);
         self.emit(ty, Op::Unary { op, operand })
@@ -861,7 +1736,11 @@ impl Lowering {
         binds_this: bool,
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
-        let function = Function::new(name);
+        let mut function = Function::new(name);
+        // Stamped here rather than left at zero: `verify_module` checks it against the
+        // position, so a missed one fails the build instead of producing a closure that runs
+        // whichever function happens to be first.
+        function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
         let entry = function.entry;
         self.functions.push(function);
         self.scopes.push(Scope {
@@ -871,19 +1750,39 @@ impl Lowering {
             slots: HashMap::new(),
             next_slot: 0,
             captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
         });
 
         if binds_this {
             // Ahead of the parameters so it is slot 0 in every ordinary function. `this` is a
             // reserved word, so no source name can collide with it.
-            self.declare("this");
+            //
+            // Recorded on the function rather than left to that ordering: the backend has to
+            // know which slot to bind the incoming `this` to, and inferring it from the
+            // position would break silently the day anything is declared earlier.
+            let this_slot = self.declare("this");
+            self.functions[index].this_slot = Some(this_slot);
+
+            // `arguments` is **not** declared here. It is bound lazily, the first time a body
+            // names it (see `slot`), so a function that never mentions it has exactly the slot
+            // numbering it had before `arguments` existed. Declaring it eagerly shifted every
+            // parameter down by one in every function, which broke closures in a way that only
+            // showed under GC stress.
+            self.binds_arguments.push(index);
         }
 
         let mut parameter_slots = Vec::with_capacity(params.items.len());
+        let mut shared_parameters = Vec::new();
         for param in &params.items {
             match param.pattern.get_identifier_name() {
                 // `declare`, not `slot`: a parameter shadows an outer binding of the same name.
-                Some(param_name) => parameter_slots.push(self.declare(param_name.as_str())),
+                Some(param_name) => {
+                    let slot = self.declare(param_name.as_str());
+                    if self.shared.contains(param_name.as_str()) {
+                        shared_parameters.push(slot);
+                    }
+                    parameter_slots.push(slot);
+                }
                 None => {
                     self.note("destructuring parameter", param.span.start);
                     // Still consumes a position, or every later parameter would shift down one
@@ -894,7 +1793,17 @@ impl Lowering {
             }
         }
 
+        // A shared parameter arrives as a plain value — the caller has no cell to pass — so it
+        // is wrapped here, before any of the body can read it. Read first, then make the cell:
+        // `make_cell` overwrites the slot, and the incoming argument is what goes inside.
+        for slot in shared_parameters {
+            let arrived = self.emit(Type::Unknown, Op::Load { slot });
+            self.make_cell(slot);
+            self.write(slot, arrived);
+        }
+
         if let Some(body) = body {
+            self.hoist(&body.statements);
             for statement in &body.statements {
                 self.statement(statement);
             }
@@ -908,6 +1817,11 @@ impl Lowering {
             self.terminate(Terminator::Return(None));
         }
 
+        if binds_this {
+            // Paired with the push above. Without this an arrow lowered after a nested function
+            // would look up `arguments` in a function that had already finished.
+            self.binds_arguments.pop();
+        }
         let scope = self.scopes.pop().expect("just pushed");
         let names: Vec<String> = scope
             .captures
@@ -1015,6 +1929,7 @@ impl Lowering {
     fn implicit_constructor(&mut self, name: &str) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
+        function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
         let entry = function.entry;
         function.captures = Vec::new();
         self.functions.push(function);
@@ -1025,6 +1940,7 @@ impl Lowering {
             slots: HashMap::new(),
             next_slot: 0,
             captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
         });
         self.declare("this");
         self.terminate(Terminator::Return(None));
@@ -1042,6 +1958,69 @@ impl Lowering {
     fn temporary(&mut self) -> u32 {
         let name = format!(" tmp{}", self.scope().next_slot);
         self.declare(&name)
+    }
+
+    /// A template literal: `` `a${b}c` ``.
+    ///
+    /// Lowered as concatenation, which is what it is. **The first piece is always a string**,
+    /// even when the template starts with a substitution — `` `${1}${2}` `` is `"12"` and not
+    /// `3`, and starting from the empty string rather than the first substitution is the whole
+    /// of why.
+    ///
+    /// A template with no substitutions is a single constant, so `` `abc` `` costs nothing that
+    /// `"abc"` does not.
+    fn template(&mut self, template: &oxc_ast::ast::TemplateLiteral<'_>) -> ValueId {
+        let piece = |quasi: &oxc_ast::ast::TemplateElement<'_>| {
+            quasi
+                .value
+                .cooked
+                .as_ref()
+                .map_or_else(|| quasi.value.raw.to_string(), ToString::to_string)
+        };
+        let mut quasis = template.quasis.iter();
+        let first = quasis.next().map(piece).unwrap_or_default();
+        let mut result = self.emit(Type::String, Op::Const(Constant::String(first)));
+
+        for (expression, quasi) in template.expressions.iter().zip(quasis) {
+            let value = self.expression(expression);
+            result = self.emit(
+                Type::String,
+                Op::Binary {
+                    op: BinaryOp::Add,
+                    left: result,
+                    right: value,
+                },
+            );
+            let text = piece(quasi);
+            // An empty trailing piece adds nothing, so it is not emitted — `` `${a}${b}` ``
+            // should not cost two concatenations with `""`.
+            if !text.is_empty() {
+                let tail = self.emit(Type::String, Op::Const(Constant::String(text)));
+                result = self.emit(
+                    Type::String,
+                    Op::Binary {
+                        op: BinaryOp::Add,
+                        left: result,
+                        right: tail,
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    /// A property key that has to be evaluated: `{[expr]: v}` or `{1: v}`.
+    ///
+    /// `None` for a key this cannot evaluate, which the caller reports.
+    fn property_key_value(&mut self, key: &Key<'_>) -> Option<ValueId> {
+        match key {
+            Key::NumericLiteral(literal) => {
+                Some(self.emit(Type::Number, Op::Const(Constant::Number(literal.value))))
+            }
+            other => other
+                .as_expression()
+                .map(|expression| self.expression(expression)),
+        }
     }
 
     fn object(&mut self, object: &oxc_ast::ast::ObjectExpression<'_>) -> ValueId {
@@ -1064,19 +2043,38 @@ impl Lowering {
             match property {
                 ObjectPropertyKind::ObjectProperty(property) => {
                     let name = match &property.key {
-                        Key::StaticIdentifier(identifier) => identifier.name.to_string(),
-                        Key::StringLiteral(literal) => literal.value.to_string(),
-                        _ => {
-                            self.note("computed property key", property.span.start);
-                            continue;
-                        }
+                        Key::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
+                        Key::StringLiteral(literal) => Some(literal.value.to_string()),
+                        // A computed or numeric key is not known here, so it is stored through
+                        // the computed path — which is also where the number-to-name rule
+                        // lives, so `{1: x}` and `o[1] = x` cannot disagree about the name.
+                        _ => None,
                     };
-                    let value = self.expression(&property.value);
-                    self.emit_effect(Op::PropertyStore {
-                        object: result,
-                        key: PropertyKey::new(&name),
-                        value,
-                    });
+                    match name {
+                        Some(name) => {
+                            let value = self.expression(&property.value);
+                            self.emit_effect(Op::PropertyStore {
+                                object: result,
+                                key: PropertyKey::new(&name),
+                                value,
+                            });
+                        }
+                        None => {
+                            let Some(key) = self.property_key_value(&property.key) else {
+                                self.note("property key", property.span.start);
+                                continue;
+                            };
+                            // **The key is evaluated before the value**, which is the order the
+                            // specification gives and is observable whenever either has an
+                            // effect.
+                            let value = self.expression(&property.value);
+                            self.emit_effect(Op::ComputedStore {
+                                object: result,
+                                key,
+                                value,
+                            });
+                        }
+                    }
                 }
                 ObjectPropertyKind::SpreadProperty(spread) => {
                     self.note("object spread", spread.span.start);
@@ -1090,15 +2088,8 @@ impl Lowering {
 /// A statement's kind, for the unsupported list.
 fn kind_of(statement: &Statement<'_>) -> &'static str {
     match statement {
-        Statement::ForStatement(_) => "for statement",
-        Statement::ForInStatement(_) => "for-in statement",
-        Statement::ForOfStatement(_) => "for-of statement",
         Statement::FunctionDeclaration(_) => "function declaration",
         Statement::ClassDeclaration(_) => "class declaration",
-        Statement::TryStatement(_) => "try statement",
-        Statement::SwitchStatement(_) => "switch statement",
-        Statement::BreakStatement(_) => "break statement",
-        Statement::ContinueStatement(_) => "continue statement",
         Statement::ImportDeclaration(_) => "import declaration",
         _ => "statement",
     }
@@ -1110,13 +2101,22 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         Expression::ArrowFunctionExpression(_) => "arrow function",
         Expression::FunctionExpression(_) => "function expression",
         Expression::ArrayExpression(_) => "array literal",
-        Expression::ComputedMemberExpression(_) => "computed member access",
         Expression::UnaryExpression(_) => "unary expression",
+        Expression::UpdateExpression(_) => "update expression",
         Expression::LogicalExpression(_) => "logical expression",
         Expression::ConditionalExpression(_) => "conditional expression",
-        Expression::TemplateLiteral(_) => "template literal",
         Expression::AwaitExpression(_) => "await expression",
         Expression::NewExpression(_) => "new expression",
-        _ => "expression",
+        Expression::StringLiteral(_) => "string literal",
+        Expression::BigIntLiteral(_) => "bigint literal",
+        Expression::SequenceExpression(_) => "comma expression",
+        Expression::TaggedTemplateExpression(_) => "tagged template",
+        Expression::PrivateFieldExpression(_) => "private field",
+        Expression::Super(_) => "super",
+        Expression::YieldExpression(_) => "yield expression",
+        Expression::ChainExpression(_) => "optional chain",
+        // A name rather than "expression": the unsupported list is read to decide what to
+        // implement next, and a bucket everything unrecognised falls into says nothing.
+        _ => "an expression this compiler does not name yet",
     }
 }
