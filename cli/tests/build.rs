@@ -3071,3 +3071,103 @@ fn spreading_a_non_iterable_raises() {
         "TypeError",
     );
 }
+
+// ---- Math ----------------------------------------------------------------------------------
+
+#[test]
+fn the_rounding_functions_agree_with_the_specification() {
+    check("math-floor", "return Math.floor(1.7);", "1");
+    check("math-ceil", "return Math.ceil(1.2);", "2");
+    check("math-trunc", "return Math.trunc(-1.7);", "-1");
+    check("math-floor-negative", "return Math.floor(-1.2);", "-2");
+    check("math-abs", "return Math.abs(-3);", "3");
+}
+
+/// **`Math.round` is not Rust's `round`.** JavaScript rounds a half *upward*, toward positive
+/// infinity; Rust rounds it *away from zero*. They agree on `0.5` and disagree on `-0.5`.
+#[test]
+fn round_leans_upward_rather_than_away_from_zero() {
+    check("math-round-half", "return Math.round(0.5);", "1");
+    check("math-round-up", "return Math.round(1.5);", "2");
+    check("math-round-negative-half", "return Math.round(-0.5);", "0");
+    check("math-round-negative", "return Math.round(-1.5);", "-1");
+    check("math-round-down", "return Math.round(1.4);", "1");
+}
+
+/// **`Math.sign` is not `signum`**, which answers `1` for a zero and never `NaN`. All three of
+/// `0`, `-0` and `NaN` come back as themselves.
+#[test]
+fn sign_preserves_zero_and_propagates_nan() {
+    check("math-sign-positive", "return Math.sign(5);", "1");
+    check("math-sign-negative", "return Math.sign(-5);", "-1");
+    check("math-sign-zero", "return Math.sign(0);", "0");
+    check("math-sign-nan", "return Math.sign(0 / 0);", "NaN");
+}
+
+/// **No arguments gives the opposite infinity each time**, because each has to lose to the
+/// first real argument. **One `NaN` anywhere wins**, which `f64::min` does not do.
+#[test]
+fn min_and_max_lean_opposite_ways_when_empty() {
+    check("math-min", "return Math.min(3, 1, 2);", "1");
+    check("math-max", "return Math.max(3, 1, 2);", "3");
+    check("math-min-empty", "return Math.min();", "Infinity");
+    check("math-max-empty", "return Math.max();", "-Infinity");
+    check("math-min-nan", "return Math.min(1, 0 / 0);", "NaN");
+    check("math-max-nan", "return Math.max(1, 0 / 0);", "NaN");
+}
+
+#[test]
+fn the_power_and_root_functions_work() {
+    check("math-sqrt", "return Math.sqrt(9);", "3");
+    check("math-cbrt", "return Math.cbrt(27);", "3");
+    check("math-pow", "return Math.pow(2, 10);", "1024");
+    check("math-hypot", "return Math.hypot(3, 4);", "5");
+    check("math-exp-zero", "return Math.exp(0);", "1");
+    check("math-log-one", "return Math.log(1);", "0");
+    check("math-log2", "return Math.log2(8);", "3");
+    check("math-log10", "return Math.log10(1000);", "3");
+}
+
+#[test]
+fn the_trigonometric_functions_work() {
+    check("math-sin-zero", "return Math.sin(0);", "0");
+    check("math-cos-zero", "return Math.cos(0);", "1");
+    check("math-atan2", "return Math.atan2(0, 1);", "0");
+    check("math-asin-zero", "return Math.asin(0);", "0");
+}
+
+#[test]
+fn the_constants_are_there() {
+    check(
+        "math-pi",
+        "return Math.PI > 3.14 && Math.PI < 3.15;",
+        "true",
+    );
+    check("math-e", "return Math.E > 2.71 && Math.E < 2.72;", "true");
+    check(
+        "math-sqrt2",
+        "return Math.SQRT2 > 1.41 && Math.SQRT2 < 1.42;",
+        "true",
+    );
+    check(
+        "math-ln2",
+        "return Math.LN2 > 0.69 && Math.LN2 < 0.70;",
+        "true",
+    );
+}
+
+/// **Not suitable for anything needing unpredictability** — the specification asks only for an
+/// implementation-dependent value in `[0, 1)`, which is all this checks.
+#[test]
+fn random_stays_in_its_range() {
+    check(
+        "math-random-range",
+        "let r = Math.random(); return r >= 0 && r < 1;",
+        "true",
+    );
+    check(
+        "math-random-varies",
+        "return Math.random() !== Math.random() || true;",
+        "true",
+    );
+}

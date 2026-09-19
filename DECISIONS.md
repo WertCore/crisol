@@ -3999,3 +3999,34 @@ let one of them quietly produce a one-element array.
 **The corpus snapshot is the review**, and this is what it is for: the dump shows the leading
 `array [v2]`, the `extend v3, ...v4` with its exception branch, and the trailing `extend v3,
 v7`. Reading that is how the lowering was checked, not by trusting that it compiled.
+
+## D-134
+
+**`Math`, and the three places its functions are not their Rust namesakes.**
+
+Status: Accepted
+
+Forty-nine test262 failures were `Math is not defined`. The functions are pure `f64` work with
+nothing to root, so most of them are a one-line macro. The three that are not are the whole
+value of writing this down:
+
+- **`Math.round` is not `f64::round`.** JavaScript rounds a half *upward*, toward positive
+  infinity; Rust rounds it *away from zero*. They agree on `0.5` and disagree on `-0.5`, which
+  is `-0` in JavaScript and `-1` in Rust. `floor(x + 0.5)` is the rule, with the non-finite
+  cases passed through because adding to an infinity would not survive it.
+- **`Math.sign` is not `f64::signum`**, which answers `1.0` for a zero and never `NaN`.
+  JavaScript gives back `0`, `-0` and `NaN` as themselves.
+- **`Math.min`/`max` are not `f64::min`/`max`**, which return the *other* operand when one is
+  `NaN`. In JavaScript one `NaN` anywhere wins. With no arguments each returns the opposite
+  infinity, because each has to lose to the first real argument.
+
+Each of those would have passed a casual reading and failed a specific test, which is why each
+has one.
+
+**`Math.random` is a xorshift generator seeded from the clock, and is not suitable for anything
+needing unpredictability.** The specification asks only for an implementation-dependent value
+in `[0, 1)`, which is what it delivers — said plainly because the name reads like a guarantee
+it is not making.
+
+The constants are defined separately from the functions: they are properties, so they have no
+table entry, and the object they hang on exists only because naming a method created it.

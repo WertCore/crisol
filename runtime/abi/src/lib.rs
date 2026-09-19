@@ -2441,6 +2441,30 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "hasOwn", object_has_own),
     ("Object", "assign", object_assign),
     ("Array", "isArray", array_is_array),
+    ("Math", "abs", math_abs),
+    ("Math", "floor", math_floor),
+    ("Math", "ceil", math_ceil),
+    ("Math", "round", math_round),
+    ("Math", "trunc", math_trunc),
+    ("Math", "sign", math_sign),
+    ("Math", "sqrt", math_sqrt),
+    ("Math", "cbrt", math_cbrt),
+    ("Math", "exp", math_exp),
+    ("Math", "log", math_log),
+    ("Math", "log2", math_log2),
+    ("Math", "log10", math_log10),
+    ("Math", "sin", math_sin),
+    ("Math", "cos", math_cos),
+    ("Math", "tan", math_tan),
+    ("Math", "asin", math_asin),
+    ("Math", "acos", math_acos),
+    ("Math", "atan", math_atan),
+    ("Math", "atan2", math_atan2),
+    ("Math", "pow", math_pow),
+    ("Math", "hypot", math_hypot),
+    ("Math", "min", math_min),
+    ("Math", "max", math_max),
+    ("Math", "random", math_random),
     ("Array", "of", array_of),
 ];
 
@@ -2896,6 +2920,219 @@ extern "C" fn object_assign(
     })
 }
 
+/// The first argument as a number, which is what every one-argument `Math` function takes.
+fn math_argument(argc: u64, argv: *const u64) -> f64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    to_number(unsafe { argument(argc, argv, 0) })
+}
+
+/// Defines a one-argument `Math` function from a plain `f64` operation.
+macro_rules! math_unary {
+    ($name:ident, $doc:expr, $body:expr) => {
+        #[doc = $doc]
+        extern "C" fn $name(
+            _closure: u64,
+            _this_value: u64,
+            _new_target: u64,
+            argc: u64,
+            argv: *const u64,
+        ) -> u64 {
+            let operation: fn(f64) -> f64 = $body;
+            from_number(operation(math_argument(argc, argv)))
+        }
+    };
+}
+
+math_unary!(math_abs, "`Math.abs`.", f64::abs);
+math_unary!(math_floor, "`Math.floor`.", f64::floor);
+math_unary!(math_ceil, "`Math.ceil`.", f64::ceil);
+math_unary!(math_trunc, "`Math.trunc`.", f64::trunc);
+math_unary!(math_sqrt, "`Math.sqrt`.", f64::sqrt);
+math_unary!(math_cbrt, "`Math.cbrt`.", f64::cbrt);
+math_unary!(math_exp, "`Math.exp`.", f64::exp);
+math_unary!(math_log, "`Math.log` — the natural logarithm.", f64::ln);
+math_unary!(math_log2, "`Math.log2`.", f64::log2);
+math_unary!(math_log10, "`Math.log10`.", f64::log10);
+math_unary!(math_sin, "`Math.sin`.", f64::sin);
+math_unary!(math_cos, "`Math.cos`.", f64::cos);
+math_unary!(math_tan, "`Math.tan`.", f64::tan);
+math_unary!(math_asin, "`Math.asin`.", f64::asin);
+math_unary!(math_acos, "`Math.acos`.", f64::acos);
+math_unary!(math_atan, "`Math.atan`.", f64::atan);
+
+/// `Math.round`.
+///
+/// **Not `f64::round`.** JavaScript rounds a half *upward* — toward positive infinity — and
+/// Rust rounds it *away from zero*. They agree on `0.5` and disagree on `-0.5`, which is `-0`
+/// in JavaScript and `-1` in Rust. `floor(x + 0.5)` is the rule, with the non-finite cases
+/// passed through because adding to an infinity or a `NaN` would not survive it.
+extern "C" fn math_round(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = math_argument(argc, argv);
+    if !value.is_finite() {
+        return from_number(value);
+    }
+    from_number((value + 0.5).floor())
+}
+
+/// `Math.sign`.
+///
+/// **Not `f64::signum`**, which answers `1.0` for a zero and never `NaN`. JavaScript preserves
+/// the zero's sign and propagates `NaN`, so all three of `0`, `-0` and `NaN` come back as
+/// themselves.
+extern "C" fn math_sign(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = math_argument(argc, argv);
+    if value.is_nan() || value == 0.0 {
+        return from_number(value);
+    }
+    from_number(if value > 0.0 { 1.0 } else { -1.0 })
+}
+
+/// `Math.atan2(y, x)` — note the order.
+extern "C" fn math_atan2(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let y = to_number(unsafe { argument(argc, argv, 0) });
+    // SAFETY: as above.
+    let x = to_number(unsafe { argument(argc, argv, 1) });
+    from_number(y.atan2(x))
+}
+
+/// `Math.pow`.
+extern "C" fn math_pow(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let base = to_number(unsafe { argument(argc, argv, 0) });
+    // SAFETY: as above.
+    let exponent = to_number(unsafe { argument(argc, argv, 1) });
+    from_number(base.powf(exponent))
+}
+
+/// `Math.hypot`.
+extern "C" fn math_hypot(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let mut total = 0.0;
+    for position in 0..argc as usize {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        let value = to_number(unsafe { argument(argc, argv, position) });
+        total += value * value;
+    }
+    from_number(total.sqrt())
+}
+
+/// `min` and `max`, which differ only in which way they lean.
+///
+/// **No arguments gives the identity, and it is the *opposite* infinity each time**: `min()` is
+/// `Infinity` and `max()` is `-Infinity`, because each has to lose to the first real argument.
+/// **One `NaN` anywhere wins**, which `f64::min` does not do — it returns the other operand.
+fn extremum(argc: u64, argv: *const u64, want_max: bool) -> u64 {
+    let mut best = if want_max {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
+    for position in 0..argc as usize {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        let value = to_number(unsafe { argument(argc, argv, position) });
+        if value.is_nan() {
+            return from_number(f64::NAN);
+        }
+        // `>` and `<` rather than `f64::max`, so `-0` and `0` keep the specification's order:
+        // `Math.max(-0, 0)` is `0` and `Math.min(0, -0)` is `-0`.
+        let better = if want_max {
+            value > best || (value == 0.0 && best == 0.0 && best.is_sign_negative())
+        } else {
+            value < best || (value == 0.0 && best == 0.0 && value.is_sign_negative())
+        };
+        if better {
+            best = value;
+        }
+    }
+    from_number(best)
+}
+
+/// `Math.min`.
+extern "C" fn math_min(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    extremum(argc, argv, false)
+}
+
+/// `Math.max`.
+extern "C" fn math_max(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    extremum(argc, argv, true)
+}
+
+/// `Math.random`, over a xorshift generator seeded from the clock.
+///
+/// **Not suitable for anything that needs unpredictability**, and the specification does not
+/// require it to be — it asks only for an implementation-dependent value in `[0, 1)`. Stated
+/// here because "random" reads like a guarantee it is not making.
+extern "C" fn math_random(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    RANDOM_STATE.with(|cell| {
+        let mut state = cell.get();
+        if state == 0 {
+            state = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x2545_f491_4f6c_dd1d, |since| since.as_nanos() as u64)
+                | 1;
+        }
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        cell.set(state);
+        // The top 53 bits, which is exactly the mantissa a double can hold without rounding.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "53 bits is what an f64 represents exactly"
+        )]
+        let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+        from_number(unit)
+    })
+}
+
 /// `Array.isArray(value)`.
 extern "C" fn array_is_array(
     _closure: u64,
@@ -3151,6 +3388,23 @@ impl Runtime {
                 (self.global_object(globals.handle(), name), cell)
             {
                 self.define(constructor, "prototype", prototype.to_value());
+            }
+        }
+        // `Math`'s constants, which are properties rather than functions and so have no table
+        // entry. The object itself already exists: naming a method in `NAMESPACE_NATIVES` is
+        // what creates it.
+        if let Some(math) = self.global_object(globals.handle(), "Math") {
+            for (name, value) in [
+                ("PI", std::f64::consts::PI),
+                ("E", std::f64::consts::E),
+                ("LN2", std::f64::consts::LN_2),
+                ("LN10", std::f64::consts::LN_10),
+                ("LOG2E", std::f64::consts::LOG2_E),
+                ("LOG10E", std::f64::consts::LOG10_E),
+                ("SQRT2", std::f64::consts::SQRT_2),
+                ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+            ] {
+                self.define(math, name, Value::number(value));
             }
         }
         self.define(globals.handle(), "globalThis", globals.to_value());
@@ -4856,6 +5110,9 @@ pub extern "C" fn crisol_strict_equal(left: u64, right: u64) -> u64 {
 }
 
 thread_local! {
+    /// The generator behind `Math.random`. Zero means "not seeded yet".
+    static RANDOM_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
     /// The value a `throw` is carrying, while it propagates.
     ///
     /// Held here rather than returned alongside the signal because a call returns one word.
