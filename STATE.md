@@ -34,16 +34,16 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**33 passed, 328 failed, 0 crashed, 18 refused.** Regular expressions work, over the
-`JsRegExp` already sitting finished in `crisol-builtins` (D-123).
+**38 passed, 323 failed, 0 crashed, 18 refused.** `JSON` taken from `crisol-builtins`
+(D-124), and `Function`, `String` and `RegExp` now reach the prototypes their instances already
+use (D-125) — `Function.prototype` existed all along and could not be named.
 
-**That crate is tested and unshipped** (D-122): 230 passing tests over `Date`, `JSON`, `Map`,
-`Set`, `Promise`, `Proxy`, descriptors and the iterator protocol, none of it reachable from a
-compiled program, because `crisol-abi` does not depend on it and rewrote a smaller version.
-`Object.defineProperty` now exists twice. Everything in it that does not touch `Realm` — which
-is most of it — can be called directly, and `RegExp` is the first one taken.
+Still unshipped from that crate (D-122), in the order the failures ask for it: `Date` (18),
+`Symbol` (15), `Proxy` (13), `Map` and `Set` (3 each). `Map` and `Set` are harder than they
+look — `JsMap` holds `Value`s the collector cannot see, so they need tracing before they can
+hold anything that moves.
 
-Refusals are down to 18, nearly all array holes (11).
+Refusals are 18, nearly all array holes (11).
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -79,7 +79,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1152 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1163 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

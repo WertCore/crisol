@@ -654,7 +654,58 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("String", to_string_global),
     ("Number", to_number_global),
     ("Boolean", to_boolean_global),
+    ("Function", unconstructable),
+    ("RegExp", make_regexp),
 ];
+
+/// A global that exists so its `prototype` can be reached, but cannot be called.
+///
+/// **`Function` is bound because `Function.prototype` has to be reachable**, not because
+/// `new Function(body)` works — that compiles source at runtime, which this engine does not
+/// do. Calling it raises rather than answering something wrong, and the binding existing is
+/// what lets `Function.prototype.call` be named at all.
+extern "C" fn unconstructable(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    raise("this constructor is not supported", "TypeError")
+}
+
+/// `RegExp(source, flags)` and `new RegExp(source, flags)`.
+extern "C" fn make_regexp(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let first = unsafe { argument(argc, argv, 0) };
+    // **An existing regular expression is re-read through `source`**, so `new RegExp(/a/g)`
+    // copies the pattern rather than stringifying the object into `"/a/g"`.
+    let source = property_text(first, "source")
+        .or_else(|| to_text(first))
+        .unwrap_or_default();
+    // SAFETY: as above.
+    let given = unsafe { argument(argc, argv, 1) };
+    let flags = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
+        property_text(first, "flags").unwrap_or_default()
+    } else {
+        to_text(given).unwrap_or_default()
+    };
+    // SAFETY: both strings are live for the call.
+    unsafe {
+        crisol_create_regexp(
+            source.as_ptr(),
+            source.len() as u64,
+            flags.as_ptr(),
+            flags.len() as u64,
+        )
+    }
+}
 
 /// `new Error(message)` and every error subclass.
 ///
@@ -833,11 +884,18 @@ fn with_pattern<T>(
     Some(outcome)
 }
 
-/// A named property of `object`, as text.
+/// A named property of `object`, as text, or `None` if it is not there.
+///
+/// **Absent has to be `None` and not `"undefined"`.** `to_text` spells every value out,
+/// including `undefined`, so a caller asking whether a property exists would be told yes and
+/// handed the word — which is how `new RegExp("ab+")` came to compile the pattern `undefined`.
 fn property_text(object: u64, name: &str) -> Option<String> {
     let key = name.to_owned();
     // SAFETY: `key` is a live Rust string.
     let bits = unsafe { crisol_property_load(object, key.as_ptr(), key.len() as u64) };
+    if Value::from_bits(bits).kind() == crisol_value::Kind::Undefined {
+        return None;
+    }
     to_text(bits)
 }
 
@@ -1393,6 +1451,8 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "keys", object_keys),
     ("Object", "getOwnPropertyNames", object_own_names),
     ("Object", "defineProperty", object_define_property),
+    ("JSON", "parse", json_parse),
+    ("JSON", "stringify", json_stringify),
     ("Object", "getOwnPropertyDescriptor", object_own_descriptor),
     ("Object", "values", object_values),
     ("Object", "create", object_create),
@@ -2090,13 +2150,20 @@ impl Runtime {
             let function = self.native_function(NATIVES.len() + GLOBAL_NATIVES.len() + index);
             self.define_method(owner, method, function.to_value());
         }
-        // `Array.prototype` is the object every array already inherits from, not a new one —
-        // otherwise `[].map === Array.prototype.map` would be false.
-        if let (Some(array), Some(prototype)) = (
-            self.global_object(globals.handle(), "Array"),
-            ARRAY_PROTOTYPE.with(std::cell::Cell::get),
-        ) {
-            self.define(array, "prototype", prototype.to_value());
+        // Each constructor's `prototype` is the object its instances already inherit from, not
+        // a new one — otherwise `[].map === Array.prototype.map` would be false, and the same
+        // for every other pair.
+        for (name, cell) in [
+            ("Array", ARRAY_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Function", FUNCTION_PROTOTYPE.with(std::cell::Cell::get)),
+            ("String", STRING_PROTOTYPE.with(std::cell::Cell::get)),
+            ("RegExp", REGEXP_PROTOTYPE.with(std::cell::Cell::get)),
+        ] {
+            if let (Some(constructor), Some(prototype)) =
+                (self.global_object(globals.handle(), name), cell)
+            {
+                self.define(constructor, "prototype", prototype.to_value());
+            }
         }
         self.define(globals.handle(), "globalThis", globals.to_value());
         self.define(globals.handle(), "undefined", Value::UNDEFINED);
@@ -3847,15 +3914,11 @@ pub extern "C" fn crisol_typeof(value: u64) -> u64 {
         crisol_value::Kind::String => "string",
         crisol_value::Kind::Symbol => "symbol",
         crisol_value::Kind::Object => {
-            // A closure keeps its function index where no property can reach it, so having one
-            // is what makes an object callable — and callable is what `typeof` reports on.
-            let callable = value
-                .as_address()
-                .map(GcRef::from_address)
-                .is_some_and(|handle| {
-                    with_runtime(|runtime| runtime.heap.internal(handle, 0).is_some())
-                });
-            if callable { "function" } else { "object" }
+            if is_callable(value.to_bits()) {
+                "function"
+            } else {
+                "object"
+            }
         }
     };
     new_string(name)
@@ -4166,4 +4229,179 @@ pub unsafe extern "C" fn crisol_create_regexp(
         });
     });
     object
+}
+
+/// Whether `value` can be called.
+///
+/// A closure keeps its function index where no property can reach it, so **having one is what
+/// makes an object callable** — which is what `typeof` reports on, and what JSON leaves out.
+fn is_callable(value: u64) -> bool {
+    Value::from_bits(value)
+        .as_address()
+        .map(GcRef::from_address)
+        .is_some_and(|handle| with_runtime(|runtime| runtime.heap.internal(handle, 0).is_some()))
+}
+
+/// A heap value as JSON, or `None` for one JSON has no spelling for.
+///
+/// **`undefined` and functions are `None`, not null.** The difference is what makes
+/// `JSON.stringify({a: undefined})` the string `"{}"` rather than `{"a":null}`, while
+/// `JSON.stringify([undefined])` *is* `[null]` — an array cannot drop an element without
+/// changing its length, so the two containers treat the same absence differently.
+///
+/// `visiting` carries the objects above this one, so a cycle is caught rather than followed.
+fn to_json(value: u64, visiting: &mut Vec<GcRef>) -> Result<Option<crisol_builtins::Json>, ()> {
+    let held = Value::from_bits(value);
+    match held.kind() {
+        crisol_value::Kind::Undefined => return Ok(None),
+        crisol_value::Kind::Null => return Ok(Some(crisol_builtins::Json::Null)),
+        crisol_value::Kind::Boolean => {
+            return Ok(Some(crisol_builtins::Json::Bool(
+                held.as_boolean().unwrap_or(false),
+            )));
+        }
+        crisol_value::Kind::String => {
+            return Ok(text_of(value).map(crisol_builtins::Json::String));
+        }
+        _ => {}
+    }
+    if let Some(number) = held.as_number() {
+        // **A non-finite number is `null`**, because JSON has no spelling for `NaN` or an
+        // infinity and refusing the whole document over one would be worse.
+        return Ok(Some(if number.is_finite() {
+            crisol_builtins::Json::Number(number)
+        } else {
+            crisol_builtins::Json::Null
+        }));
+    }
+
+    let Some(handle) = handle_of(value) else {
+        return Ok(None);
+    };
+    if visiting.contains(&handle) {
+        // A cycle. `Err` rather than a truncated document, because a document that silently
+        // stops describing the value is worse than no document.
+        return Err(());
+    }
+    if is_callable(value) {
+        return Ok(None);
+    }
+    visiting.push(handle);
+    let converted = if let Some((array, length)) = elements_of(value) {
+        let mut items = Vec::with_capacity(length);
+        for index in 0..length {
+            // An element with no JSON spelling becomes `null`: an array cannot drop one
+            // without changing its length.
+            let item = to_json(element_at(array, index), visiting)?;
+            items.push(item.unwrap_or(crisol_builtins::Json::Null));
+        }
+        crisol_builtins::Json::Array(items)
+    } else {
+        let mut entries = Vec::new();
+        for name in enumerable_keys(value) {
+            let key = name.clone();
+            // SAFETY: `key` is a live Rust string.
+            let held = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
+            // A property with no JSON spelling is dropped, which is what makes
+            // `{a: undefined}` stringify as `{}`.
+            if let Some(item) = to_json(held, visiting)? {
+                entries.push((name, item));
+            }
+        }
+        crisol_builtins::Json::Object(entries)
+    };
+    visiting.pop();
+    Ok(Some(converted))
+}
+
+/// JSON as a heap value.
+fn from_json(json: &crisol_builtins::Json) -> u64 {
+    match json {
+        crisol_builtins::Json::Null => Value::NULL.to_bits(),
+        crisol_builtins::Json::Bool(flag) => boolean(*flag).to_bits(),
+        crisol_builtins::Json::Number(number) => from_number(*number),
+        crisol_builtins::Json::String(text) => new_string(text),
+        crisol_builtins::Json::Array(items) => with_new_array(items.len(), |array| {
+            for (index, item) in items.iter().enumerate() {
+                // Built and stored one at a time: the array is rooted and the element is not,
+                // so holding several before storing any would leave them collectable.
+                let value = from_json(item);
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(array, index, Value::from_bits(value));
+                });
+            }
+            array.to_value().to_bits()
+        }),
+        crisol_builtins::Json::Object(entries) => {
+            let object = crisol_create_object();
+            with_rooted(&[object], || {
+                let Some(handle) = handle_of(object) else {
+                    return;
+                };
+                for (name, item) in entries {
+                    let value = from_json(item);
+                    with_runtime(|runtime| {
+                        runtime.define(handle, name, Value::from_bits(value));
+                    });
+                }
+            });
+            object
+        }
+    }
+}
+
+/// `JSON.parse`.
+extern "C" fn json_parse(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(text) = to_text(unsafe { argument(argc, argv, 0) }) else {
+        return raise("cannot parse this value as JSON", "SyntaxError");
+    };
+    match crisol_builtins::parse(&text) {
+        // The reviver argument is not applied. Recorded rather than ignored silently: a
+        // program passing one gets the parsed document unchanged, which is wrong quietly.
+        Ok(json) => from_json(&json),
+        Err(error) => raise(&format!("{error}"), "SyntaxError"),
+    }
+}
+
+/// `JSON.stringify`.
+extern "C" fn json_stringify(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above. The second argument is a replacer, which is not applied.
+    let space = Value::from_bits(unsafe { argument(argc, argv, 2) })
+        .as_number()
+        .unwrap_or(0.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "an indent, clamped to what the specification allows"
+    )]
+    let indent = space.clamp(0.0, 10.0) as usize;
+
+    let mut visiting = Vec::new();
+    match to_json(value, &mut visiting) {
+        // **`undefined` for a value JSON cannot spell**, which is what
+        // `JSON.stringify(undefined)` answers — not the string `"undefined"`.
+        Ok(None) => Value::UNDEFINED.to_bits(),
+        Ok(Some(json)) => new_string(&crisol_builtins::stringify(&json, indent)),
+        Err(()) => raise(
+            "cannot stringify a structure that contains itself",
+            "TypeError",
+        ),
+    }
 }

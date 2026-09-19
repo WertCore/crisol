@@ -2182,3 +2182,177 @@ fn an_invalid_pattern_raises_where_it_is_written() {
         "SyntaxError",
     );
 }
+
+// ---- JSON --------------------------------------------------------------------------------
+
+#[test]
+fn json_round_trips_the_simple_shapes() {
+    check("json-number", "return JSON.stringify(1);", "1");
+    check("json-string", "return JSON.stringify(\"a\");", "\"a\"");
+    check("json-true", "return JSON.stringify(true);", "true");
+    check("json-null", "return JSON.stringify(null);", "null");
+    check("json-array", "return JSON.stringify([1, 2]);", "[1,2]");
+    check("json-object", "return JSON.stringify({a: 1});", "{\"a\":1}");
+}
+
+/// **`undefined` for a value JSON cannot spell** — not the string `"undefined"`.
+#[test]
+fn stringify_answers_undefined_for_what_json_cannot_spell() {
+    check(
+        "json-undefined",
+        "return JSON.stringify(undefined);",
+        "undefined",
+    );
+    check(
+        "json-function",
+        "return JSON.stringify(function () { return 1; });",
+        "undefined",
+    );
+}
+
+/// **An object drops a property JSON cannot spell; an array cannot.** An array would have to
+/// change its length to drop an element, so the same absence becomes `null` there and nothing
+/// at all in an object.
+#[test]
+fn an_absent_value_is_dropped_in_an_object_and_nulled_in_an_array() {
+    check(
+        "json-object-undefined",
+        "return JSON.stringify({a: undefined});",
+        "{}",
+    );
+    check(
+        "json-array-undefined",
+        "return JSON.stringify([undefined]);",
+        "[null]",
+    );
+    check(
+        "json-object-mixed",
+        "return JSON.stringify({a: 1, b: undefined});",
+        "{\"a\":1}",
+    );
+}
+
+/// **A non-finite number is `null`**: JSON has no spelling for `NaN` or an infinity, and
+/// refusing the whole document over one would be worse.
+#[test]
+fn a_non_finite_number_stringifies_as_null() {
+    check("json-nan", "return JSON.stringify(0 / 0);", "null");
+    check("json-infinity", "return JSON.stringify(1 / 0);", "null");
+}
+
+/// A structure containing itself raises rather than producing a truncated document.
+#[test]
+fn a_cycle_raises_rather_than_truncating() {
+    check(
+        "json-cycle",
+        "let r = \"\"; let a = {}; a.self = a; \
+         try { JSON.stringify(a); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+#[test]
+fn json_parse_builds_values_back() {
+    check("json-parse-number", "return JSON.parse(\"1\");", "1");
+    check(
+        "json-parse-object",
+        "return JSON.parse(\"{\\\"a\\\":7}\").a;",
+        "7",
+    );
+    check(
+        "json-parse-array",
+        "return JSON.parse(\"[1,2,3]\")[1];",
+        "2",
+    );
+    check(
+        "json-parse-nested",
+        "return JSON.parse(\"{\\\"a\\\":[1]}\").a[0];",
+        "1",
+    );
+    check("json-parse-null", "return JSON.parse(\"null\");", "null");
+}
+
+#[test]
+fn json_parse_raises_on_malformed_input() {
+    check(
+        "json-parse-bad",
+        "let r = \"\"; try { JSON.parse(\"{\"); } catch (e) { r = e.name; } return r;",
+        "SyntaxError",
+    );
+}
+
+#[test]
+fn json_round_trips_through_both_directions() {
+    check(
+        "json-roundtrip",
+        "let o = {a: 1, b: [2, 3]}; let back = JSON.parse(JSON.stringify(o)); return back.b[1];",
+        "3",
+    );
+}
+
+// ---- constructors reach the prototypes their instances use ---------------------------------
+
+/// Each constructor's `prototype` is the object its instances already inherit from, not a new
+/// one — otherwise `[].map === Array.prototype.map` would be false.
+#[test]
+fn a_constructor_prototype_is_the_one_instances_inherit() {
+    check(
+        "proto-array",
+        "return [].map === Array.prototype.map;",
+        "true",
+    );
+    check(
+        "proto-string",
+        "return \"\".trim === String.prototype.trim;",
+        "true",
+    );
+    check(
+        "proto-regexp",
+        "return /a/.test === RegExp.prototype.test;",
+        "true",
+    );
+    check(
+        "proto-function",
+        "let f = function () { return 1; }; return f.call === Function.prototype.call;",
+        "true",
+    );
+}
+
+/// **`Function` is bound so `Function.prototype` can be reached**, not because
+/// `new Function(body)` works — that compiles source at runtime, which this engine does not do,
+/// so calling it raises rather than answering something wrong.
+#[test]
+fn the_function_constructor_raises_rather_than_pretending() {
+    check(
+        "function-ctor",
+        "let r = \"\"; try { Function(\"return 1\"); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+#[test]
+fn the_regexp_constructor_builds_the_same_thing_a_literal_does() {
+    check(
+        "regexp-ctor",
+        "return new RegExp(\"ab+\").test(\"abb\");",
+        "true",
+    );
+    check(
+        "regexp-ctor-flags",
+        "return new RegExp(\"AB\", \"i\").test(\"ab\");",
+        "true",
+    );
+    check(
+        "regexp-ctor-source",
+        "return new RegExp(\"a+\").source;",
+        "a+",
+    );
+    // An existing regular expression is re-read through `source`, so this copies the pattern
+    // rather than stringifying the object into `"/a/g"`.
+    check("regexp-ctor-copy", "return new RegExp(/a+/g).source;", "a+");
+    check(
+        "regexp-ctor-copy-flags",
+        "return new RegExp(/a+/g).flags;",
+        "g",
+    );
+}

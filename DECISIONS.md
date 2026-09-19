@@ -3739,3 +3739,49 @@ second allocated — a collection in between freed a value the object was about 
 back as `[unreadable string]`. The fix is the rule the array methods already follow: create and
 store one at a time. The bug is only reachable when a collection lands in that window, so the
 test that caught it was the one asserting `.source` rather than any test of matching.
+
+## D-124
+
+**`JSON` is `crisol-builtins::json`, and the two containers disagree about absence.**
+
+Status: Accepted
+
+The second of the unshipped builtins taken (D-122). `Json` is owned data with no `Realm` in it,
+so the work is two converters and nothing else.
+
+**An object drops a property JSON cannot spell; an array cannot.** `JSON.stringify({a:
+undefined})` is `"{}"` and `JSON.stringify([undefined])` is `"[null]"` — an array would have to
+change its length to drop an element, so the same absence has to be written two ways. A single
+"skip what you cannot spell" rule gets one of them wrong.
+
+**`undefined` for a value JSON cannot spell at the top level**, not the string `"undefined"`.
+**A non-finite number is `null`**, because JSON has no spelling for `NaN` or an infinity and
+refusing the whole document over one would be worse. A structure containing itself raises,
+rather than producing a document that silently stops describing the value.
+
+Not done, and recorded rather than left to be found: **the reviver and replacer arguments are
+ignored.** A program passing one gets the unchanged document, which is wrong quietly.
+
+## D-125
+
+**A constructor's `prototype` is the object its instances already inherit from.**
+
+Status: Accepted
+
+`Function`, `String` and `RegExp` were each missing that link, so `Function.prototype` existed
+and could not be named. Fifty test262 cases failed on `Function is not defined` while the
+object they wanted was built and rooted — the same failure as D-122, one level down: the thing
+existed and nothing pointed at it.
+
+Binding all four through one loop is what makes `[].map === Array.prototype.map` and
+`"".trim === String.prototype.trim` true for the same reason rather than by coincidence.
+
+**`Function` is bound so its prototype is reachable, not because `new Function(body)` works** —
+that compiles source at runtime, which this engine does not do. Calling it raises rather than
+answering something wrong.
+
+**Consequence: `property_text` returned `Some("undefined")` for an absent property**, because
+`to_text` spells every value out. A caller asking whether a property exists was told yes and
+handed the word — which is how `new RegExp("ab+")` came to compile the pattern `undefined`. The
+test that caught it was the plain one, `new RegExp("ab+").test("abb")`, not any of the ones
+written for the interesting cases.
