@@ -34,14 +34,15 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**55 passed, 310 failed, 0 crashed, 14 refused.** `Math` (D-134), which was 49 failures on its
-own. Three of its functions are not their Rust namesakes — `round` leans upward rather than away
-from zero, `sign` preserves a signed zero and propagates `NaN`, and `min`/`max` let one `NaN`
-win where `f64::min` returns the other operand.
+**56 passed, 309 failed, 0 crashed, 14 refused.** `arguments` (D-135), bound lazily so a
+function that never names it keeps the slot numbering it had before — declaring it eagerly
+shifted every parameter down by one and broke closures under GC stress.
 
-Still unshipped from `crisol-builtins` (D-122): `Symbol` (28), `Proxy` (14), `Set` (7).
-`arguments` (25) is not in that crate and is a frontend gap. Spread in a **call** —
-`f(...args)` — still needs a dynamic argument count that a call site does not have.
+It is an array and a copy, where the specification has an array-*like* that aliases its
+parameters. Both differences are asserted in tests rather than left to be found.
+
+Still unshipped from `crisol-builtins` (D-122): `Symbol` (28), `Proxy` (14), `Set` (7). Spread
+in a **call** — `f(...args)` — still needs a dynamic argument count a call site does not have.
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -77,7 +78,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1212 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1217 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

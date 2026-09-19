@@ -78,6 +78,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_loose_not_equal",
     "crisol_in",
     "crisol_array_extend",
+    "crisol_create_arguments",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -6007,4 +6008,33 @@ pub extern "C" fn crisol_array_extend(array: u64, value: u64, spread: u64) -> u6
         }
         Value::UNDEFINED.to_bits()
     })
+}
+
+/// The `arguments` object for a call, as an array.
+///
+/// **An array rather than the specification's array-*like*.** A real `arguments` is a plain
+/// object with a `length`, `Symbol.iterator`, and — outside strict mode — aliasing between its
+/// elements and the named parameters, so `arguments[0] = 1` changes `a`. None of that is here:
+/// this is a genuine array holding a *copy* of what the caller passed.
+///
+/// What that buys is everything array-shaped working immediately — `length`, indexing,
+/// `for-of`, spread. What it costs is the aliasing, and `Array.isArray(arguments)` answering
+/// `true` where a real engine says `false`. Recorded rather than left to be discovered, because
+/// both differences read as correct until a test looks straight at them.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_create_arguments(argc: u64, argv: *const u64) -> u64 {
+    let given: Vec<u64> = (0..argc as usize)
+        // SAFETY: the caller guarantees `argc` readable values at `argv`.
+        .map(|position| unsafe { argument(argc, argv, position) })
+        .collect();
+    // **Rooted across the allocation.** This runs in the callee's prologue, before any of its
+    // slots exist, so the only thing describing these values is the caller's frame — and a
+    // collection during the array's own allocation would free an argument the array is about
+    // to hold. It reads back as an element that is there and unreadable.
+    with_rooted(&given, || array_of_values(&given))
 }

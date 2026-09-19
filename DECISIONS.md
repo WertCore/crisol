@@ -4030,3 +4030,36 @@ it is not making.
 
 The constants are defined separately from the functions: they are properties, so they have no
 table entry, and the object they hang on exists only because naming a method created it.
+
+## D-135
+
+**`arguments` is bound lazily, and is an array.**
+
+Status: Accepted, with two differences from the specification recorded
+
+The slot is created the first time a body names `arguments`, not when the function is lowered.
+That is not an optimisation — the first attempt declared it in every function that binds `this`,
+which **shifted every parameter down by one slot** and broke closures. It broke them only under
+GC stress, because the damage was to the frame the collector reads rather than to any value a
+test printed. Binding lazily means a function that never mentions `arguments` has exactly the
+numbering it had before the feature existed.
+
+**An arrow inherits the enclosing function's `arguments`**, which is the rule `this` follows and
+falls out of the lookup: arrows are absent from the stack of functions that bind it, so
+resolution walks past them and the ordinary capture machinery does the rest. Not a special case.
+
+Two differences from the specification, both of which read as correct until something looks
+straight at them:
+
+- **It is an array, not an array-*like*.** Everything array-shaped works at once — `length`,
+  indexing, `for-of`, spread — and `Array.isArray(arguments)` answers `true` where a real engine
+  says `false`.
+- **It is a copy, so it does not alias the named parameters.** Outside strict mode a real
+  engine makes `arguments[0] = 1` change `a`. Here it does not, and there is a test asserting
+  the difference rather than a comment hoping nobody notices.
+
+**Consequence: the fifth rooting bug of this shape.** `crisol_create_arguments` runs in the
+callee's prologue, before any of its slots exist, so the only thing describing the argument
+values is the caller's frame — and the array's own allocation could collect one it was about to
+hold. The rule has not changed since D-127: a value between allocation and its first store is
+invisible, and every allocation in that gap is a chance to lose it.

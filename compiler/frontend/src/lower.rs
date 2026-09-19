@@ -147,6 +147,11 @@ struct Lowering {
     unsupported: Vec<Unsupported>,
     /// Names a closure must share rather than copy, from [`crate::escape`].
     shared: std::collections::HashSet<String>,
+    /// Functions that would bind `arguments` if something asked for it, innermost last.
+    ///
+    /// An arrow is absent from this, which is what makes it inherit the enclosing function's —
+    /// the same rule `this` follows, and it falls out of the lookup rather than being a case.
+    binds_arguments: Vec<usize>,
     /// Where an unlabelled `break` goes, innermost last.
     breaks: Vec<BlockId>,
     /// Where a raised exception goes, innermost last. Empty means out of the function.
@@ -174,6 +179,7 @@ impl Lowering {
         let mut lowering = Self {
             functions: vec![function],
             shared: std::collections::HashSet::new(),
+            binds_arguments: Vec::new(),
             breaks: Vec::new(),
             handlers: Vec::new(),
             continues: Vec::new(),
@@ -910,6 +916,34 @@ impl Lowering {
     /// A name that resolves nowhere is a **global**, not a new local. Treating it as a local is
     /// what made `Object` a fresh empty variable rather than something the runtime provides,
     /// so every test that used a builtin compared against `undefined`.
+    /// Binds `arguments` in the nearest enclosing function that has one, on first mention.
+    ///
+    /// **Lazily, and that is the point.** A function that never names `arguments` keeps the
+    /// slot numbering it had before the feature existed, and its prologue builds nothing.
+    /// Declaring the slot in every function shifted every parameter down by one and broke
+    /// closures — visibly only under GC stress, because the damage was to the frame the
+    /// collector reads rather than to any value a test printed.
+    ///
+    /// Returns the slot in the *current* scope, which for an arrow is the capture the ordinary
+    /// machinery just created.
+    fn bind_arguments(&mut self) -> Option<u32> {
+        let owner = *self.binds_arguments.last()?;
+        // Declared in the owning scope, which is the innermost one belonging to that function.
+        let depth = self
+            .scopes
+            .iter()
+            .rposition(|scope| scope.function == owner)?;
+        let next = self.scopes[depth].next_slot;
+        self.scopes[depth].next_slot += 1;
+        self.scopes[depth]
+            .slots
+            .insert("arguments".to_owned(), next);
+        self.functions[owner].arguments_slot = Some(next);
+        // Now resolve it from here: inside the owner that is the slot just made, and inside an
+        // arrow it walks out and becomes a capture, exactly as `this` does.
+        Some(self.slot("arguments"))
+    }
+
     fn resolves(&self, name: &str) -> bool {
         self.scopes
             .iter()
@@ -917,6 +951,12 @@ impl Lowering {
     }
 
     fn slot(&mut self, name: &str) -> u32 {
+        if name == "arguments"
+            && !self.resolves(name)
+            && let Some(slot) = self.bind_arguments()
+        {
+            return slot;
+        }
         if let Some(slot) = self.scope().slots.get(name) {
             return *slot;
         }
@@ -1189,7 +1229,13 @@ impl Lowering {
                 if identifier.name == "undefined" {
                     return self.emit(Type::Undefined, Op::Const(Constant::Undefined));
                 }
-                if self.resolves(identifier.name.as_str()) {
+                // `arguments` resolves to a binding that does not exist until it is asked
+                // for, so the check has to admit it — otherwise the first mention falls
+                // through to a global load and reports the binding missing that it was about
+                // to create.
+                if self.resolves(identifier.name.as_str())
+                    || (identifier.name == "arguments" && !self.binds_arguments.is_empty())
+                {
                     let slot = self.slot(identifier.name.as_str());
                     return self.read(slot);
                 }
@@ -1716,6 +1762,13 @@ impl Lowering {
             // position would break silently the day anything is declared earlier.
             let this_slot = self.declare("this");
             self.functions[index].this_slot = Some(this_slot);
+
+            // `arguments` is **not** declared here. It is bound lazily, the first time a body
+            // names it (see `slot`), so a function that never mentions it has exactly the slot
+            // numbering it had before `arguments` existed. Declaring it eagerly shifted every
+            // parameter down by one in every function, which broke closures in a way that only
+            // showed under GC stress.
+            self.binds_arguments.push(index);
         }
 
         let mut parameter_slots = Vec::with_capacity(params.items.len());
@@ -1764,6 +1817,11 @@ impl Lowering {
             self.terminate(Terminator::Return(None));
         }
 
+        if binds_this {
+            // Paired with the push above. Without this an arrow lowered after a nested function
+            // would look up `arguments` in a function that had already finished.
+            self.binds_arguments.pop();
+        }
         let scope = self.scopes.pop().expect("just pushed");
         let names: Vec<String> = scope
             .captures

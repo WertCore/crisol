@@ -711,6 +711,16 @@ pub struct Function {
     /// earlier, and the failure would be a `this` bound to some other local — a plausible
     /// value, not a crash.
     pub this_slot: Option<u32>,
+    /// The slot holding `arguments`, for a function whose body names it.
+    ///
+    /// `None` when the body never mentions it, which is almost every function — **building the
+    /// array unconditionally would put an allocation in the prologue of every call**, and the
+    /// collector would have to trace it, for a binding nothing reads.
+    ///
+    /// On the function rather than inferred from position, for the same reason `this_slot` is:
+    /// the backend has to know which slot to fill, and guessing would bind a plausible wrong
+    /// value rather than fail.
+    pub arguments_slot: Option<u32>,
     /// Slots that receive the captured values, positionally matching [`Op::Closure`]'s
     /// `captures`.
     ///
@@ -740,6 +750,7 @@ impl Function {
             name: name.to_owned(),
             parameters: Vec::new(),
             this_slot: None,
+            arguments_slot: None,
             captures: Vec::new(),
             entry: BlockId(0),
             blocks: vec![Block {

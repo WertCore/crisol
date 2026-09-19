@@ -3171,3 +3171,86 @@ fn random_stays_in_its_range() {
         "true",
     );
 }
+
+// ---- arguments ------------------------------------------------------------------------------
+
+#[test]
+fn arguments_holds_what_the_caller_passed() {
+    check(
+        "arguments-length",
+        "let f = function () { return arguments.length; }; return f(1, 2, 3);",
+        "3",
+    );
+    check(
+        "arguments-index",
+        "let f = function () { return arguments[1]; }; return f(\"a\", \"b\");",
+        "b",
+    );
+    check(
+        "arguments-none",
+        "let f = function () { return arguments.length; }; return f();",
+        "0",
+    );
+    // More arguments than parameters is exactly the case `arguments` exists for.
+    check(
+        "arguments-extra",
+        "let f = function (a) { return arguments.length; }; return f(1, 2, 3);",
+        "3",
+    );
+}
+
+/// **An array, not the specification's array-*like*.** That buys everything array-shaped
+/// working at once, and costs the aliasing and the `Array.isArray` answer.
+#[test]
+fn arguments_behaves_as_an_array_here() {
+    check(
+        "arguments-join",
+        "let f = function () { return arguments.join(\"-\"); }; return f(1, 2);",
+        "1-2",
+    );
+    check(
+        "arguments-spread",
+        "let f = function () { return [...arguments].length; }; return f(1, 2);",
+        "2",
+    );
+    check(
+        "arguments-forof",
+        "let f = function () { let t = 0; for (let x of arguments) { t = t + x; } return t; }; \
+         return f(1, 2, 3);",
+        "6",
+    );
+}
+
+/// A copy, so writing to `arguments` does not reach the named parameter. A real engine aliases
+/// them outside strict mode; this does not, and the difference is asserted rather than assumed.
+#[test]
+fn arguments_does_not_alias_its_parameters() {
+    check(
+        "arguments-no-alias",
+        "let f = function (a) { arguments[0] = 9; return a; }; return f(1);",
+        "1",
+    );
+}
+
+/// **An arrow has no `arguments` of its own** and sees the enclosing function's, which is the
+/// same rule `this` follows — and falls out of resolving the name through the ordinary capture
+/// machinery rather than being special-cased.
+#[test]
+fn an_arrow_sees_the_enclosing_arguments() {
+    check(
+        "arguments-arrow",
+        "let f = function () { let g = () => arguments.length; return g(); }; return f(1, 2);",
+        "2",
+    );
+}
+
+/// A function that never names `arguments` must not pay for it. Nothing observable proves the
+/// prologue is empty, so this only pins that the name stays unbound at the top level.
+#[test]
+fn arguments_is_not_a_global() {
+    check(
+        "arguments-not-global",
+        "let r = \"\"; try { let n = arguments.length; } catch (e) { r = e.name; } return r;",
+        "ReferenceError",
+    );
+}

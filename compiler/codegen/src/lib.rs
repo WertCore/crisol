@@ -190,6 +190,7 @@ const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
 const ITERATE_SYMBOL: &str = "crisol_iterate";
 const CREATE_REGEXP_SYMBOL: &str = "crisol_create_regexp";
 const ARRAY_EXTEND_SYMBOL: &str = "crisol_array_extend";
+const CREATE_ARGUMENTS_SYMBOL: &str = "crisol_create_arguments";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -256,6 +257,8 @@ struct ObjectHelpers<T> {
     create_regexp: T,
     /// `crisol_array_extend(array, value, spread) -> exception or undefined`
     array_extend: T,
+    /// `crisol_create_arguments(argc, argv) -> array`
+    create_arguments: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -366,6 +369,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     iterate.params.push(AbiParam::new(types::I64));
     iterate.returns.push(AbiParam::new(types::I64));
 
+    let mut create_arguments = module.make_signature();
+    create_arguments.params.push(AbiParam::new(types::I64));
+    create_arguments.params.push(AbiParam::new(pointer));
+    create_arguments.returns.push(AbiParam::new(types::I64));
+
     let mut array_extend = module.make_signature();
     array_extend.params.push(AbiParam::new(types::I64));
     array_extend.params.push(AbiParam::new(types::I64));
@@ -425,6 +433,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         iterate: declare(ITERATE_SYMBOL, &iterate)?,
         create_regexp: declare(CREATE_REGEXP_SYMBOL, &create_regexp)?,
         array_extend: declare(ARRAY_EXTEND_SYMBOL, &array_extend)?,
+        create_arguments: declare(CREATE_ARGUMENTS_SYMBOL, &create_arguments)?,
         unary,
     })
 }
@@ -962,6 +971,9 @@ impl Backend for Cranelift {
             array_extend: self
                 .module
                 .declare_func_in_func(self.objects.array_extend, &mut context.func),
+            create_arguments: self
+                .module
+                .declare_func_in_func(self.objects.create_arguments, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1102,6 +1114,19 @@ impl Lowering<'_> {
             self.builder.def_var(variable, incoming[1]);
         }
         // `incoming[2]` is `new.target`, which nothing reads until classes.
+
+        // `arguments`, built here because this is where `argc` and `argv` are. Only for a
+        // function whose body actually named it — the frontend leaves the slot unset otherwise,
+        // so nothing else pays an allocation in its prologue.
+        if let Some(slot) = function.arguments_slot {
+            let call = self
+                .builder
+                .ins()
+                .call(self.objects.create_arguments, &[argc, argv]);
+            let built = self.builder.inst_results(call)[0];
+            let variable = self.variable(slot);
+            self.builder.def_var(variable, built);
+        }
 
         let undefined = self
             .builder
@@ -2061,6 +2086,9 @@ impl Jit {
             array_extend: self
                 .module
                 .declare_func_in_func(self.objects.array_extend, &mut context.func),
+            create_arguments: self
+                .module
+                .declare_func_in_func(self.objects.create_arguments, &mut context.func),
             unary: self
                 .objects
                 .unary
