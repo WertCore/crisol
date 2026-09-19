@@ -111,6 +111,14 @@ jobs:
           # takes the real reading with a timeout that suits it.
           echo "CRISOL_TEST262_SAMPLE=40" >> "$GITHUB_ENV"
 
+      # **`cargo test` does not build a `staticlib`.** The test262 runner links compiled
+      # programs against `libcrisol_abi.a`, which only `cargo build` emits — so the suite has
+      # been asserting its absence on every Linux run since `CRISOL_REQUIRE_TEST262` was
+      # added. It passed locally because a developer runs `cargo build -p crisol-abi` by habit
+      # before testing, which is precisely the difference a CI job exists to catch.
+      - name: Build the runtime archive
+        run: cargo build -p crisol-abi
+
       - name: Test
         run: cargo test --workspace --all-features
         env:

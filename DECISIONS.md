@@ -4159,3 +4159,33 @@ than left in a log nobody opens.
 `CRISOL_TEST262_SAMPLE` exists for iterating locally. The default is left alone for anything
 reported, because **two sample sizes are two different measurements** and comparing them says
 nothing.
+
+## D-140
+
+**CI had been red for two days and the local gate said green.**
+
+Status: Accepted, and the gap is the point
+
+Every one of the last twenty-five runs failed, across every commit of this session. The cause
+was one line: **`cargo test` does not build a `staticlib`.** The test262 runner links compiled
+programs against `libcrisol_abi.a`, which only `cargo build -p crisol-abi` emits — so on CI the
+suite asserted its absence, every time, since `CRISOL_REQUIRE_TEST262` was added.
+
+It passed locally because a developer runs `cargo build -p crisol-abi` out of habit before
+testing. That habit *is* the difference between the two environments, and it is exactly what a
+CI job exists to catch — so the job caught it, and nobody read the result.
+
+D-121 recorded the same shape once already: a per-package clippy run standing in for the
+workspace one. This is worse, because the substitute was not even the same machine. **Running
+the five steps locally is not "running CI"**; it is running a similar thing on a host that has
+been configured by everything done on it since.
+
+**Consequence, found immediately once the corpus actually ran: compiled programs have never
+linked on Linux.** A Rust `staticlib` leaves the allocator, threads and `dlopen` to the final
+link; macOS's driver supplies them implicitly and GNU ld does not, so `-lpthread -ldl -lm` have
+to be named. All 12,213 cases failed at the link step.
+
+And the failure reported as the single word `link`, with the message discarded — twelve
+thousand cases under one row that said nothing about why, when the message named the missing
+library outright. That is the third time a diagnostic has hidden its own cause (D-113, D-129);
+the reason string now carries the linker's last line.

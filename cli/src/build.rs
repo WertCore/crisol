@@ -220,16 +220,25 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
     })?;
 
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
-    let result = Command::new(&compiler)
+    let mut command = Command::new(&compiler);
+    command
         .arg(&entry_path)
         .arg(&object_path)
         .arg(runtime)
         .arg("-o")
-        .arg(output)
-        .output()
-        .map_err(|error| BuildError::Link {
-            message: format!("cannot run {compiler}: {error}"),
-        })?;
+        .arg(output);
+    // **The Rust runtime archive needs these named on Linux and not on macOS**, which is the
+    // whole reason this worked here and linked nothing in CI. A Rust `staticlib` leaves its
+    // dependencies on the system allocator, threads and `dlopen` for the final link to
+    // resolve; macOS's driver supplies them implicitly and GNU ld does not. Every test262
+    // case failed at the link step, and the failure was recorded as the word "link" with the
+    // message discarded — so the run reported twelve thousand refusals and no reason.
+    if cfg!(target_os = "linux") {
+        command.args(["-lpthread", "-ldl", "-lm"]);
+    }
+    let result = command.output().map_err(|error| BuildError::Link {
+        message: format!("cannot run {compiler}: {error}"),
+    })?;
 
     if !result.status.success() {
         return Err(BuildError::Link {

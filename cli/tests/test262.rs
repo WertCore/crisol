@@ -192,6 +192,17 @@ fn stage_of(error: &crisol::build::BuildError) -> String {
             |first| first.split(" (byte").next().unwrap_or(first).to_owned(),
         ),
         crisol::build::BuildError::Parse { .. } => "parse".to_owned(),
+        // **The message, not just the word.** A link failure recorded as `"link"` grouped
+        // twelve thousand cases under one row that said nothing about why — and the cause was
+        // a missing `-lpthread` that the message names outright. The last line is the one
+        // that carries it; the rest is the command echo.
+        crisol::build::BuildError::Link { message } => {
+            let detail = message
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .unwrap_or("link");
+            format!("link: {}", detail.chars().take(80).collect::<String>())
+        }
         crisol::build::BuildError::Malformed { .. } => "malformed IR".to_owned(),
         // The backend's own message, not just "codegen": it names the construct it could not
         // lower, and that is the list worth reading. The function name prefix is stripped so
@@ -205,7 +216,6 @@ fn stage_of(error: &crisol::build::BuildError) -> String {
             }
             format!("codegen: {reason}")
         }
-        crisol::build::BuildError::Link { .. } => "link".to_owned(),
         crisol::build::BuildError::Unreadable { .. } => "unreadable".to_owned(),
     }
 }
