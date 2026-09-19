@@ -3785,3 +3785,35 @@ answering something wrong.
 handed the word — which is how `new RegExp("ab+")` came to compile the pattern `undefined`. The
 test that caught it was the plain one, `new RegExp("ab+").test("abb")`, not any of the ones
 written for the interesting cases.
+
+## D-126
+
+**`Date` is `crisol-builtins::date`, and its time value lives in a hidden property.**
+
+Status: Accepted
+
+The third of the unshipped builtins taken (D-122). The calendar arithmetic was already written
+and tested; what was missing was somewhere to keep the time value and a prototype to hang the
+readers on.
+
+**Internal slot zero already means "callable"** — [`is_callable`] reads it, and that is what
+makes `typeof f` answer `"function"`. A date borrowing it would become a function. So the time
+value is a property that enumeration does not see and `delete` cannot remove, which descriptors
+(D-116) made expressible. It is still readable by name, which a real internal slot would not
+be; that gap is the price of not having internal slots and is written down rather than hidden.
+
+**`getMonth` is 0-based and `getDate` is 1-based.** They disagree deliberately, and a single
+field reader parameterised on the wrong thing would get one of them wrong silently.
+
+**The local-time methods are the UTC ones.** There is no timezone database here, so `getHours`
+and `getUTCHours` are the same function — correct exactly where the offset is zero and wrong by
+the offset everywhere else. `getTimezoneOffset` answers `0` for the same reason, which at least
+makes the three consistent with each other rather than consistently wrong in different
+directions.
+
+**An invalid date raises from `toISOString` and prints from `toString`.** The first has no
+spelling for one; the second has `"Invalid Date"`. The field readers answer `NaN`. Three
+different right answers to the same broken input.
+
+`new Date()` reads the clock through `Date.now`, so there is one clock rather than two that
+could drift apart.

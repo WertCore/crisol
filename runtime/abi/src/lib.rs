@@ -584,6 +584,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(FUNCTION_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(STRING_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(REGEXP_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(DATE_PROTOTYPE.with(std::cell::Cell::get));
         roots
     }));
 }
@@ -600,6 +601,8 @@ thread_local! {
     static STRING_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The prototype every regular expression inherits from.
     static REGEXP_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every date inherits from.
+    static DATE_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// Compiled patterns, keyed by their source and flags.
     ///
     /// **A memo, not ownership.** The authoritative `lastIndex` is a property on the JavaScript
@@ -656,6 +659,7 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Boolean", to_boolean_global),
     ("Function", unconstructable),
     ("RegExp", make_regexp),
+    ("Date", make_date_object),
 ];
 
 /// A global that exists so its `prototype` can be reached, but cannot be called.
@@ -834,6 +838,300 @@ extern "C" fn construct_plain_object(
 ///
 /// Numbered after [`NATIVES`] and [`GLOBAL_NATIVES`], continuing the one negative index space
 /// so `crisol_closure_code` still has a single rule.
+/// Where a date keeps its time value.
+///
+/// **A hidden property standing in for an internal slot.** Internal slot zero already means
+/// "this is callable" (see [`is_callable`]), so a date cannot use one without becoming a
+/// function. The property is non-enumerable and non-configurable, so `Object.keys` and
+/// `for-in` do not see it and a program cannot delete it — but it is still readable by name,
+/// which a real internal slot would not be.
+const DATE_TIME: &str = "__time";
+
+/// Methods on `Date.prototype`.
+///
+/// **The local-time methods are the UTC ones.** There is no timezone database here, so
+/// `getHours` and `getUTCHours` are the same function — correct exactly where the offset is
+/// zero, and wrong by the offset everywhere else. `getTimezoneOffset` answers `0` for the
+/// same reason, which at least makes the three consistent with each other.
+const DATE_NATIVES: &[(&str, Native)] = &[
+    ("getTime", date_get_time),
+    ("valueOf", date_get_time),
+    ("getFullYear", date_full_year),
+    ("getUTCFullYear", date_full_year),
+    ("getMonth", date_month),
+    ("getUTCMonth", date_month),
+    ("getDate", date_day_of_month),
+    ("getUTCDate", date_day_of_month),
+    ("getDay", date_week_day),
+    ("getUTCDay", date_week_day),
+    ("getHours", date_hours),
+    ("getUTCHours", date_hours),
+    ("getMinutes", date_minutes),
+    ("getUTCMinutes", date_minutes),
+    ("getSeconds", date_seconds),
+    ("getUTCSeconds", date_seconds),
+    ("getMilliseconds", date_milliseconds),
+    ("getUTCMilliseconds", date_milliseconds),
+    ("getTimezoneOffset", date_timezone_offset),
+    ("toISOString", date_to_iso),
+    ("toJSON", date_to_iso),
+    ("toString", date_to_text),
+];
+
+/// The time value a date holds, or `NaN` if it is not a date.
+fn time_of(this_value: u64) -> f64 {
+    property_number(this_value, DATE_TIME).unwrap_or(f64::NAN)
+}
+
+/// One of the field readers, all of which answer `NaN` for an invalid date.
+fn date_field(this_value: u64, read: impl FnOnce(&crisol_builtins::Fields) -> i64) -> u64 {
+    let time = time_of(this_value);
+    crisol_builtins::fields(time).map_or_else(
+        || from_number(f64::NAN),
+        |fields| {
+            #[expect(clippy::cast_precision_loss, reason = "a calendar field")]
+            let value = read(&fields) as f64;
+            from_number(value)
+        },
+    )
+}
+
+/// `Date.prototype.getTime` and `valueOf`.
+extern "C" fn date_get_time(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    from_number(time_of(this_value))
+}
+
+/// `Date.prototype.getFullYear`.
+extern "C" fn date_full_year(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| fields.year)
+}
+
+/// `Date.prototype.getMonth`, which is **0-based**.
+extern "C" fn date_month(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| fields.month)
+}
+
+/// `Date.prototype.getDate`, which is **1-based** — unlike `getMonth`, and unlike `getDay`.
+extern "C" fn date_day_of_month(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| fields.day)
+}
+
+/// `Date.prototype.getDay` — the weekday, 0 for Sunday.
+extern "C" fn date_week_day(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| i64::from(fields.week_day))
+}
+
+/// `Date.prototype.getHours`.
+extern "C" fn date_hours(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| fields.hour)
+}
+
+/// `Date.prototype.getMinutes`.
+extern "C" fn date_minutes(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| fields.minute)
+}
+
+/// `Date.prototype.getSeconds`.
+extern "C" fn date_seconds(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| fields.second)
+}
+
+/// `Date.prototype.getMilliseconds`.
+extern "C" fn date_milliseconds(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    date_field(this_value, |fields| fields.millisecond)
+}
+
+/// `Date.prototype.getTimezoneOffset`, which is always zero here.
+extern "C" fn date_timezone_offset(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    from_number(0.0)
+}
+
+/// `Date.prototype.toISOString` and `toJSON`.
+extern "C" fn date_to_iso(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    // **An invalid date raises here and prints as text elsewhere.** `toISOString` has no
+    // spelling for one, where `toString` does.
+    crisol_builtins::to_iso_string(time_of(this_value)).map_or_else(
+        || raise("this date cannot be represented as ISO text", "RangeError"),
+        |text| new_string(&text),
+    )
+}
+
+/// `Date.prototype.toString`.
+extern "C" fn date_to_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    crisol_builtins::to_iso_string(time_of(this_value)).map_or_else(
+        || new_string(crisol_builtins::INVALID_DATE),
+        |text| new_string(&text),
+    )
+}
+
+/// `Date.now()`.
+extern "C" fn date_now(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(f64::NAN, |since| {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "milliseconds since 1970 stay inside f64's exact-integer range for \
+                          another quarter of a million years"
+            )]
+            let millis = since.as_millis() as f64;
+            millis
+        });
+    from_number(now)
+}
+
+/// `Date(…)` and `new Date(…)`.
+///
+/// **No arguments is now, one is a time value, and more are calendar fields.** The three are
+/// different enough that reading the count is the whole of the dispatch — and a missing
+/// argument is not the same as `undefined` for the middle case, because `new Date(undefined)`
+/// is an invalid date where `new Date()` is not.
+extern "C" fn make_date_object(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let time = match argc {
+        // No arguments is now, which is the same clock `Date.now` reads.
+        0 => Value::from_bits(date_now(0, 0, 0, 0, std::ptr::null()))
+            .as_number()
+            .unwrap_or(f64::NAN),
+        1 => {
+            // SAFETY: the convention guarantees `argc` readable values at `argv`.
+            let given = unsafe { argument(argc, argv, 0) };
+            to_number(given)
+        }
+        _ => {
+            let part = |position: usize, fallback: f64| -> f64 {
+                if (position as u64) < argc {
+                    // SAFETY: the position was just checked against `argc`.
+                    to_number(unsafe { argument(argc, argv, position) })
+                } else {
+                    fallback
+                }
+            };
+            let year = part(0, f64::NAN);
+            let month = part(1, 0.0);
+            let day = part(2, 1.0);
+            // The calendar parts are whole numbers and the clock parts are not, which is the
+            // signature `time_from_civil` has. A non-finite year makes the whole date invalid,
+            // so it is checked rather than cast.
+            if !year.is_finite() || !month.is_finite() || !day.is_finite() {
+                f64::NAN
+            } else {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "checked finite just above; TimeClip rejects anything out of range"
+                )]
+                let (year, month, day) = (year as i64, month as i64, day as i64);
+                crisol_builtins::time_from_civil(
+                    year,
+                    month,
+                    day,
+                    part(3, 0.0),
+                    part(4, 0.0),
+                    part(5, 0.0),
+                    part(6, 0.0),
+                )
+            }
+        }
+    };
+    let time = crisol_builtins::time_clip(time);
+
+    let object = crisol_create_object();
+    with_rooted(&[object], || {
+        if let Some(handle) = handle_of(object) {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, DATE_TIME, Value::number(time));
+                if let Some(prototype) = DATE_PROTOTYPE.with(std::cell::Cell::get) {
+                    runtime.heap.set_prototype(handle, Some(prototype));
+                }
+            });
+        }
+    });
+    object
+}
+
 /// Methods on `RegExp.prototype`.
 const REGEXP_NATIVES: &[(&str, Native)] = &[
     ("test", regexp_test),
@@ -1451,6 +1749,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "keys", object_keys),
     ("Object", "getOwnPropertyNames", object_own_names),
     ("Object", "defineProperty", object_define_property),
+    ("Date", "now", date_now),
     ("JSON", "parse", json_parse),
     ("JSON", "stringify", json_stringify),
     ("Object", "getOwnPropertyDescriptor", object_own_descriptor),
@@ -2034,6 +2333,7 @@ impl Runtime {
         runtime.build_function_prototype();
         runtime.build_string_prototype();
         runtime.build_regexp_prototype();
+        runtime.build_date_prototype();
         runtime.build_array_prototype();
         runtime.build_globals();
         runtime
@@ -2158,6 +2458,7 @@ impl Runtime {
             ("Function", FUNCTION_PROTOTYPE.with(std::cell::Cell::get)),
             ("String", STRING_PROTOTYPE.with(std::cell::Cell::get)),
             ("RegExp", REGEXP_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Date", DATE_PROTOTYPE.with(std::cell::Cell::get)),
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -2219,6 +2520,32 @@ impl Runtime {
         }
     }
 
+    /// Defines a property that enumeration does not see and `delete` cannot remove.
+    ///
+    /// Used where the specification has an internal slot and this engine has nowhere to put
+    /// one: internal slot zero already means "callable" ([`is_callable`]), so an object cannot
+    /// borrow it without becoming a function. **The property is still readable by name**,
+    /// which a real internal slot would not be.
+    fn define_hidden(&self, object: GcRef, name: &str, value: Value) {
+        self.define(object, name, value);
+        let key = PropertyKey::new(name);
+        let slot = self
+            .heap
+            .shape_of(object)
+            .and_then(|shape| self.shapes.borrow().lookup(shape, &key));
+        if let Some(slot) = slot {
+            self.heap.set_attributes(
+                object,
+                slot.index(),
+                crisol_value::Attributes {
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+    }
+
     /// Builds the object every function inherits from.
     ///
     /// The object is rooted **before** its own methods are made, because those are functions
@@ -2271,6 +2598,26 @@ impl Runtime {
             + FUNCTION_NATIVES.len()
             + STRING_NATIVES.len();
         for (index, (name, _)) in REGEXP_NATIVES.iter().enumerate() {
+            let method = self.native_function(base + index);
+            self.define_method(prototype.handle(), name, method.to_value());
+        }
+    }
+
+    /// Builds the object every date inherits from.
+    fn build_date_prototype(&self) {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let prototype = scope.alloc(shape, 0);
+        DATE_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+
+        let base = NATIVES.len()
+            + GLOBAL_NATIVES.len()
+            + NAMESPACE_NATIVES.len()
+            + ANONYMOUS_NATIVES.len()
+            + FUNCTION_NATIVES.len()
+            + STRING_NATIVES.len()
+            + REGEXP_NATIVES.len();
+        for (index, (name, _)) in DATE_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
             self.define_method(prototype.handle(), name, method.to_value());
         }
@@ -3523,7 +3870,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + STRING_NATIVES.len();
-        return REGEXP_NATIVES
+        if let Some((_, function)) = REGEXP_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + REGEXP_NATIVES.len();
+        return DATE_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }

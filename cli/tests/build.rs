@@ -2356,3 +2356,152 @@ fn the_regexp_constructor_builds_the_same_thing_a_literal_does() {
         "g",
     );
 }
+
+// ---- Date --------------------------------------------------------------------------------
+
+/// **No arguments is now, one is a time value, and more are calendar fields.** The three are
+/// different enough that the argument count is the whole of the dispatch.
+#[test]
+fn a_date_can_be_built_three_ways() {
+    check("date-from-ms", "return new Date(0).getTime();", "0");
+    check(
+        "date-from-ms-value",
+        "return new Date(86400000).getTime();",
+        "86400000",
+    );
+    check(
+        "date-from-fields",
+        "return new Date(2020, 0, 1).getFullYear();",
+        "2020",
+    );
+    // `Date.now()` is a moving target, so this asserts only that it is in this century.
+    check(
+        "date-now-plausible",
+        "return Date.now() > 1600000000000;",
+        "true",
+    );
+}
+
+/// **`getMonth` is 0-based and `getDate` is 1-based.** They disagree deliberately, so a single
+/// field reader would get one of them wrong.
+#[test]
+fn the_calendar_fields_disagree_about_where_they_start() {
+    check(
+        "date-month",
+        "return new Date(2020, 5, 15).getMonth();",
+        "5",
+    );
+    check("date-day", "return new Date(2020, 5, 15).getDate();", "15");
+    check(
+        "date-year",
+        "return new Date(2020, 5, 15).getFullYear();",
+        "2020",
+    );
+    // Sunday is 0. 2020-06-15 was a Monday.
+    check(
+        "date-weekday",
+        "return new Date(2020, 5, 15).getDay();",
+        "1",
+    );
+}
+
+#[test]
+fn the_clock_fields_read_back() {
+    check(
+        "date-hours",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getHours();",
+        "13",
+    );
+    check(
+        "date-minutes",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getMinutes();",
+        "24",
+    );
+    check(
+        "date-seconds",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getSeconds();",
+        "35",
+    );
+    check(
+        "date-ms",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getMilliseconds();",
+        "678",
+    );
+}
+
+/// **The local-time methods are the UTC ones**: there is no timezone database here, so the two
+/// are the same function and `getTimezoneOffset` answers `0` to stay consistent with them.
+#[test]
+fn local_and_utc_agree_because_the_offset_is_always_zero() {
+    check(
+        "date-utc-hours",
+        "let d = new Date(0); return d.getHours() === d.getUTCHours();",
+        "true",
+    );
+    check(
+        "date-offset",
+        "return new Date(0).getTimezoneOffset();",
+        "0",
+    );
+}
+
+#[test]
+fn a_date_prints_as_iso_text() {
+    check(
+        "date-iso",
+        "return new Date(0).toISOString();",
+        "1970-01-01T00:00:00.000Z",
+    );
+    check(
+        "date-iso-value",
+        "return new Date(2020, 0, 2, 3, 4, 5).toISOString();",
+        "2020-01-02T03:04:05.000Z",
+    );
+}
+
+/// **An invalid date raises from `toISOString` and prints as text from `toString`.** The first
+/// has no spelling for one and the second does.
+#[test]
+fn an_invalid_date_answers_differently_to_each_printer() {
+    check(
+        "date-invalid-time",
+        "return new Date(0 / 0).getTime();",
+        "NaN",
+    );
+    check(
+        "date-invalid-field",
+        "return new Date(0 / 0).getFullYear();",
+        "NaN",
+    );
+    check(
+        "date-invalid-text",
+        "return new Date(0 / 0).toString();",
+        "Invalid Date",
+    );
+    check(
+        "date-invalid-iso",
+        "let r = \"\"; try { new Date(0 / 0).toISOString(); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
+
+/// The time value is kept where enumeration cannot see it, because the specification puts it
+/// in an internal slot and this engine has nowhere to put one.
+#[test]
+fn a_dates_time_value_is_not_enumerable() {
+    check("date-keys", "return Object.keys(new Date(0)).length;", "0");
+    check(
+        "date-forin",
+        "let n = 0; for (let k in new Date(0)) { n = n + 1; } return n;",
+        "0",
+    );
+}
+
+#[test]
+fn a_date_stringifies_through_json() {
+    check(
+        "date-tojson",
+        "return new Date(0).toJSON();",
+        "1970-01-01T00:00:00.000Z",
+    );
+}
