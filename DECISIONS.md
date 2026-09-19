@@ -4189,3 +4189,27 @@ And the failure reported as the single word `link`, with the message discarded �
 thousand cases under one row that said nothing about why, when the message named the missing
 library outright. That is the third time a diagnostic has hidden its own cause (D-113, D-129);
 the reason string now carries the linker's last line.
+
+## D-141
+
+**One CI run per ref, and the corpus only when somebody will read it.**
+
+Status: Accepted
+
+The corpus job failed with `exit code 143` and *"the runner has received a shutdown signal"* —
+which says nothing about the code, because it is not about the code. A push to a branch with an
+open pull request fires the `pull_request` workflow, and a manual dispatch fires another; each
+spawns the whole matrix, so sixteen concurrent jobs were competing and the runners were
+reclaimed. **Both** runs died within seconds of each other, which is what distinguishes this
+from one cancelling the other.
+
+Two changes. A **concurrency group** keyed on the ref, so a newer run supersedes an older one
+cleanly instead of racing it. And the full corpus now runs **only on `main` or on request** —
+the matrix job already carries a sample of 40 as a smoke check, and a compile-and-link per case
+across twelve thousand cases is not something to spend on every commit when nobody is going to
+read the result.
+
+The general point, which cost three runs to learn: **a red CI job is not necessarily a claim
+about the code**. Two of the three failures this session were the environment — a missing
+`staticlib`, then a reclaimed runner — and reading the error rather than assuming a regression
+is what separated them.

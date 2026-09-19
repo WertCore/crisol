@@ -6,6 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One run per ref. A push to a branch with an open pull request fires **two** workflows — the
+# `push` (or `pull_request`) event and any manual dispatch — and each spawns the whole matrix.
+# Sixteen concurrent jobs was enough for the runners to be reclaimed mid-run, which surfaces as
+# `exit code 143` and a shutdown signal rather than anything about the code.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -306,6 +314,11 @@ jobs:
   # anything, so it gets its own runner and its own budget.
   test262:
     name: test262 (full corpus)
+    # **Not on every push.** The corpus is a compile and a link per case, and the matrix job
+    # already carries a sample of 40 as a smoke check. Running the full thing on each commit
+    # was most of the load that got the runners reclaimed — it belongs on `main` and on
+    # request, where somebody is actually going to read the number.
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
