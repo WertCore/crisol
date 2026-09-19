@@ -1362,6 +1362,18 @@ impl Lowering {
             }
             Expression::UnaryExpression(unary) => self.unary(unary),
             Expression::TemplateLiteral(template) => self.template(template),
+            Expression::RegExpLiteral(literal) => {
+                // The pattern is compiled when the literal is evaluated, so an invalid one
+                // raises a `SyntaxError` there rather than inside whatever later called `test`.
+                let regexp = self.emit(
+                    Type::Object(None),
+                    Op::CreateRegExp {
+                        source: literal.regex.pattern.text.to_string(),
+                        flags: literal.regex.flags.to_string(),
+                    },
+                );
+                self.propagate(regexp)
+            }
             Expression::LogicalExpression(logical) => self.logical(logical),
             Expression::ConditionalExpression(conditional) => self.conditional(conditional),
             Expression::ArrayExpression(array) => {
@@ -1974,7 +1986,6 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         Expression::AwaitExpression(_) => "await expression",
         Expression::NewExpression(_) => "new expression",
         Expression::StringLiteral(_) => "string literal",
-        Expression::RegExpLiteral(_) => "regular expression literal",
         Expression::BigIntLiteral(_) => "bigint literal",
         Expression::SequenceExpression(_) => "comma expression",
         Expression::TaggedTemplateExpression(_) => "tagged template",

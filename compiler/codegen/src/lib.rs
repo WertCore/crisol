@@ -185,6 +185,7 @@ const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
 const DELETE_SYMBOL: &str = "crisol_delete";
 const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
 const ITERATE_SYMBOL: &str = "crisol_iterate";
+const CREATE_REGEXP_SYMBOL: &str = "crisol_create_regexp";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -247,6 +248,8 @@ struct ObjectHelpers<T> {
     enumerate: T,
     /// `crisol_iterate(value) -> something indexable`
     iterate: T,
+    /// `crisol_create_regexp(source, source_len, flags, flags_len) -> object`
+    create_regexp: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -357,6 +360,13 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     iterate.params.push(AbiParam::new(types::I64));
     iterate.returns.push(AbiParam::new(types::I64));
 
+    let mut create_regexp = module.make_signature();
+    create_regexp.params.push(AbiParam::new(pointer));
+    create_regexp.params.push(AbiParam::new(types::I64));
+    create_regexp.params.push(AbiParam::new(pointer));
+    create_regexp.params.push(AbiParam::new(types::I64));
+    create_regexp.returns.push(AbiParam::new(types::I64));
+
     let mut unary_signature = module.make_signature();
     unary_signature.params.push(AbiParam::new(types::I64));
     unary_signature.returns.push(AbiParam::new(types::I64));
@@ -401,6 +411,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         delete: declare(DELETE_SYMBOL, &delete)?,
         enumerate: declare(ENUMERATE_SYMBOL, &enumerate)?,
         iterate: declare(ITERATE_SYMBOL, &iterate)?,
+        create_regexp: declare(CREATE_REGEXP_SYMBOL, &create_regexp)?,
         unary,
     })
 }
@@ -455,6 +466,16 @@ fn keys_of(function: &Function) -> Vec<String> {
                 | Op::PropertyStore { key, .. }
                 | Op::GlobalLoad { name: key } => key.as_str(),
                 Op::Const(Constant::String(text)) => text.as_str(),
+                // A pattern and its flags are interned the same way, so the data section holds
+                // one copy of each however often the literal appears.
+                Op::CreateRegExp { source, flags } => {
+                    for text in [source, flags] {
+                        if !keys.iter().any(|seen: &String| seen == text) {
+                            keys.push(text.clone());
+                        }
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             if !keys.iter().any(|seen: &String| seen == key) {
@@ -922,6 +943,9 @@ impl Backend for Cranelift {
             iterate: self
                 .module
                 .declare_func_in_func(self.objects.iterate, &mut context.func),
+            create_regexp: self
+                .module
+                .declare_func_in_func(self.objects.create_regexp, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1538,6 +1562,17 @@ impl Lowering<'_> {
                 }
                 Some(array)
             }
+            Op::CreateRegExp { source, flags } => {
+                // Both halves are interned like any other constant text, so a pattern used
+                // twice is stored once.
+                let (source_pointer, source_length) = self.text_operands(source)?;
+                let (flags_pointer, flags_length) = self.text_operands(flags)?;
+                let call = self.builder.ins().call(
+                    self.objects.create_regexp,
+                    &[source_pointer, source_length, flags_pointer, flags_length],
+                );
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::Iterate { object } => {
                 let object = self.value(*object);
                 let call = self.builder.ins().call(self.objects.iterate, &[object]);
@@ -1990,6 +2025,9 @@ impl Jit {
             iterate: self
                 .module
                 .declare_func_in_func(self.objects.iterate, &mut context.func),
+            create_regexp: self
+                .module
+                .declare_func_in_func(self.objects.create_regexp, &mut context.func),
             unary: self
                 .objects
                 .unary

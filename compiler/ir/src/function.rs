@@ -319,6 +319,16 @@ pub enum Op {
         /// What to iterate.
         object: ValueId,
     },
+    /// `/source/flags` — a regular expression object.
+    ///
+    /// The pattern and flags are constants, so they ride in the operation rather than as
+    /// operands: a literal's pattern cannot be computed.
+    CreateRegExp {
+        /// The pattern, without its delimiters.
+        source: String,
+        /// The flag letters.
+        flags: String,
+    },
     /// `delete object[key]`.
     ///
     /// One operation for both spellings, because `delete o.x` and `delete o["x"]` are the same
@@ -466,6 +476,7 @@ impl Op {
                 | Self::Delete { .. }
                 | Self::Enumerate { .. }
                 | Self::Iterate { .. }
+                | Self::CreateRegExp { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -481,6 +492,7 @@ impl Op {
             Self::Const(_)
             | Self::Load { .. }
             | Self::CreateObject { .. }
+            | Self::CreateRegExp { .. }
             | Self::CaughtValue
             | Self::GlobalLoad { .. } => Vec::new(),
             Self::Store { value, .. } | Self::Await { value } => vec![*value],

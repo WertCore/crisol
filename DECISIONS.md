@@ -3681,3 +3681,61 @@ of the time.
 
 Both failures have the same shape: a number or a check that was true once, reused as though it
 were still being taken.
+
+## D-122
+
+**`crisol-builtins` exists, is tested, and nothing ships it.**
+
+Status: Recorded, partly acted on
+
+The crate holds seventeen modules and **230 passing tests**: an object model with `Realm`,
+descriptors, `Proxy`, `Reflect`, `Promise`, `RegExp` over `regress`, `Date`, `JSON`, `Map` and
+`Set`, `Symbol`, the iterator protocol, and the conversion algorithms. No production code
+depends on it. `crisol-abi` — the runtime compiled programs actually call — depends only on
+`crisol-gc` and `crisol-value`, and reimplements a smaller version of the same ground.
+
+So 230 of the workspace's passing tests cover code no compiled program can reach, and
+`Object.defineProperty` was written twice: once in `descriptor.rs` with `validate_and_apply`,
+and once again in D-116 by someone who had not looked.
+
+The two halves are not interchangeable. `crisol-builtins` has its own object model —
+`ObjectId` indexes a `Realm`, not the collector's heap — so adopting it wholesale means moving
+compiled code off `crisol-gc`, which is not a refactor.
+
+What *is* reachable is everything that does not touch `Realm`, which is most of it:
+`regexp`, `date`, `json`, `convert`, `collections`, `string`, `symbol`, `array`, `error`,
+`iterator`, `promise` and `proxy` are all free of it. Those are pure algorithms over Rust types
+and can be called directly.
+
+`RegExp` is the first one taken (D-123). `Date`, `JSON`, `Map` and `Set` are the same shape of
+work and are the obvious next ones — each is currently "not defined" at runtime while sitting
+finished and tested in the tree.
+
+## D-123
+
+**`RegExp` is `crisol-builtins::JsRegExp`, and `lastIndex` lives on the object.**
+
+Status: Accepted
+
+The pattern is compiled when the literal is **evaluated**, not at first use, so an invalid one
+raises a `SyntaxError` where it is written rather than inside whatever later called `test`.
+
+`JsRegExp` owns a cursor, and so does the JavaScript object — `lastIndex` is writable from a
+program, so it cannot live only in Rust. The property is authoritative: the compiled pattern is
+set from it before each use and read back after. Two owners of a value the program can change
+would disagree the first time it changed one.
+
+Compiled patterns are memoised by source and flags. That is a memo and not ownership, which is
+what makes it safe to share one compiled pattern between two objects with the same literal.
+
+**`exec` answers `null`, not `undefined`** — `while ((m = re.exec(s)) !== null)` is the idiom
+that depends on it. Its result is an array carrying `index` and `input` as properties, and
+**a group that did not participate is `undefined` rather than `""`**, which is the distinction
+`Captured` keeps by storing `Option` per group.
+
+**Consequence: a rooting bug, caught by the test that read the property back.** Both the source
+and the flags strings were built before either was stored, leaving the first unrooted while the
+second allocated — a collection in between freed a value the object was about to hold. It read
+back as `[unreadable string]`. The fix is the rule the array methods already follow: create and
+store one at a time. The bug is only reachable when a collection lands in that window, so the
+test that caught it was the one asserting `.source` rather than any test of matching.

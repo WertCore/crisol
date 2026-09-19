@@ -157,11 +157,11 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("a working directory");
     let file = directory.join("main.js");
-    // A regular expression literal still lowers to a recorded gap rather than to nothing. This
-    // case has to be replaced whenever the construct it names becomes supported — which is the
-    // point: the test is about *refusing*, so it must always name something actually refused.
-    // It named `for-of` until that landed, and this is the second time it has been rewritten.
-    std::fs::write(&file, "let r = /ab+/; return 1;").expect("write");
+    // A class still lowers to a recorded gap rather than to nothing. This case has to be
+    // replaced whenever the construct it names becomes supported — which is the point: the test
+    // is about *refusing*, so it must always name something actually refused. It has named
+    // `for-of` and then a regular expression literal, and been rewritten each time one landed.
+    std::fs::write(&file, "class A extends Object {} return 1;").expect("write");
 
     let error =
         crisol::build::build(&file, &directory.join("main"), &runtime).expect_err("should refuse");
@@ -2102,5 +2102,83 @@ fn for_of_can_assign_to_an_existing_variable() {
         "forof-assign",
         "let x = 0; for (x of [1, 2]) { } return x;",
         "2",
+    );
+}
+
+// ---- regular expressions ------------------------------------------------------------------
+
+#[test]
+fn a_regular_expression_literal_matches() {
+    check("re-test", "return /ab+/.test(\"xabbby\");", "true");
+    check("re-test-miss", "return /ab+/.test(\"xyz\");", "false");
+    check("re-flags-i", "return /AB/i.test(\"ab\");", "true");
+    check("re-flags-absent", "return /AB/.test(\"ab\");", "false");
+}
+
+#[test]
+fn a_regular_expression_reports_its_own_shape() {
+    check("re-source", "return /ab+/g.source;", "ab+");
+    check("re-flags", "return /ab+/gi.flags;", "gi");
+    check("re-global", "return /a/g.global;", "true");
+    check("re-not-global", "return /a/.global;", "false");
+    check("re-tostring", "return /ab+/gi.toString();", "/ab+/gi");
+}
+
+/// **`exec` answers `null`, not `undefined`**, which is what `m !== null` tests for.
+#[test]
+fn exec_returns_a_match_array_or_null() {
+    check("re-exec-null", "return /z/.exec(\"abc\");", "null");
+    check("re-exec-whole", "return /b./.exec(\"abcd\")[0];", "bc");
+    check("re-exec-index", "return /b./.exec(\"abcd\").index;", "1");
+    check("re-exec-input", "return /b./.exec(\"abcd\").input;", "abcd");
+}
+
+/// **A group that did not participate is `undefined`, not `""`.** The difference is visible
+/// only when the pattern makes a group optional, which is why it is tested directly.
+#[test]
+fn exec_distinguishes_a_missing_group_from_an_empty_one() {
+    check("re-group", "return /(a)(b)/.exec(\"ab\")[2];", "b");
+    check(
+        "re-group-absent",
+        "return /(a)|(z)/.exec(\"a\")[2];",
+        "undefined",
+    );
+    check(
+        "re-group-count",
+        "return /(a)(b)/.exec(\"ab\").length;",
+        "3",
+    );
+}
+
+/// `lastIndex` is a property because a program may assign to it, and the compiled pattern is
+/// set from it rather than owning it.
+#[test]
+fn a_global_regular_expression_advances_last_index() {
+    check(
+        "re-lastindex",
+        "let r = /a/g; r.test(\"aa\"); return r.lastIndex;",
+        "1",
+    );
+    check(
+        "re-lastindex-assigned",
+        "let r = /a/g; r.lastIndex = 1; return r.exec(\"ba\").index;",
+        "1",
+    );
+    // A non-global pattern does not advance, so repeated calls agree.
+    check(
+        "re-lastindex-inert",
+        "let r = /a/; r.test(\"aa\"); return r.lastIndex;",
+        "0",
+    );
+}
+
+/// **The pattern is compiled when the literal is evaluated**, so an invalid one raises there
+/// rather than inside whatever later called `test`.
+#[test]
+fn an_invalid_pattern_raises_where_it_is_written() {
+    check(
+        "re-invalid",
+        "let r = \"\"; try { let bad = /(/; } catch (e) { r = e.name; } return r;",
+        "SyntaxError",
     );
 }

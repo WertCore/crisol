@@ -73,6 +73,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_delete",
     "crisol_enumerate",
     "crisol_iterate",
+    "crisol_create_regexp",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -582,6 +583,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(GLOBALS.with(std::cell::Cell::get));
         roots.extend(FUNCTION_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(STRING_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(REGEXP_PROTOTYPE.with(std::cell::Cell::get));
         roots
     }));
 }
@@ -596,6 +598,17 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     /// The prototype every string inherits from.
     static STRING_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every regular expression inherits from.
+    static REGEXP_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// Compiled patterns, keyed by their source and flags.
+    ///
+    /// **A memo, not ownership.** The authoritative `lastIndex` is a property on the JavaScript
+    /// object, because a program can read and write it; the compiled pattern here is set from
+    /// that property before each use and read back after. Keeping the `JsRegExp` as the owner
+    /// of its cursor would mean two copies of a value the program can change, and they would
+    /// disagree the first time it did.
+    static PATTERNS: RefCell<std::collections::HashMap<(String, String), crisol_builtins::JsRegExp>> =
+        RefCell::new(std::collections::HashMap::new());
 }
 
 /// A function implemented here rather than compiled, called through the uniform convention.
@@ -770,6 +783,155 @@ extern "C" fn construct_plain_object(
 ///
 /// Numbered after [`NATIVES`] and [`GLOBAL_NATIVES`], continuing the one negative index space
 /// so `crisol_closure_code` still has a single rule.
+/// Methods on `RegExp.prototype`.
+const REGEXP_NATIVES: &[(&str, Native)] = &[
+    ("test", regexp_test),
+    ("exec", regexp_exec),
+    ("toString", regexp_to_string),
+];
+
+/// Runs `body` against the pattern compiled from `source` and `flags`.
+///
+/// The cursor is loaded from the object's `lastIndex` before and stored back after, so the
+/// property stays authoritative and a program that assigns to it is obeyed.
+fn with_pattern<T>(
+    this_value: u64,
+    body: impl FnOnce(&mut crisol_builtins::JsRegExp) -> T,
+) -> Option<T> {
+    let source = property_text(this_value, "source")?;
+    let flags_text = property_text(this_value, "flags")?;
+    let cursor = property_number(this_value, "lastIndex").unwrap_or(0.0);
+
+    let (outcome, moved) = PATTERNS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = (source.clone(), flags_text.clone());
+        if !cache.contains_key(&key) {
+            let flags = crisol_builtins::Flags::parse(&flags_text).ok()?;
+            let compiled = crisol_builtins::JsRegExp::new(&source, flags).ok()?;
+            cache.insert(key.clone(), compiled);
+        }
+        let pattern = cache.get_mut(&key)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a cursor past the end is handled by `exec`, and a negative one clamps"
+        )]
+        let start = cursor.max(0.0) as usize;
+        pattern.set_last_index(start);
+        let outcome = body(pattern);
+        Some((outcome, pattern.last_index()))
+    })?;
+
+    // Written back through the ordinary path, so a `lastIndex` the program made non-writable
+    // is honoured rather than bypassed.
+    if let Some(handle) = handle_of(this_value) {
+        let name = "lastIndex".to_owned();
+        #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+        let value = Value::number(moved as f64);
+        with_runtime(|runtime| runtime.define(handle, &name, value));
+    }
+    Some(outcome)
+}
+
+/// A named property of `object`, as text.
+fn property_text(object: u64, name: &str) -> Option<String> {
+    let key = name.to_owned();
+    // SAFETY: `key` is a live Rust string.
+    let bits = unsafe { crisol_property_load(object, key.as_ptr(), key.len() as u64) };
+    to_text(bits)
+}
+
+/// A named property of `object`, as a number.
+fn property_number(object: u64, name: &str) -> Option<f64> {
+    let key = name.to_owned();
+    // SAFETY: `key` is a live Rust string.
+    let bits = unsafe { crisol_property_load(object, key.as_ptr(), key.len() as u64) };
+    Value::from_bits(bits).as_number()
+}
+
+/// `RegExp.prototype.test`.
+extern "C" fn regexp_test(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
+    let found = with_pattern(this_value, |pattern| pattern.test(&text)).unwrap_or(false);
+    if found { Value::TRUE } else { Value::FALSE }.to_bits()
+}
+
+/// `RegExp.prototype.exec`.
+///
+/// **The result is an array with extra properties**, not a plain array: `index` and `input`
+/// ride along with the matched text and its groups. A group that did not participate is
+/// `undefined`, which is **not** the same as one that matched empty — the difference is why
+/// the groups are stored one at a time rather than filtered.
+extern "C" fn regexp_exec(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
+    let Some(Some(found)) = with_pattern(this_value, |pattern| pattern.exec(&text)) else {
+        // **`null`, not `undefined`**, which is what `while ((m = re.exec(s)) !== null)` tests.
+        return Value::NULL.to_bits();
+    };
+
+    with_rooted(&[this_value], || {
+        let whole = text
+            .get(found.start..found.end)
+            .unwrap_or_default()
+            .to_owned();
+        with_new_array(found.groups.len() + 1, |array| {
+            let first = new_string(&whole);
+            with_runtime(|runtime| {
+                runtime.heap.set_element(array, 0, Value::from_bits(first));
+            });
+            for (position, group) in found.groups.iter().enumerate() {
+                let value = match group {
+                    Some((start, end)) => new_string(text.get(*start..*end).unwrap_or_default()),
+                    None => Value::UNDEFINED.to_bits(),
+                };
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(array, position + 1, Value::from_bits(value));
+                });
+            }
+            // Byte offsets become code-unit offsets, so `index` is in the same space
+            // `length` and `charAt` use (D-115).
+            let prefix = text.get(..found.start).unwrap_or_default();
+            #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+            let index = Value::number(prefix.encode_utf16().count() as f64);
+            let input = new_string(&text);
+            with_runtime(|runtime| {
+                runtime.define(array, "index", index);
+                runtime.define(array, "input", Value::from_bits(input));
+            });
+            array.to_value().to_bits()
+        })
+    })
+}
+
+/// `RegExp.prototype.toString`.
+extern "C" fn regexp_to_string(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let source = property_text(this_value, "source").unwrap_or_default();
+    let flags = property_text(this_value, "flags").unwrap_or_default();
+    new_string(&format!("/{source}/{flags}"))
+}
+
 /// Methods on `String.prototype`.
 const STRING_NATIVES: &[(&str, Native)] = &[
     ("charAt", string_char_at),
@@ -1811,6 +1973,7 @@ impl Runtime {
         // that live on it.
         runtime.build_function_prototype();
         runtime.build_string_prototype();
+        runtime.build_regexp_prototype();
         runtime.build_array_prototype();
         runtime.build_globals();
         runtime
@@ -2022,6 +2185,25 @@ impl Runtime {
             + ANONYMOUS_NATIVES.len()
             + FUNCTION_NATIVES.len();
         for (index, (name, _)) in STRING_NATIVES.iter().enumerate() {
+            let method = self.native_function(base + index);
+            self.define_method(prototype.handle(), name, method.to_value());
+        }
+    }
+
+    /// Builds the object every regular expression inherits from.
+    fn build_regexp_prototype(&self) {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let prototype = scope.alloc(shape, 0);
+        REGEXP_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+
+        let base = NATIVES.len()
+            + GLOBAL_NATIVES.len()
+            + NAMESPACE_NATIVES.len()
+            + ANONYMOUS_NATIVES.len()
+            + FUNCTION_NATIVES.len()
+            + STRING_NATIVES.len();
+        for (index, (name, _)) in REGEXP_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
             self.define_method(prototype.handle(), name, method.to_value());
         }
@@ -3270,7 +3452,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + FUNCTION_NATIVES.len();
-        return STRING_NATIVES
+        if let Some((_, function)) = STRING_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + STRING_NATIVES.len();
+        return REGEXP_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
@@ -3909,4 +4095,75 @@ pub extern "C" fn crisol_iterate(value: u64) -> u64 {
         });
     }
     raise("value is not iterable", "TypeError")
+}
+
+/// `/source/flags` — a regular expression object.
+///
+/// **The pattern is compiled here, not at first use**, so a syntactically invalid one is a
+/// `SyntaxError` at the point the literal is evaluated rather than a surprise inside whatever
+/// later called `test`.
+///
+/// # Safety
+///
+/// `source` and `flags` must each point to `*_len` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_create_regexp(
+    source: *const u8,
+    source_len: u64,
+    flags: *const u8,
+    flags_len: u64,
+) -> u64 {
+    // SAFETY: the caller guarantees the lengths and the encoding.
+    let Some(source) = (unsafe { key_text(source, source_len) }) else {
+        return raise("a regular expression needs a pattern", "SyntaxError");
+    };
+    // SAFETY: as above.
+    let Some(flags_text) = (unsafe { key_text(flags, flags_len) }) else {
+        return raise("a regular expression needs its flags", "SyntaxError");
+    };
+
+    let Ok(parsed) = crisol_builtins::Flags::parse(&flags_text) else {
+        return raise("invalid regular expression flags", "SyntaxError");
+    };
+    let compiled = match crisol_builtins::JsRegExp::new(&source, parsed) {
+        Ok(compiled) => compiled,
+        Err(message) => return raise(&message, "SyntaxError"),
+    };
+    PATTERNS.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert((source.clone(), flags_text.clone()), compiled);
+    });
+
+    let object = crisol_create_object();
+    with_rooted(&[object], || {
+        let Some(handle) = handle_of(object) else {
+            return;
+        };
+        // **Created and stored one at a time.** Both strings built first would leave the first
+        // one unrooted while the second allocates, and a collection in between would free a
+        // value the object was about to hold — which reads back as a string that is not there.
+        let source_value = new_string(&source);
+        with_runtime(|runtime| {
+            runtime.define(handle, "source", Value::from_bits(source_value));
+        });
+        let flags_value = new_string(&flags_text);
+        with_runtime(|runtime| {
+            runtime.define(handle, "flags", Value::from_bits(flags_value));
+            // `lastIndex` is the cursor, and it is a property because a program may assign to
+            // it — the compiled pattern is set from it rather than owning it.
+            runtime.define(handle, "lastIndex", Value::number(0.0));
+            runtime.define(handle, "global", boolean(parsed.global));
+            runtime.define(handle, "ignoreCase", boolean(parsed.ignore_case));
+            runtime.define(handle, "multiline", boolean(parsed.multiline));
+            runtime.define(handle, "sticky", boolean(parsed.sticky));
+            runtime.define(handle, "unicode", boolean(parsed.unicode));
+            runtime.define(handle, "dotAll", boolean(parsed.dot_all));
+            if let Some(prototype) = REGEXP_PROTOTYPE.with(std::cell::Cell::get) {
+                runtime.heap.set_prototype(handle, Some(prototype));
+            }
+        });
+    });
+    object
 }

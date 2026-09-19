@@ -34,12 +34,16 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**23 passed, 293 failed, 0 crashed, 63 refused.** Computed property keys and template literals
-(D-119) and `for-of` over arrays and strings (D-120). Passes did not move: the cases that now
-compile fail on other grounds, which is what a refusal was hiding.
+**33 passed, 328 failed, 0 crashed, 18 refused.** Regular expressions work, over the
+`JsRegExp` already sitting finished in `crisol-builtins` (D-123).
 
-The refusals are now almost entirely **regular expression literals (45)** — they were 26 until
-`for-of` and template literals stopped being reported first. Then array holes (11).
+**That crate is tested and unshipped** (D-122): 230 passing tests over `Date`, `JSON`, `Map`,
+`Set`, `Promise`, `Proxy`, descriptors and the iterator protocol, none of it reachable from a
+compiled program, because `crisol-abi` does not depend on it and rewrote a smaller version.
+`Object.defineProperty` now exists twice. Everything in it that does not touch `Realm` — which
+is most of it — can be called directly, and `RegExp` is the first one taken.
+
+Refusals are down to 18, nearly all array holes (11).
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -75,7 +79,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1146 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1152 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure
