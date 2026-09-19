@@ -84,6 +84,29 @@ impl<'a> Visit<'a> for Escape {
         oxc_ast_visit::walk::walk_assignment_expression(self, assignment);
     }
 
+    /// **A `var` with an initialiser is an assignment**, because the binding already exists —
+    /// hoisting created it, and the declaration only writes to it.
+    ///
+    /// Without this a function declared above a `var` captured the slot's value at the moment
+    /// the closure was made, which is the `undefined` the hoist put there. The function was
+    /// then permanently blind to the value the declaration assigned a line later, which is the
+    /// shape of `function read() { return x; } var x = 7;`.
+    ///
+    /// `let` and `const` do not need it: their binding *is* the declaration, so nothing can
+    /// capture them before it runs.
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if declaration.kind.is_var() {
+            for declarator in &declaration.declarations {
+                if declarator.init.is_some()
+                    && let Some(name) = declarator.id.get_identifier_name()
+                {
+                    self.assigned.insert(name.to_string());
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_variable_declaration(self, declaration);
+    }
+
     fn visit_function(
         &mut self,
         function: &oxc_ast::ast::Function<'a>,

@@ -36,7 +36,21 @@ use support::{Metadata, discover, parse, skip_or_root};
 /// Every case that compiles also links and runs, which costs a `cc` invocation — so the whole
 /// corpus is minutes rather than seconds. The default is a sample large enough for the
 /// proportions to mean something; `CRISOL_TEST262_ALL=1` runs all of them.
+///
+/// **The cost grows as the engine improves**, which is not obvious: a refused case costs
+/// milliseconds and a compiled one costs a `cc` invocation, so the run gets slower every time
+/// something stops being refused. `CRISOL_TEST262_SAMPLE` exists for that — a smaller sample
+/// while iterating, with the default kept for any number that gets reported, because two
+/// sample sizes are two different measurements and comparing them says nothing.
 const SAMPLE: usize = 400;
+
+/// The sample size to use, honouring `CRISOL_TEST262_SAMPLE`.
+fn sample_size() -> usize {
+    std::env::var("CRISOL_TEST262_SAMPLE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(SAMPLE)
+}
 
 /// What happened to one case.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -215,7 +229,7 @@ fn the_suite_is_attempted_and_the_result_reported() {
     let limit = if std::env::var("CRISOL_TEST262_ALL").is_ok() {
         cases.len()
     } else {
-        SAMPLE.min(cases.len())
+        sample_size().min(cases.len())
     };
     // Evenly spaced rather than the first N: the corpus is ordered by directory, so a prefix
     // is entirely `Array` and says nothing about the rest.

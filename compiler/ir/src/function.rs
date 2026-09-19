@@ -392,6 +392,16 @@ pub enum Op {
         /// The key, as a value.
         key: ValueId,
     },
+    /// Reads a name that resolves to no binding: a global, answering `undefined` when it is
+    /// absent instead of raising.
+    ///
+    /// **Only `typeof` may ask this way.** Every other read of a missing global is a
+    /// `ReferenceError`, and `typeof` is the one operator the specification exempts — which is
+    /// why `typeof somethingUndeclared` is `"undefined"` and not a thrown error.
+    GlobalLoadOptional {
+        /// The name.
+        name: PropertyKey,
+    },
     /// Reads a name that resolves to no binding: a global.
     ///
     /// Distinct from [`Op::Load`] because a global is not a slot — it is a property of an
@@ -547,7 +557,8 @@ impl Op {
             | Self::CreateObject { .. }
             | Self::CreateRegExp { .. }
             | Self::CaughtValue
-            | Self::GlobalLoad { .. } => Vec::new(),
+            | Self::GlobalLoad { .. }
+            | Self::GlobalLoadOptional { .. } => Vec::new(),
             Self::Store { value, .. } | Self::Await { value } => vec![*value],
             Self::Call {
                 callee,

@@ -4063,3 +4063,99 @@ callee's prologue, before any of its slots exist, so the only thing describing t
 values is the caller's frame — and the array's own allocation could collect one it was about to
 hold. The rule has not changed since D-127: a value between allocation and its first store is
 invisible, and every allocation in that gap is a chance to lose it.
+
+## D-136
+
+**`var` is hoisted, which is what made test262's own helpers work.**
+
+Status: Accepted, fixing a bug with a large blast radius
+
+`var` and `let` were lowered identically — declared where they appear. A `var` is
+**function-scoped**, so its name exists from the top of the function whatever line declares it,
+and function declarations are hoisted *above* it. So a hoisted function could not see a `var`
+declared below it: the name resolved to nothing and became a global load.
+
+test262's `propertyHelper.js` is exactly that shape — `var __getOwnPropertyDescriptor = …` at
+the top of the file, read by `verifyProperty`, a hoisted function lowered before the assignment
+was reached. Eighteen cases failed with `__getOwnPropertyDescriptor is not defined`, and the
+variable was right there in the same file.
+
+The hoist pass already had the insight it needed — *"every name first, then every body"* — and
+simply did not include `var`. Now it collects them through blocks, loops, `try` and `switch`,
+but **not into nested functions**, because a `var` belongs to the nearest enclosing *function*
+and hoisting one out of a nested function would bind it in the wrong scope.
+
+**Hoisted means declared, not assigned.** Reading before the declaring statement gives
+`undefined`; `var x;` after `x = 1` must not reset it, which is why a declarator with no
+initialiser does nothing at its own site.
+
+**Consequence: a `var` initialiser counts as an assignment in the escape analysis.** The binding
+already exists by then, so the declaration is a write — and without that, a function declared
+above it captured the slot's value when the closure was made, which is the `undefined` the hoist
+had just put there. The function was permanently blind to the value assigned a line later.
+
+## D-137
+
+**Three operators were answering confidently and wrongly.**
+
+Status: Accepted
+
+Each was found by a test written for something else, which is the argument for writing the
+obvious assertions down even when the feature looks finished.
+
+- **`typeof` threw on an undeclared name.** The lowering's own comment said it is "the only
+  operator that does not throw on an undeclared identifier" — and then sent the operand through
+  the ordinary global load, which raises. `typeof nothingHere` was a `ReferenceError` instead of
+  `"undefined"`. It now reads the global through a variant that answers `undefined`, and clears
+  the pending throw so the next `catch` is not handed an exception nobody raised.
+- **`<`, `<=`, `>`, `>=` coerced both sides to `f64` unconditionally**, so every string
+  comparison was a `NaN` comparison — **false in both directions**. `"a" < "b"` and `"b" < "a"`
+  were both false, so a sort comparator written the ordinary way answered `0` for every pair and
+  sorted nothing. Two strings now compare lexicographically and everything else numerically,
+  with the `fcmp` fast path kept for operands the lattice already knows are numbers.
+- **`to_text` read `[object Object]` off every object without asking it.** `String([1, 2])` was
+  that string rather than `"1,2"`; the array had a perfectly good `toString` that nothing
+  called. Objects are now asked, `toString` first — the mirror of the `valueOf`-first order
+  `==` uses, and **the order is the whole difference**: a string context asks for text first and
+  a numeric one asks for a number first.
+
+## D-138
+
+**`sort` and `splice`.**
+
+Status: Accepted
+
+**The default sort order is by text, not by number.** `[10, 9].sort()` is `[10, 9]` because
+`"10"` sorts before `"9"`. **`undefined` sorts to the end and never reaches the comparator**,
+which is why it is partitioned out rather than compared.
+
+The sort is a hand-rolled merge rather than `sort_by`, because Rust's sort may **panic** when
+the comparison is not a total order — and a JavaScript comparator is arbitrary user code, so
+`sort(() => 1)` is legal and inconsistent. A panic in a runtime helper is not recoverable; a
+strange permutation is. It is stable, as the specification has required since ES2019.
+
+**`splice` answers the removed elements and mutates in place**, the pair of jobs that makes it
+the odd one out among the array methods. **No second argument removes everything from `start`
+on, and a second argument of `0` removes nothing** — different behaviours, so the argument
+*count* decides rather than the value.
+
+## D-139
+
+**test262 gets its own CI job, because its cost grows as the engine improves.**
+
+Status: Accepted
+
+A refused case costs milliseconds; a compiled one costs a `cc` invocation and a link. So the
+suite has got slower every time something stopped being refused — the run is now long enough
+that it cannot share a job with checks that should finish quickly, and long enough that local
+runs were being lost to timeouts before they reported anything.
+
+The split is: a **smoke sample of 40** in the matrix job, which catches an outright break, and a
+**dedicated job running the whole corpus** with three hours and a runner to itself. The full
+numbers and the reason breakdown go to the job summary, and the log is kept as an artifact —
+a pass rate says how much, and the reasons say what to do next, so both are published rather
+than left in a log nobody opens.
+
+`CRISOL_TEST262_SAMPLE` exists for iterating locally. The default is left alone for anything
+reported, because **two sample sizes are two different measurements** and comparing them says
+nothing.

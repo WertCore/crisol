@@ -3254,3 +3254,245 @@ fn arguments_is_not_a_global() {
         "ReferenceError",
     );
 }
+
+// ---- var hoisting ---------------------------------------------------------------------------
+
+/// **A `var` is function-scoped and hoisted**, so its name exists from the top of the function
+/// whatever line declares it. This is the shape test262's own `propertyHelper.js` has — a `var`
+/// at the top of the file read by a hoisted function — and lowering the declaration where it
+/// appeared left every hoisted function above it unable to see the name.
+#[test]
+fn a_hoisted_function_sees_a_var_declared_below_it() {
+    check(
+        "var-hoist-function",
+        "function read() { return later; } var later = 7; return read();",
+        "7",
+    );
+    check(
+        "var-hoist-alias",
+        "function get() { return alias(1, 2); } var alias = Math.max; return get();",
+        "2",
+    );
+}
+
+/// **Hoisted means declared, not assigned.** Reading before the declaring statement runs gives
+/// `undefined`, which is exactly what separates `var` from `let`.
+#[test]
+fn a_var_read_before_its_declaration_is_undefined() {
+    check("var-before", "let r = x; var x = 1; return r;", "undefined");
+    check("var-after", "var x = 1; return x;", "1");
+}
+
+/// A `var` inside a block belongs to the function around it, not the block.
+#[test]
+fn a_var_inside_a_block_escapes_the_block() {
+    check("var-in-block", "{ var x = 1; } return x;", "1");
+    check("var-in-if", "if (true) { var y = 2; } return y;", "2");
+    check(
+        "var-in-loop",
+        "for (let i = 0; i < 1; i = i + 1) { var z = 3; } return z;",
+        "3",
+    );
+    check(
+        "var-in-try",
+        "try { var t = 4; } catch (e) { } return t;",
+        "4",
+    );
+}
+
+/// **`var x;` after an assignment must not clobber it.** The hoist already set the binding to
+/// `undefined`; a declaration with no initialiser has nothing left to do.
+#[test]
+fn a_var_declaration_without_an_initialiser_does_not_reset_it() {
+    check("var-redeclare", "x = 5; var x; return x;", "5");
+    check("var-twice", "var x = 1; var x; return x;", "1");
+}
+
+/// A nested function's own `var`s belong to it, not to the function around it.
+#[test]
+fn a_nested_functions_vars_stay_inside_it() {
+    check(
+        "var-nested-scope",
+        "let f = function () { var inner = 1; return inner; }; \
+         let r = f(); let outer = typeof inner; return outer;",
+        "undefined",
+    );
+}
+
+/// **`typeof` is the one operator that does not throw on an undeclared name.** The comment in
+/// the lowering said so long before the code did — the operand went through the ordinary global
+/// load, which raises, so this was a `ReferenceError` instead of a string.
+#[test]
+fn typeof_an_undeclared_name_is_a_string() {
+    check(
+        "typeof-undeclared",
+        "return typeof nothingHere;",
+        "undefined",
+    );
+    check("typeof-declared", "let x = 1; return typeof x;", "number");
+    check("typeof-global", "return typeof Object;", "function");
+    // Every *other* read of a missing global is still a `ReferenceError`.
+    check(
+        "undeclared-read-still-throws",
+        "let r = \"\"; try { let v = nothingHere; } catch (e) { r = e.name; } return r;",
+        "ReferenceError",
+    );
+}
+
+// ---- sort and splice --------------------------------------------------------------------
+
+/// **The default sort order is by text, not by number.** `[10, 9].sort()` is `[10, 9]`, because
+/// `"10"` sorts before `"9"`. That surprises everyone once, and it is the specification's rule.
+#[test]
+fn sort_compares_as_text_unless_told_otherwise() {
+    check(
+        "sort-text",
+        "return [\"c\", \"a\", \"b\"].sort().join(\"\");",
+        "abc",
+    );
+    check(
+        "sort-numbers-as-text",
+        "return [10, 9, 1].sort().join(\",\");",
+        "1,10,9",
+    );
+    check(
+        "sort-comparator",
+        "return [10, 9, 1].sort(function (a, b) { return a - b; }).join(\",\");",
+        "1,9,10",
+    );
+    check(
+        "sort-descending",
+        "return [1, 3, 2].sort(function (a, b) { return b - a; }).join(\",\");",
+        "3,2,1",
+    );
+}
+
+/// **`undefined` sorts to the end and never reaches the comparator.**
+#[test]
+fn undefined_sorts_last() {
+    check(
+        "sort-undefined-last",
+        "let a = [3, undefined, 1]; a.sort(); return a[2] === undefined;",
+        "true",
+    );
+    check(
+        "sort-undefined-not-compared",
+        "let seen = 0; [1, undefined, 2].sort(function (a, b) { seen = seen + 1; return 0; }); \
+         return seen;",
+        "1",
+    );
+}
+
+/// Stable since ES2019: equal elements keep the order they were in.
+#[test]
+fn sort_is_stable() {
+    check(
+        "sort-stable",
+        "let a = [\"b1\", \"a1\", \"b2\", \"a2\"]; \
+         a.sort(function (x, y) { return x.charAt(0) < y.charAt(0) ? -1 : (x.charAt(0) > y.charAt(0) ? 1 : 0); }); \
+         return a.join(\",\");",
+        "a1,a2,b1,b2",
+    );
+}
+
+/// **`splice` answers the removed elements and mutates in place** — the pair of jobs that makes
+/// it the odd one out among the array methods.
+#[test]
+fn splice_removes_and_answers_what_it_removed() {
+    check(
+        "splice-removed",
+        "return [1, 2, 3].splice(1, 1).join(\",\");",
+        "2",
+    );
+    check(
+        "splice-remaining",
+        "let a = [1, 2, 3]; a.splice(1, 1); return a.join(\",\");",
+        "1,3",
+    );
+    check(
+        "splice-insert",
+        "let a = [1, 4]; a.splice(1, 0, 2, 3); return a.join(\",\");",
+        "1,2,3,4",
+    );
+    check(
+        "splice-replace",
+        "let a = [1, 9, 3]; a.splice(1, 1, 2); return a.join(\",\");",
+        "1,2,3",
+    );
+}
+
+/// **No second argument removes everything from `start` on**, which is different from passing
+/// a count of zero — so the argument *count* decides, not the value.
+#[test]
+fn splice_without_a_count_removes_the_rest() {
+    check(
+        "splice-to-end",
+        "let a = [1, 2, 3]; a.splice(1); return a.join(\",\");",
+        "1",
+    );
+    check(
+        "splice-count-zero",
+        "let a = [1, 2, 3]; a.splice(1, 0); return a.join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "splice-negative",
+        "let a = [1, 2, 3]; a.splice(-1); return a.join(\",\");",
+        "1,2",
+    );
+}
+
+#[test]
+fn an_array_prints_as_its_elements() {
+    check("array-tostring", "return [1, 2, 3].toString();", "1,2,3");
+    check(
+        "array-tostring-nested",
+        "return String([1, [2, 3]]);",
+        "1,2,3",
+    );
+    check(
+        "array-tostring-nullish",
+        "return [1, null, 2].toString();",
+        "1,,2",
+    );
+}
+
+/// **Two strings compare lexicographically; everything else numerically.** Coercing both sides
+/// to a number made every string comparison a `NaN` comparison — false in *both* directions, so
+/// a sort comparator written the ordinary way answered `0` for every pair and sorted nothing.
+#[test]
+fn relational_operators_compare_strings_as_text() {
+    check("less-strings", "return \"a\" < \"b\";", "true");
+    check("less-strings-reverse", "return \"b\" < \"a\";", "false");
+    check("greater-strings", "return \"b\" > \"a\";", "true");
+    check("less-equal-strings", "return \"a\" <= \"a\";", "true");
+    // As text `"10"` precedes `"9"`; as numbers it does not. Both are right, for their types.
+    check("less-numeric-strings", "return \"10\" < \"9\";", "true");
+    check("less-numbers", "return 10 < 9;", "false");
+    // A string against a number is numeric, so this reads `"10"` as ten.
+    check("less-mixed", "return \"10\" < 9;", "false");
+}
+
+/// `NaN` makes all four false, which is not the same as the negation of the opposite operator.
+#[test]
+fn nan_is_not_ordered() {
+    check("less-nan", "return 0 / 0 < 1;", "false");
+    check("greater-nan", "return 0 / 0 > 1;", "false");
+    check("less-equal-nan", "return 0 / 0 <= 0 / 0;", "false");
+}
+
+/// **An object is asked for its text**, through `toString` and then `valueOf`. Reading
+/// `[object Object]` off every object made `String([1, 2])` that string instead of `"1,2"` —
+/// the array had a perfectly good `toString` that nothing called.
+#[test]
+fn an_object_is_asked_how_it_reads_as_text() {
+    check("text-array", "return String([1, 2]);", "1,2");
+    check("text-array-concat", "return \"\" + [1, 2];", "1,2");
+    check(
+        "text-custom",
+        "let o = {toString: function () { return \"x\"; }}; return String(o);",
+        "x",
+    );
+    // A plain object still reads as `[object Object]`, through the inherited `toString`.
+    check("text-plain-object", "return String({});", "[object Object]");
+}

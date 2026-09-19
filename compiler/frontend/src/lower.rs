@@ -306,18 +306,33 @@ impl Lowering {
 
     /// `let`/`const`/`var`, which a `for` initialiser also uses.
     fn variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'_>) {
+        let hoisted = declaration.kind.is_var();
         for declarator in &declaration.declarations {
             let Some(name) = declarator.id.get_identifier_name() else {
                 self.note("destructuring declaration", declarator.span.start);
                 continue;
             };
+            // **A `var` with no initialiser does nothing here.** The hoist already set it to
+            // `undefined`; assigning again would clobber a value an earlier statement gave it,
+            // which is what `var x;` after `x = 1` must not do.
+            if hoisted && declarator.init.is_none() {
+                continue;
+            }
             let value = match &declarator.init {
                 Some(init) => self.expression(init),
                 None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
             };
-            // `declare`, not `slot`: a `let` shadows an outer binding rather than capturing it.
-            let slot = self.declare(name.as_str());
-            self.bind(name.as_str(), slot, value);
+            if hoisted {
+                // The binding already exists, from the hoist. `slot` finds it; `declare` would
+                // make a second one and leave every reader of the first looking at `undefined`.
+                let slot = self.slot(name.as_str());
+                self.write(slot, value);
+            } else {
+                // `declare`, not `slot`: a `let` shadows an outer binding rather than
+                // capturing it.
+                let slot = self.declare(name.as_str());
+                self.bind(name.as_str(), slot, value);
+            }
         }
     }
 
@@ -750,6 +765,29 @@ impl Lowering {
     /// block's scope, which needs block scoping the lowering does not model, so those are left
     /// where they are and still refused — visibly, rather than bound in the wrong scope.
     fn hoist(&mut self, statements: &[Statement<'_>]) {
+        // **`var` is hoisted too, and that is not a detail.** A `var` is function-scoped, so
+        // its name exists from the top of the function whatever line declares it. Declaring it
+        // where it appears left every hoisted function above it unable to see it — and
+        // test262's `propertyHelper.js` is exactly that shape: `var __getOwnPropertyDescriptor
+        // = …` at the top of the file, read by `verifyProperty`, a hoisted function lowered
+        // before the assignment was reached. The name resolved to nothing, became a global
+        // load, and the case failed with `__getOwnPropertyDescriptor is not defined`.
+        let mut names = Vec::new();
+        collect_var_names(statements, &mut names);
+        for name in names {
+            if self.scope().slots.contains_key(&name) {
+                continue;
+            }
+            let slot = self.declare(&name);
+            // Hoisted means *declared*, not assigned: reading before the declaring statement
+            // runs gives `undefined`, which is what distinguishes `var` from `let`.
+            let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+            self.write(slot, undefined);
+            if self.shared.contains(&name) {
+                self.make_cell(slot);
+            }
+        }
+
         let named: Vec<(String, &oxc_ast::ast::Function<'_>)> = statements
             .iter()
             .filter_map(|statement| {
@@ -1581,7 +1619,26 @@ impl Lowering {
             UnaryOperator::BitwiseNot => (UnaryOp::BitNot, Type::Number),
             // `typeof` produces one of a fixed set of strings, and is the only operator that
             // does not throw on an undeclared identifier.
-            UnaryOperator::Typeof => (UnaryOp::TypeOf, Type::String),
+            // **`typeof` is the one operator that does not throw on an undeclared name.** The
+            // comment here said so long before the code did: the operand went through the
+            // ordinary global load, which raises, so `typeof nothing` was a `ReferenceError`
+            // instead of the string `"undefined"`.
+            UnaryOperator::Typeof => {
+                if let Expression::Identifier(identifier) = &unary.argument
+                    && !self.resolves(identifier.name.as_str())
+                {
+                    let name = PropertyKey::new(identifier.name.as_str());
+                    let value = self.emit(Type::Unknown, Op::GlobalLoadOptional { name });
+                    return self.emit(
+                        Type::String,
+                        Op::Unary {
+                            op: UnaryOp::TypeOf,
+                            operand: value,
+                        },
+                    );
+                }
+                (UnaryOp::TypeOf, Type::String)
+            }
             UnaryOperator::Void => (UnaryOp::Void, Type::Undefined),
             UnaryOperator::Delete => return self.delete(unary),
         };
@@ -2118,5 +2175,72 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         // A name rather than "expression": the unsupported list is read to decide what to
         // implement next, and a bucket everything unrecognised falls into says nothing.
         _ => "an expression this compiler does not name yet",
+    }
+}
+
+/// Every name a `var` declares in `statements`, including inside nested blocks and loops.
+///
+/// **Through blocks but not through functions.** A `var` is scoped to the nearest enclosing
+/// *function*, so one inside an `if` belongs to the function around it — and one inside a nested
+/// function belongs to that function, not this one. Walking into a function body would hoist its
+/// locals into the wrong scope, which is worse than not hoisting at all.
+fn collect_var_names(statements: &[Statement<'_>], into: &mut Vec<String>) {
+    for statement in statements {
+        collect_var_names_of(statement, into);
+    }
+}
+
+/// One statement's `var` names.
+fn collect_var_names_of(statement: &Statement<'_>, into: &mut Vec<String>) {
+    use oxc_ast::ast::ForStatementInit;
+
+    match statement {
+        Statement::VariableDeclaration(declaration) if declaration.kind.is_var() => {
+            for declarator in &declaration.declarations {
+                if let Some(name) = declarator.id.get_identifier_name() {
+                    into.push(name.to_string());
+                }
+            }
+        }
+        Statement::BlockStatement(block) => collect_var_names(&block.body, into),
+        Statement::IfStatement(statement) => {
+            collect_var_names_of(&statement.consequent, into);
+            if let Some(alternate) = &statement.alternate {
+                collect_var_names_of(alternate, into);
+            }
+        }
+        Statement::ForStatement(statement) => {
+            if let Some(ForStatementInit::VariableDeclaration(declaration)) = &statement.init
+                && declaration.kind.is_var()
+            {
+                for declarator in &declaration.declarations {
+                    if let Some(name) = declarator.id.get_identifier_name() {
+                        into.push(name.to_string());
+                    }
+                }
+            }
+            collect_var_names_of(&statement.body, into);
+        }
+        Statement::ForInStatement(statement) => collect_var_names_of(&statement.body, into),
+        Statement::ForOfStatement(statement) => collect_var_names_of(&statement.body, into),
+        Statement::WhileStatement(statement) => collect_var_names_of(&statement.body, into),
+        Statement::DoWhileStatement(statement) => collect_var_names_of(&statement.body, into),
+        Statement::LabeledStatement(statement) => collect_var_names_of(&statement.body, into),
+        Statement::TryStatement(statement) => {
+            collect_var_names(&statement.block.body, into);
+            if let Some(handler) = &statement.handler {
+                collect_var_names(&handler.body.body, into);
+            }
+            if let Some(finalizer) = &statement.finalizer {
+                collect_var_names(&finalizer.body, into);
+            }
+        }
+        Statement::SwitchStatement(statement) => {
+            for case in &statement.cases {
+                collect_var_names(&case.consequent, into);
+            }
+        }
+        // A function's own `var`s belong to it, so the walk stops here.
+        _ => {}
     }
 }

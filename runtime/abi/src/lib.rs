@@ -79,6 +79,8 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_in",
     "crisol_array_extend",
     "crisol_create_arguments",
+    "crisol_global_load_optional",
+    "crisol_relational",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -656,7 +658,218 @@ const NATIVES: &[(&str, Native)] = &[
     ("at", array_at),
     ("findLast", array_find_last),
     ("findLastIndex", array_find_last_index),
+    ("sort", array_sort),
+    ("splice", array_splice),
+    ("toString", array_to_text),
+    ("toLocaleString", array_to_text),
 ];
+
+/// A stable merge sort over `values`, ordered by `before`.
+///
+/// **Hand-rolled rather than `sort_by`.** Rust's sort may panic when the comparison is not a
+/// total order, and a JavaScript comparator is arbitrary user code — `sort(() => 1)` is legal
+/// and inconsistent. A panic in a runtime helper is not recoverable, so the order has to be
+/// merged by hand, where an inconsistent answer produces a strange permutation and nothing
+/// worse.
+fn merge_sort(values: &mut Vec<u64>, before: &mut impl FnMut(u64, u64) -> bool) {
+    let length = values.len();
+    if length < 2 {
+        return;
+    }
+    let mut buffer = values.clone();
+    let mut width = 1;
+    while width < length {
+        let mut start = 0;
+        while start < length {
+            let middle = (start + width).min(length);
+            let end = (start + 2 * width).min(length);
+            let (mut left, mut right, mut at) = (start, middle, start);
+            while left < middle && right < end {
+                if before(values[right], values[left]) {
+                    buffer[at] = values[right];
+                    right += 1;
+                } else {
+                    // `!before(right, left)` keeps equal elements in order, which is what makes
+                    // this stable — the specification has required a stable sort since ES2019.
+                    buffer[at] = values[left];
+                    left += 1;
+                }
+                at += 1;
+            }
+            while left < middle {
+                buffer[at] = values[left];
+                left += 1;
+                at += 1;
+            }
+            while right < end {
+                buffer[at] = values[right];
+                right += 1;
+                at += 1;
+            }
+            start += 2 * width;
+        }
+        std::mem::swap(values, &mut buffer);
+        width *= 2;
+    }
+}
+
+/// `Array.prototype.sort`.
+///
+/// **The default order is by text, not by number.** `[10, 9].sort()` is `[10, 9]`, because
+/// `"10"` sorts before `"9"`. That surprises everyone once and is the specification's rule.
+///
+/// **`undefined` sorts to the end** and never reaches the comparator, which is why it is
+/// partitioned out rather than compared.
+extern "C" fn array_sort(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return this_value;
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let comparator = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // Every value here is still in the array, which is rooted, so the collector can see
+        // them all while the comparator runs.
+        let mut present = Vec::with_capacity(length);
+        let mut absent = 0;
+        for index in 0..length {
+            let element = element_at(array, index);
+            if Value::from_bits(element).kind() == crisol_value::Kind::Undefined {
+                absent += 1;
+            } else {
+                present.push(element);
+            }
+        }
+
+        let mut before = |left: u64, right: u64| -> bool {
+            if is_callable(comparator) {
+                let verdict = call_value(comparator, Value::UNDEFINED.to_bits(), &[left, right]);
+                return Value::from_bits(verdict)
+                    .as_number()
+                    .is_some_and(|order| order < 0.0);
+            }
+            to_text(left)
+                .zip(to_text(right))
+                .is_some_and(|(a, b)| a < b)
+        };
+        merge_sort(&mut present, &mut before);
+
+        with_runtime(|runtime| {
+            for (index, value) in present.iter().enumerate() {
+                runtime
+                    .heap
+                    .set_element(array, index, Value::from_bits(*value));
+            }
+            for offset in 0..absent {
+                runtime
+                    .heap
+                    .set_element(array, present.len() + offset, Value::UNDEFINED);
+            }
+        });
+        this_value
+    })
+}
+
+/// `Array.prototype.splice`.
+///
+/// **Answers the removed elements and mutates in place**, which is the pair of jobs that makes
+/// it the odd one out among the array methods — every other mutator answers the array or a
+/// count.
+extern "C" fn array_splice(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    // **No second argument removes everything from `start` on**; a second argument of
+    // `undefined` removes nothing. The two are different, which is why `argc` is read rather
+    // than the value.
+    let removing = if argc < 2 {
+        length - start
+    } else {
+        // SAFETY: as above.
+        let asked = Value::from_bits(unsafe { argument(argc, argv, 1) })
+            .as_number()
+            .unwrap_or(0.0);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped into 0..=remaining"
+        )]
+        let count = asked.max(0.0) as usize;
+        count.min(length - start)
+    };
+
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let removed: Vec<u64> = (0..removing)
+            .map(|offset| element_at(array, start + offset))
+            .collect();
+        let inserted: Vec<u64> = (2..argc as usize)
+            // SAFETY: as above.
+            .map(|position| unsafe { argument(argc, argv, position) })
+            .collect();
+        let tail: Vec<u64> = (start + removing..length)
+            .map(|index| element_at(array, index))
+            .collect();
+
+        with_runtime(|runtime| {
+            let mut at = start;
+            for value in inserted.iter().chain(tail.iter()) {
+                runtime
+                    .heap
+                    .set_element(array, at, Value::from_bits(*value));
+                at += 1;
+            }
+            runtime.heap.truncate_elements(array, at);
+        });
+        array_of_values(&removed)
+    })
+}
+
+/// `Array.prototype.toString` and `toLocaleString` — the elements, comma-separated.
+extern "C" fn array_to_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return new_string("");
+    };
+    with_rooted(&[this_value], || {
+        let mut out = String::new();
+        for index in 0..length {
+            if index > 0 {
+                out.push(',');
+            }
+            let element = Value::from_bits(element_at(array, index));
+            if !matches!(
+                element.kind(),
+                crisol_value::Kind::Null | crisol_value::Kind::Undefined
+            ) && let Some(text) = to_text(element.to_bits())
+            {
+                out.push_str(&text);
+            }
+        }
+        new_string(&out)
+    })
+}
 
 /// `Array.prototype.reduceRight`.
 ///
@@ -5249,8 +5462,19 @@ pub unsafe extern "C" fn crisol_create_string(text: *const u8, length: u64) -> u
 }
 
 /// How a value reads as text, for `+` and for printing.
+///
+/// **An object is asked**, through `toString` and then `valueOf`. Reading `[object Object]` off
+/// every object without asking made `String([1, 2])` that string instead of `"1,2"`, and
+/// `"" + [1]` likewise — the array had a perfectly good `toString` that nothing called.
 fn to_text(bits: u64) -> Option<String> {
     let value = Value::from_bits(bits);
+    if value.kind() == crisol_value::Kind::Object && handle_of(bits).is_some() && !is_callable(bits)
+    {
+        let asked = to_primitive_text(bits);
+        if asked != bits {
+            return to_text(asked);
+        }
+    }
     match value.kind() {
         crisol_value::Kind::String => text_of(bits),
         crisol_value::Kind::Number => value.as_number().map(number_text),
@@ -5906,6 +6130,29 @@ fn loosely_equal(left: u64, right: u64, round: u32) -> bool {
     false
 }
 
+/// An object as a primitive, preferring `toString`.
+///
+/// The mirror of [`to_primitive`], which prefers `valueOf`. **The order is the whole
+/// difference**: a string context asks for text first and a numeric one asks for a number
+/// first, and an object that answers both would otherwise give the wrong one to one of them.
+fn to_primitive_text(value: u64) -> u64 {
+    for name in ["toString", "valueOf"] {
+        let key = name.to_owned();
+        // SAFETY: `key` is a live Rust string.
+        let method = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
+        if !is_callable(method) {
+            continue;
+        }
+        let result = call_value(method, value, &[]);
+        if handle_of(result).is_none()
+            || Value::from_bits(result).kind() == crisol_value::Kind::String
+        {
+            return result;
+        }
+    }
+    value
+}
+
 /// An object as a primitive, for `==`.
 ///
 /// `valueOf` first and `toString` second, which is the order for everything except `Date`. A
@@ -6037,4 +6284,73 @@ pub unsafe extern "C" fn crisol_create_arguments(argc: u64, argv: *const u64) ->
     // collection during the array's own allocation would free an argument the array is about
     // to hold. It reads back as an element that is there and unreadable.
     with_rooted(&given, || array_of_values(&given))
+}
+
+/// Reads a global, answering `undefined` when it is absent rather than raising.
+///
+/// **Only `typeof` asks this way.** Every other read of a missing global is a `ReferenceError`;
+/// `typeof` is the one operator the specification exempts, which is what makes
+/// `typeof somethingUndeclared` the string `"undefined"` instead of a thrown error.
+///
+/// # Safety
+///
+/// `name` must point to `length` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_global_load_optional(name: *const u8, length: u64) -> u64 {
+    // SAFETY: the caller promises `length` readable UTF-8 bytes at `name`.
+    let loaded = unsafe { crisol_global_load(name, length) };
+    if Value::from_bits(loaded).is_exception() {
+        // The throw is already recorded as pending, so it has to be cleared — leaving it would
+        // hand the *next* `catch` an exception nobody raised.
+        let _cleared = crisol_pending_exception();
+        return Value::UNDEFINED.to_bits();
+    }
+    loaded
+}
+
+/// `<`, `<=`, `>`, `>=` on values that are not both known to be numbers.
+///
+/// **Two strings compare lexicographically, and everything else numerically.** `"a" < "b"` is
+/// true and `"10" < "9"` is *also* true — as text, `"1"` precedes `"9"` — while `10 < 9` is
+/// false. Coercing both sides to a number unconditionally made every string comparison a `NaN`
+/// comparison, which is `false` for all four operators; so `"a" < "b"` and `"b" < "a"` were both
+/// false, and a sort comparator written the ordinary way returned `0` for every pair.
+///
+/// `which` is 0 for `<`, 1 for `<=`, 2 for `>`, 3 for `>=`.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_relational(left: u64, right: u64, which: u64) -> u64 {
+    with_rooted(&[left, right], || {
+        let left = to_primitive(left);
+        with_rooted(&[left], || {
+            let right = to_primitive(right);
+            let both_strings = Value::from_bits(left).kind() == crisol_value::Kind::String
+                && Value::from_bits(right).kind() == crisol_value::Kind::String;
+
+            let outcome = if both_strings {
+                let (Some(a), Some(b)) = (text_of(left), text_of(right)) else {
+                    return Value::FALSE.to_bits();
+                };
+                match which {
+                    0 => a < b,
+                    1 => a <= b,
+                    2 => a > b,
+                    _ => a >= b,
+                }
+            } else {
+                let a = to_number(left);
+                let b = to_number(right);
+                // **`NaN` makes all four false**, which falls out of IEEE comparison and is
+                // worth not second-guessing: `!(a < b)` is not `a >= b` here.
+                match which {
+                    0 => a < b,
+                    1 => a <= b,
+                    2 => a > b,
+                    _ => a >= b,
+                }
+            };
+            boolean(outcome).to_bits()
+        })
+    })
 }

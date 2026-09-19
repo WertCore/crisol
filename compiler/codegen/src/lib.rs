@@ -191,6 +191,8 @@ const ITERATE_SYMBOL: &str = "crisol_iterate";
 const CREATE_REGEXP_SYMBOL: &str = "crisol_create_regexp";
 const ARRAY_EXTEND_SYMBOL: &str = "crisol_array_extend";
 const CREATE_ARGUMENTS_SYMBOL: &str = "crisol_create_arguments";
+const GLOBAL_LOAD_OPTIONAL_SYMBOL: &str = "crisol_global_load_optional";
+const RELATIONAL_SYMBOL: &str = "crisol_relational";
 
 /// The runtime symbol each unary operator calls when its operand's type is not known.
 ///
@@ -259,6 +261,10 @@ struct ObjectHelpers<T> {
     array_extend: T,
     /// `crisol_create_arguments(argc, argv) -> array`
     create_arguments: T,
+    /// `crisol_global_load_optional(name, length) -> value or undefined`
+    global_load_optional: T,
+    /// `crisol_relational(left, right, which) -> boolean`
+    relational: T,
 }
 
 /// Declares the object helpers as imports in `module`.
@@ -369,6 +375,17 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     iterate.params.push(AbiParam::new(types::I64));
     iterate.returns.push(AbiParam::new(types::I64));
 
+    let mut relational = module.make_signature();
+    relational.params.push(AbiParam::new(types::I64));
+    relational.params.push(AbiParam::new(types::I64));
+    relational.params.push(AbiParam::new(types::I64));
+    relational.returns.push(AbiParam::new(types::I64));
+
+    let mut global_load_optional = module.make_signature();
+    global_load_optional.params.push(AbiParam::new(pointer));
+    global_load_optional.params.push(AbiParam::new(types::I64));
+    global_load_optional.returns.push(AbiParam::new(types::I64));
+
     let mut create_arguments = module.make_signature();
     create_arguments.params.push(AbiParam::new(types::I64));
     create_arguments.params.push(AbiParam::new(pointer));
@@ -434,6 +451,8 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         create_regexp: declare(CREATE_REGEXP_SYMBOL, &create_regexp)?,
         array_extend: declare(ARRAY_EXTEND_SYMBOL, &array_extend)?,
         create_arguments: declare(CREATE_ARGUMENTS_SYMBOL, &create_arguments)?,
+        global_load_optional: declare(GLOBAL_LOAD_OPTIONAL_SYMBOL, &global_load_optional)?,
+        relational: declare(RELATIONAL_SYMBOL, &relational)?,
         unary,
     })
 }
@@ -486,7 +505,8 @@ fn keys_of(function: &Function) -> Vec<String> {
             let key = match &instruction.op {
                 Op::PropertyLoad { key, .. }
                 | Op::PropertyStore { key, .. }
-                | Op::GlobalLoad { name: key } => key.as_str(),
+                | Op::GlobalLoad { name: key }
+                | Op::GlobalLoadOptional { name: key } => key.as_str(),
                 Op::Const(Constant::String(text)) => text.as_str(),
                 // A pattern and its flags are interned the same way, so the data section holds
                 // one copy of each however often the literal appears.
@@ -974,6 +994,12 @@ impl Backend for Cranelift {
             create_arguments: self
                 .module
                 .declare_func_in_func(self.objects.create_arguments, &mut context.func),
+            global_load_optional: self
+                .module
+                .declare_func_in_func(self.objects.global_load_optional, &mut context.func),
+            relational: self
+                .module
+                .declare_func_in_func(self.objects.relational, &mut context.func),
             unary: self
                 .objects
                 .unary
@@ -1448,10 +1474,16 @@ impl Lowering<'_> {
                 let left = self.value(*left_id);
                 let right = self.value(*right_id);
                 let condition = match op {
+                    // **Only when both sides are known numbers.** Two strings compare
+                    // lexicographically, and coercing them to `f64` made every string
+                    // comparison a `NaN` comparison — false in both directions, so a sort
+                    // comparator written the ordinary way answered `0` for every pair.
                     CompareOp::Less
                     | CompareOp::LessEqual
                     | CompareOp::Greater
-                    | CompareOp::GreaterEqual => {
+                    | CompareOp::GreaterEqual
+                        if self.is_number(*left_id) && self.is_number(*right_id) =>
+                    {
                         let left = self.as_f64(left);
                         let right = self.as_f64(right);
                         let cc = match op {
@@ -1465,6 +1497,33 @@ impl Lowering<'_> {
                             _ => cranelift_codegen::ir::condcodes::FloatCC::GreaterThanOrEqual,
                         };
                         self.builder.ins().fcmp(cc, left, right)
+                    }
+                    // Anything else is a call: the answer depends on both runtime types.
+                    CompareOp::Less
+                    | CompareOp::LessEqual
+                    | CompareOp::Greater
+                    | CompareOp::GreaterEqual => {
+                        let which = match op {
+                            CompareOp::Less => 0,
+                            CompareOp::LessEqual => 1,
+                            CompareOp::Greater => 2,
+                            _ => 3,
+                        };
+                        let which = self.builder.ins().iconst(types::I64, which);
+                        let call = self
+                            .builder
+                            .ins()
+                            .call(self.objects.relational, &[left, right, which]);
+                        let answer = self.builder.inst_results(call)[0];
+                        let boxed_true = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, crisol_value::Value::TRUE.to_bits() as i64);
+                        self.builder.ins().icmp(
+                            cranelift_codegen::ir::condcodes::IntCC::Equal,
+                            answer,
+                            boxed_true,
+                        )
                     }
                     // On **numbers**, `===` is exactly `f64` equality: `NaN === NaN` is false
                     // and `fcmp eq` on NaN is false; `+0 === -0` is true and `fcmp eq` on the
@@ -1669,6 +1728,14 @@ impl Lowering<'_> {
                     .builder
                     .ins()
                     .call(self.objects.global_load, &[pointer, length]);
+                Some(self.builder.inst_results(call)[0])
+            }
+            Op::GlobalLoadOptional { name } => {
+                let (pointer, length) = self.key_operands(name)?;
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.global_load_optional, &[pointer, length]);
                 Some(self.builder.inst_results(call)[0])
             }
             Op::CaughtValue => {
@@ -2089,6 +2156,12 @@ impl Jit {
             create_arguments: self
                 .module
                 .declare_func_in_func(self.objects.create_arguments, &mut context.func),
+            global_load_optional: self
+                .module
+                .declare_func_in_func(self.objects.global_load_optional, &mut context.func),
+            relational: self
+                .module
+                .declare_func_in_func(self.objects.relational, &mut context.func),
             unary: self
                 .objects
                 .unary
