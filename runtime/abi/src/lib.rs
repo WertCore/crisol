@@ -642,7 +642,247 @@ const NATIVES: &[(&str, Native)] = &[
     ("every", array_every),
     ("some", array_some),
     ("fill", array_fill),
+    ("reduceRight", array_reduce_right),
+    ("flat", array_flat),
+    ("flatMap", array_flat_map),
+    ("at", array_at),
+    ("findLast", array_find_last),
+    ("findLastIndex", array_find_last_index),
 ];
+
+/// `Array.prototype.reduceRight`.
+///
+/// **Not `reduce` with a reversed list.** The callback still receives each element's real
+/// index, so reversing the array first would hand it the wrong ones — and for a callback that
+/// looks at the index, that is a wrong answer rather than a slower one.
+extern "C" fn array_reduce_right(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let mut position = length;
+        let mut total = if argc > 1 {
+            // SAFETY: the count was just checked.
+            unsafe { argument(argc, argv, 1) }
+        } else if position == 0 {
+            // **An empty array with no initial value is a `TypeError`**, not `undefined` —
+            // there is no answer to give, and inventing one hides the mistake.
+            return raise(
+                "reduceRight of an empty array with no initial value",
+                "TypeError",
+            );
+        } else {
+            position -= 1;
+            element_at(array, position)
+        };
+        while position > 0 {
+            position -= 1;
+            let element = element_at(array, position);
+            total = call_value(
+                callback,
+                Value::UNDEFINED.to_bits(),
+                &[total, element, index_value(position), this_value],
+            );
+            if Value::from_bits(total).is_exception() {
+                return total;
+            }
+        }
+        total
+    })
+}
+
+/// Appends `value` to `into`, spreading it if it is an array and `depth` allows.
+fn flatten_into(into: &mut Vec<u64>, value: u64, depth: i32) {
+    match elements_of(value) {
+        Some((array, length)) if depth > 0 => {
+            for index in 0..length {
+                flatten_into(into, element_at(array, index), depth - 1);
+            }
+        }
+        _ => into.push(value),
+    }
+}
+
+/// `Array.prototype.flat`.
+extern "C" fn array_flat(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = Value::from_bits(unsafe { argument(argc, argv, 0) });
+    // **One level by default**, not all of them — `[[1, [2]]].flat()` still holds an array.
+    let depth = given
+        .as_number()
+        .map_or(1.0, |number| if number.is_nan() { 0.0 } else { number });
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped to a depth no array can exceed"
+    )]
+    let depth = depth.clamp(0.0, f64::from(i32::MAX)) as i32;
+
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let mut flattened = Vec::new();
+        for index in 0..length {
+            flatten_into(&mut flattened, element_at(array, index), depth);
+        }
+        array_of_values(&flattened)
+    })
+}
+
+/// `Array.prototype.flatMap` — map, then flatten one level.
+extern "C" fn array_flat_map(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // **Mapped into a rooted array before anything is flattened.** The callback allocates,
+        // and a plain `Vec` of results is invisible to the collector — every result but the
+        // newest would be freed under it. Flattening afterwards runs no JavaScript, so nothing
+        // can move once the loop is done.
+        with_new_array(length, |mapped| {
+            for index in 0..length {
+                let result = call_value(
+                    callback,
+                    Value::UNDEFINED.to_bits(),
+                    &[element_at(array, index), index_value(index), this_value],
+                );
+                if Value::from_bits(result).is_exception() {
+                    return result;
+                }
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(mapped, index, Value::from_bits(result));
+                });
+            }
+            let mut flattened = Vec::new();
+            for index in 0..length {
+                // Exactly one level, always — `flatMap` takes no depth.
+                flatten_into(&mut flattened, element_at(mapped, index), 1);
+            }
+            array_of_values(&flattened)
+        })
+    })
+}
+
+/// `Array.prototype.at`.
+///
+/// **A negative index counts from the end and out of range is `undefined`** — which is what
+/// separates `at` from indexing, where `-1` is a property name rather than a position.
+extern "C" fn array_at(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) })
+        .as_number()
+        .unwrap_or(0.0);
+    if wanted.is_nan() {
+        return element_at(array, 0);
+    }
+    #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+    let span = length as f64;
+    let resolved = if wanted < 0.0 { span + wanted } else { wanted };
+    if resolved < 0.0 || resolved >= span {
+        return Value::UNDEFINED.to_bits();
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked against both ends just above"
+    )]
+    let index = resolved as usize;
+    element_at(array, index)
+}
+
+/// `findLast` and `findLastIndex`, which walk backwards.
+fn find_last_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        for index in (0..length).rev() {
+            let element = element_at(array, index);
+            let verdict = call_value(
+                callback,
+                this_value,
+                &[element, index_value(index), this_value],
+            );
+            if is_truthy(Value::from_bits(verdict)) {
+                return if want_index {
+                    index_value(index)
+                } else {
+                    element
+                };
+            }
+        }
+        if want_index {
+            Value::number(-1.0).to_bits()
+        } else {
+            Value::UNDEFINED.to_bits()
+        }
+    })
+}
+
+/// `Array.prototype.findLast`.
+extern "C" fn array_find_last(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    find_last_with(this_value, argc, argv, false)
+}
+
+/// `Array.prototype.findLastIndex`.
+extern "C" fn array_find_last_index(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    find_last_with(this_value, argc, argv, true)
+}
 
 /// Every global that is a function, in the order their indices name them.
 ///
@@ -1307,7 +1547,220 @@ const STRING_NATIVES: &[(&str, Native)] = &[
     ("split", string_split),
     ("toString", string_to_string),
     ("valueOf", string_to_string),
+    ("at", string_at),
+    ("trimStart", string_trim_start),
+    ("trimEnd", string_trim_end),
+    ("padStart", string_pad_start),
+    ("padEnd", string_pad_end),
+    ("replace", string_replace),
+    ("replaceAll", string_replace_all),
 ];
+
+/// `String.prototype.at`.
+///
+/// **A negative index counts from the end and out of range is `undefined`**, where `charAt`
+/// gives `""` — the two differ at exactly the place a caller is most likely to conflate them.
+extern "C" fn string_at(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let units = code_units(&text);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) })
+        .as_number()
+        .unwrap_or(0.0);
+    let wanted = if wanted.is_nan() { 0.0 } else { wanted };
+    #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+    let span = units.len() as f64;
+    let resolved = if wanted < 0.0 { span + wanted } else { wanted };
+    if resolved < 0.0 || resolved >= span {
+        return Value::UNDEFINED.to_bits();
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked against both ends just above"
+    )]
+    let index = resolved as usize;
+    units_between(&units, index, index + 1)
+}
+
+/// `String.prototype.trimStart`.
+extern "C" fn string_trim_start(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(text.trim_start()))
+}
+
+/// `String.prototype.trimEnd`.
+extern "C" fn string_trim_end(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(text.trim_end()))
+}
+
+/// `padStart` and `padEnd`, which differ only in which side the filling goes.
+fn pad_with(this_value: u64, argc: u64, argv: *const u64, at_start: bool) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return new_string("");
+    };
+    let units = code_units(&text);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = Value::from_bits(unsafe { argument(argc, argv, 0) })
+        .as_number()
+        .unwrap_or(0.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to a length no string can exceed"
+    )]
+    let target = target.clamp(0.0, f64::from(u32::MAX)) as usize;
+    if target <= units.len() {
+        return new_string(&text);
+    }
+    // SAFETY: as above.
+    let given = unsafe { argument(argc, argv, 1) };
+    let filler = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
+        " ".to_owned()
+    } else {
+        to_text(given).unwrap_or_default()
+    };
+    // **An empty filler pads nothing**, and answering the original rather than looping is the
+    // whole of why that case is checked.
+    if filler.is_empty() {
+        return new_string(&text);
+    }
+
+    let wanted = target - units.len();
+    let filler_units = code_units(&filler);
+    let mut padding: Vec<u16> = Vec::with_capacity(wanted);
+    while padding.len() < wanted {
+        let take = wanted - padding.len();
+        padding.extend(filler_units.iter().take(take));
+    }
+    let padding = String::from_utf16_lossy(&padding);
+    new_string(&if at_start {
+        format!("{padding}{text}")
+    } else {
+        format!("{text}{padding}")
+    })
+}
+
+/// `String.prototype.padStart`.
+extern "C" fn string_pad_start(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    pad_with(this_value, argc, argv, true)
+}
+
+/// `String.prototype.padEnd`.
+extern "C" fn string_pad_end(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    pad_with(this_value, argc, argv, false)
+}
+
+/// `replace` and `replaceAll`.
+///
+/// **A string pattern replaces the first occurrence and a global regular expression replaces
+/// every one**, which is why the pattern's own flags decide rather than the method name — and
+/// why `replaceAll` with a non-global regular expression is a `TypeError` rather than quietly
+/// behaving like `replace`.
+fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return new_string("");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let pattern = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let replacement = unsafe { argument(argc, argv, 1) };
+
+    // A regular expression pattern, recognised by its `source` rather than by a type tag.
+    if let Some(source) = property_text(pattern, "source") {
+        let flags = property_text(pattern, "flags").unwrap_or_default();
+        let global = flags.contains('g');
+        if all && !global {
+            return raise("replaceAll needs a global regular expression", "TypeError");
+        }
+        let Some(replacement) = to_text(replacement) else {
+            return new_string(&text);
+        };
+        let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
+            return new_string(&text);
+        };
+        let Ok(mut compiled) = crisol_builtins::JsRegExp::new(&source, parsed) else {
+            return new_string(&text);
+        };
+        let mut out = String::new();
+        let mut cursor = 0;
+        for found in compiled.all_matches(&text) {
+            out.push_str(text.get(cursor..found.start).unwrap_or_default());
+            out.push_str(&replacement);
+            cursor = found.end;
+            if !global {
+                break;
+            }
+        }
+        out.push_str(text.get(cursor..).unwrap_or_default());
+        return new_string(&out);
+    }
+
+    let Some(needle) = to_text(pattern) else {
+        return new_string(&text);
+    };
+    let Some(replacement) = to_text(replacement) else {
+        return new_string(&text);
+    };
+    new_string(&if all {
+        text.replace(&needle, &replacement)
+    } else {
+        text.replacen(&needle, &replacement, 1)
+    })
+}
+
+/// `String.prototype.replace`.
+extern "C" fn string_replace(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    replace_with(this_value, argc, argv, false)
+}
+
+/// `String.prototype.replaceAll`.
+extern "C" fn string_replace_all(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    replace_with(this_value, argc, argv, true)
+}
 
 /// A string as the code units JavaScript counts.
 ///
@@ -2410,7 +2863,7 @@ impl Runtime {
         self.heap
             .set_internal(object.handle(), 0, Value::number(encoded));
         let text = self.string(name);
-        self.define(object.handle(), "name", text);
+        self.define_named(object.handle(), "name", text);
         self.define(globals, name, object.to_value());
         object.handle()
     }
@@ -2436,9 +2889,10 @@ impl Runtime {
             let prototype = scope.alloc(shape, 0);
             self.define(function.handle(), "prototype", prototype.to_value());
             // The constructor's own name, which `make_error` reads back so that `TypeError`
-            // and `RangeError` can be the same code with different bindings.
+            // and `RangeError` can be the same code with different bindings. Not enumerable,
+            // for the same reason a method's name is not.
             let text = self.string(name);
-            self.define(function.handle(), "name", text);
+            self.define_named(function.handle(), "name", text);
             self.define(globals.handle(), name, function.to_value());
         }
         // `Object` and `Array` are functions that also carry methods. Created here rather than
@@ -2501,7 +2955,12 @@ impl Runtime {
     /// visit `map`, `filter` and every other array method — the loop was right and the
     /// properties were wrong.
     fn define_method(&self, object: GcRef, name: &str, value: Value) {
+        // **Stored before anything else is allocated.** `native_function` hands back an
+        // unrooted handle, so the function is only reachable once it is on the prototype —
+        // allocating first leaves a window where a collection frees the thing being defined.
+        // The symptom is a method that is `undefined` under GC stress and fine without it.
         self.define(object, name, value);
+
         let key = PropertyKey::new(name);
         let slot = self
             .heap
@@ -2513,6 +2972,40 @@ impl Runtime {
                 slot.index(),
                 crisol_value::Attributes {
                     writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+
+        // **A function knows its own name.** `Array.prototype.forEach.name` is `"forEach"`, and
+        // test262 checks it for every built-in it covers — the name was in the table that
+        // created the function and was simply never written down on it. Safe here: the
+        // function is reachable from `object`, which the caller roots.
+        if let Some(function) = value.as_address().map(GcRef::from_address) {
+            let text = self.string(name);
+            self.define_named(function, "name", text);
+        }
+    }
+
+    /// Defines a built-in's `name`, which is not writable but is configurable.
+    ///
+    /// Those are the attributes the specification gives it: a program cannot assign to
+    /// `f.name` but can redefine it, which is what makes `Object.defineProperty(f, "name", …)`
+    /// work where `f.name = "x"` silently does nothing.
+    fn define_named(&self, object: GcRef, name: &str, value: Value) {
+        self.define(object, name, value);
+        let key = PropertyKey::new(name);
+        let slot = self
+            .heap
+            .shape_of(object)
+            .and_then(|shape| self.shapes.borrow().lookup(shape, &key));
+        if let Some(slot) = slot {
+            self.heap.set_attributes(
+                object,
+                slot.index(),
+                crisol_value::Attributes {
+                    writable: false,
                     enumerable: false,
                     configurable: true,
                 },

@@ -2505,3 +2505,197 @@ fn a_date_stringifies_through_json() {
         "1970-01-01T00:00:00.000Z",
     );
 }
+
+// ---- built-ins know their own names --------------------------------------------------------
+
+/// **A function knows its own name**, and it is not enumerable. The name was in the table that
+/// created every built-in and was simply never written down on it.
+#[test]
+fn a_built_in_carries_its_name() {
+    check("name-method", "return [].forEach.name;", "forEach");
+    check("name-string", "return \"\".trim.name;", "trim");
+    check("name-nested", "return Object.keys.name;", "keys");
+    check("name-hidden", "return Object.keys([].forEach).length;", "0");
+}
+
+/// A program cannot assign to `f.name` but can redefine it, which is what non-writable and
+/// configurable means together.
+#[test]
+fn a_name_resists_assignment_but_not_redefinition() {
+    check(
+        "name-assign",
+        "let f = [].forEach; f.name = \"other\"; return f.name;",
+        "forEach",
+    );
+    check(
+        "name-redefine",
+        "let f = [].forEach; Object.defineProperty(f, \"name\", {value: \"other\"}); return f.name;",
+        "other",
+    );
+}
+
+// ---- more array methods --------------------------------------------------------------------
+
+/// **`reduceRight` is not `reduce` over a reversed list**: the callback still gets each
+/// element's real index, so reversing first would hand it the wrong ones.
+#[test]
+fn reduce_right_walks_backwards_with_real_indices() {
+    check(
+        "reduceright",
+        "return [\"a\", \"b\", \"c\"].reduceRight(function (t, x) { return t + x; });",
+        "cba",
+    );
+    check(
+        "reduceright-index",
+        "return [1, 2].reduceRight(function (t, x, i) { return t + i; }, 0);",
+        "1",
+    );
+    check(
+        "reduceright-initial",
+        "return [1, 2, 3].reduceRight(function (t, x) { return t + x; }, 10);",
+        "16",
+    );
+}
+
+/// An empty array with no initial value has no answer to give, so it raises rather than
+/// inventing one.
+#[test]
+fn reduce_right_on_an_empty_array_raises() {
+    check(
+        "reduceright-empty",
+        "let r = \"\"; try { [].reduceRight(function (t, x) { return t; }); } \
+         catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// **`flat` goes one level by default**, not all of them.
+#[test]
+fn flat_takes_a_depth() {
+    check("flat-default", "return [1, [2, 3]].flat().length;", "3");
+    check("flat-one-level", "return [1, [2, [3]]].flat().length;", "3");
+    check("flat-deep", "return [1, [2, [3]]].flat(2).length;", "3");
+    check("flat-deep-value", "return [[1, [2]]].flat(2)[1];", "2");
+    check("flat-zero", "return [1, [2]].flat(0).length;", "2");
+}
+
+/// `flatMap` flattens exactly one level, always — it takes no depth.
+#[test]
+fn flat_map_maps_then_flattens_once() {
+    check(
+        "flatmap",
+        "return [1, 2].flatMap(function (x) { return [x, x]; }).length;",
+        "4",
+    );
+    check(
+        "flatmap-nested",
+        "return [1].flatMap(function (x) { return [[x]]; })[0].length;",
+        "1",
+    );
+}
+
+/// **`at` counts a negative index from the end and answers `undefined` out of range**, which
+/// is what separates it from indexing.
+#[test]
+fn at_accepts_a_negative_index() {
+    check("at-positive", "return [1, 2, 3].at(1);", "2");
+    check("at-negative", "return [1, 2, 3].at(-1);", "3");
+    check("at-out-of-range", "return [1, 2].at(5);", "undefined");
+    check("at-string", "return \"abc\".at(-1);", "c");
+    // `charAt` answers `""` where `at` answers `undefined` — the pair differ on purpose.
+    check("at-vs-charat", "return \"abc\".charAt(9);", "");
+    check("at-string-oob", "return \"abc\".at(9);", "undefined");
+}
+
+#[test]
+fn find_last_walks_backwards() {
+    check(
+        "findlast",
+        "return [1, 5, 2, 5].findLast(function (x) { return x === 5; });",
+        "5",
+    );
+    check(
+        "findlastindex",
+        "return [1, 5, 2, 5].findLastIndex(function (x) { return x === 5; });",
+        "3",
+    );
+    check(
+        "findlastindex-none",
+        "return [1].findLastIndex(function (x) { return x === 9; });",
+        "-1",
+    );
+}
+
+// ---- more string methods ---------------------------------------------------------------
+
+#[test]
+fn trim_can_take_one_side() {
+    check("trimstart", "return \"  a  \".trimStart() + \"|\";", "a  |");
+    check("trimend", "return \"|\" + \"  a  \".trimEnd();", "|  a");
+}
+
+/// **An empty filler pads nothing** — answering the original rather than looping is the whole
+/// reason that case is checked.
+#[test]
+fn padding_fills_to_a_length() {
+    check("padstart", "return \"5\".padStart(3, \"0\");", "005");
+    check("padend", "return \"5\".padEnd(3, \"0\");", "500");
+    // Anchored with a sentinel: `execute` trims the program's output, so an expectation that
+    // begins or ends with a space can never match however correct the code is.
+    check(
+        "padstart-default",
+        "return \"|\" + \"a\".padStart(3);",
+        "|  a",
+    );
+    check(
+        "padstart-short",
+        "return \"abcd\".padStart(2, \"0\");",
+        "abcd",
+    );
+    check(
+        "padstart-empty-filler",
+        "return \"a\".padStart(5, \"\");",
+        "a",
+    );
+    check(
+        "padstart-truncated",
+        "return \"a\".padStart(4, \"xy\");",
+        "xyxa",
+    );
+}
+
+/// **A string pattern replaces the first occurrence and a global regular expression replaces
+/// every one**, so the pattern's flags decide rather than the method name.
+#[test]
+fn replace_follows_the_patterns_own_flags() {
+    check(
+        "replace-string",
+        "return \"aaa\".replace(\"a\", \"b\");",
+        "baa",
+    );
+    check(
+        "replaceall-string",
+        "return \"aaa\".replaceAll(\"a\", \"b\");",
+        "bbb",
+    );
+    check(
+        "replace-regexp",
+        "return \"aaa\".replace(/a/, \"b\");",
+        "baa",
+    );
+    check(
+        "replace-regexp-global",
+        "return \"aaa\".replace(/a/g, \"b\");",
+        "bbb",
+    );
+}
+
+/// `replaceAll` with a non-global pattern raises rather than quietly behaving like `replace`.
+#[test]
+fn replace_all_refuses_a_non_global_pattern() {
+    check(
+        "replaceall-nonglobal",
+        "let r = \"\"; try { \"aa\".replaceAll(/a/, \"b\"); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}

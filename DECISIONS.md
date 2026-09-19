@@ -3817,3 +3817,53 @@ different right answers to the same broken input.
 
 `new Date()` reads the clock through `Date.now`, so there is one clock rather than two that
 could drift apart.
+
+## D-127
+
+**A built-in knows its own name, and naming it caught the rooting rule again.**
+
+Status: Accepted
+
+`Array.prototype.forEach.name` is `"forEach"`, and test262 checks it for every built-in it
+covers. The name was sitting in the table that created each function and had simply never been
+written onto it. It is not writable but is configurable — so `f.name = "x"` silently does
+nothing while `Object.defineProperty(f, "name", …)` works.
+
+**The change broke nearly every test, and only under GC stress.** `native_function` hands back
+an unrooted handle; the function becomes reachable when it is stored on the prototype.
+Allocating the name string *before* storing it left a window where a collection freed the
+function being named. The symptom was a method that was `undefined` under stress and fine
+without it.
+
+This is the third time this session the same rule has been the bug: **create, store, then
+allocate again** — `new RegExp` (D-123), `flatMap` below, and here. The rule is not "root
+carefully"; it is that a value between allocation and its first store is invisible, and every
+allocation in that gap is a chance to lose it.
+
+`flatMap` had it in a different shape: results accumulated in a Rust `Vec` while the callback
+allocated, so every result but the newest was unreachable. Fixed by mapping into a rooted array
+first and flattening afterwards, when no JavaScript runs and nothing can move.
+
+## D-128
+
+**More of `Array.prototype` and `String.prototype`, and the pairs that differ.**
+
+Status: Accepted
+
+- **`reduceRight` is not `reduce` over a reversed list.** The callback still receives each
+  element's real index, so reversing first would hand it the wrong ones — a wrong answer rather
+  than a slower one, for any callback that reads the index.
+- **`flat` goes one level by default**, not all of them; `flatMap` goes exactly one, always,
+  because it takes no depth.
+- **`at` counts a negative index from the end and answers `undefined` out of range**, where
+  `charAt` answers `""`. The two differ at exactly the place a caller conflates them.
+- **`replaceAll` with a non-global pattern is a `TypeError`**, not a quiet `replace`. The
+  pattern's own flags decide how many matches are replaced, so a method name that disagreed
+  with them would have to pick one to ignore.
+- **An empty pad filler pads nothing.** Answering the original rather than looping forever is
+  the whole reason that case is written down.
+
+**Consequence: a test expectation that could never pass.** `execute` trims the program's
+output, so `check(…, "  a")` compares against `"a"` however correct the code is. The test was
+wrong and `padStart` was right. Expectations now carry a sentinel where leading or trailing
+space is the point.
