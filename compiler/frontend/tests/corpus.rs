@@ -73,6 +73,9 @@ const CORPUS: &[(&str, &str)] = &[
     ("assign-is-an-expression", "let a = 1; let b = (a = 2);"),
     ("strict-equal", "let a = 1; let b = 2; let c = a === b;"),
     ("strict-not-equal", "let a = 1; let b = 2; let c = a !== b;"),
+    ("loose-equal", "let a = 1; let b = 2; let c = a == b;"),
+    ("loose-not-equal", "let a = 1; let b = 2; let c = a != b;"),
+    ("in-operator", "let o = {a: 1}; let c = \"a\" in o;"),
     ("less", "let a = 1; let b = 2; let c = a < b;"),
     ("less-equal", "let a = 1; let b = 2; let c = a <= b;"),
     ("greater", "let a = 1; let b = 2; let c = a > b;"),
@@ -340,7 +343,6 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // `==` is not `===`: it coerces, and the coercion table needs machinery that is not
         // here yet. Lowering it as a strict comparison would be wrong for every mixed-type
         // operand, which is the only case anyone writes `==` for.
-        ("let a = 1 == 2;", "binary operator =="),
         // `extends` needs the prototype chain wired through the parent *and* `super` resolved
         // inside methods. Half of that produces a class that constructs and then fails its
         // first inherited call.

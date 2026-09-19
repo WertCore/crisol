@@ -1440,7 +1440,9 @@ impl Lowering {
             BinaryOperator::ShiftRight => BinaryOp::ShiftRight,
             BinaryOperator::ShiftRightZeroFill => BinaryOp::UnsignedShiftRight,
             BinaryOperator::Instanceof => BinaryOp::InstanceOf,
-            // `==`, `!=`, `in` — each needs machinery this does not have yet.
+            BinaryOperator::Equality => BinaryOp::LooseEqual,
+            BinaryOperator::Inequality => BinaryOp::LooseNotEqual,
+            BinaryOperator::In => BinaryOp::In,
             _ => {
                 self.note(
                     &format!("binary operator {}", operator.as_str()),
@@ -1456,10 +1458,21 @@ impl Lowering {
         // typing it `Number` would let codegen emit a float add for a string concatenation.
         let ty = if op.is_always_numeric() {
             Type::Number
+        } else if op.is_always_boolean() {
+            Type::Bool
         } else {
+            // `+` alone, which may concatenate — typing it `Number` would let codegen emit a
+            // float add for a string concatenation.
             Type::Unknown
         };
-        self.emit(ty, Op::Binary { op, left, right })
+        let result = self.emit(ty, Op::Binary { op, left, right });
+        // **Only `in` can raise**, so only `in` pays for the check. `instanceof` and `+` answer
+        // for every input they are given, and the other operators coerce with `ToNumber`, which
+        // has no failing case over the values this engine has.
+        if matches!(op, BinaryOp::In) {
+            return self.propagate(result);
+        }
+        result
     }
 
     fn unary(&mut self, unary: &UnaryExpression<'_>) -> ValueId {

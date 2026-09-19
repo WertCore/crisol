@@ -165,16 +165,52 @@ pub enum BinaryOp {
     /// chain, not about ordering or equality, and it is not symmetric in any sense `CompareOp`
     /// would suggest.
     InstanceOf,
+    /// `==` — equality **after** coercion.
+    ///
+    /// A binary operator rather than a [`CompareOp`] on purpose. Every `CompareOp` has a
+    /// machine instruction behind it when both sides are numbers; `==` never does, because
+    /// deciding what to compare means reading both types first. Putting it here keeps the
+    /// comparison lattice honest about which comparisons can be lowered to a `fcmp`.
+    LooseEqual,
+    /// `!=`.
+    LooseNotEqual,
+    /// `in` — whether a property is on the object or anywhere up its chain.
+    In,
 }
 
 impl BinaryOp {
     /// Whether the result is always a number.
     ///
-    /// True for everything except [`BinaryOp::Add`], which may concatenate. This is the
-    /// distinction codegen needs before it can emit a float instruction.
+    /// This is the distinction codegen needs before it can emit a float instruction, so it is
+    /// **listed rather than negated**. It was `!matches!(self, Self::Add)`, which is true of
+    /// the arithmetic and also of `instanceof` — an operator that answers a boolean and was
+    /// therefore typed `number` from the day it was added. Writing the true cases out means a
+    /// new operator has to be classified rather than inheriting the answer for arithmetic.
     #[must_use]
     pub const fn is_always_numeric(self) -> bool {
-        !matches!(self, Self::Add)
+        matches!(
+            self,
+            Self::Subtract
+                | Self::Multiply
+                | Self::Divide
+                | Self::Remainder
+                | Self::Exponent
+                | Self::BitAnd
+                | Self::BitOr
+                | Self::BitXor
+                | Self::ShiftLeft
+                | Self::ShiftRight
+                | Self::UnsignedShiftRight
+        )
+    }
+
+    /// Whether the result is always a boolean.
+    #[must_use]
+    pub const fn is_always_boolean(self) -> bool {
+        matches!(
+            self,
+            Self::InstanceOf | Self::LooseEqual | Self::LooseNotEqual | Self::In
+        )
     }
 
     /// The symbol, for the text dump.
@@ -194,6 +230,9 @@ impl BinaryOp {
             Self::ShiftRight => ">>",
             Self::UnsignedShiftRight => ">>>",
             Self::InstanceOf => "instanceof",
+            Self::LooseEqual => "==",
+            Self::LooseNotEqual => "!=",
+            Self::In => "in",
         }
     }
 }

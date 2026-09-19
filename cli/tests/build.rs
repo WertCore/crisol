@@ -2857,3 +2857,146 @@ fn bind_can_turn_a_method_into_a_free_function() {
         "1-2",
     );
 }
+
+// ---- loose equality and `in` ---------------------------------------------------------------
+
+/// `===` was always here. These pin the behaviour that makes it worth preferring, so a later
+/// change to `==` cannot quietly loosen it.
+#[test]
+fn strict_equality_does_not_coerce() {
+    check("strict-same", "return 1 === 1;", "true");
+    check("strict-number-string", "return 1 === \"1\";", "false");
+    check("strict-zero-false", "return 0 === false;", "false");
+    check(
+        "strict-null-undefined",
+        "return null === undefined;",
+        "false",
+    );
+    // Strings compare by their characters, not by identity, however many cells they came from.
+    check("strict-strings", "return \"a\" + \"b\" === \"ab\";", "true");
+    check("strict-nan", "return 0 / 0 === 0 / 0;", "false");
+    check("strict-zeroes", "return 0 === -0;", "true");
+    check("strict-not", "return 1 !== 2;", "true");
+}
+
+/// **`null` and `undefined` equal each other and nothing else** — not `0`, not `""`, not
+/// `false`. That is the rule behind `x == null` as the idiomatic "is it either".
+#[test]
+fn nullish_values_equal_only_each_other() {
+    check("loose-null-undefined", "return null == undefined;", "true");
+    check("loose-null-zero", "return null == 0;", "false");
+    check("loose-null-empty", "return null == \"\";", "false");
+    check("loose-null-false", "return null == false;", "false");
+    check("loose-undefined-zero", "return undefined == 0;", "false");
+    check("loose-null-null", "return null == null;", "true");
+}
+
+/// **A string meeting a number becomes a number**, never the reverse.
+#[test]
+fn a_string_meeting_a_number_is_read_as_one() {
+    check("loose-string-number", "return \"10\" == 10;", "true");
+    check("loose-string-number-no", "return \"11\" == 10;", "false");
+    check("loose-empty-zero", "return \"\" == 0;", "true");
+    check("loose-space-zero", "return \" \" == 0;", "true");
+}
+
+/// **A boolean becomes a number first**, on whichever side it is.
+#[test]
+fn a_boolean_is_read_as_a_number_before_anything_else() {
+    check("loose-true-one", "return true == 1;", "true");
+    check("loose-false-zero", "return false == 0;", "true");
+    check("loose-true-string", "return true == \"1\";", "true");
+    check("loose-false-empty", "return false == \"\";", "true");
+    check("loose-true-two", "return true == 2;", "false");
+}
+
+/// **`==` is not transitive**, and this is the example worth keeping in view: the first two
+/// coerce and the third does not.
+#[test]
+fn loose_equality_is_not_transitive() {
+    check("loose-empty-zero-again", "return \"\" == 0;", "true");
+    check("loose-zero-string-zero", "return \"0\" == 0;", "true");
+    check("loose-empty-zero-string", "return \"\" == \"0\";", "false");
+}
+
+/// An object becomes a primitive through `valueOf` and then `toString`.
+#[test]
+fn an_object_is_read_as_a_primitive() {
+    check(
+        "loose-valueof",
+        "let o = {valueOf: function () { return 5; }}; return o == 5;",
+        "true",
+    );
+    check(
+        "loose-tostring",
+        "let o = {toString: function () { return \"x\"; }}; return o == \"x\";",
+        "true",
+    );
+    // `valueOf` is tried first, so it wins when both are there.
+    check(
+        "loose-valueof-first",
+        "let o = {valueOf: function () { return 1; }, toString: function () { return \"2\"; }}; \
+         return o == 1;",
+        "true",
+    );
+}
+
+/// `NaN` is equal to nothing, including itself, under either operator.
+#[test]
+fn nan_is_equal_to_nothing() {
+    check("loose-nan", "return 0 / 0 == 0 / 0;", "false");
+    check("loose-nan-zero", "return 0 / 0 == 0;", "false");
+    check("loose-not-equal", "return 1 != 2;", "true");
+    check("loose-not-equal-coerced", "return 1 != \"1\";", "false");
+}
+
+/// **Inherited counts**, which is the whole difference between `in` and `hasOwnProperty`.
+#[test]
+fn the_in_operator_looks_up_the_chain() {
+    check("in-own", "return \"a\" in {a: 1};", "true");
+    check("in-absent", "return \"b\" in {a: 1};", "false");
+    check(
+        "in-inherited",
+        "let base = {a: 1}; let o = Object.create(base); return \"a\" in o;",
+        "true",
+    );
+    check(
+        "in-vs-hasown",
+        "let base = {a: 1}; let o = Object.create(base); return o.hasOwnProperty(\"a\");",
+        "false",
+    );
+    check("in-array-index", "return 1 in [1, 2];", "true");
+    check("in-array-past", "return 5 in [1, 2];", "false");
+    check("in-method", "return \"map\" in [];", "true");
+}
+
+/// The right side of `in` has to be an object.
+#[test]
+fn in_refuses_a_primitive_on_the_right() {
+    check(
+        "in-primitive",
+        "let r = \"\"; try { \"a\" in 5; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// `instanceof` answers a boolean and was typed `number` in the IR from the day it was added —
+/// `is_always_numeric` was written as "everything except `+`". These pin the answer in both a
+/// value position and a condition, which is where a wrong type would show.
+#[test]
+fn instanceof_answers_a_boolean() {
+    check("instanceof-value", "return [] instanceof Array;", "true");
+    check("instanceof-false", "return ({}) instanceof Array;", "false");
+    check(
+        "instanceof-condition",
+        "let r = 0; if ([] instanceof Array) { r = 1; } return r;",
+        "1",
+    );
+    check(
+        "instanceof-typeof",
+        "return typeof ([] instanceof Array);",
+        "boolean",
+    );
+    check("loose-equal-typeof", "return typeof (1 == 1);", "boolean");
+    check("in-typeof", "return typeof (\"a\" in {a: 1});", "boolean");
+}

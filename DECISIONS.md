@@ -3915,3 +3915,58 @@ Every identity assertion in the acceptance suite is now preceded by a `typeof` c
 is something to identify. The pattern generalises past this case: an assertion whose two sides
 can both be missing is not testing what it appears to test, and `===` on `undefined` is the
 commonest way to get one.
+
+## D-131
+
+**`==`, `!=` and `in`. `===` was never the gap.**
+
+Status: Accepted
+
+`===` and `!==` have been lowered since the comparison operators landed, including the part that
+is easy to get wrong: **strings compare by their characters, not by identity**, so `"a" === "a"`
+holds however many separate cells the two came from. What the refusal list called "binary
+operator ==" was *loose* equality.
+
+`==` is a [`BinaryOp`] rather than a [`CompareOp`] on purpose. Every `CompareOp` has a machine
+instruction behind it when both sides are numbers; `==` never does, because deciding what to
+compare means reading both types first. Keeping it out of the comparison lattice keeps that
+lattice honest about which comparisons can become an `fcmp`.
+
+The rule is short and the consequences are not:
+
+- **`null` and `undefined` equal each other and nothing else** — not `0`, not `""`, not `false`.
+  Checked before any coercion, or `null == 0` would become `0 == 0`.
+- **A boolean becomes a number first**, on whichever side it is.
+- **A string meeting a number becomes a number**, never the reverse.
+- **An object becomes a primitive** through `valueOf` then `toString`.
+- Same type defers to `===`, so everything already right about `NaN` and the two zeroes is
+  inherited rather than restated.
+
+**Not transitive**, and the example is in the tests: `"" == 0` and `"0" == 0` are both true
+while `"" == "0"` is false.
+
+A round limit stops the recursion, because a `valueOf` returning another object would otherwise
+spin. The specification throws there; throwing from inside `==` would need an exception path the
+operator does not have, and that difference is recorded rather than papered over.
+
+**Only `in` can raise**, so only `in` pays for an exception check at the call site. `instanceof`
+and `+` answer for every input, and the rest coerce with `ToNumber`, which has no failing case
+over this engine's values.
+
+## D-132
+
+**A binary operator's result type is listed, not negated.**
+
+Status: Accepted, fixing a bug older than this change
+
+`is_always_numeric` was `!matches!(self, Self::Add)` — "everything except `+`". That is true of
+the arithmetic and also of **`instanceof`**, which answers a boolean and has therefore been
+typed `number` in the IR since the day it was added. Adding `==`, `!=` and `in` would have
+inherited the same wrong answer, which is how the negation compounds.
+
+The predicate now lists the numeric operators, and a companion lists the boolean ones, so a new
+operator has to be classified rather than inheriting the answer for arithmetic.
+
+**The corpus snapshot is what caught it.** The dump prints each value's type, so `v4: number =
+== v2, v3` was visible in the diff the test asked to be reviewed. No assertion anywhere
+mentioned operator result types; the snapshot showed one and made it obvious.

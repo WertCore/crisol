@@ -74,6 +74,9 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_enumerate",
     "crisol_iterate",
     "crisol_create_regexp",
+    "crisol_loose_equal",
+    "crisol_loose_not_equal",
+    "crisol_in",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -5536,4 +5539,169 @@ extern "C" fn json_stringify(
             "TypeError",
         ),
     }
+}
+
+/// `left == right` — equality after coercion.
+///
+/// The rule is short and the consequences are not. **Same type defers to `===`**, so everything
+/// `===` already gets right about `NaN` and the two zeroes is inherited rather than restated.
+/// Across types exactly three coercions apply, in this order:
+///
+/// - **`null` and `undefined` equal each other and nothing else.** Not `0`, not `""`, not
+///   `false`. This is the rule that makes `x == null` the idiomatic "is it either", and it is
+///   also why `document.all`-style exceptions are the only ones a real engine carves out.
+/// - **A boolean becomes a number first**, on whichever side it is. That is why `[] == false`
+///   is true: `false` becomes `0`, the array becomes `""`, and `""` becomes `0`.
+/// - **An object becomes a primitive, and a string meeting a number becomes a number.** Never
+///   the reverse — `"10" == 10` compares `10` with `10`, not `"10"` with `"10"`.
+///
+/// Not transitive, and the example is worth keeping in view: `"" == 0` and `"0" == 0` are both
+/// true while `"" == "0"` is false, because the first two coerce and the third does not.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_loose_equal(left: u64, right: u64) -> u64 {
+    // **Both operands rooted for the whole comparison.** Coercing an object calls its
+    // `valueOf`, which is JavaScript and allocates — and the *other* operand is a live value
+    // nothing else is holding. The symptom is a comparison that is right until a collection
+    // lands in the middle of it.
+    with_rooted(&[left, right], || {
+        boolean(loosely_equal(left, right, 0)).to_bits()
+    })
+}
+
+/// `left != right`.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_loose_not_equal(left: u64, right: u64) -> u64 {
+    with_rooted(&[left, right], || {
+        boolean(!loosely_equal(left, right, 0)).to_bits()
+    })
+}
+
+/// How many times `==` may re-enter itself before giving up.
+///
+/// Each coercion strictly simplifies one side — object to primitive, boolean to number, string
+/// to number — so two rounds is the most the specification can need. The limit is here so a
+/// `valueOf` that returns another object cannot spin forever.
+const COERCION_ROUNDS: u32 = 4;
+
+/// The comparison behind `==`.
+fn loosely_equal(left: u64, right: u64, round: u32) -> bool {
+    if round >= COERCION_ROUNDS {
+        return false;
+    }
+    let a = Value::from_bits(left);
+    let b = Value::from_bits(right);
+
+    let nullish = |value: Value| {
+        matches!(
+            value.kind(),
+            crisol_value::Kind::Undefined | crisol_value::Kind::Null
+        )
+    };
+    // **`null` and `undefined` equal each other and nothing else**, so this is checked before
+    // any coercion — `null == 0` must not become `0 == 0`.
+    if nullish(a) || nullish(b) {
+        return nullish(a) && nullish(b);
+    }
+
+    // Same type is `===`, which already knows about `NaN` and the two zeroes.
+    if a.kind() == b.kind() && !(a.as_number().is_some() ^ b.as_number().is_some()) {
+        return Value::from_bits(crisol_strict_equal(left, right)) == Value::TRUE;
+    }
+
+    // A boolean becomes a number first, whichever side it is on.
+    if a.kind() == crisol_value::Kind::Boolean {
+        return loosely_equal(from_number(to_number(left)), right, round + 1);
+    }
+    if b.kind() == crisol_value::Kind::Boolean {
+        return loosely_equal(left, from_number(to_number(right)), round + 1);
+    }
+
+    let numeric = |value: Value| value.as_number().is_some();
+    let stringy = |value: Value| value.kind() == crisol_value::Kind::String;
+
+    // A string meeting a number becomes a number — never the reverse.
+    if stringy(a) && numeric(b) {
+        return loosely_equal(from_number(to_number(left)), right, round + 1);
+    }
+    if numeric(a) && stringy(b) {
+        return loosely_equal(left, from_number(to_number(right)), round + 1);
+    }
+
+    // An object meeting a primitive becomes a primitive.
+    let objectish = |value: u64| {
+        handle_of(value).is_some() && Value::from_bits(value).kind() != crisol_value::Kind::String
+    };
+    // **The fresh primitive is rooted before the next round.** `toString` returns a new
+    // string, and the round after this one may call *another* `valueOf` — which allocates,
+    // with the string reachable from nothing.
+    if objectish(left) && (numeric(b) || stringy(b)) {
+        let primitive = to_primitive(left);
+        return with_rooted(&[primitive], || loosely_equal(primitive, right, round + 1));
+    }
+    if (numeric(a) || stringy(a)) && objectish(right) {
+        let primitive = to_primitive(right);
+        return with_rooted(&[primitive], || loosely_equal(left, primitive, round + 1));
+    }
+    false
+}
+
+/// An object as a primitive, for `==`.
+///
+/// `valueOf` first and `toString` second, which is the order for everything except `Date`. A
+/// result that is still an object is handed back unchanged and the round limit stops the
+/// recursion — the specification throws there, and throwing from inside `==` would need an
+/// exception path the operator does not have.
+fn to_primitive(value: u64) -> u64 {
+    for name in ["valueOf", "toString"] {
+        let key = name.to_owned();
+        // SAFETY: `key` is a live Rust string.
+        let method = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
+        if !is_callable(method) {
+            continue;
+        }
+        let result = call_value(method, value, &[]);
+        if handle_of(result).is_none()
+            || Value::from_bits(result).kind() == crisol_value::Kind::String
+        {
+            return result;
+        }
+    }
+    value
+}
+
+/// `key in object` — whether the property is on it or anywhere up its chain.
+///
+/// **Inherited counts**, which is the whole difference from `hasOwnProperty`. An index past the
+/// end of an array is absent, so `5 in [1, 2]` is false where `1 in [1, 2]` is true.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_in(key: u64, object: u64) -> u64 {
+    if handle_of(object).is_none() {
+        return raise("the right side of `in` must be an object", "TypeError");
+    }
+    if let Some(index) = as_index(Value::from_bits(key))
+        && let Some((_, length)) = elements_of(object)
+    {
+        return boolean(index < length).to_bits();
+    }
+    let Some(name) = to_text(key) else {
+        return Value::FALSE.to_bits();
+    };
+
+    let mut current = object;
+    for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+        if own_property(current, &name).is_some() {
+            return Value::TRUE.to_bits();
+        }
+        let Some(handle) = handle_of(current) else {
+            break;
+        };
+        match with_runtime(|runtime| runtime.heap.prototype_of(handle)) {
+            Some(parent) => current = parent.to_value().to_bits(),
+            None => break,
+        }
+    }
+    Value::FALSE.to_bits()
 }

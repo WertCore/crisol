@@ -158,6 +158,9 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
     (BinaryOp::ShiftRight, "crisol_shift_right"),
     (BinaryOp::UnsignedShiftRight, "crisol_unsigned_shift_right"),
     (BinaryOp::InstanceOf, "crisol_instanceof"),
+    (BinaryOp::LooseEqual, "crisol_loose_equal"),
+    (BinaryOp::LooseNotEqual, "crisol_loose_not_equal"),
+    (BinaryOp::In, "crisol_in"),
 ];
 
 /// The runtime symbols an object operation calls.
