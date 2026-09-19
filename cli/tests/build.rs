@@ -2296,6 +2296,12 @@ fn json_round_trips_through_both_directions() {
 /// one — otherwise `[].map === Array.prototype.map` would be false.
 #[test]
 fn a_constructor_prototype_is_the_one_instances_inherit() {
+    // As above: the identity is preceded by a check that there is anything to identify.
+    check(
+        "proto-exists",
+        "return typeof Array.prototype.map;",
+        "function",
+    );
     check(
         "proto-array",
         "return [].map === Array.prototype.map;",
@@ -2697,5 +2703,157 @@ fn replace_all_refuses_a_non_global_pattern() {
         "replaceall-nonglobal",
         "let r = \"\"; try { \"aa\".replaceAll(/a/, \"b\"); } catch (e) { r = e.name; } return r;",
         "TypeError",
+    );
+}
+
+// ---- Object.prototype and bind -----------------------------------------------------------
+
+/// **Own means own**: a property found on the prototype answers `false`, which is the whole
+/// reason `hasOwnProperty` exists rather than `key in object`.
+#[test]
+fn has_own_property_does_not_look_up_the_chain() {
+    check(
+        "hasown-yes",
+        "return ({a: 1}).hasOwnProperty(\"a\");",
+        "true",
+    );
+    check(
+        "hasown-no",
+        "return ({a: 1}).hasOwnProperty(\"b\");",
+        "false",
+    );
+    check(
+        "hasown-inherited",
+        "let base = {a: 1}; let o = Object.create(base); return o.hasOwnProperty(\"a\");",
+        "false",
+    );
+    check(
+        "hasown-array-index",
+        "return [1, 2].hasOwnProperty(0);",
+        "true",
+    );
+    check(
+        "hasown-array-past",
+        "return [1, 2].hasOwnProperty(5);",
+        "false",
+    );
+}
+
+#[test]
+fn property_is_enumerable_follows_the_descriptor() {
+    check(
+        "enumerable-yes",
+        "return ({a: 1}).propertyIsEnumerable(\"a\");",
+        "true",
+    );
+    check(
+        "enumerable-no",
+        "let o = {}; Object.defineProperty(o, \"b\", {value: 1}); \
+         return o.propertyIsEnumerable(\"b\");",
+        "false",
+    );
+    // A built-in method is not enumerable either.
+    check(
+        "enumerable-builtin",
+        "return Array.prototype.propertyIsEnumerable(\"map\");",
+        "false",
+    );
+}
+
+/// The `typeof` check is not padding. **Two undefineds are equal**, so an identity test on its
+/// own passes just as well when neither side exists — which is exactly what this did before
+/// `Object.prototype`'s methods were reachable at all.
+#[test]
+fn every_object_reaches_object_prototype() {
+    check(
+        "chain-exists",
+        "return typeof Object.prototype.hasOwnProperty;",
+        "function",
+    );
+    check(
+        "chain-plain",
+        "return ({}).hasOwnProperty === Object.prototype.hasOwnProperty;",
+        "true",
+    );
+    // Through one object rather than a copy per prototype, so an array finds the same function.
+    check(
+        "chain-array",
+        "return [].hasOwnProperty === Object.prototype.hasOwnProperty;",
+        "true",
+    );
+    check(
+        "chain-isprototypeof",
+        "return Object.prototype.isPrototypeOf({});",
+        "true",
+    );
+    check(
+        "chain-isprototypeof-no",
+        "return ({}).isPrototypeOf({});",
+        "false",
+    );
+}
+
+/// **The array tag is the only one distinguished**: a real engine reads `Symbol.toStringTag`,
+/// and without symbols the honest choice is the one distinction that can be made.
+#[test]
+fn object_to_string_reports_a_tag() {
+    check(
+        "tag-object",
+        "return Object.prototype.toString.call({});",
+        "[object Object]",
+    );
+    check(
+        "tag-array",
+        "return Object.prototype.toString.call([]);",
+        "[object Array]",
+    );
+    check(
+        "tag-null",
+        "return Object.prototype.toString.call(null);",
+        "[object Null]",
+    );
+}
+
+/// **The bound arguments come first and the call's own follow**, which is what makes
+/// `f.bind(null, 1)(2)` the same as `f(1, 2)`.
+#[test]
+fn bind_fixes_a_receiver_and_leading_arguments() {
+    check(
+        "bind-this",
+        "let f = function () { return this.x; }; return f.bind({x: 5})();",
+        "5",
+    );
+    check(
+        "bind-args",
+        "let f = function (a, b) { return a + b; }; return f.bind(null, 1)(2);",
+        "3",
+    );
+    check(
+        "bind-all-args",
+        "let f = function (a, b) { return a + b; }; return f.bind(null, 1, 2)();",
+        "3",
+    );
+    check(
+        "bind-no-args",
+        "let f = function (a) { return a; }; return f.bind(null)(7);",
+        "7",
+    );
+}
+
+/// The pattern test262's own property helper is built on, and the reason so much of the suite
+/// depended on `bind` existing at all.
+#[test]
+fn bind_can_turn_a_method_into_a_free_function() {
+    check(
+        "bind-uncurry",
+        "let has = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+         return has({a: 1}, \"a\");",
+        "true",
+    );
+    check(
+        "bind-uncurry-join",
+        "let join = Function.prototype.call.bind(Array.prototype.join); \
+         return join([1, 2], \"-\");",
+        "1-2",
     );
 }

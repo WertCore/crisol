@@ -3867,3 +3867,51 @@ Status: Accepted
 output, so `check(…, "  a")` compares against `"a"` however correct the code is. The test was
 wrong and `padStart` was right. Expectations now carry a sentinel where leading or trailing
 space is the point.
+
+## D-129
+
+**`Function.prototype.bind`, and `Object.prototype` existing at all.**
+
+Status: Accepted
+
+test262's own `propertyHelper.js` opens with
+`Function.prototype.call.bind(Object.prototype.hasOwnProperty)`. Neither `bind` nor
+`Object.prototype` existed, so the helper threw while loading and **every test that includes it
+failed** — whatever the test was about. That is why one commit moved `is not a function` from
+121 to 51.
+
+**A native can see its own object.** The calling convention passes the callee as the first
+operand, which is what lets a bound function find its target without the engine having closures
+a native could capture. The target, receiver and leading arguments are hidden properties, for
+the same reason a date's time value is (D-126): internal slot zero already means "callable",
+and a bound function is exactly a callable.
+
+**The bound arguments come first and the call's own follow**, which is what makes
+`f.bind(null, 1)(2)` the same as `f(1, 2)`.
+
+`Object.prototype` is now the end of every chain — plain objects, and the other prototypes too,
+so `[].hasOwnProperty` and `({}).hasOwnProperty` are one function rather than a copy each.
+**Own means own**: `hasOwnProperty` answers `false` for something found on the prototype, which
+is the whole reason it exists rather than `in`.
+
+**Consequence: an ordering bug that hid one property deep.** The object at the end of every
+chain has to exist before anything links to it, so it was built first — but its methods are
+*functions*, and functions made before `Function.prototype` exists do not get `call`. So
+`Object.prototype.toString` was fine and `Object.prototype.toString.call` was not. Allocating
+the object early and populating it after `Function.prototype` is the fix, and the split is now
+the documented point of having two functions.
+
+## D-130
+
+**An identity test between two absent things passes.**
+
+Status: Accepted
+
+`({}).hasOwnProperty === Object.prototype.hasOwnProperty` was green while **both sides were
+`undefined`**. It went green the moment it was written and stayed green through the bug it was
+supposed to catch.
+
+Every identity assertion in the acceptance suite is now preceded by a `typeof` check that there
+is something to identify. The pattern generalises past this case: an assertion whose two sides
+can both be missing is not testing what it appears to test, and `===` on `undefined` is the
+commonest way to get one.

@@ -34,14 +34,13 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**42 passed, 319 failed, 0 crashed, 18 refused.** Built-ins carry their own `name` (D-127),
-and `Array.prototype` gained `reduceRight`, `flat`, `flatMap`, `at`, `findLast` and
-`findLastIndex` while `String.prototype` gained `at`, `trimStart`, `trimEnd`, `padStart`,
-`padEnd`, `replace` and `replaceAll` (D-128).
+**54 passed, 307 failed, 0 crashed, 18 refused.** `Function.prototype.bind` and
+`Object.prototype` (D-129). test262's own `propertyHelper.js` is built on
+`Function.prototype.call.bind(Object.prototype.hasOwnProperty)`, so it threw while loading and
+took every test that includes it down with it — `is not a function` fell from 121 to 51.
 
 Still unshipped from `crisol-builtins` (D-122): `Symbol` (21), `Proxy` (13), `Map` and `Set`
-(3 each). `Symbol` is not a wiring job like the last three — a symbol is a value kind, so
-making one work as a property key reaches into `PropertyKey` rather than sitting on top of it.
+(3 each).
 
 Refusals are 18, nearly all array holes (11).
 
@@ -79,7 +78,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1183 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1189 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure

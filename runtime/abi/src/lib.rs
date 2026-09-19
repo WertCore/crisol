@@ -585,6 +585,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(STRING_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(REGEXP_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(DATE_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(OBJECT_PROTOTYPE.with(std::cell::Cell::get));
         roots
     }));
 }
@@ -603,6 +604,8 @@ thread_local! {
     static REGEXP_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The prototype every date inherits from.
     static DATE_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every object inherits from, at the end of every chain.
+    static OBJECT_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// Compiled patterns, keyed by their source and flags.
     ///
     /// **A memo, not ownership.** The authoritative `lastIndex` is a property on the JavaScript
@@ -1050,7 +1053,7 @@ extern "C" fn to_boolean_global(
 /// Numbered last, after [`NATIVES`], [`GLOBAL_NATIVES`] and [`NAMESPACE_NATIVES`]. A table of
 /// its own because the index space is shared: the first version of this pointed at index 0 of
 /// the *first* table, so calling `Object()` ran `Array.prototype.map`.
-const ANONYMOUS_NATIVES: &[Native] = &[construct_plain_object];
+const ANONYMOUS_NATIVES: &[Native] = &[construct_plain_object, bound_call];
 
 /// The index within [`ANONYMOUS_NATIVES`] of the plain-object constructor.
 ///
@@ -1058,6 +1061,19 @@ const ANONYMOUS_NATIVES: &[Native] = &[construct_plain_object];
 /// wrong for `Array` — `Array(3)` should give a three-element array. Recorded rather than left
 /// to be discovered.
 const CONSTRUCT_PLAIN_OBJECT: usize = 0;
+
+/// The index within [`ANONYMOUS_NATIVES`] of the body every bound function runs.
+const BOUND_CALL: usize = 1;
+
+/// Where a bound function keeps what it was bound to.
+///
+/// Hidden rather than internal for the same reason a date's time value is (D-126): internal
+/// slot zero already means "callable", and a bound function is exactly a callable.
+const BOUND_TARGET: &str = "__target";
+/// The receiver a bound function supplies.
+const BOUND_THIS: &str = "__boundThis";
+/// The leading arguments a bound function supplies.
+const BOUND_ARGS: &str = "__boundArgs";
 
 /// What a namespace object does when called: give back an object.
 extern "C" fn construct_plain_object(
@@ -1274,6 +1290,123 @@ extern "C" fn date_to_text(
         || new_string(crisol_builtins::INVALID_DATE),
         |text| new_string(&text),
     )
+}
+
+/// Methods on `Object.prototype`, which every object inherits.
+const OBJECT_NATIVES: &[(&str, Native)] = &[
+    ("hasOwnProperty", object_has_own_property),
+    ("propertyIsEnumerable", object_property_is_enumerable),
+    ("isPrototypeOf", object_is_prototype_of),
+    ("toString", object_to_text),
+    ("toLocaleString", object_to_text),
+    ("valueOf", object_value_of),
+];
+
+/// `Object.prototype.hasOwnProperty`.
+///
+/// **Own means own**: a property found on the prototype answers `false`, which is the whole
+/// reason this exists rather than `key in object`.
+extern "C" fn object_has_own_property(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(name) = to_text(unsafe { argument(argc, argv, 0) }) else {
+        return Value::FALSE.to_bits();
+    };
+    if let Some(index) = as_index(Value::from_bits(
+        // SAFETY: as above.
+        unsafe { argument(argc, argv, 0) },
+    )) && let Some((_, length)) = elements_of(this_value)
+    {
+        return boolean(index < length).to_bits();
+    }
+    boolean(own_property(this_value, &name).is_some()).to_bits()
+}
+
+/// `Object.prototype.propertyIsEnumerable`.
+extern "C" fn object_property_is_enumerable(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(name) = to_text(unsafe { argument(argc, argv, 0) }) else {
+        return Value::FALSE.to_bits();
+    };
+    let Some(handle) = handle_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    let found = own_property(this_value, &name).is_some_and(|(slot, _)| {
+        with_runtime(|runtime| runtime.heap.attributes_of(handle, slot).enumerable)
+    });
+    boolean(found).to_bits()
+}
+
+/// `Object.prototype.isPrototypeOf`.
+extern "C" fn object_is_prototype_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let other = unsafe { argument(argc, argv, 0) };
+    let Some(wanted) = handle_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    let Some(mut current) = handle_of(other) else {
+        return Value::FALSE.to_bits();
+    };
+    for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+        let Some(parent) = with_runtime(|runtime| runtime.heap.prototype_of(current)) else {
+            return Value::FALSE.to_bits();
+        };
+        if parent == wanted {
+            return Value::TRUE.to_bits();
+        }
+        current = parent;
+    }
+    Value::FALSE.to_bits()
+}
+
+/// `Object.prototype.toString`.
+extern "C" fn object_to_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    // **The array tag is the only one distinguished.** A real engine reads
+    // `Symbol.toStringTag` and a class list; without symbols the honest choice is the one
+    // distinction that can be made without guessing.
+    if elements_of(this_value).is_some() {
+        return new_string("[object Array]");
+    }
+    match Value::from_bits(this_value).kind() {
+        crisol_value::Kind::Undefined => new_string("[object Undefined]"),
+        crisol_value::Kind::Null => new_string("[object Null]"),
+        _ if is_callable(this_value) => new_string("[object Function]"),
+        _ => new_string("[object Object]"),
+    }
+}
+
+/// `Object.prototype.valueOf`.
+extern "C" fn object_value_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_value
 }
 
 /// `Date.now()`.
@@ -2146,7 +2279,98 @@ extern "C" fn string_to_string(
 }
 
 /// Methods on `Function.prototype`, which every function inherits.
-const FUNCTION_NATIVES: &[(&str, Native)] = &[("call", function_call), ("apply", function_apply)];
+const FUNCTION_NATIVES: &[(&str, Native)] = &[
+    ("call", function_call),
+    ("apply", function_apply),
+    ("bind", function_bind),
+];
+
+/// `f.bind(receiver, …leading)`.
+///
+/// **A native can see its own object**: the calling convention passes the callee as the first
+/// operand, which is what lets a bound function find what it was bound to without the engine
+/// having closures that a native could capture.
+extern "C" fn function_bind(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let bound = with_runtime(|runtime| {
+            runtime
+                .native_function(
+                    NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + BOUND_CALL,
+                )
+                .to_value()
+                .to_bits()
+        });
+        with_rooted(&[bound], || {
+            let Some(handle) = handle_of(bound) else {
+                return Value::UNDEFINED.to_bits();
+            };
+            // Each piece is stored before the next is made, so nothing sits unrooted while an
+            // allocation runs (D-127).
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, BOUND_TARGET, Value::from_bits(this_value));
+            });
+            // SAFETY: the convention guarantees `argc` readable values at `argv`.
+            let receiver = unsafe { argument(argc, argv, 0) };
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, BOUND_THIS, Value::from_bits(receiver));
+            });
+            let leading: Vec<u64> = (1..argc as usize)
+                // SAFETY: as above.
+                .map(|position| unsafe { argument(argc, argv, position) })
+                .collect();
+            let held = array_of_values(&leading);
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, BOUND_ARGS, Value::from_bits(held));
+            });
+            bound
+        })
+    })
+}
+
+/// What every bound function runs.
+///
+/// **The bound arguments come first and the call's own follow**, which is what makes
+/// `f.bind(null, 1)(2)` the same as `f(1, 2)`.
+extern "C" fn bound_call(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let read = |name: &str| {
+        let key = name.to_owned();
+        // SAFETY: `key` is a live Rust string.
+        unsafe { crisol_property_load(closure, key.as_ptr(), key.len() as u64) }
+    };
+    let target = read(BOUND_TARGET);
+    let receiver = read(BOUND_THIS);
+    let held = read(BOUND_ARGS);
+
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(closure, argc, argv) };
+    with_rooted(&live, || {
+        let mut all = Vec::new();
+        if let Some((array, length)) = elements_of(held) {
+            for index in 0..length {
+                all.push(element_at(array, index));
+            }
+        }
+        for position in 0..argc as usize {
+            // SAFETY: as above.
+            all.push(unsafe { argument(argc, argv, position) });
+        }
+        call_value(target, receiver, &all)
+    })
+}
 
 /// `f.call(receiver, …args)`.
 ///
@@ -2781,9 +3005,13 @@ impl Runtime {
             heap,
             shapes: RefCell::new(Shapes::new()),
         };
-        // **First**, because every function made afterwards links to it — including the ones
-        // that live on it.
+        // The object at the end of every chain has to exist before anything links to it, but
+        // its methods are functions, so they cannot be made until `Function.prototype` does.
+        runtime.allocate_object_prototype();
+        // This next, because every function made afterwards links to it — including the ones
+        // that live on it, and the ones on `Object.prototype` below.
         runtime.build_function_prototype();
+        runtime.build_object_prototype();
         runtime.build_string_prototype();
         runtime.build_regexp_prototype();
         runtime.build_date_prototype();
@@ -2913,6 +3141,7 @@ impl Runtime {
             ("String", STRING_PROTOTYPE.with(std::cell::Cell::get)),
             ("RegExp", REGEXP_PROTOTYPE.with(std::cell::Cell::get)),
             ("Date", DATE_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Object", OBJECT_PROTOTYPE.with(std::cell::Cell::get)),
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -3039,6 +3268,52 @@ impl Runtime {
         }
     }
 
+    /// Builds the object at the end of every prototype chain.
+    /// Links `object` to the end of every prototype chain.
+    ///
+    /// Called for each of the other prototypes, so `[].hasOwnProperty` resolves the same way
+    /// `({}).hasOwnProperty` does — through one object rather than a copy per prototype.
+    fn inherit_from_object(&self, object: GcRef) {
+        if let Some(base) = OBJECT_PROTOTYPE.with(std::cell::Cell::get)
+            && base != object
+        {
+            self.heap.set_prototype(object, Some(base));
+        }
+    }
+
+    /// Allocates the object at the end of every prototype chain, with nothing on it yet.
+    ///
+    /// **Split from its methods, and the split is the point.** The object has to exist before
+    /// anything can link to it, and its methods are functions, which have to be made *after*
+    /// `Function.prototype` exists or they will not have `call`. Building it in one step left
+    /// `Object.prototype.toString.call` out of reach while `Object.prototype.toString` was
+    /// perfectly fine — a gap that shows up only one property further along.
+    fn allocate_object_prototype(&self) {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let prototype = scope.alloc(shape, 0);
+        OBJECT_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+    }
+
+    /// Puts the methods on it, once functions can be made properly.
+    fn build_object_prototype(&self) {
+        let Some(prototype) = OBJECT_PROTOTYPE.with(std::cell::Cell::get) else {
+            return;
+        };
+        let base = NATIVES.len()
+            + GLOBAL_NATIVES.len()
+            + NAMESPACE_NATIVES.len()
+            + ANONYMOUS_NATIVES.len()
+            + FUNCTION_NATIVES.len()
+            + STRING_NATIVES.len()
+            + REGEXP_NATIVES.len()
+            + DATE_NATIVES.len();
+        for (index, (name, _)) in OBJECT_NATIVES.iter().enumerate() {
+            let method = self.native_function(base + index);
+            self.define_method(prototype, name, method.to_value());
+        }
+    }
+
     /// Builds the object every function inherits from.
     ///
     /// The object is rooted **before** its own methods are made, because those are functions
@@ -3048,6 +3323,7 @@ impl Runtime {
         let scope = self.heap.scope();
         let prototype = scope.alloc(shape, 0);
         FUNCTION_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+        self.inherit_from_object(prototype.handle());
 
         let base = NATIVES.len()
             + GLOBAL_NATIVES.len()
@@ -3065,6 +3341,7 @@ impl Runtime {
         let scope = self.heap.scope();
         let prototype = scope.alloc(shape, 0);
         STRING_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+        self.inherit_from_object(prototype.handle());
 
         let base = NATIVES.len()
             + GLOBAL_NATIVES.len()
@@ -3083,6 +3360,7 @@ impl Runtime {
         let scope = self.heap.scope();
         let prototype = scope.alloc(shape, 0);
         REGEXP_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+        self.inherit_from_object(prototype.handle());
 
         let base = NATIVES.len()
             + GLOBAL_NATIVES.len()
@@ -3102,6 +3380,7 @@ impl Runtime {
         let scope = self.heap.scope();
         let prototype = scope.alloc(shape, 0);
         DATE_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+        self.inherit_from_object(prototype.handle());
 
         let base = NATIVES.len()
             + GLOBAL_NATIVES.len()
@@ -3126,6 +3405,7 @@ impl Runtime {
         let scope = self.heap.scope();
         let prototype = scope.alloc(shape, 0);
         ARRAY_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+        self.inherit_from_object(prototype.handle());
 
         for (index, (name, _)) in NATIVES.iter().enumerate() {
             let method = self.native_function(index);
@@ -3162,7 +3442,11 @@ pub extern "C" fn crisol_create_object() -> u64 {
         // frame: the value is about to land in a slot the stack map describes, and the next
         // collection cannot happen before then, because only an allocation triggers one.
         let scope = runtime.heap.scope();
-        scope.alloc(shape, 0).to_value().to_bits()
+        let object = scope.alloc(shape, 0);
+        // Every object ends its chain at `Object.prototype`, which is what makes
+        // `({}).hasOwnProperty` resolve at all.
+        runtime.inherit_from_object(object.handle());
+        object.to_value().to_bits()
     })
 }
 
@@ -4367,7 +4651,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + REGEXP_NATIVES.len();
-        return DATE_NATIVES
+        if let Some((_, function)) = DATE_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + DATE_NATIVES.len();
+        return OBJECT_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
