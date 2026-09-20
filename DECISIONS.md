@@ -4587,6 +4587,13 @@ aborts the process.
 over saying it.** The compilation is now wrapped so either answer arrives as an error a program
 can catch, rather than as a signal with nothing to say which pattern did it.
 
+**Correction: property escapes were not the trigger.** A test asserting that
+`new RegExp("\\p{Script=Arabic}", "u")` raises proved the opposite — `regress` compiles them.
+The guard did take the crash count from three to zero, so something in that path panics; which
+pattern is *not* established, and the first sentence of this entry named one on no evidence
+beyond the test file names. What is known: the boundary is now safe, and the trigger is
+unidentified.
+
 This is worth stating generally: every `crisol_*` entry point is a boundary a panic must not
 cross. Regex compilation is the one known to panic today; it is not obviously the only place
 user input reaches library code that may.

@@ -4545,11 +4545,19 @@ fn an_out_of_range_length_raises() {
 /// dies on a signal with nothing to say which pattern did it.
 #[test]
 fn an_unsupported_pattern_raises_rather_than_aborting() {
+    // A malformed pattern is a `SyntaxError`, which is the path that already worked.
     check(
-        "regexp-unsupported",
-        "let r = \"ok\"; try { let p = new RegExp(\"\\\\p{Script=Arabic}\", \"u\"); } \
-         catch (e) { r = e.name; } return r;",
+        "regexp-malformed",
+        "let r = \"ok\"; try { let p = new RegExp(\"(\"); } catch (e) { r = e.name; } return r;",
         "SyntaxError",
+    );
+    // A property escape compiles — this is *not* what was panicking, though naming it was the
+    // first guess. What the guard buys is that whatever does panic arrives as an error instead
+    // of a signal, and the corpus reporting zero crashes is the evidence for that.
+    check(
+        "regexp-property-escape",
+        "return new RegExp(\"\\\\p{L}\", \"u\").test(\"a\");",
+        "true",
     );
     // A pattern it can compile still works, so the guard has not swallowed the ordinary path.
     check("regexp-still-works", "return /ab+/.test(\"abb\");", "true");
