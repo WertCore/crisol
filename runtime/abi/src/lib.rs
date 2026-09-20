@@ -6580,15 +6580,13 @@ extern "C" fn array_map(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let Some((array, length)) = elements_of(this_value) else {
-            return Value::UNDEFINED.to_bits();
-        };
+        let length = indexed_length(this_value);
         // SAFETY: the convention guarantees `argc` readable values at `argv`.
         let callback = unsafe { argument(argc, argv, 0) };
 
         with_new_array(length, |result| {
             for index in 0..length {
-                let element = element_at(array, index);
+                let element = indexed_get(this_value, index);
                 let mapped = call_value(
                     callback,
                     this_value,
@@ -6616,9 +6614,7 @@ extern "C" fn array_filter(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let Some((array, length)) = elements_of(this_value) else {
-            return Value::UNDEFINED.to_bits();
-        };
+        let length = indexed_length(this_value);
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
 
@@ -6627,7 +6623,7 @@ extern "C" fn array_filter(
         with_new_array(length, |result| {
             let mut kept = 0;
             for index in 0..length {
-                let element = element_at(array, index);
+                let element = indexed_get(this_value, index);
                 let verdict = call_value(
                     callback,
                     this_value,
@@ -6661,13 +6657,11 @@ extern "C" fn array_for_each(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let Some((array, length)) = elements_of(this_value) else {
-            return Value::UNDEFINED.to_bits();
-        };
+        let length = indexed_length(this_value);
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
         for index in 0..length {
-            let element = element_at(array, index);
+            let element = indexed_get(this_value, index);
             call_value(
                 callback,
                 this_value,
@@ -7148,13 +7142,11 @@ extern "C" fn array_index_of(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let Some((array, length)) = elements_of(this_value) else {
-            return Value::UNDEFINED.to_bits();
-        };
+        let length = indexed_length(this_value);
         // SAFETY: as above.
         let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
         for index in 0..length {
-            let element = Value::from_bits(element_at(array, index));
+            let element = Value::from_bits(indexed_get(this_value, index));
             // `indexOf` uses strict equality, so `NaN` is never found — `[NaN].indexOf(NaN)` is
             // `-1`. Comparing the numbers rather than the bits is what gets that right.
             let same = match (element.as_number(), wanted.as_number()) {
