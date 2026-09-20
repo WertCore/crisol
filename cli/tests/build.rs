@@ -4512,3 +4512,45 @@ fn assigning_to_length_resizes_an_array() {
         "3",
     );
 }
+
+/// **A length above 2^32-1 is a `RangeError`** — the specification's rule, and the only thing
+/// between `[].length = 4294967297` and an attempt to materialise four billion elements, which
+/// was a crash rather than an error a test could report.
+#[test]
+fn an_out_of_range_length_raises() {
+    check(
+        "length-too-big",
+        "let r = \"\"; try { [].length = 4294967297; } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "length-negative",
+        "let r = \"\"; try { [].length = -1; } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "length-fractional",
+        "let r = \"\"; try { [].length = 1.5; } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "length-legal",
+        "let a = [1, 2]; a.length = 1; return a.length;",
+        "1",
+    );
+}
+
+/// **A panic must not cross an `extern "C"` boundary.** A pattern the engine cannot compile is
+/// a `SyntaxError` whether the compiler says so or falls over saying it — otherwise the program
+/// dies on a signal with nothing to say which pattern did it.
+#[test]
+fn an_unsupported_pattern_raises_rather_than_aborting() {
+    check(
+        "regexp-unsupported",
+        "let r = \"ok\"; try { let p = new RegExp(\"\\\\p{Script=Arabic}\", \"u\"); } \
+         catch (e) { r = e.name; } return r;",
+        "SyntaxError",
+    );
+    // A pattern it can compile still works, so the guard has not swallowed the ordinary path.
+    check("regexp-still-works", "return /ab+/.test(\"abb\");", "true");
+}

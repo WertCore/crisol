@@ -5951,7 +5951,17 @@ pub unsafe extern "C" fn crisol_property_store(
         && let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
     {
         let wanted = to_number(value);
-        if wanted.is_finite() && wanted >= 0.0 {
+        // **Above 2^32-1 is a `RangeError`**, which is the specification's rule and also the
+        // only thing standing between `[].length = 4294967297` and an attempt to materialise
+        // four billion elements. That attempt was a crash, not an error a test could report.
+        if !wanted.is_finite()
+            || wanted < 0.0
+            || wanted > f64::from(u32::MAX)
+            || wanted.fract() != 0.0
+        {
+            return raise("invalid array length", "RangeError");
+        }
+        {
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -7913,9 +7923,16 @@ pub unsafe extern "C" fn crisol_create_regexp(
     let Ok(parsed) = crisol_builtins::Flags::parse(&flags_text) else {
         return raise("invalid regular expression flags", "SyntaxError");
     };
-    let compiled = match crisol_builtins::JsRegExp::new(&source, parsed) {
-        Ok(compiled) => compiled,
-        Err(message) => return raise(&message, "SyntaxError"),
+    // **A panic must not cross this boundary.** `crisol_create_regexp` is `extern "C"`, so an
+    // unwind out of it aborts the process — the program dies on a signal with nothing to say
+    // which pattern did it. A pattern the engine cannot compile is a `SyntaxError`, whether
+    // the compiler says so or falls over saying it: three test262 cases were being reported as
+    // crashes because `\p{…}` property escapes take the second route.
+    let compiled = std::panic::catch_unwind(|| crisol_builtins::JsRegExp::new(&source, parsed));
+    let compiled = match compiled {
+        Ok(Ok(compiled)) => compiled,
+        Ok(Err(message)) => return raise(&message, "SyntaxError"),
+        Err(_) => return raise("this pattern is not supported", "SyntaxError"),
     };
     PATTERNS.with(|cache| {
         cache

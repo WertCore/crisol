@@ -4570,3 +4570,29 @@ signal, with nothing to say which line caused it.
 
 Growing fills with `undefined` where the specification says holes — the same approximation array
 literals already make, and refused rather than faked there (D-133). Shrinking is exact.
+
+## D-155
+
+**A panic must not cross the `extern "C"` boundary.**
+
+Status: Accepted
+
+Three test262 cases were reported as **crashes**, and the names all pointed at Unicode regex
+support. The first guess — that they were building enormous strings — was wrong, and fixing that
+(D-154) changed nothing for them. The actual cause is that `regress` *panics* on `\p{…}`
+property escapes rather than returning an error, and an unwind out of an `extern "C"` function
+aborts the process.
+
+**A pattern the engine cannot compile is a `SyntaxError` whether the compiler says so or falls
+over saying it.** The compilation is now wrapped so either answer arrives as an error a program
+can catch, rather than as a signal with nothing to say which pattern did it.
+
+This is worth stating generally: every `crisol_*` entry point is a boundary a panic must not
+cross. Regex compilation is the one known to panic today; it is not obviously the only place
+user input reaches library code that may.
+
+**And a second crash was mine.** `[].length = 4294967297` tried to materialise four billion
+elements, because D-154 made the assignment resize without bounding it. A length above 2^32-1
+is a `RangeError`, which is both the specification's rule and the thing standing between that
+assignment and the process dying. Adding a feature added a crash; the corpus said so within one
+run, which is the argument for measuring after every change rather than at the end of a batch.
