@@ -593,6 +593,8 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(REGEXP_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(DATE_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(OBJECT_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(MAP_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(SET_PROTOTYPE.with(std::cell::Cell::get));
         roots
     }));
 }
@@ -613,6 +615,10 @@ thread_local! {
     static DATE_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The prototype every object inherits from, at the end of every chain.
     static OBJECT_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every `Map` inherits from.
+    static MAP_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every `Set` inherits from.
+    static SET_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// Compiled patterns, keyed by their source and flags.
     ///
     /// **A memo, not ownership.** The authoritative `lastIndex` is a property on the JavaScript
@@ -1121,7 +1127,99 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Function", unconstructable),
     ("RegExp", make_regexp),
     ("Date", make_date_object),
+    ("Map", make_map),
+    ("Set", make_set),
 ];
+
+/// Where a `Map` or `Set` keeps its contents.
+///
+/// **A heap array, not a Rust collection.** `crisol-builtins` has a `JsMap` and it is not used
+/// here, which is a departure from D-122 worth stating: it holds `Value`s in a Rust `HashMap`,
+/// and a `Value` can be a reference the collector must trace. Keeping them outside the heap
+/// would need a registry of live maps in the root set — and that registry would keep the
+/// contents of *dead* maps alive too, because nothing tells it when a wrapper is collected.
+/// A backing array inside the heap is traced already, for free and without a leak.
+///
+/// The cost is lookup: this is a scan, where a `HashMap` is not. Correct and linear beats fast
+/// and leaking, and the day it matters the fix is a real hash table in the heap rather than a
+/// Rust one beside it.
+const COLLECTION_ENTRIES: &str = "__entries";
+/// How many entries a `Map` or `Set` holds.
+///
+/// A plain property because `size` is an accessor in the specification and there are no
+/// accessors here. It is maintained on every mutation rather than counted on every read.
+const COLLECTION_SIZE: &str = "size";
+
+/// SameValueZero — the comparison `Map` and `Set` key on.
+///
+/// **`NaN` equals itself here**, which `===` does not do. That is the whole difference, and it
+/// is why a set can contain `NaN` at all: without it, every `add(NaN)` would add another.
+fn same_value_zero(left: u64, right: u64) -> bool {
+    let (a, b) = (Value::from_bits(left), Value::from_bits(right));
+    match (a.as_number(), b.as_number()) {
+        (Some(x), Some(y)) => x == y || (x.is_nan() && y.is_nan()),
+        _ => same_value(a, b),
+    }
+}
+
+/// The backing array of a `Map` or `Set`.
+fn entries_of(collection: u64) -> Option<(GcRef, usize)> {
+    let key = COLLECTION_ENTRIES.to_owned();
+    // SAFETY: `key` is a live Rust string.
+    let held = unsafe { crisol_property_load(collection, key.as_ptr(), key.len() as u64) };
+    elements_of(held)
+}
+
+/// Records how many entries a collection now holds.
+fn set_collection_size(collection: u64, entries: usize, stride: usize) {
+    if let Some(handle) = handle_of(collection) {
+        #[expect(clippy::cast_precision_loss, reason = "a count of heap entries")]
+        let size = (entries / stride) as f64;
+        with_runtime(|runtime| runtime.define_hidden(handle, COLLECTION_SIZE, Value::number(size)));
+    }
+}
+
+/// Builds a `Map` or a `Set`: an object with a backing array and a size.
+fn new_collection(prototype: Option<GcRef>) -> u64 {
+    let object = crisol_create_object();
+    with_rooted(&[object], || {
+        let Some(handle) = handle_of(object) else {
+            return;
+        };
+        // Stored before the size is written, so nothing is unrooted across an allocation.
+        let entries = array_of_values(&[]);
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, COLLECTION_ENTRIES, Value::from_bits(entries));
+            runtime.define_hidden(handle, COLLECTION_SIZE, Value::number(0.0));
+            if let Some(prototype) = prototype {
+                runtime.heap.set_prototype(handle, Some(prototype));
+            }
+        });
+    });
+    object
+}
+
+/// `new Map()`.
+extern "C" fn make_map(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get))
+}
+
+/// `new Set()`.
+extern "C" fn make_set(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_collection(SET_PROTOTYPE.with(std::cell::Cell::get))
+}
 
 /// A global that exists so its `prototype` can be reached, but cannot be called.
 ///
@@ -1539,6 +1637,300 @@ extern "C" fn date_to_text(
         || new_string(crisol_builtins::INVALID_DATE),
         |text| new_string(&text),
     )
+}
+
+/// Methods on `Map.prototype`.
+///
+/// **A map stores key and value adjacently** in one backing array, so an entry is a pair at an
+/// even offset. One array rather than two keeps them from ever disagreeing about length.
+const MAP_NATIVES: &[(&str, Native)] = &[
+    ("get", map_get),
+    ("set", map_set),
+    ("has", map_has),
+    ("delete", map_delete),
+    ("clear", collection_clear),
+    ("forEach", map_for_each),
+];
+
+/// Methods on `Set.prototype`.
+const SET_NATIVES: &[(&str, Native)] = &[
+    ("add", set_add),
+    ("has", set_has),
+    ("delete", set_delete),
+    ("clear", collection_clear),
+    ("forEach", set_for_each),
+];
+
+/// Where `key` sits in the backing array, stepping by `stride`.
+fn find_entry(array: GcRef, length: usize, stride: usize, key: u64) -> Option<usize> {
+    (0..length)
+        .step_by(stride)
+        .find(|index| same_value_zero(element_at(array, *index), key))
+}
+
+/// `Map.prototype.get`.
+extern "C" fn map_get(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    // **`undefined` for a missing key**, which is indistinguishable from a key whose value is
+    // `undefined` — that is what `has` is for, and why both exist.
+    find_entry(array, length, 2, key).map_or_else(
+        || Value::UNDEFINED.to_bits(),
+        |at| element_at(array, at + 1),
+    )
+}
+
+/// `Map.prototype.set`.
+extern "C" fn map_set(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let value = unsafe { argument(argc, argv, 1) };
+
+    let existing = find_entry(array, length, 2, key);
+    with_runtime(|runtime| match existing {
+        // **An existing key keeps its position.** Insertion order is observable through
+        // `forEach`, and re-setting a key does not move it to the end.
+        Some(at) => {
+            runtime
+                .heap
+                .set_element(array, at + 1, Value::from_bits(value));
+        }
+        None => {
+            runtime
+                .heap
+                .set_element(array, length, Value::from_bits(key));
+            runtime
+                .heap
+                .set_element(array, length + 1, Value::from_bits(value));
+        }
+    });
+    if existing.is_none() {
+        set_collection_size(this_value, length + 2, 2);
+    }
+    // Answers the map, so `m.set(a, 1).set(b, 2)` chains.
+    this_value
+}
+
+/// `Map.prototype.has`.
+extern "C" fn map_has(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    boolean(find_entry(array, length, 2, key).is_some()).to_bits()
+}
+
+/// Removes the entry at `at`, closing the gap so insertion order survives.
+fn remove_entry(collection: u64, array: GcRef, length: usize, at: usize, stride: usize) {
+    with_runtime(|runtime| {
+        for index in at..length - stride {
+            let moved = runtime
+                .heap
+                .element(array, index + stride)
+                .unwrap_or(Value::UNDEFINED);
+            runtime.heap.set_element(array, index, moved);
+        }
+        runtime.heap.truncate_elements(array, length - stride);
+    });
+    set_collection_size(collection, length - stride, stride);
+}
+
+/// `Map.prototype.delete`.
+extern "C" fn map_delete(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    let Some(at) = find_entry(array, length, 2, key) else {
+        // **`false` for a key that was not there**, where `delete` on an object answers `true`.
+        // The two operators are asking different questions.
+        return Value::FALSE.to_bits();
+    };
+    remove_entry(this_value, array, length, at, 2);
+    Value::TRUE.to_bits()
+}
+
+/// `Map.prototype.clear` and `Set.prototype.clear`.
+extern "C" fn collection_clear(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some((array, _)) = entries_of(this_value) {
+        with_runtime(|runtime| runtime.heap.truncate_elements(array, 0));
+        set_collection_size(this_value, 0, 1);
+    }
+    Value::UNDEFINED.to_bits()
+}
+
+/// `Map.prototype.forEach`, which passes `(value, key, map)`.
+///
+/// **Value first, then key** — the opposite of how the pair is stored and of how most people
+/// read it, and the specification's order.
+extern "C" fn map_for_each(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, _length)) = entries_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let mut index = 0;
+        // `length` is re-read rather than captured, so a callback that deletes an entry does
+        // not walk off the end of a shortened array.
+        while index + 1 < entries_of(this_value).map_or(0, |(_, len)| len) {
+            let key = element_at(array, index);
+            let value = element_at(array, index + 1);
+            let outcome = call_value(
+                callback,
+                Value::UNDEFINED.to_bits(),
+                &[value, key, this_value],
+            );
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
+            }
+            index += 2;
+        }
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// `Set.prototype.add`.
+extern "C" fn set_add(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    if find_entry(array, length, 1, value).is_none() {
+        with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(array, length, Value::from_bits(value));
+        });
+        set_collection_size(this_value, length + 1, 1);
+    }
+    this_value
+}
+
+/// `Set.prototype.has`.
+extern "C" fn set_has(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    boolean(find_entry(array, length, 1, value).is_some()).to_bits()
+}
+
+/// `Set.prototype.delete`.
+extern "C" fn set_delete(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    let Some(at) = find_entry(array, length, 1, value) else {
+        return Value::FALSE.to_bits();
+    };
+    remove_entry(this_value, array, length, at, 1);
+    Value::TRUE.to_bits()
+}
+
+/// `Set.prototype.forEach`, which passes `(value, value, set)`.
+///
+/// **The value twice**, so a callback written for a map's `(value, key)` works unchanged on a
+/// set — the specification's reason, and it looks like a mistake until you know it.
+extern "C" fn set_for_each(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, _)) = entries_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let mut index = 0;
+        while index < entries_of(this_value).map_or(0, |(_, len)| len) {
+            let value = element_at(array, index);
+            let outcome = call_value(
+                callback,
+                Value::UNDEFINED.to_bits(),
+                &[value, value, this_value],
+            );
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
+            }
+            index += 1;
+        }
+        Value::UNDEFINED.to_bits()
+    })
 }
 
 /// Methods on `Object.prototype`, which every object inherits.
@@ -3511,6 +3903,7 @@ impl Runtime {
         runtime.build_string_prototype();
         runtime.build_regexp_prototype();
         runtime.build_date_prototype();
+        runtime.build_collection_prototypes();
         runtime.build_array_prototype();
         runtime.build_globals();
         runtime
@@ -3638,6 +4031,8 @@ impl Runtime {
             ("RegExp", REGEXP_PROTOTYPE.with(std::cell::Cell::get)),
             ("Date", DATE_PROTOTYPE.with(std::cell::Cell::get)),
             ("Object", OBJECT_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Map", MAP_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Set", SET_PROTOTYPE.with(std::cell::Cell::get)),
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -3905,6 +4300,33 @@ impl Runtime {
         for (index, (name, _)) in DATE_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
             self.define_method(prototype.handle(), name, method.to_value());
+        }
+    }
+
+    /// Builds the prototypes `Map` and `Set` instances inherit from.
+    fn build_collection_prototypes(&self) {
+        let base = NATIVES.len()
+            + GLOBAL_NATIVES.len()
+            + NAMESPACE_NATIVES.len()
+            + ANONYMOUS_NATIVES.len()
+            + FUNCTION_NATIVES.len()
+            + STRING_NATIVES.len()
+            + REGEXP_NATIVES.len()
+            + DATE_NATIVES.len()
+            + OBJECT_NATIVES.len();
+        for (cell, natives, offset) in [
+            (&MAP_PROTOTYPE, MAP_NATIVES, 0),
+            (&SET_PROTOTYPE, SET_NATIVES, MAP_NATIVES.len()),
+        ] {
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            cell.with(|slot| slot.set(Some(prototype.handle())));
+            self.inherit_from_object(prototype.handle());
+            for (index, (name, _)) in natives.iter().enumerate() {
+                let method = self.native_function(base + offset + index);
+                self.define_method(prototype.handle(), name, method.to_value());
+            }
         }
     }
 
@@ -5168,7 +5590,15 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + DATE_NATIVES.len();
-        return OBJECT_NATIVES
+        if let Some((_, function)) = OBJECT_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + OBJECT_NATIVES.len();
+        if let Some((_, function)) = MAP_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + MAP_NATIVES.len();
+        return SET_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }

@@ -4376,3 +4376,36 @@ Status: Accepted
 `sed` takes SIGPIPE, and `pipefail` turns that into a failed step. So the job summary — the
 counts and the reason breakdown — was published only when the run was short enough not to need
 truncating.
+
+## D-148
+
+**`Map` and `Set` keep their contents in the heap, not in `crisol-builtins`.**
+
+Status: Accepted — a deliberate departure from D-122
+
+`crisol-builtins` has a tested `JsMap` and `JsSet` and they are **not** used, which needs saying
+because D-122 argues for taking what is already written. They hold `Value`s in a Rust
+collection, and a `Value` can be a reference the collector must trace. Using them would mean a
+registry of live maps in the root set — and that registry would keep the contents of **dead**
+maps alive too, because nothing tells it when a wrapper is collected. A leak is not a better
+trade than a rewrite.
+
+A backing array inside the heap is traced already, for free and without a leak. One array with
+key and value adjacent, rather than two, so the pair can never disagree about length.
+
+The cost is honest: lookup is a **scan** where a `HashMap` is not. Correct and linear beats fast
+and leaking, and the day it matters the fix is a real hash table *in the heap*, not a Rust one
+beside it.
+
+Three behaviours worth pinning, each of which looks like a mistake until you know the rule:
+
+- **SameValueZero, so `NaN` is its own key.** `===` says `NaN !== NaN`, and without the
+  difference every `add(NaN)` would add another. `+0` and `-0` are one key.
+- **Re-setting a key keeps its position.** Insertion order is observable through `forEach`, and
+  a reassignment is not a reinsertion.
+- **`Map.forEach` passes value *then* key** — the opposite of storage order — and
+  **`Set.forEach` passes the value twice**, so a callback written for a map works on a set.
+
+`size` is a plain property maintained on every mutation, because the specification makes it an
+accessor and there are no accessors here. Iterators (`keys`, `values`, `entries`) are absent for
+the same reason `for-of` is partial (D-120): there is no `Symbol.iterator` to hang them on.

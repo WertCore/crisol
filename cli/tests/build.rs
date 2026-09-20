@@ -3578,3 +3578,202 @@ fn a_string_wrappers_value_is_hidden() {
         "0",
     );
 }
+
+// ---- Map and Set ---------------------------------------------------------------------------
+
+#[test]
+fn a_map_stores_and_retrieves_by_key() {
+    check(
+        "map-set-get",
+        "let m = new Map(); m.set(\"a\", 1); return m.get(\"a\");",
+        "1",
+    );
+    check(
+        "map-size",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); return m.size;",
+        "2",
+    );
+    check(
+        "map-has",
+        "let m = new Map(); m.set(\"a\", 1); return m.has(\"a\");",
+        "true",
+    );
+    check(
+        "map-has-not",
+        "let m = new Map(); return m.has(\"a\");",
+        "false",
+    );
+    check("map-empty-size", "return new Map().size;", "0");
+    // Answers the map, so calls chain.
+    check(
+        "map-chains",
+        "let m = new Map(); m.set(\"a\", 1).set(\"b\", 2); return m.size;",
+        "2",
+    );
+}
+
+/// **`undefined` for a missing key is indistinguishable from a stored `undefined`** — which is
+/// what `has` is for, and why both exist.
+#[test]
+fn a_map_distinguishes_absent_from_undefined_only_through_has() {
+    check("map-missing", "return new Map().get(\"a\");", "undefined");
+    check(
+        "map-stored-undefined",
+        "let m = new Map(); m.set(\"a\", undefined); return m.get(\"a\");",
+        "undefined",
+    );
+    check(
+        "map-stored-undefined-has",
+        "let m = new Map(); m.set(\"a\", undefined); return m.has(\"a\");",
+        "true",
+    );
+}
+
+/// **An existing key keeps its position.** Insertion order is observable through `forEach`, and
+/// re-setting a key does not move it to the end.
+#[test]
+fn a_map_keeps_insertion_order_through_a_reassignment() {
+    check(
+        "map-order",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); m.set(\"a\", 3); \
+         let s = \"\"; m.forEach(function (v, k) { s = s + k; }); return s;",
+        "ab",
+    );
+    check(
+        "map-reassign-size",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"a\", 2); return m.size;",
+        "1",
+    );
+}
+
+/// **`forEach` passes value first, then key** — the opposite of how the pair is stored.
+#[test]
+fn map_for_each_passes_the_value_before_the_key() {
+    check(
+        "map-foreach-order",
+        "let m = new Map(); m.set(\"k\", \"v\"); \
+         let s = \"\"; m.forEach(function (value, key) { s = value + key; }); return s;",
+        "vk",
+    );
+}
+
+#[test]
+fn a_map_can_delete_and_clear() {
+    check(
+        "map-delete",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); m.delete(\"a\"); return m.size;",
+        "1",
+    );
+    check(
+        "map-delete-answer",
+        "let m = new Map(); m.set(\"a\", 1); return m.delete(\"a\");",
+        "true",
+    );
+    // **`false` for a key that was not there**, where `delete` on an object answers `true`.
+    check(
+        "map-delete-absent",
+        "return new Map().delete(\"a\");",
+        "false",
+    );
+    check(
+        "map-delete-keeps-order",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); m.set(\"c\", 3); m.delete(\"b\"); \
+         let s = \"\"; m.forEach(function (v, k) { s = s + k; }); return s;",
+        "ac",
+    );
+    check(
+        "map-clear",
+        "let m = new Map(); m.set(\"a\", 1); m.clear(); return m.size;",
+        "0",
+    );
+}
+
+#[test]
+fn a_set_holds_each_value_once() {
+    check(
+        "set-add",
+        "let s = new Set(); s.add(1); s.add(2); return s.size;",
+        "2",
+    );
+    check(
+        "set-duplicate",
+        "let s = new Set(); s.add(1); s.add(1); return s.size;",
+        "1",
+    );
+    check(
+        "set-has",
+        "let s = new Set(); s.add(1); return s.has(1);",
+        "true",
+    );
+    check(
+        "set-delete",
+        "let s = new Set(); s.add(1); s.delete(1); return s.size;",
+        "0",
+    );
+    check("set-delete-absent", "return new Set().delete(1);", "false");
+    check(
+        "set-clear",
+        "let s = new Set(); s.add(1); s.clear(); return s.size;",
+        "0",
+    );
+}
+
+/// **`NaN` equals itself here**, which `===` does not do — without SameValueZero every
+/// `add(NaN)` would add another.
+#[test]
+fn a_collection_keys_on_same_value_zero() {
+    check(
+        "set-nan",
+        "let s = new Set(); s.add(0 / 0); s.add(0 / 0); return s.size;",
+        "1",
+    );
+    check(
+        "set-nan-has",
+        "let s = new Set(); s.add(0 / 0); return s.has(0 / 0);",
+        "true",
+    );
+    // `+0` and `-0` are the same key.
+    check(
+        "set-zeroes",
+        "let s = new Set(); s.add(0); s.add(-0); return s.size;",
+        "1",
+    );
+    check(
+        "map-nan-key",
+        "let m = new Map(); m.set(0 / 0, \"x\"); return m.get(0 / 0);",
+        "x",
+    );
+}
+
+/// **`Set.prototype.forEach` passes the value twice**, so a callback written for a map works
+/// unchanged on a set.
+#[test]
+fn set_for_each_passes_the_value_twice() {
+    check(
+        "set-foreach",
+        "let s = new Set(); s.add(\"a\"); s.add(\"b\"); \
+         let out = \"\"; s.forEach(function (v) { out = out + v; }); return out;",
+        "ab",
+    );
+    check(
+        "set-foreach-twice",
+        "let s = new Set(); s.add(\"x\"); \
+         let out = \"\"; s.forEach(function (v, k) { out = v + k; }); return out;",
+        "xx",
+    );
+}
+
+/// An object key is compared by identity, not by contents.
+#[test]
+fn an_object_key_is_its_own_key() {
+    check(
+        "map-object-key",
+        "let a = {}; let b = {}; let m = new Map(); m.set(a, 1); m.set(b, 2); return m.size;",
+        "2",
+    );
+    check(
+        "map-object-key-get",
+        "let a = {}; let m = new Map(); m.set(a, 7); return m.get(a);",
+        "7",
+    );
+}
