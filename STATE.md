@@ -34,6 +34,13 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
+**Open, and the top issue: the collector is wrong on Linux x86-64 (D-142).** 103 of 238
+acceptance cases fail there and **every one only under GC stress**; all 238 pass without it, and
+all 238 pass on macOS arm64 in both modes. Found only once compiled programs could link on
+Linux at all (D-140) — before that the suite had never run there.
+
+test262 numbers below are from macOS and are not a cross-platform claim.
+
 **56 passed, 309 failed, 0 crashed, 14 refused.** `arguments` (D-135), bound lazily so a
 function that never names it keeps the slot numbering it had before — declaring it eagerly
 shifted every parameter down by one and broke closures under GC stress.

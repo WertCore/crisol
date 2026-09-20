@@ -4213,3 +4213,35 @@ The general point, which cost three runs to learn: **a red CI job is not necessa
 about the code**. Two of the three failures this session were the environment — a missing
 `staticlib`, then a reclaimed runner — and reading the error rather than assuming a regression
 is what separated them.
+
+## D-142
+
+**The collector is wrong on Linux x86-64, and nothing could see it until the linker worked.**
+
+Status: Open — characterised, not fixed
+
+With `-lpthread -ldl -lm` supplied (D-140), compiled programs link on Linux for the first time
+and the acceptance suite ran there for the first time. **103 of 238 cases fail, and every one
+of them fails only under GC stress.** Without stress, all 238 pass. macOS arm64 passes all 238
+in both modes.
+
+That is a precise fault, not a vague one: the engine is correct on Linux and **the collector is
+not**. The symptom is a live value read back as `undefined` — `let outer = function (n) { let
+bump = function () { n = n + 1; }; bump(); return n; }` answers `undefined` instead of `6` when
+a collection lands at every allocation.
+
+The frame walk itself looks right for both targets and was checked rather than assumed: on
+aarch64 `stp x29, x30, [sp, #-16]!` and on x86-64 `call` plus `push rbp` both leave the saved
+frame pointer at `[fp]` and the return address at `[fp + 8]`, so `fp + 16` is the caller's stack
+pointer at the call on each. The divergence is somewhere past that — most likely what Cranelift
+reports stack map slots *relative to* on x86-64.
+
+Not fixed here, because bisecting it needs a Linux host to run against and guessing at a
+collector is how a subtle bug becomes a silent one. Recorded as the top open issue instead.
+
+**The reason it hid for so long is the interesting part.** Three separate things had to be
+wrong at once for this to stay invisible: the archive was never built in CI, so the suite
+asserted its absence rather than running; the link would have failed anyway for want of three
+libraries; and the failure was reported as the word `link` with the message discarded. Each of
+those looked like a small infrastructure annoyance. Together they hid a real defect in the one
+subsystem the project's own notes call the hardest to test.
