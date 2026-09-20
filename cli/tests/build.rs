@@ -5832,3 +5832,174 @@ fn create_and_is_prototype_of_check_what_they_are_given() {
         "false",
     );
 }
+
+/// A character is non-configurable and has no slot to say so, so redefining one has to be
+/// refused by the derived answer or it quietly grows a second property with the same name.
+#[test]
+fn a_character_cannot_be_redefined() {
+    check(
+        "redefine-character",
+        "let s = new String(\"ab\"); \
+         try { Object.defineProperty(s, \"0\", {value: \"z\"}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Redefining it to what it already is changes nothing and is allowed.
+    check(
+        "redefine-character-to-itself",
+        "let s = new String(\"ab\"); \
+         Object.defineProperty(s, \"0\", {value: \"a\"}); return s[0];",
+        "a",
+    );
+    // A string is a cell but not an object, so a handle is not the test the target needs.
+    check(
+        "define-on-a-primitive-string",
+        "try { Object.defineProperty(\"ab\", \"x\", {value: 1}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **Freezing keeps a property being an accessor.** Clearing the flag turned the pair of
+/// functions in the slot into the property's value, so a frozen getter read back as a
+/// two-element array instead of being called.
+#[test]
+fn freezing_an_accessor_leaves_it_an_accessor() {
+    check(
+        "freeze-getter",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         Object.freeze(o); return o.x;",
+        "7",
+    );
+    // An accessor has no writability to freeze, so being non-configurable is the whole of it.
+    check(
+        "frozen-getter-is-frozen",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         return Object.isFrozen(Object.freeze(o));",
+        "true",
+    );
+    check(
+        "frozen-getter-descriptor",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         Object.freeze(o); \
+         let d = Object.getOwnPropertyDescriptor(o, \"x\"); \
+         return typeof d.get + \",\" + d.configurable;",
+        "function,false",
+    );
+}
+
+/// **Every own name shadows, not only the enumerable ones.** A non-enumerable own property
+/// hides an inherited one of the same name, so a `for-in` must visit neither.
+#[test]
+fn a_hidden_property_still_shadows_an_inherited_one() {
+    check(
+        "forin-shadowed-by-non-enumerable",
+        "let a = {x: 1}; let b = Object.create(a); \
+         Object.defineProperty(b, \"x\", {value: 2, enumerable: false}); \
+         let s = \"\"; for (let k in b) { s = s + k; } return s.length;",
+        "0",
+    );
+    // An enumerable own property is visited once, not once per level.
+    check(
+        "forin-shadowed-by-enumerable",
+        "let a = {x: 1}; let b = Object.create(a); b.x = 2; \
+         let s = \"\"; for (let k in b) { s = s + k; } return s;",
+        "x",
+    );
+    check(
+        "forin-inherits",
+        "let a = {x: 1}; let b = Object.create(a); b.y = 2; \
+         let s = \"\"; for (let k in b) { s = s + k; } return s;",
+        "yx",
+    );
+    // A character is non-configurable and has no slot to say so, so `delete` has to refuse it
+    // from the derived answer.
+    check(
+        "delete-a-character",
+        "let s = new String(\"ab\"); return delete s[0];",
+        "false",
+    );
+}
+
+/// **A function's `prototype` is not enumerable**, which matters because every function a
+/// program can see is an object it might enumerate.
+#[test]
+fn a_functions_prototype_is_not_enumerable() {
+    check(
+        "function-keys",
+        "return Object.keys(function () {}).length;",
+        "0",
+    );
+    check(
+        "function-forin",
+        "let s = \"\"; for (let k in function () {}) { s = s + k; } return s.length;",
+        "0",
+    );
+    // Still there, and still what `new` and `instanceof` read.
+    check(
+        "function-prototype-is-present",
+        "function f() {} return Object.getOwnPropertyNames(f).indexOf(\"prototype\") >= 0;",
+        "true",
+    );
+    check(
+        "function-prototype-still-links",
+        "function f() {} return new f() instanceof f;",
+        "true",
+    );
+    check("constructor-keys", "return Object.keys(Array).length;", "0");
+}
+
+/// **`constructor` is the link back**, and nothing had it: `({}).constructor` was `undefined`,
+/// which is how a program asks what made something.
+#[test]
+fn a_prototype_points_back_at_its_constructor() {
+    check(
+        "object-constructor",
+        "return ({}).constructor === Object;",
+        "true",
+    );
+    check(
+        "array-constructor",
+        "return [].constructor === Array;",
+        "true",
+    );
+    check(
+        "string-constructor",
+        "return \"x\".constructor === String;",
+        "true",
+    );
+    check(
+        "function-constructor",
+        "function f() {} return new f().constructor === f;",
+        "true",
+    );
+    // Not enumerable, or every object would list it.
+    check(
+        "constructor-is-not-enumerable",
+        "return Object.keys(Object.prototype).indexOf(\"constructor\");",
+        "-1",
+    );
+    // Configurable, which is how a subclass replaces it — `define_method` would also have
+    // renamed the function to `"constructor"`, which is why it is not that.
+    check(
+        "constructor-keeps-its-name",
+        "return Object.prototype.constructor.name;",
+        "Object",
+    );
+}
+
+/// `toLocaleString` is a hook: it calls the receiver's own `toString`, so an override is
+/// visible through it. Pointing it at the default made every override invisible.
+#[test]
+fn to_locale_string_calls_the_receivers_to_string() {
+    check(
+        "to-locale-string-override",
+        "let o = {toString: function () { return \"x\"; }}; return o.toLocaleString();",
+        "x",
+    );
+    check(
+        "to-locale-string-default",
+        "return ({}).toLocaleString();",
+        "[object Object]",
+    );
+}

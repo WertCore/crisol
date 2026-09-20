@@ -2721,9 +2721,34 @@ const OBJECT_NATIVES: &[(&str, Native)] = &[
     ("propertyIsEnumerable", object_property_is_enumerable),
     ("isPrototypeOf", object_is_prototype_of),
     ("toString", object_to_text),
-    ("toLocaleString", object_to_text),
+    ("toLocaleString", object_to_locale_text),
     ("valueOf", object_value_of),
 ];
+
+/// `Object.prototype.toLocaleString` — **`this.toString()`, not `Object.prototype.toString`**.
+///
+/// It is a hook: the point of it is that an object overriding `toString` is localised through
+/// that override. Pointing it straight at the default made every override invisible, which
+/// looks right for a plain object and is wrong for every object that has one.
+extern "C" fn object_to_locale_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot convert") {
+        return thrown;
+    }
+    let method = "toString".to_owned();
+    // SAFETY: `method` is a live Rust string.
+    let to_string =
+        unsafe { crisol_property_load(this_value, method.as_ptr(), method.len() as u64) };
+    if !is_callable(to_string) {
+        return raise("toString is not a function", "TypeError");
+    }
+    call_value(to_string, this_value, &[])
+}
 
 /// `Object.prototype.__defineGetter__` and `__defineSetter__`.
 ///
@@ -4643,8 +4668,13 @@ extern "C" fn object_define_property(
         // SAFETY: as above.
         let descriptor = unsafe { argument(argc, argv, 2) };
 
-        let Some(handle) = handle_of(target) else {
-            return raise("cannot define a property on a non-object", "TypeError");
+        // **A string and a symbol are cells too**, so a handle is not the test — the kind is.
+        // Without that, `Object.defineProperty("ab", …)` reached the string's own cell and
+        // defined a property on a primitive, which is a `TypeError` in the specification and
+        // a property nothing can read here.
+        let handle = match handle_of(target) {
+            Some(handle) if Value::from_bits(target).kind() == crisol_value::Kind::Object => handle,
+            _ => return raise("cannot define a property on a non-object", "TypeError"),
         };
         let Some(name) = to_text(key) else {
             return raise("a property key must be a name", "TypeError");
@@ -4765,8 +4795,18 @@ extern "C" fn object_define_property(
         //
         // Without this, `Object.defineProperty` would undo its own guarantees: a property
         // frozen by `Object.freeze` could be quietly thawed by redefining it.
-        if let Some((slot, current_value)) = existing {
-            let current = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
+        // Read from the slot if there is one and from the derived answer if there is not: a
+        // string's characters are non-configurable and have no slot to say so, so redefining
+        // one was accepted and quietly grew a second property with the same name.
+        let current_state = match existing {
+            Some((slot, value)) => Some((
+                with_runtime(|runtime| runtime.heap.attributes_of(handle, slot)),
+                value,
+            )),
+            None => derived_own_property(target, &name)
+                .map(|(bits, attributes)| (attributes, Value::from_bits(bits))),
+        };
+        if let Some((current, current_value)) = current_state {
             if !current.configurable {
                 let asked_configurable = descriptor_flag(descriptor, "configurable");
                 let asked_enumerable = descriptor_flag(descriptor, "enumerable");
@@ -5916,7 +5956,10 @@ fn restrict_own_properties(object: u64, writable: bool) {
                     writable: writable && current.writable,
                     enumerable: current.enumerable,
                     configurable: false,
-                    accessor: false,
+                    // **And it keeps being an accessor.** Clearing this turned the pair of
+                    // functions in the slot into the property's *value*, so a frozen getter
+                    // read back as a two-element array instead of being called.
+                    accessor: current.accessor,
                 },
             );
         });
@@ -5993,7 +6036,10 @@ extern "C" fn object_is_frozen(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let target = unsafe { argument(argc, argv, 0) };
     boolean(all_properties_are(target, |attributes| {
-        !attributes.writable && !attributes.configurable
+        // **An accessor has no writability to freeze**, so being non-configurable is the
+        // whole of what frozen means for one. Asking about `writable` as well made every
+        // object with a getter unfreezable.
+        !attributes.configurable && (attributes.accessor || !attributes.writable)
     }))
     .to_bits()
 }
@@ -6134,7 +6180,7 @@ extern "C" fn object_define_properties(
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        if handle_of(target).is_none() {
+        if Value::from_bits(target).kind() != crisol_value::Kind::Object {
             return raise("cannot define properties on a non-object", "TypeError");
         }
         for name in enumerable_keys(descriptors) {
@@ -6442,9 +6488,11 @@ impl Runtime {
             self.heap
                 .set_internal(function.handle(), 0, Value::number(encoded));
             // A constructor needs a `prototype` for `instanceof` to find, exactly as a compiled
-            // function does.
+            // function does — and not enumerable, exactly as a compiled function's is not.
+            // `define_hidden` gives the attribute set the specification names here: writable,
+            // neither enumerable nor configurable.
             let prototype = scope.alloc(shape, 0);
-            self.define(function.handle(), "prototype", prototype.to_value());
+            self.define_hidden(function.handle(), "prototype", prototype.to_value());
             // The constructor's own name, which `make_error` reads back so that `TypeError`
             // and `RangeError` can be the same code with different bindings. Not enumerable,
             // for the same reason a method's name is not.
@@ -6497,7 +6545,11 @@ impl Runtime {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
             {
-                self.define(constructor, "prototype", prototype.to_value());
+                self.define_hidden(constructor, "prototype", prototype.to_value());
+                // **And the link back.** `({}).constructor === Object` is how a program asks
+                // what made something, and `Array.prototype.constructor` is what a subclass
+                // replaces; neither existed, so both answered `undefined`.
+                self.define_linking(prototype, "constructor", constructor.to_value());
             }
         }
         // The well-known symbols, as values on `Symbol`. **Present but not yet usable as
@@ -6638,6 +6690,32 @@ impl Runtime {
                 slot.index(),
                 crisol_value::Attributes {
                     writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                },
+            );
+        }
+    }
+
+    /// Defines a link enumeration skips but a program may still replace or remove.
+    ///
+    /// The attribute set `constructor` has — writable, not enumerable, configurable. It is
+    /// **not** `define_method`, because that one also names the function it defines, and
+    /// `Object.prototype.constructor` has to keep being called `Object`.
+    fn define_linking(&self, object: GcRef, name: &str, value: Value) {
+        self.define(object, name, value);
+        let key = PropertyKey::new(name);
+        let slot = self
+            .heap
+            .shape_of(object)
+            .and_then(|shape| self.shapes.borrow().lookup(shape, &key));
+        if let Some(slot) = slot {
+            self.heap.set_attributes(
+                object,
+                slot.index(),
+                crisol_value::Attributes {
+                    writable: true,
                     enumerable: false,
                     configurable: true,
                     accessor: false,
@@ -7511,6 +7589,21 @@ pub extern "C" fn crisol_create_closure(function: u64, captures: u64) -> u64 {
         runtime
             .heap
             .set(closure.handle(), slot.index(), prototype.to_value());
+        // **A function's `prototype` is not enumerable.** Left as an ordinary property it
+        // turned up in `Object.keys(f)` and in `for (k in f)` — for every function a program
+        // can see, which is most of the objects it has.
+        runtime.heap.set_attributes(
+            closure.handle(),
+            slot.index(),
+            crisol_value::Attributes {
+                writable: true,
+                enumerable: false,
+                configurable: false,
+                accessor: false,
+            },
+        );
+        // The link back, which is what `new f().constructor === f` reads.
+        runtime.define_linking(prototype.handle(), "constructor", closure.to_value());
         closure.to_value().to_bits()
     })
 }
@@ -9021,6 +9114,14 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
     let Some(name) = key_of(key_value) else {
         return Value::TRUE.to_bits();
     };
+    // A property nothing stores can still be non-configurable — a string's characters are —
+    // and there is no slot for the walk below to read that off.
+    if own_property(object, name.as_str()).is_none()
+        && derived_own_property(object, name.as_str())
+            .is_some_and(|(_, attributes)| !attributes.configurable)
+    {
+        return Value::FALSE.to_bits();
+    }
     with_runtime(|runtime| {
         let Some(shape) = runtime.heap.shape_of(handle) else {
             return Value::TRUE.to_bits();
@@ -9059,15 +9160,24 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
 pub extern "C" fn crisol_enumerate(object: u64) -> u64 {
     with_rooted(&[object], || {
         let mut names: Vec<String> = Vec::new();
+        // **Every own name shadows, not only the enumerable ones.** A non-enumerable property
+        // hides an inherited one of the same name — the loop must not visit it — and tracking
+        // only what was emitted meant the inherited one showed through the thing hiding it.
+        let mut shadowed: Vec<String> = Vec::new();
         let mut current = object;
         for _ in 0..PROTOTYPE_CHAIN_LIMIT {
             let Some(handle) = handle_of(current) else {
                 break;
             };
-            for name in enumerable_keys(current) {
-                if !names.contains(&name) {
-                    names.push(name);
+            let enumerable = enumerable_keys(current);
+            for name in own_keys(current) {
+                if shadowed.contains(&name) {
+                    continue;
                 }
+                if enumerable.contains(&name) {
+                    names.push(name.clone());
+                }
+                shadowed.push(name);
             }
             let next = with_runtime(|runtime| runtime.heap.prototype_of(handle));
             match next {

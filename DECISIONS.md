@@ -5037,3 +5037,32 @@ wrongly. When keys learn about symbols this becomes a real iteration and nothing
 
 The result has **no prototype**, which is the method's whole design: the keys come out of the
 data, so a group named `"toString"` has to be a group and not the inherited method.
+
+## D-176
+
+**A prototype points back at its constructor, and a function's `prototype` is not enumerable.**
+
+Status: Accepted
+
+Nothing defined `constructor` anywhere, so `({}).constructor` was `undefined` — the ordinary
+way a program asks what made an object, and the property a subclass replaces. It is defined on
+every built-in prototype and on every compiled function's, as writable, non-enumerable and
+configurable.
+
+Not through `define_method`, which is the other place with those attributes: that one also
+names the function it defines, so `Object.prototype.constructor` would have come out called
+`"constructor"`.
+
+**And the other direction was enumerable.** A function's `prototype` was an ordinary property,
+so `Object.keys(f)` reported it for every function a program can see. That is one line in
+three places and it was wrong in all three.
+
+## D-177
+
+**`toLocaleString` calls the receiver's `toString`, not the default one.**
+
+Status: Accepted
+
+It was wired straight to `Object.prototype.toString`, which is right for a plain object and
+wrong for every object with an override — and being a hook for exactly that override is the
+only reason the method exists.
