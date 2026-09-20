@@ -2077,6 +2077,235 @@ extern "C" fn to_boolean_global(
     truth
 }
 
+/// How many arguments each built-in declares.
+///
+/// **`Function.length` is a fixed number per method**, not a property of the implementation:
+/// the count of parameters before the first with a default or a rest. test262 checks it for
+/// every built-in it covers — 227 files do nothing else — and no built-in here had one at all,
+/// so each of those failed on a method that was otherwise complete.
+///
+/// Keyed by owner as well as name, because one name disagrees with itself:
+/// `Number.prototype.toString` takes a radix and every other `toString` takes nothing. A
+/// method absent from this table gets no `length`, which is what it had before — a missing
+/// answer rather than a wrong one.
+///
+/// The numbers were read out of test262 rather than recalled: 138 of these appear in a
+/// `length.js` or an older `.length ===` assertion, and the rest are the specification's and
+/// unambiguous. Transcribing them from memory would have put wrong numbers where there had
+/// been none, which is worse than the gap.
+const ARITIES: &[(&str, &str, u32)] = &[
+    // The constructors themselves, owned by no object — `Array.length` is one, not the number
+    // of arrays. Their arities come from the same reading.
+    ("global", "Array", 1),
+    ("global", "Boolean", 1),
+    ("global", "Date", 7),
+    ("global", "Error", 1),
+    ("global", "Function", 1),
+    ("global", "Map", 0),
+    ("global", "Number", 1),
+    ("global", "Object", 1),
+    ("global", "RangeError", 1),
+    ("global", "ReferenceError", 1),
+    ("global", "RegExp", 2),
+    ("global", "Set", 0),
+    ("global", "String", 1),
+    ("global", "Symbol", 0),
+    ("global", "SyntaxError", 1),
+    ("global", "TypeError", 1),
+    ("global", "isFinite", 1),
+    ("global", "isNaN", 1),
+    ("global", "parseFloat", 1),
+    ("global", "parseInt", 2),
+    ("Array", "from", 1),
+    ("Array", "isArray", 1),
+    ("Array", "of", 0),
+    ("Array.prototype", "at", 1),
+    ("Array.prototype", "concat", 1),
+    ("Array.prototype", "copyWithin", 2),
+    ("Array.prototype", "entries", 0),
+    ("Array.prototype", "every", 1),
+    ("Array.prototype", "fill", 1),
+    ("Array.prototype", "filter", 1),
+    ("Array.prototype", "find", 1),
+    ("Array.prototype", "findIndex", 1),
+    ("Array.prototype", "findLast", 1),
+    ("Array.prototype", "findLastIndex", 1),
+    ("Array.prototype", "flat", 0),
+    ("Array.prototype", "flatMap", 1),
+    ("Array.prototype", "forEach", 1),
+    ("Array.prototype", "includes", 1),
+    ("Array.prototype", "indexOf", 1),
+    ("Array.prototype", "join", 1),
+    ("Array.prototype", "keys", 0),
+    ("Array.prototype", "lastIndexOf", 1),
+    ("Array.prototype", "map", 1),
+    ("Array.prototype", "pop", 0),
+    ("Array.prototype", "push", 1),
+    ("Array.prototype", "reduce", 1),
+    ("Array.prototype", "reduceRight", 1),
+    ("Array.prototype", "reverse", 0),
+    ("Array.prototype", "shift", 0),
+    ("Array.prototype", "slice", 2),
+    ("Array.prototype", "some", 1),
+    ("Array.prototype", "sort", 1),
+    ("Array.prototype", "splice", 2),
+    ("Array.prototype", "toLocaleString", 0),
+    ("Array.prototype", "toReversed", 0),
+    ("Array.prototype", "toSorted", 1),
+    ("Array.prototype", "toSpliced", 2),
+    ("Array.prototype", "toString", 0),
+    ("Array.prototype", "unshift", 1),
+    ("Array.prototype", "values", 0),
+    ("Array.prototype", "with", 2),
+    ("Date", "UTC", 7),
+    ("Date", "now", 0),
+    ("Date", "parse", 1),
+    ("Date.prototype", "getDate", 0),
+    ("Date.prototype", "getDay", 0),
+    ("Date.prototype", "getFullYear", 0),
+    ("Date.prototype", "getHours", 0),
+    ("Date.prototype", "getMilliseconds", 0),
+    ("Date.prototype", "getMinutes", 0),
+    ("Date.prototype", "getMonth", 0),
+    ("Date.prototype", "getSeconds", 0),
+    ("Date.prototype", "getTime", 0),
+    ("Date.prototype", "getTimezoneOffset", 0),
+    ("Date.prototype", "getUTCDate", 0),
+    ("Date.prototype", "getUTCDay", 0),
+    ("Date.prototype", "getUTCFullYear", 0),
+    ("Date.prototype", "getUTCHours", 0),
+    ("Date.prototype", "getUTCMilliseconds", 0),
+    ("Date.prototype", "getUTCMinutes", 0),
+    ("Date.prototype", "getUTCMonth", 0),
+    ("Date.prototype", "getUTCSeconds", 0),
+    ("Date.prototype", "toISOString", 0),
+    ("Date.prototype", "toJSON", 1),
+    ("Date.prototype", "toString", 0),
+    ("Date.prototype", "valueOf", 0),
+    ("Function.prototype", "apply", 2),
+    ("Function.prototype", "bind", 1),
+    ("Function.prototype", "call", 1),
+    ("JSON", "parse", 2),
+    ("JSON", "stringify", 3),
+    ("Map.prototype", "clear", 0),
+    ("Map.prototype", "delete", 1),
+    ("Map.prototype", "forEach", 1),
+    ("Map.prototype", "get", 1),
+    ("Map.prototype", "has", 1),
+    ("Map.prototype", "set", 2),
+    ("Math", "abs", 1),
+    ("Math", "acos", 1),
+    ("Math", "asin", 1),
+    ("Math", "atan", 1),
+    ("Math", "atan2", 2),
+    ("Math", "cbrt", 1),
+    ("Math", "ceil", 1),
+    ("Math", "cos", 1),
+    ("Math", "exp", 1),
+    ("Math", "floor", 1),
+    ("Math", "hypot", 2),
+    ("Math", "log", 1),
+    ("Math", "log10", 1),
+    ("Math", "log2", 1),
+    ("Math", "max", 2),
+    ("Math", "min", 2),
+    ("Math", "pow", 2),
+    ("Math", "random", 0),
+    ("Math", "round", 1),
+    ("Math", "sign", 1),
+    ("Math", "sin", 1),
+    ("Math", "sqrt", 1),
+    ("Math", "tan", 1),
+    ("Math", "trunc", 1),
+    ("Number", "isFinite", 1),
+    ("Number", "isInteger", 1),
+    ("Number", "isNaN", 1),
+    ("Number", "isSafeInteger", 1),
+    ("Number", "parseFloat", 1),
+    ("Number", "parseInt", 2),
+    ("Number.prototype", "toFixed", 1),
+    ("Number.prototype", "toLocaleString", 0),
+    ("Number.prototype", "toString", 1),
+    ("Number.prototype", "valueOf", 0),
+    ("Object", "assign", 2),
+    ("Object", "create", 2),
+    ("Object", "defineProperties", 2),
+    ("Object", "defineProperty", 3),
+    ("Object", "entries", 1),
+    ("Object", "freeze", 1),
+    ("Object", "fromEntries", 1),
+    ("Object", "getOwnPropertyDescriptor", 2),
+    ("Object", "getOwnPropertyDescriptors", 1),
+    ("Object", "getOwnPropertyNames", 1),
+    ("Object", "getOwnPropertySymbols", 1),
+    ("Object", "getPrototypeOf", 1),
+    ("Object", "groupBy", 2),
+    ("Object", "hasOwn", 2),
+    ("Object", "is", 2),
+    ("Object", "isExtensible", 1),
+    ("Object", "isFrozen", 1),
+    ("Object", "isSealed", 1),
+    ("Object", "keys", 1),
+    ("Object", "preventExtensions", 1),
+    ("Object", "seal", 1),
+    ("Object", "setPrototypeOf", 2),
+    ("Object", "values", 1),
+    ("Object.prototype", "__defineGetter__", 2),
+    ("Object.prototype", "__defineSetter__", 2),
+    ("Object.prototype", "__lookupGetter__", 1),
+    ("Object.prototype", "__lookupSetter__", 1),
+    ("Object.prototype", "hasOwnProperty", 1),
+    ("Object.prototype", "isPrototypeOf", 1),
+    ("Object.prototype", "propertyIsEnumerable", 1),
+    ("Object.prototype", "toLocaleString", 0),
+    ("Object.prototype", "toString", 0),
+    ("Object.prototype", "valueOf", 0),
+    ("RegExp.prototype", "exec", 1),
+    ("RegExp.prototype", "test", 1),
+    ("RegExp.prototype", "toString", 0),
+    ("Set.prototype", "add", 1),
+    ("Set.prototype", "clear", 0),
+    ("Set.prototype", "delete", 1),
+    ("Set.prototype", "forEach", 1),
+    ("Set.prototype", "has", 1),
+    ("String", "fromCharCode", 1),
+    ("String", "fromCodePoint", 1),
+    ("String.prototype", "at", 1),
+    ("String.prototype", "charAt", 1),
+    ("String.prototype", "charCodeAt", 1),
+    ("String.prototype", "concat", 1),
+    ("String.prototype", "endsWith", 1),
+    ("String.prototype", "includes", 1),
+    ("String.prototype", "indexOf", 1),
+    ("String.prototype", "lastIndexOf", 1),
+    ("String.prototype", "padEnd", 1),
+    ("String.prototype", "padStart", 1),
+    ("String.prototype", "repeat", 1),
+    ("String.prototype", "replace", 2),
+    ("String.prototype", "replaceAll", 2),
+    ("String.prototype", "slice", 2),
+    ("String.prototype", "split", 2),
+    ("String.prototype", "startsWith", 1),
+    ("String.prototype", "substring", 2),
+    ("String.prototype", "toLowerCase", 0),
+    ("String.prototype", "toString", 0),
+    ("String.prototype", "toUpperCase", 0),
+    ("String.prototype", "trim", 0),
+    ("String.prototype", "trimEnd", 0),
+    ("String.prototype", "trimStart", 0),
+    ("String.prototype", "valueOf", 0),
+    ("Symbol", "for", 1),
+    ("Symbol", "keyFor", 1),
+];
+
+/// The arity the specification gives `owner.name`, if it gives one.
+fn arity_of(owner: &str, name: &str) -> Option<u32> {
+    ARITIES
+        .iter()
+        .find(|(table, method, _)| *table == owner && *method == name)
+        .map(|(_, _, arity)| *arity)
+}
+
 /// Built-ins reachable only as the body of a namespace object, not by any name.
 ///
 /// Numbered last, after [`NATIVES`], [`GLOBAL_NATIVES`] and [`NAMESPACE_NATIVES`]. A table of
@@ -6727,6 +6956,9 @@ impl Runtime {
             .set_internal(object.handle(), 0, Value::number(encoded));
         let text = self.string(name);
         self.define_named(object.handle(), "name", text);
+        if let Some(arity) = arity_of("global", name) {
+            self.define_named(object.handle(), "length", Value::number(f64::from(arity)));
+        }
         self.define(globals, name, object.to_value());
         object.handle()
     }
@@ -6758,6 +6990,9 @@ impl Runtime {
             // name is not.
             let text = self.string(name);
             self.define_named(function.handle(), "name", text);
+            if let Some(arity) = arity_of("global", name) {
+                self.define_named(function.handle(), "length", Value::number(f64::from(arity)));
+            }
             self.define(globals.handle(), name, function.to_value());
         }
         // `Object` and `Array` are functions that also carry methods. Created here rather than
@@ -6767,7 +7002,7 @@ impl Runtime {
         for (index, (namespace, method, _)) in NAMESPACE_NATIVES.iter().enumerate() {
             let owner = self.ensure_global_object(globals.handle(), namespace);
             let function = self.native_function(NATIVES.len() + GLOBAL_NATIVES.len() + index);
-            self.define_method(owner, method, function.to_value());
+            self.define_method(owner, namespace, method, function.to_value());
         }
         // **An error's kind lives on its prototype.** `new TypeError("x").name` is `"TypeError"`
         // and `Object.keys` of the instance is empty, which only works if the string is on the
@@ -6804,7 +7039,7 @@ impl Runtime {
                 let method = self.native_function(
                     NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ERROR_TO_TEXT,
                 );
-                self.define_method(prototype, "toString", method.to_value());
+                self.define_method(prototype, "Error.prototype", "toString", method.to_value());
             } else if let Some(base) =
                 self.global_object(globals.handle(), "Error")
                     .and_then(|base| {
@@ -6952,7 +7187,7 @@ impl Runtime {
     /// false, configurable: true }`. Defining them as ordinary properties made `for (k in [])`
     /// visit `map`, `filter` and every other array method — the loop was right and the
     /// properties were wrong.
-    fn define_method(&self, object: GcRef, name: &str, value: Value) {
+    fn define_method(&self, object: GcRef, owner: &str, name: &str, value: Value) {
         // **Stored before anything else is allocated.** `native_function` hands back an
         // unrooted handle, so the function is only reachable once it is on the prototype —
         // allocating first leaves a window where a collection frees the thing being defined.
@@ -6984,6 +7219,13 @@ impl Runtime {
         if let Some(function) = value.as_address().map(GcRef::from_address) {
             let text = self.string(name);
             self.define_named(function, "name", text);
+            // **And how many arguments it declares**, which carries the same attributes as
+            // the name and is checked just as often. Only where [`ARITIES`] knows: a method
+            // it does not list keeps having none, which is a missing answer rather than a
+            // wrong one.
+            if let Some(arity) = arity_of(owner, name) {
+                self.define_named(function, "length", Value::number(f64::from(arity)));
+            }
         }
     }
 
@@ -7135,7 +7377,7 @@ impl Runtime {
             + DATE_NATIVES.len();
         for (index, (name, _)) in OBJECT_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
-            self.define_method(prototype, name, method.to_value());
+            self.define_method(prototype, "Object.prototype", name, method.to_value());
         }
     }
 
@@ -7156,7 +7398,12 @@ impl Runtime {
             + ANONYMOUS_NATIVES.len();
         for (index, (name, _)) in FUNCTION_NATIVES.iter().enumerate() {
             let function = self.native_function(base + index);
-            self.define_method(prototype.handle(), name, function.to_value());
+            self.define_method(
+                prototype.handle(),
+                "Function.prototype",
+                name,
+                function.to_value(),
+            );
         }
     }
 
@@ -7175,7 +7422,12 @@ impl Runtime {
             + FUNCTION_NATIVES.len();
         for (index, (name, _)) in STRING_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
-            self.define_method(prototype.handle(), name, method.to_value());
+            self.define_method(
+                prototype.handle(),
+                "String.prototype",
+                name,
+                method.to_value(),
+            );
         }
     }
 
@@ -7195,7 +7447,12 @@ impl Runtime {
             + STRING_NATIVES.len();
         for (index, (name, _)) in REGEXP_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
-            self.define_method(prototype.handle(), name, method.to_value());
+            self.define_method(
+                prototype.handle(),
+                "RegExp.prototype",
+                name,
+                method.to_value(),
+            );
         }
     }
 
@@ -7216,7 +7473,12 @@ impl Runtime {
             + REGEXP_NATIVES.len();
         for (index, (name, _)) in DATE_NATIVES.iter().enumerate() {
             let method = self.native_function(base + index);
-            self.define_method(prototype.handle(), name, method.to_value());
+            self.define_method(
+                prototype.handle(),
+                "Date.prototype",
+                name,
+                method.to_value(),
+            );
         }
     }
 
@@ -7231,21 +7493,29 @@ impl Runtime {
             + REGEXP_NATIVES.len()
             + DATE_NATIVES.len()
             + OBJECT_NATIVES.len();
-        for (cell, natives, offset) in [
-            (&MAP_PROTOTYPE, MAP_NATIVES, 0),
-            (&SET_PROTOTYPE, SET_NATIVES, MAP_NATIVES.len()),
+        for (cell, owner, natives, offset) in [
+            (&MAP_PROTOTYPE, "Map.prototype", MAP_NATIVES, 0),
+            (
+                &SET_PROTOTYPE,
+                "Set.prototype",
+                SET_NATIVES,
+                MAP_NATIVES.len(),
+            ),
             (
                 &SYMBOL_PROTOTYPE,
+                "Symbol.prototype",
                 SYMBOL_NATIVES,
                 MAP_NATIVES.len() + SET_NATIVES.len(),
             ),
             (
                 &ARRAY_ITERATOR_PROTOTYPE,
+                "Array Iterator",
                 ARRAY_ITERATOR_NATIVES,
                 MAP_NATIVES.len() + SET_NATIVES.len() + SYMBOL_NATIVES.len(),
             ),
             (
                 &NUMBER_PROTOTYPE,
+                "Number.prototype",
                 NUMBER_NATIVES,
                 MAP_NATIVES.len()
                     + SET_NATIVES.len()
@@ -7254,6 +7524,7 @@ impl Runtime {
             ),
             (
                 &BOOLEAN_PROTOTYPE,
+                "Boolean.prototype",
                 BOOLEAN_NATIVES,
                 MAP_NATIVES.len()
                     + SET_NATIVES.len()
@@ -7269,7 +7540,7 @@ impl Runtime {
             self.inherit_from_object(prototype.handle());
             for (index, (name, _)) in natives.iter().enumerate() {
                 let method = self.native_function(base + offset + index);
-                self.define_method(prototype.handle(), name, method.to_value());
+                self.define_method(prototype.handle(), owner, name, method.to_value());
             }
         }
     }
@@ -7288,7 +7559,12 @@ impl Runtime {
 
         for (index, (name, _)) in NATIVES.iter().enumerate() {
             let method = self.native_function(index);
-            self.define_method(prototype.handle(), name, method.to_value());
+            self.define_method(
+                prototype.handle(),
+                "Array.prototype",
+                name,
+                method.to_value(),
+            );
         }
     }
 }

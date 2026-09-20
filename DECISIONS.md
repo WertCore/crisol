@@ -5189,3 +5189,26 @@ complained about rather than by guessing:
   the enumerable own properties and reads each one as a descriptor, so a constant became
   `3.14159…` where a descriptor was wanted. The constants are now readable and nothing else,
   which is the attribute set the specification gives them.
+
+## D-184
+
+**A built-in declares how many arguments it takes.**
+
+Status: Accepted
+
+`Function.length` is the count of parameters before the first with a default or a rest — a
+number the specification fixes per method, not something an implementation chooses. No built-in
+here had one at all, so `Object.keys.length` was `undefined`, and 227 corpus files that check
+nothing else failed on methods that were otherwise complete.
+
+The table is keyed by **owner and name**, because one name disagrees with itself:
+`Number.prototype.toString` takes a radix and every other `toString` takes nothing. A method
+the table does not list gets no `length`, which is what it had before — a missing answer rather
+than a wrong one, and the difference matters because a wrong `length` is invisible until
+something reads it.
+
+**The numbers were read out of test262, not recalled.** 138 of the 180 appear in a `length.js`
+or an older `.length ===` assertion; the rest are the specification's and unambiguous
+(`Math.pow` is two, `Math.random` is zero). Transcribing 180 arities from memory would have put
+wrong numbers where there had been none, which is worse than the gap — and there is no way to
+derive one from a `Native`, whose signature is the same five operands for every built-in.

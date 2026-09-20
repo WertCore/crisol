@@ -6354,3 +6354,45 @@ fn a_namespaces_constants_are_not_enumerable() {
         "12",
     );
 }
+
+/// **A built-in's `length` is fixed by the specification** — the count of parameters before
+/// the first with a default — and test262 checks it for every one it covers. No built-in had
+/// one at all, so each of those failed on a method that was otherwise complete.
+#[test]
+fn a_built_in_declares_how_many_arguments_it_takes() {
+    check("length-object-keys", "return Object.keys.length;", "1");
+    check(
+        "length-object-define-property",
+        "return Object.defineProperty.length;",
+        "3",
+    );
+    check("length-object-assign", "return Object.assign.length;", "2");
+    check(
+        "length-has-own-property",
+        "return Object.prototype.hasOwnProperty.length;",
+        "1",
+    );
+    // Zero is a real answer, and the one a default would have got wrong.
+    check("length-array-pop", "return [].pop.length;", "0");
+    check(
+        "length-value-of",
+        "return Object.prototype.valueOf.length;",
+        "0",
+    );
+    check("length-array-slice", "return [].slice.length;", "2");
+    // The constructors declare one too.
+    check("length-object-constructor", "return Object.length;", "1");
+    check("length-array-constructor", "return Array.length;", "1");
+    // Same attributes as `name`: not writable, not enumerable, configurable.
+    check(
+        "length-descriptor",
+        "let d = Object.getOwnPropertyDescriptor(Object.keys, \"length\"); \
+         return d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "false,false,true",
+    );
+    check(
+        "length-is-not-enumerable",
+        "return Object.keys(Object.keys).length;",
+        "0",
+    );
+}
