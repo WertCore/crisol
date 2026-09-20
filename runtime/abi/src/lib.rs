@@ -6414,6 +6414,11 @@ extern "C" fn object_define_properties(
         if Value::from_bits(target).kind() != crisol_value::Kind::Object {
             return raise("cannot define properties on a non-object", "TypeError");
         }
+        // The map of descriptors is coerced like any other argument, so a primitive is
+        // wrapped and describes nothing — and a nullish one is the error.
+        if let Some(thrown) = reject_nullish(descriptors, "cannot read the descriptors") {
+            return thrown;
+        }
         for name in enumerable_keys(descriptors) {
             let key = name.clone();
             // SAFETY: `key` is a live Rust string.
@@ -7446,7 +7451,16 @@ pub unsafe extern "C" fn crisol_property_store(
         } else if runtime.heap.is_deleted(handle, slot.index()) {
             // The shape still names the slot, so the tombstone is the only thing that made it
             // absent — clearing it is what brings the property back.
+            //
+            // **As a new property, not as the one that was deleted.** The slot still carries
+            // whatever attributes that one had, and an assignment creates a writable,
+            // enumerable, configurable property whatever stood there before: a property made
+            // read-only, deleted, and then assigned to came back read-only, so the second
+            // write to it was silently dropped.
             runtime.heap.set_deleted(handle, slot.index(), false);
+            runtime
+                .heap
+                .set_attributes(handle, slot.index(), crisol_value::Attributes::DATA);
         } else if !runtime.heap.attributes_of(handle, slot.index()).writable {
             // **A write to a non-writable property is silently ignored**, not an error —
             // outside strict mode, which is the only mode there is here. Only an existing

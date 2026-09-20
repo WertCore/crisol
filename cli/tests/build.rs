@@ -6242,11 +6242,42 @@ fn a_deleted_property_is_gone_from_every_question() {
         "false",
     );
     // A property deleted after being made read-only is not read-only any more: it is nothing.
+    // Asserted with *two* writes, because the slot keeps its attributes and the first write
+    // clears the tombstone — one write passes whether or not the attributes were reset.
     check(
         "deleted-read-only-can-be-redefined",
         "let o = {}; \
          Object.defineProperty(o, \"x\", {value: 1, writable: false, configurable: true}); \
-         delete o.x; o.x = 2; return o.x;",
-        "2",
+         delete o.x; o.x = 2; o.x = 3; return o.x;",
+        "3",
+    );
+    check(
+        "revived-property-is-enumerable",
+        "let o = {}; \
+         Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
+         delete o.x; o.x = 2; return Object.keys(o).join(\",\");",
+        "x",
+    );
+}
+
+/// `defineProperties` coerces its map of descriptors like any other argument, so a nullish one
+/// is the error and a primitive simply describes nothing.
+#[test]
+fn define_properties_checks_its_map() {
+    check(
+        "define-properties-null-map",
+        "try { Object.defineProperties({}, null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "define-properties-primitive-map",
+        "return Object.keys(Object.defineProperties({}, 5)).length;",
+        "0",
+    );
+    check(
+        "define-properties-applies",
+        "let o = Object.defineProperties({}, {x: {value: 1, enumerable: true}}); \
+         return o.x + \",\" + Object.keys(o).join(\"\");",
+        "1,x",
     );
 }
