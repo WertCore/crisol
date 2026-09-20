@@ -1890,6 +1890,35 @@ Both mutation-tested.
 
 ---
 
+## Where the corpus stands
+
+The number that matters is `cargo test -p crisol --test test262` on CI, at the default sample
+of 1500. **490 passed at the start of the `Object` work and 677 after it**, with crashes at
+zero throughout; the sample is identical between runs, so the two are comparable. D-168 to
+D-187 are that work.
+
+**Read the failure histogram before picking anything up.** The runner prints examples per
+failure reason *and* per area, and the two cuts disagree usefully: the `Object` area barely
+moved across the first half of that work while twenty-one more cases passed, because the
+element-descriptor machinery is shared and the wins landed in `Array.prototype`. Picking by
+area alone would have looked like no progress.
+
+What remains is no longer shaped like missing methods:
+
+- **110 cases are globals that do not exist** — `Proxy` (42), `Promise` (33), `$262` (11),
+  `Uint8Array` (7). `Reflect` was the fourth and is now in (D-187); it was cheap precisely
+  because every one of its operations already existed behind a property access. The other two
+  are not: `Proxy` wants traps threaded through every property operation, and `Promise` wants a
+  microtask queue.
+- **Symbols cannot be property keys** (D-149), which is the ceiling on `Object` and on every
+  iterator protocol. It is the single change that unblocks the most.
+- **A compiled function has no `name` and no `length`**, and a class's methods are enumerable.
+  Both want the same thing — a way to define a non-enumerable property from the IR — so they
+  are one piece of work in the compiler rather than two in the runtime. Built-ins got theirs in
+  D-184.
+
+---
+
 ## Next session
 
 1. Read `DECISIONS.md` and this file.
