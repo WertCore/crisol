@@ -4747,12 +4747,24 @@ extern "C" fn object_define_property(
         {
             let getter = read_descriptor_field(descriptor, "get");
             let setter = read_descriptor_field(descriptor, "set");
+            // **And the elements have to still be ordinary.** A frozen or sealed run is
+            // non-configurable, which is the generic path's business — taking the fast one
+            // would write straight past the refusal that freezing is for.
             let unrestricted = !is_callable(getter)
                 && !is_callable(setter)
+                && elements_are_writable(target)
+                && elements_are_configurable(target)
                 && descriptor_flag(descriptor, "writable") != Some(false)
                 && descriptor_flag(descriptor, "enumerable") != Some(false)
                 && descriptor_flag(descriptor, "configurable") != Some(false);
             if unrestricted {
+                // Growing the run is the addition a non-extensible object refuses.
+                if index >= count && !is_extensible(target) {
+                    return raise(
+                        "cannot add an element to a non-extensible object",
+                        "TypeError",
+                    );
+                }
                 let given = read_descriptor_field(descriptor, "value");
                 let has_value = Value::from_bits(given).kind() != crisol_value::Kind::Undefined
                     || own_property(descriptor, "value").is_some();
@@ -4806,6 +4818,17 @@ extern "C" fn object_define_property(
             None => derived_own_property(target, &name)
                 .map(|(bits, attributes)| (attributes, Value::from_bits(bits))),
         };
+        // **A non-extensible object refuses a property it does not have**, which is the one
+        // refusal `defineProperty` never made — so `Object.preventExtensions(o)` stopped
+        // assignment and let a definition straight through, which is the hole it exists to
+        // close.
+        if current_state.is_none() && !is_extensible(target) {
+            return raise(
+                "cannot add a property to a non-extensible object",
+                "TypeError",
+            );
+        }
+
         if let Some((current, current_value)) = current_state
             && !current.configurable
         {

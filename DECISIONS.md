@@ -5066,3 +5066,22 @@ Status: Accepted
 It was wired straight to `Object.prototype.toString`, which is right for a plain object and
 wrong for every object with an override — and being a hook for exactly that override is the
 only reason the method exists.
+
+## D-178
+
+**`defineProperty` refuses to add to a non-extensible object.**
+
+Status: Accepted
+
+It was the one refusal the method never made. `Object.preventExtensions(o)` stopped assignment
+and let a *definition* straight through, which is precisely the hole it exists to close — and
+test262's very first `defineProperty` case checks it.
+
+An existing property may still be redefined, subject to the configurability rules: it is the
+adding that stops. On an array the same rule reads as "growing the run of elements is the
+addition", so defining an index past the end is refused and defining one below it is not.
+
+**A frozen or sealed array skips the fast path.** The array-index shortcut writes the element
+directly, which would have gone straight past the refusal that freezing is for; it now defers
+to the generic path whenever the elements are not ordinary, and that path reads their
+attributes from the derived answer (D-169).

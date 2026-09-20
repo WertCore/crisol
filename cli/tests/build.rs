@@ -6003,3 +6003,46 @@ fn to_locale_string_calls_the_receivers_to_string() {
         "[object Object]",
     );
 }
+
+/// **A non-extensible object refuses a property it does not have** — the one refusal
+/// `defineProperty` never made, so `preventExtensions` stopped assignment and let a definition
+/// straight through.
+#[test]
+fn defining_respects_extensibility() {
+    check(
+        "define-on-non-extensible",
+        "let o = Object.preventExtensions({}); \
+         try { Object.defineProperty(o, \"x\", {value: 1}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // An existing property may still be redefined: it is the *adding* that stops.
+    check(
+        "redefine-on-non-extensible",
+        "let o = {x: 1}; Object.preventExtensions(o); \
+         Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+    check(
+        "define-element-on-non-extensible",
+        "let a = Object.preventExtensions([1]); \
+         try { Object.defineProperty(a, \"1\", {value: 2}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A frozen element is non-configurable, so redefining its value is refused too.
+    check(
+        "define-frozen-element",
+        "let a = Object.freeze([1]); \
+         try { Object.defineProperty(a, \"0\", {value: 2}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "define-properties-on-non-extensible",
+        "let o = Object.preventExtensions({}); \
+         try { Object.defineProperties(o, {x: {value: 1}}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
