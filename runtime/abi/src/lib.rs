@@ -6185,6 +6185,14 @@ pub extern "C" fn crisol_construct_this(callee: u64) -> u64 {
 #[unsafe(no_mangle)]
 #[must_use]
 pub extern "C" fn crisol_construct_result(this_value: u64, returned: u64) -> u64 {
+    // **A throw is not a return value.** The rule below — a constructor answering a primitive
+    // yields the instance instead — was swallowing the exception signal, which is not an
+    // object either. So `new RegExp("(")` raised a `SyntaxError` inside and handed back a
+    // perfectly good empty object, and the `try` around it never saw anything. The literal
+    // form `/(/ ` raised correctly, which is what made the two disagree.
+    if Value::from_bits(returned).is_exception() {
+        return returned;
+    }
     if Value::from_bits(returned).kind() == crisol_value::Kind::Object {
         returned
     } else {

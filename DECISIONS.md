@@ -4603,3 +4603,23 @@ elements, because D-154 made the assignment resize without bounding it. A length
 is a `RangeError`, which is both the specification's rule and the thing standing between that
 assignment and the process dying. Adding a feature added a crash; the corpus said so within one
 run, which is the argument for measuring after every change rather than at the end of a batch.
+
+## D-156
+
+**A throw is not a return value.**
+
+Status: Accepted
+
+`crisol_construct_result` implements the rule that a constructor answering a primitive yields
+the instance rather than the primitive. The exception signal is not an object either, so it took
+the same branch: a constructor that raised handed back a perfectly good empty object, and the
+`try` around it saw nothing at all.
+
+`new RegExp("(")` was silent while `/(/ ` raised correctly — the literal propagates at the call
+site and the constructor's exception never reached one. Every constructor was affected, not just
+this one; a user function that throws was equally swallowed.
+
+**The shape of the bug is worth keeping**: a rule written as "if not an object, do X" is a
+rule that also catches the sentinel, and the sentinel was introduced later than the rule. Every
+place that tests a value's kind to decide control flow is a place where the exception signal
+needs its own answer first.

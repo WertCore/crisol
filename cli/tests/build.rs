@@ -4562,3 +4562,27 @@ fn an_unsupported_pattern_raises_rather_than_aborting() {
     // A pattern it can compile still works, so the guard has not swallowed the ordinary path.
     check("regexp-still-works", "return /ab+/.test(\"abb\");", "true");
 }
+
+/// **A throw is not a return value.** "A constructor answering a primitive yields the instance"
+/// was swallowing the exception signal, which is not an object either — so a constructor that
+/// raised handed back a perfectly good empty object and the `try` around it saw nothing.
+#[test]
+fn a_constructor_that_throws_is_not_swallowed() {
+    check(
+        "construct-throws",
+        "let r = \"ok\"; try { let p = new RegExp(\"(\"); } catch (e) { r = e.name; } return r;",
+        "SyntaxError",
+    );
+    check(
+        "construct-throws-user",
+        "let F = function () { throw new TypeError(\"no\"); }; \
+         let r = \"ok\"; try { let v = new F(); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    // The rule it was hiding behind still holds: a primitive return yields the instance.
+    check(
+        "construct-primitive-still",
+        "let F = function () { this.x = 1; return 42; }; return new F().x;",
+        "1",
+    );
+}
