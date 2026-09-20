@@ -6281,3 +6281,24 @@ fn define_properties_checks_its_map() {
         "1,x",
     );
 }
+
+/// Defining a property that was deleted brings it back. The shape keeps naming a deleted
+/// property's slot, so writing a value into one without clearing the mark left the property
+/// both defined and absent.
+#[test]
+fn a_deleted_property_can_be_defined_again() {
+    check(
+        "define-after-delete",
+        "let o = {x: 1}; delete o.x; \
+         Object.defineProperty(o, \"x\", {value: 2, enumerable: true}); return o.x;",
+        "2",
+    );
+    check(
+        "define-after-delete-attributes",
+        "let o = {x: 1}; delete o.x; \
+         Object.defineProperty(o, \"x\", {value: 2}); \
+         let d = Object.getOwnPropertyDescriptor(o, \"x\"); \
+         return d.value + \",\" + d.enumerable + \",\" + d.writable;",
+        "2,false,false",
+    );
+}

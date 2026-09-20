@@ -4552,6 +4552,12 @@ unsafe fn define_ignoring_writability(handle: GcRef, name: &str, value: u64) -> 
         if shape != current {
             runtime.heap.transition(handle, shape, width);
         }
+        // **A defined property is present**, so the tombstone goes. The shape keeps naming a
+        // deleted property's slot, and writing a value into it without clearing the mark left
+        // the property both defined and absent: `defineProperty` after a `delete` set the
+        // value, found nothing when it went back to set the attributes, and returned as
+        // though it had worked.
+        runtime.heap.set_deleted(handle, slot.index(), false);
         runtime
             .heap
             .set(handle, slot.index(), Value::from_bits(value));
