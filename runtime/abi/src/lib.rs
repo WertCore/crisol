@@ -2178,6 +2178,22 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Date.prototype", "getUTCMinutes", 0),
     ("Date.prototype", "getUTCMonth", 0),
     ("Date.prototype", "getUTCSeconds", 0),
+    ("Date.prototype", "setDate", 1),
+    ("Date.prototype", "setFullYear", 3),
+    ("Date.prototype", "setHours", 4),
+    ("Date.prototype", "setMilliseconds", 1),
+    ("Date.prototype", "setMinutes", 3),
+    ("Date.prototype", "setMonth", 2),
+    ("Date.prototype", "setSeconds", 2),
+    ("Date.prototype", "setTime", 1),
+    ("Date.prototype", "setUTCDate", 1),
+    ("Date.prototype", "setUTCFullYear", 3),
+    ("Date.prototype", "setUTCHours", 4),
+    ("Date.prototype", "setUTCMilliseconds", 1),
+    ("Date.prototype", "setUTCMinutes", 3),
+    ("Date.prototype", "setUTCMonth", 2),
+    ("Date.prototype", "setUTCSeconds", 2),
+    ("Date.prototype", "toLocaleString", 0),
     ("Date.prototype", "toISOString", 0),
     ("Date.prototype", "toJSON", 1),
     ("Date.prototype", "toString", 0),
@@ -2563,7 +2579,227 @@ const DATE_NATIVES: &[(&str, Native)] = &[
     ("toISOString", date_to_iso),
     ("toJSON", date_to_iso),
     ("toString", date_to_text),
+    ("toLocaleString", date_to_text),
+    ("setTime", date_set_time),
+    ("setFullYear", date_set_full_year),
+    ("setUTCFullYear", date_set_full_year),
+    ("setMonth", date_set_month),
+    ("setUTCMonth", date_set_month),
+    ("setDate", date_set_day_of_month),
+    ("setUTCDate", date_set_day_of_month),
+    ("setHours", date_set_hours),
+    ("setUTCHours", date_set_hours),
+    ("setMinutes", date_set_minutes),
+    ("setUTCMinutes", date_set_minutes),
+    ("setSeconds", date_set_seconds),
+    ("setUTCSeconds", date_set_seconds),
+    ("setMilliseconds", date_set_milliseconds),
+    ("setUTCMilliseconds", date_set_milliseconds),
 ];
+
+/// `MakeDay` — a day number from a year, a **0-based** month and a **1-based** date.
+///
+/// **Everything rolls over rather than erroring**, which is the whole reason the setters can
+/// be one operation: `setMonth(13)` moves the year and `setDate(0)` moves to the last day of
+/// the previous month, and neither needs a special case.
+fn make_day(year: f64, month: f64, day: f64) -> f64 {
+    if !year.is_finite() || !month.is_finite() || !day.is_finite() {
+        return f64::NAN;
+    }
+    let (year, month, day) = (year.trunc(), month.trunc(), day.trunc());
+    let years = year + (month / 12.0).floor();
+    // **Bounded before the conversion.** The civil arithmetic below is integer, and a year of
+    // 1e20 would wrap rather than answer — silently, and into a plausible date. Anything this
+    // far out is outside the range `time_clip` accepts, so `NaN` is the answer either way;
+    // this is only about reaching it safely.
+    if years.abs() > 400_000.0 {
+        return f64::NAN;
+    }
+    let months = month.rem_euclid(12.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "both bounded immediately above"
+    )]
+    let days = crisol_builtins::days_from_civil(years as i64, months as i64, 1);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a day count from a year within 400000, far inside f64's exact-integer range"
+    )]
+    let days = days as f64;
+    days + day - 1.0
+}
+
+/// Writes a date's time value and answers it, which is what every setter returns.
+fn store_time(handle: GcRef, time: f64) -> u64 {
+    with_runtime(|runtime| {
+        runtime.define_hidden(handle, DATE_TIME, Value::number(time));
+    });
+    from_number(time)
+}
+
+/// Where in the broken-down fields each setter starts writing.
+const DATE_YEAR: usize = 0;
+
+/// The shared body of every `Date.prototype.set…` but `setTime`.
+///
+/// **They are one operation with a different starting field.** `setHours(h, m, s, ms)` writes
+/// four of the seven and `setMinutes(m, s, ms)` writes three of the same four, so written
+/// separately they are the same decompose-replace-recompose seven times over — with seven
+/// chances to get the argument count subtly wrong in a way only one test notices.
+///
+/// **The arguments are coerced before the date is checked.** Coercion runs user code, and the
+/// specification orders those effects before the answer — so an invalid date still calls the
+/// `valueOf` it was handed. The first argument is coerced even when absent, which is why
+/// `d.setHours()` yields an invalid date rather than leaving the date alone.
+fn date_set(this_value: u64, argc: u64, argv: *const u64, first: usize, count: usize) -> u64 {
+    let Some(handle) = handle_of(this_value) else {
+        return raise("not a date", "TypeError");
+    };
+    if own_property(this_value, DATE_TIME).is_none() {
+        return raise("not a date", "TypeError");
+    }
+    let supplied = (argc as usize).min(count).max(1);
+    let mut given = [f64::NAN; 7];
+    for (index, slot) in given.iter_mut().enumerate().take(supplied) {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        *slot = to_number(unsafe { argument(argc, argv, index) });
+    }
+
+    let time = time_of(this_value);
+    // **`setFullYear` starts from the epoch when the date is invalid**, and every other setter
+    // answers `NaN`. That asymmetry is the specification's: a year is enough to name a date
+    // and an hour is not.
+    let base = if time.is_nan() {
+        if first == DATE_YEAR {
+            0.0
+        } else {
+            return store_time(handle, f64::NAN);
+        }
+    } else {
+        time
+    };
+    let Some(fields) = crisol_builtins::fields(base) else {
+        return store_time(handle, f64::NAN);
+    };
+
+    #[expect(clippy::cast_precision_loss, reason = "calendar fields")]
+    let mut parts = [
+        fields.year as f64,
+        fields.month as f64,
+        fields.day as f64,
+        fields.hour as f64,
+        fields.minute as f64,
+        fields.second as f64,
+        fields.millisecond as f64,
+    ];
+    for (index, value) in given.iter().enumerate().take(supplied) {
+        parts[first + index] = *value;
+    }
+    let stamp = crisol_builtins::time_clip(crisol_builtins::make_date(
+        make_day(parts[0], parts[1], parts[2]),
+        crisol_builtins::make_time(parts[3], parts[4], parts[5], parts[6]),
+    ));
+    store_time(handle, stamp)
+}
+
+/// `Date.prototype.setTime` — the time value outright, with no calendar arithmetic at all.
+extern "C" fn date_set_time(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(handle) = handle_of(this_value) else {
+        return raise("not a date", "TypeError");
+    };
+    if own_property(this_value, DATE_TIME).is_none() {
+        return raise("not a date", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = to_number(unsafe { argument(argc, argv, 0) });
+    store_time(handle, crisol_builtins::time_clip(given))
+}
+
+/// `Date.prototype.setFullYear` and its UTC twin.
+///
+/// The two are the same function because this engine has no local-time offset — see
+/// `date_timezone_offset`, which answers zero.
+extern "C" fn date_set_full_year(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    date_set(this_value, argc, argv, 0, 3)
+}
+
+/// `Date.prototype.setMonth`.
+extern "C" fn date_set_month(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    date_set(this_value, argc, argv, 1, 2)
+}
+
+/// `Date.prototype.setDate`.
+extern "C" fn date_set_day_of_month(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    date_set(this_value, argc, argv, 2, 1)
+}
+
+/// `Date.prototype.setHours`.
+extern "C" fn date_set_hours(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    date_set(this_value, argc, argv, 3, 4)
+}
+
+/// `Date.prototype.setMinutes`.
+extern "C" fn date_set_minutes(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    date_set(this_value, argc, argv, 4, 3)
+}
+
+/// `Date.prototype.setSeconds`.
+extern "C" fn date_set_seconds(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    date_set(this_value, argc, argv, 5, 2)
+}
+
+/// `Date.prototype.setMilliseconds`.
+extern "C" fn date_set_milliseconds(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    date_set(this_value, argc, argv, 6, 1)
+}
 
 /// The time value a date holds, or `NaN` if it is not a date.
 fn time_of(this_value: u64) -> f64 {

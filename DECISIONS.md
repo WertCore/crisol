@@ -5232,3 +5232,37 @@ walk.
 **`Object.assign` coerces its target too.** `Object.assign(true, {a: 1})` answers a `Boolean`
 wrapper carrying the assignment; the primitive was handed straight back, unable to carry
 anything. That is the same rule as D-170 in the one static that had been missed.
+
+## D-186
+
+**Every `Date` setter is one operation with a different starting field.**
+
+Status: Accepted
+
+`Date` had every getter and no setters at all, which was the single largest failure reason in
+the corpus — 70 cases of `is not a function`, nearly all of them `Date.prototype.set…`.
+
+They are written as one function taking a starting field and a count, because that is what they
+are: `setHours(h, m, s, ms)` writes four of the seven broken-down fields and
+`setMinutes(m, s, ms)` writes three of the same four. Seven separate implementations would be
+the same decompose-replace-recompose seven times over, with seven chances to get an argument
+count subtly wrong in a way one test notices and the others do not.
+
+Three details that are easy to get backwards and are each a test:
+
+- **Arguments are coerced before the date is checked.** Coercion runs user code and the
+  specification orders those effects first, so an invalid date still calls the `valueOf` it was
+  handed.
+- **The first argument is coerced even when absent**, which is why `d.setHours()` yields an
+  invalid date rather than leaving the date alone.
+- **`setFullYear` starts from the epoch when the date is invalid** and every other setter
+  answers `NaN`. A year is enough to name a date and an hour is not.
+
+**The UTC twins are the same function**, as the getters already were: this engine has no
+local-time offset, and `getTimezoneOffset` answers zero. That is honest rather than convenient
+— when an offset exists the two have to split, and the pairing here is what will make that
+obvious.
+
+`MakeDay` bounds the year before converting to the integer calendar arithmetic. A year of 1e20
+would otherwise wrap into a plausible date rather than the `NaN` that `TimeClip` would have
+produced anyway.

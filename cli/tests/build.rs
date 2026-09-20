@@ -6455,3 +6455,94 @@ fn assign_coerces_its_target() {
         "TypeError",
     );
 }
+
+/// **Every `Date` setter is one operation with a different starting field**, so the fields it
+/// does not name keep what they had and the ones it does roll over rather than erroring.
+#[test]
+fn a_date_can_be_set() {
+    check(
+        "date-set-time",
+        "let d = new Date(0); d.setTime(86400000); return d.getTime();",
+        "86400000",
+    );
+    check(
+        "date-set-full-year",
+        "let d = new Date(0); d.setFullYear(2020); return d.getFullYear();",
+        "2020",
+    );
+    // The fields it does not name keep what they had.
+    check(
+        "date-set-year-keeps-the-day",
+        "let d = new Date(0); d.setFullYear(2020); \
+         return d.getMonth() + \",\" + d.getDate();",
+        "0,1",
+    );
+    check(
+        "date-set-month-and-day",
+        "let d = new Date(0); d.setFullYear(2020, 5, 17); \
+         return d.getFullYear() + \"-\" + d.getMonth() + \"-\" + d.getDate();",
+        "2020-5-17",
+    );
+    // Rolling over is what makes one operation enough for all of them.
+    check(
+        "date-set-month-rolls-the-year",
+        "let d = new Date(0); d.setMonth(13); \
+         return d.getFullYear() + \",\" + d.getMonth();",
+        "1971,1",
+    );
+    check(
+        "date-set-date-rolls-back",
+        "let d = new Date(0); d.setDate(0); \
+         return d.getFullYear() + \"-\" + d.getMonth() + \"-\" + d.getDate();",
+        "1969-11-31",
+    );
+    check(
+        "date-set-hours",
+        "let d = new Date(0); d.setHours(5, 6, 7, 8); \
+         return d.getHours() + \":\" + d.getMinutes() + \":\" + d.getSeconds() + \".\" + \
+         d.getMilliseconds();",
+        "5:6:7.8",
+    );
+    check(
+        "date-set-minutes-keeps-the-hour",
+        "let d = new Date(0); d.setHours(5); d.setMinutes(9); \
+         return d.getHours() + \":\" + d.getMinutes();",
+        "5:9",
+    );
+    // A setter answers the new time value.
+    check(
+        "date-set-returns-the-time",
+        "let d = new Date(0); return d.setMilliseconds(250);",
+        "250",
+    );
+    // The first argument is coerced even when it is absent, so a setter with none invalidates.
+    check(
+        "date-set-with-no-argument",
+        "let d = new Date(0); d.setHours(); return d.getTime();",
+        "NaN",
+    );
+    // An invalid date stays invalid — except `setFullYear`, which starts from the epoch.
+    check(
+        "date-set-hours-on-an-invalid-date",
+        "let d = new Date(NaN); d.setHours(5); return d.getTime();",
+        "NaN",
+    );
+    check(
+        "date-set-year-on-an-invalid-date",
+        "let d = new Date(NaN); d.setFullYear(1971); return d.getFullYear();",
+        "1971",
+    );
+    // A receiver that is not a date is a `TypeError`, not a quiet answer.
+    check(
+        "date-set-on-a-plain-object",
+        "try { Date.prototype.setTime.call({}, 0); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The UTC twins are the same operation: this engine has no local-time offset.
+    check(
+        "date-set-utc-hours",
+        "let d = new Date(0); d.setUTCHours(3); return d.getUTCHours();",
+        "3",
+    );
+}
