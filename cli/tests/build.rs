@@ -1566,10 +1566,14 @@ fn apply_takes_its_arguments_as_an_array() {
 /// A method reached through `call` on a receiver it was not written for must not crash.
 #[test]
 fn a_method_applied_to_a_wrong_receiver_answers_rather_than_failing() {
+    // **`-1`, not `undefined`.** A boolean has no `length`, so the search runs over zero
+    // elements and reports not-found — which is what the specification says and what this
+    // answered only once the array methods learned to read a length from anything (D-157).
+    // The old expectation recorded the previous behaviour, not the required one.
     check(
         "fn-call-boolean",
         "return Array.prototype.indexOf.call(true);",
-        "undefined",
+        "-1",
     );
 }
 
@@ -4658,4 +4662,25 @@ fn a_lone_surrogate_does_not_raise() {
         "let r = \"\"; try { String.fromCodePoint(0x110000); } catch (e) { r = e.name; } return r;",
         "RangeError",
     );
+}
+
+/// **A string wrapper is indexed by its characters.** It holds its text whole rather than one
+/// property per character, and reading one out on demand is what lets `new String("abc")[0]`
+/// work and what lets the array methods walk a wrapper at all.
+#[test]
+fn a_string_wrapper_is_indexed() {
+    check("wrapper-index", "return new String(\"abc\")[0];", "a");
+    check("wrapper-index-last", "return new String(\"abc\")[2];", "c");
+    check(
+        "wrapper-index-past",
+        "return new String(\"abc\")[9];",
+        "undefined",
+    );
+    check(
+        "wrapper-index-computed",
+        "let o = new String(\"abc\"); let i = 1; return o[i];",
+        "b",
+    );
+    // A plain object with a numbered property is unaffected.
+    check("plain-index", "let o = {0: \"z\"}; return o[0];", "z");
 }

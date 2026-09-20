@@ -6110,6 +6110,32 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
             let length = count as f64;
             return Value::number(length).to_bits();
         }
+        // **A string wrapper is indexed by its characters.** `new String("abc")[0]` is `"a"`,
+        // and the wrapper holds its text whole rather than one property per character. Reading
+        // a character out on demand costs nothing for the wrappers nobody indexes, where
+        // defining them all at construction would charge every wrapper for a case most never
+        // reach. This is also what lets the array methods walk one (D-157).
+        if let Ok(index) = name.parse::<usize>() {
+            let held = runtime
+                .heap
+                .shape_of(handle)
+                .and_then(|shape| {
+                    let key = PropertyKey::new(STRING_PRIMITIVE);
+                    runtime.shapes.borrow().lookup(shape, &key)
+                })
+                .and_then(|slot| runtime.heap.get(handle, slot.index()))
+                .and_then(|value| value.as_address())
+                .map(GcRef::from_address)
+                .and_then(|cell| runtime.heap.with_text(cell, ToOwned::to_owned));
+            if let Some(text) = held {
+                let units: Vec<u16> = text.encode_utf16().collect();
+                return units.get(index).map_or_else(
+                    || Value::UNDEFINED.to_bits(),
+                    |unit| new_string(&String::from_utf16_lossy(&[*unit])),
+                );
+            }
+        }
+
         // Walks the prototype chain. A class's methods live on one shared prototype object,
         // not on each instance, so a lookup that stopped at the receiver would find every
         // field and no method at all.

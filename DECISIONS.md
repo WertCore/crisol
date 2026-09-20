@@ -4663,3 +4663,24 @@ a mismatch it can report, where a throw stops the test before it can look.
 Fixing it properly means WTF-8 or a UTF-16 rope — a representation change, not a patch — and
 this is the second place the UTF-8 choice has shown through (D-115 was the first, where `length`
 had to count code units over a representation that does not store them).
+
+## D-159
+
+**A string wrapper is indexed by its characters, lazily.**
+
+Status: Accepted
+
+`new String("abc")[0]` is `"a"`. The wrapper holds its text whole (D-146) rather than one
+property per character, so the index had nothing to find — and once the array methods learned to
+read an array-like (D-157), `Array.prototype.filter.call(new String("abc"), …)` built an array
+of `undefined` instead of failing outright, which is a worse answer than the one it replaced.
+
+Characters are read out **on demand**. Defining them at construction would charge every wrapper
+for a case most never reach, and a wrapper is usually made to be passed somewhere, not indexed.
+
+**A test's expectation was the previous behaviour, not the required one.**
+`Array.prototype.indexOf.call(true)` was pinned at `undefined` because that is what the old
+implementation answered when it could not find real elements. The specification says `-1`: a
+boolean has no `length`, so the search runs over zero elements and reports not-found. The test
+was written to lock in an answer rather than to check one, and it took a change that made the
+behaviour *correct* to expose that.
