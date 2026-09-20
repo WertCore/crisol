@@ -40,6 +40,15 @@ jobs:
           - name: Linux (x86_64)
             os: ubuntu-latest
             budget_mib: 28 # observed 13.5 (VmRSS)
+          # **Here to separate "Linux" from "x86-64" in D-142.** The collector fails on
+          # `Linux (x86_64)` and passes on `macOS (arm64)`, which are two differences at once —
+          # the operating system and the architecture. This job holds the architecture fixed
+          # against macOS and the system fixed against x86-64, so whichever way it lands names
+          # the variable. Free for public repositories, and cheaper than reproducing it in a
+          # local VM, which filled a laptop's disk before it finished.
+          - name: Linux (arm64)
+            os: ubuntu-24.04-arm
+            budget_mib: 28 # same counter as x86-64; no separate reading yet
           - name: Windows (x86_64)
             os: windows-latest
             budget_mib: 8 # observed 3.4 (PrivateUsage)
