@@ -2060,6 +2060,12 @@ const BOUND_CALL: usize = 1;
 /// The index within [`ANONYMOUS_NATIVES`] of the array constructor.
 const CONSTRUCT_ARRAY: usize = 2;
 
+/// Marks an array whose `length` has been made non-writable.
+///
+/// A length is derived from the element count rather than stored, so there is no slot to carry
+/// its attributes — the flag has to live beside it.
+const FIXED_LENGTH: &str = "__fixedLength";
+
 /// The highest index stored as an array *element* rather than as a named property.
 ///
 /// **Elements are dense and the specification's arrays are not.** Writing `a[4294967294] = 1`
@@ -4334,6 +4340,53 @@ extern "C" fn object_define_property(
             return raise("a property key must be a name", "TypeError");
         };
 
+        // **An array's `length` is its element count, not a property**, so defining it has to
+        // resize rather than store. Storing left the array reporting two lengths at once — the
+        // descriptor said one and the elements said two — and every question after that got
+        // whichever answer its asker happened to consult.
+        if name == "length"
+            && let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
+        {
+            let read_value = "value".to_owned();
+            // SAFETY: `read_value` is a live Rust string.
+            let given = unsafe {
+                crisol_property_load(descriptor, read_value.as_ptr(), read_value.len() as u64)
+            };
+            if Value::from_bits(given).kind() != crisol_value::Kind::Undefined {
+                let wanted = to_number(given);
+                if !wanted.is_finite()
+                    || wanted < 0.0
+                    || wanted.fract() != 0.0
+                    || wanted > f64::from(u32::MAX)
+                {
+                    return raise("invalid array length", "RangeError");
+                }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "range-checked immediately above"
+                )]
+                let wanted = wanted as usize;
+                with_runtime(|runtime| {
+                    if wanted < count {
+                        runtime.heap.truncate_elements(handle, wanted);
+                    } else if wanted > count {
+                        runtime
+                            .heap
+                            .set_element(handle, wanted - 1, Value::UNDEFINED);
+                    }
+                });
+            }
+            // `writable: false` on a length is remembered separately, because there is no slot
+            // to hang an attribute on — the length is derived, so its permissions must be too.
+            if descriptor_flag(descriptor, "writable") == Some(false) {
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, FIXED_LENGTH, Value::number(1.0));
+                });
+            }
+            return target;
+        }
+
         let existing = own_property(target, &name);
         let read_field = |field: &str| -> u64 {
             let field = field.to_owned();
@@ -4532,6 +4585,7 @@ const INTERNAL_PROPERTIES: &[&str] = &[
     DATE_TIME,
     STRING_PRIMITIVE,
     NOT_EXTENSIBLE,
+    FIXED_LENGTH,
     COLLECTION_ENTRIES,
     BOUND_TARGET,
     BOUND_THIS,
@@ -6180,6 +6234,12 @@ pub unsafe extern "C" fn crisol_property_store(
     if name == "length"
         && let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
     {
+        // **A length made non-writable ignores an assignment**, silently outside strict mode,
+        // exactly as a non-writable property does. Checked here because the length has no slot
+        // whose attributes the ordinary path could consult.
+        if property_number(object, FIXED_LENGTH).is_some() {
+            return Value::UNDEFINED.to_bits();
+        }
         let wanted = to_number(value);
         // **Above 2^32-1 is a `RangeError`**, which is the specification's rule and also the
         // only thing standing between `[].length = 4294967297` and an attempt to materialise

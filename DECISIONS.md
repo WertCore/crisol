@@ -4823,3 +4823,29 @@ They route through `defineProperty` for the same reason — with one difference 
 and not a mistake: **they make an enumerable, configurable property**, where `defineProperty`'s
 defaults are the opposite (D-116). Two functions that do the same thing with opposite defaults
 is the sort of difference that is only safe to have written down.
+
+## D-166
+
+**An array's `length` is its element count, so defining it resizes.**
+
+Status: Accepted
+
+`Object.defineProperty(arr, "length", {value: 1})` stored a `length` *property* on an array that
+already derives its length from the elements. The array then reported **two lengths at once** —
+the descriptor said one and the elements said two — and every question after that got whichever
+answer its asker happened to consult. `arr.length` read the elements; a descriptor read the
+property; `hasOwnProperty("1")` read the elements again.
+
+Defining it now resizes, exactly as assigning to it does (D-154), so there is one answer.
+
+**`writable: false` on a length needs somewhere to live.** A length is derived rather than
+stored, so it has no slot whose attributes could carry the flag — it is a hidden property
+beside it, and the assignment path consults it. That is the fourth thing kept this way (D-126,
+D-146, D-151), and the list is starting to argue for real internal slots rather than a
+convention plus a growing set of names to exclude from enumeration.
+
+**On finding it:** the corpus reported a crash and reading the case did not explain one.
+Reproducing the same call as an acceptance case reported a *wrong answer* instead — `2` where
+`1` was wanted — which is what the harness difference is for: one reports a signal and the
+other prints what the program said. The crash was downstream of the disagreement, in a helper
+that trusted the two answers to match.

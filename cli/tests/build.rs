@@ -5094,14 +5094,60 @@ fn the_legacy_accessor_definers_work() {
     );
 }
 
-/// Defining `length` on an array through a descriptor. A test262 case doing this crashed, and
-/// the acceptance harness reports the thrown message where the corpus reports only a signal.
+/// **An array's `length` is its element count, not a property**, so defining it has to resize
+/// rather than store. Storing left the array reporting two lengths at once — the descriptor
+/// said one and the elements said two — and every question after that got whichever answer its
+/// asker happened to consult.
 #[test]
-fn defining_length_through_a_descriptor() {
+fn defining_length_through_a_descriptor_resizes() {
     check(
         "define-length-descriptor",
         "let a = [0, 1]; Object.defineProperties(a, {length: {value: 1, writable: false}}); \
          return a.length;",
         "1",
+    );
+    // The elements go with the length, so the dropped one is really gone.
+    check(
+        "define-length-drops-elements",
+        "let a = [0, 1]; Object.defineProperty(a, \"length\", {value: 1}); \
+         return a.hasOwnProperty(\"1\");",
+        "false",
+    );
+    check(
+        "define-length-keeps-the-rest",
+        "let a = [0, 1]; Object.defineProperty(a, \"length\", {value: 1}); return a[0];",
+        "0",
+    );
+    check(
+        "define-length-grows",
+        "let a = [0]; Object.defineProperty(a, \"length\", {value: 3}); return a.length;",
+        "3",
+    );
+    // **A length made non-writable ignores an assignment**, as a non-writable property does.
+    check(
+        "define-length-fixed",
+        "let a = [0, 1]; Object.defineProperty(a, \"length\", {value: 2, writable: false}); \
+         a.length = 1; return a.length;",
+        "2",
+    );
+    // A writable length still resizes on assignment.
+    check(
+        "define-length-still-writable",
+        "let a = [0, 1]; a.length = 1; return a.length;",
+        "1",
+    );
+    check(
+        "define-length-invalid",
+        "let r = \"\"; let a = [0]; \
+         try { Object.defineProperty(a, \"length\", {value: -1}); } catch (e) { r = e.name; } \
+         return r;",
+        "RangeError",
+    );
+    // The flag is bookkeeping, not a property the program can see.
+    check(
+        "define-length-flag-hidden",
+        "let a = [0]; Object.defineProperty(a, \"length\", {value: 1, writable: false}); \
+         return Object.getOwnPropertyNames(a).length;",
+        "0",
     );
 }
