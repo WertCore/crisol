@@ -3496,3 +3496,32 @@ fn an_object_is_asked_how_it_reads_as_text() {
     // A plain object still reads as `[object Object]`, through the inherited `toString`.
     check("text-plain-object", "return String({});", "[object Object]");
 }
+
+/// An uncaught error has to say what it was. **`describe_error` runs before `to_text`**,
+/// because `name` and `message` are what an error carries and `toString` is something most
+/// errors inherit rather than define — once `to_text` learned to ask an object (D-137), every
+/// uncaught error started describing itself as `[object Object]`.
+#[test]
+fn an_uncaught_error_reports_its_name_and_message() {
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-uncaught-text");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, "throw new TypeError(\"bad thing\");").expect("write");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("should build");
+
+    let output = std::process::Command::new(&binary)
+        .output()
+        .expect("run the binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("TypeError") && stderr.contains("bad thing"),
+        "an uncaught error should name itself, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("[object Object]"),
+        "an uncaught error should not describe itself as a plain object, got: {stderr}"
+    );
+}

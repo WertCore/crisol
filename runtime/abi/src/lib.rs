@@ -5551,7 +5551,15 @@ pub extern "C" fn crisol_typeof(value: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_report_uncaught() {
     let thrown = crisol_pending_exception();
-    let described = to_text(thrown).or_else(|| describe_error(thrown));
+    // **`describe_error` first.** This was `to_text(...).or_else(describe_error)`, which was
+    // right only while `to_text` failed on objects. Once it learned to ask an object for its
+    // text (D-137) it started succeeding with whatever `Object.prototype.toString` returns, so
+    // every thrown error described itself as `[object Object]` and `describe_error` never ran.
+    // 581 of 1061 test262 failures reported that and nothing else.
+    //
+    // The order is not arbitrary: `name` and `message` are what an error carries, and reading
+    // them beats calling a `toString` that most errors inherit rather than define.
+    let described = describe_error(thrown).or_else(|| to_text(thrown));
     eprintln!("uncaught: {}", described.as_deref().unwrap_or("an object"));
 }
 

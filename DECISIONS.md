@@ -4309,3 +4309,32 @@ testing it needs an aarch64 Linux host and the last attempt at one filled this m
 leaving it blocking would make every run red for something already understood and recorded.
 `continue-on-error` reports it without failing the build, and the line comes out the day it
 goes green.
+
+## D-145
+
+**Teaching `to_text` to ask objects broke every uncaught error message.**
+
+Status: Accepted — a regression I introduced, found by the first corpus run
+
+`crisol_report_uncaught` was `to_text(thrown).or_else(describe_error)`. That ordering was
+correct only while `to_text` **failed** on objects: an error fell through to `describe_error`,
+which reads `name` and `message`, and printed `TypeError: …`.
+
+D-137 made `to_text` ask an object for its text. From then on it *succeeded* — with whatever
+`Object.prototype.toString` returns — so `describe_error` never ran and every uncaught error
+described itself as **`[object Object]`**. In the first full-corpus run that was **581 of 1061
+failures**: more than half the suite's output was a string that says nothing.
+
+`describe_error` now runs first. The order is not arbitrary: `name` and `message` are what an
+error *carries*, and reading them beats calling a `toString` that most errors inherit rather
+than define.
+
+Two things worth keeping from how this was found:
+
+- **A fallback chain encodes an assumption about the first branch failing.** Making the first
+  branch more capable silently disabled the second. Nothing about D-137 looked like it touched
+  error reporting.
+- **The corpus is a diagnostic instrument, not only a score.** The pass count barely moved when
+  this broke; what moved was 581 failures collapsing into one indistinguishable bucket. Reading
+  the *reasons* is what caught it, and the reason it was worth reading is that they had been
+  informative before.
