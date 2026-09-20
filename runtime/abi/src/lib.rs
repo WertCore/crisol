@@ -1950,6 +1950,9 @@ extern "C" fn make_error(
             let Some(target) = handle_of(receiver) else {
                 return Value::UNDEFINED.to_bits();
             };
+            with_runtime(|runtime| {
+                runtime.define_hidden(target, ERROR_DATA, Value::number(1.0));
+            });
             if plain {
                 let prototype = handle_of(closure).and_then(|closure| {
                     with_runtime(|runtime| {
@@ -2277,6 +2280,14 @@ fn to_object(value: u64) -> Option<u64> {
 ///
 /// Numbered after [`NATIVES`] and [`GLOBAL_NATIVES`], continuing the one negative index space
 /// so `crisol_closure_code` still has a single rule.
+/// Marks an object the `Error` constructors made.
+///
+/// **The tag, not the prototype chain, is what `[object Error]` means.** The specification
+/// keys it on an internal slot the constructor installs, so `Object.create(Error.prototype)`
+/// is `[object Object]` — inheritance is not the test, and using it would have been right
+/// about every error and wrong about the one case that distinguishes the two.
+const ERROR_DATA: &str = "__errorData";
+
 /// Where a date keeps its time value.
 ///
 /// **A hidden property standing in for an internal slot.** Internal slot zero already means
@@ -3063,6 +3074,8 @@ extern "C" fn object_to_text(
                 "Function"
             } else if own_flag(this_value, DATE_TIME) {
                 "Date"
+            } else if own_flag(this_value, ERROR_DATA) {
+                "Error"
             } else {
                 // A wrapper carries the primitive it wraps, and its class follows from what
                 // that primitive is — the one thing distinguishing `new String("")` from `{}`.
@@ -5184,6 +5197,7 @@ const INTERNAL_PROPERTIES: &[&str] = &[
     NOT_EXTENSIBLE,
     FIXED_LENGTH,
     ELEMENT_RULES,
+    ERROR_DATA,
     COLLECTION_ENTRIES,
     BOUND_TARGET,
     BOUND_THIS,
@@ -9290,6 +9304,9 @@ fn raise(message: &str, kind: &str) -> u64 {
         if let Some(prototype) = error_prototype(kind) {
             with_runtime(|runtime| runtime.heap.set_prototype(handle, Some(prototype)));
         }
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, ERROR_DATA, Value::number(1.0));
+        });
         // Stored one at a time. Creating both and then storing them leaves the first reachable
         // only from a Rust local while the second allocates — and under stress that allocation
         // collects it, which is how the message came back unreadable.

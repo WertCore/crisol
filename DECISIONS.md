@@ -5135,3 +5135,16 @@ hand.
 non-enumerable — so `Object.keys(new TypeError("x"))` is empty, as it is everywhere else.
 `Error.prototype.toString` exists; errors inherited `Object.prototype.toString` and described
 themselves as `[object Object]`.
+
+## D-181
+
+**`[object Error]` is keyed on what made the object, not on what it inherits from.**
+
+Status: Accepted
+
+The specification reports the tag for an object carrying an internal slot the `Error`
+constructors install, so `Object.create(Error.prototype)` is `[object Object]`. Reading the
+prototype chain instead would have been right about every error and wrong about the one case
+that distinguishes the two — which is the case the tests check, because it is the only one
+where the answer is not obvious. The tag is a hidden property, as the other four internal
+slots are (D-126), and stays out of every enumeration.

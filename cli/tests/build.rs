@@ -6170,3 +6170,31 @@ fn an_element_can_carry_its_own_attributes() {
         "9",
     );
 }
+
+/// **The tag is keyed on what made the object, not on what it inherits from** — which is the
+/// one case where the two differ.
+#[test]
+fn an_error_reports_its_class() {
+    check(
+        "tag-error",
+        "return Object.prototype.toString.call(new TypeError(\"x\"));",
+        "[object Error]",
+    );
+    check(
+        "tag-raised-error",
+        "try { null.x; return \"no\"; } catch (e) { return Object.prototype.toString.call(e); }",
+        "[object Error]",
+    );
+    // Inheriting from `Error.prototype` does not make something an error.
+    check(
+        "tag-error-lookalike",
+        "return Object.prototype.toString.call(Object.create(Error.prototype));",
+        "[object Object]",
+    );
+    // And the tag is not a property a program can see.
+    check(
+        "error-own-names",
+        "return Object.getOwnPropertyNames(new TypeError(\"x\")).join(\",\");",
+        "message",
+    );
+}
