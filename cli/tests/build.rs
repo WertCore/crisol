@@ -4810,3 +4810,121 @@ fn a_sparse_index_does_not_exhaust_memory() {
     );
     check("dense-read-back", "let a = []; a[3] = 7; return a[3];", "7");
 }
+
+// ---- accessor properties -------------------------------------------------------------------
+
+/// **An accessor is a property whose value is computed**, so reading it calls something. The
+/// slot holds the pair of functions rather than anything the program sees.
+#[test]
+fn a_getter_is_called_on_read() {
+    check(
+        "getter-read",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 7; }}); return o.x;",
+        "7",
+    );
+    check(
+        "getter-receiver",
+        "let o = {n: 3}; Object.defineProperty(o, \"double\", \
+         {get: function () { return this.n * 2; }}); return o.double;",
+        "6",
+    );
+    check(
+        "getter-each-time",
+        "let count = 0; let o = {}; \
+         Object.defineProperty(o, \"x\", {get: function () { count = count + 1; return count; }}); \
+         o.x; o.x; return o.x;",
+        "3",
+    );
+}
+
+/// **A setter receives the write**, and a getter without one swallows it — which is what makes
+/// a read-only computed property read-only.
+#[test]
+fn a_setter_is_called_on_write() {
+    check(
+        "setter-write",
+        "let seen = 0; let o = {}; \
+         Object.defineProperty(o, \"x\", {set: function (v) { seen = v; }}); o.x = 9; return seen;",
+        "9",
+    );
+    check(
+        "setter-pair",
+        "let held = 0; let o = {}; \
+         Object.defineProperty(o, \"x\", \
+         {get: function () { return held; }, set: function (v) { held = v * 2; }}); \
+         o.x = 5; return o.x;",
+        "10",
+    );
+    check(
+        "getter-only-write-ignored",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 1; }}); \
+         o.x = 9; return o.x;",
+        "1",
+    );
+    // A setter with no getter reads as `undefined` — the whole of what a write-only property is.
+    check(
+        "setter-only-read",
+        "let o = {}; Object.defineProperty(o, \"x\", {set: function () { }}); return o.x;",
+        "undefined",
+    );
+}
+
+/// An accessor inherited from a prototype sees the instance it was reached through.
+#[test]
+fn an_inherited_accessor_uses_the_receiver() {
+    check(
+        "getter-inherited",
+        "let base = {}; Object.defineProperty(base, \"x\", \
+         {get: function () { return this.n; }}); \
+         let o = Object.create(base); o.n = 4; return o.x;",
+        "4",
+    );
+    check(
+        "setter-inherited",
+        "let seen = 0; let base = {}; \
+         Object.defineProperty(base, \"x\", {set: function (v) { seen = v; }}); \
+         let o = Object.create(base); o.x = 6; return seen;",
+        "6",
+    );
+}
+
+/// **An accessor descriptor has `get` and `set` where a data one has `value` and `writable`** —
+/// four fields, never mixed, and a caller tells them apart by which pair is present.
+#[test]
+fn a_descriptor_reports_which_kind_it_is() {
+    check(
+        "descriptor-accessor-get",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 1; }}); \
+         return typeof Object.getOwnPropertyDescriptor(o, \"x\").get;",
+        "function",
+    );
+    check(
+        "descriptor-accessor-no-value",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 1; }}); \
+         return typeof Object.getOwnPropertyDescriptor(o, \"x\").value;",
+        "undefined",
+    );
+    check(
+        "descriptor-data-no-get",
+        "let o = {a: 1}; return typeof Object.getOwnPropertyDescriptor(o, \"a\").get;",
+        "undefined",
+    );
+    check(
+        "descriptor-data-writable",
+        "let o = {a: 1}; return Object.getOwnPropertyDescriptor(o, \"a\").writable;",
+        "true",
+    );
+}
+
+/// A descriptor carrying both a value and an accessor is a `TypeError` — they describe two
+/// different kinds of property and an object cannot be both.
+#[test]
+fn a_descriptor_cannot_be_both_kinds() {
+    check(
+        "descriptor-both",
+        "let r = \"\"; let o = {}; \
+         try { Object.defineProperty(o, \"x\", {value: 1, get: function () { return 2; }}); } \
+         catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}

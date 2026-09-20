@@ -4753,3 +4753,35 @@ Doing this properly means sparse element storage, which is a representation chan
 size as the UTF-16 one (D-158) and the hash-table one (D-148). Three approximations now point at
 the same conclusion — the heap's value representations were chosen for the common case, and
 test262 is mostly not the common case.
+
+## D-163
+
+**Accessor properties, which D-116 recorded as ignored.**
+
+Status: Accepted, closing the gap that entry left open
+
+`Object.defineProperty(o, "x", {get, set})` was accepted and silently produced a data property
+holding nothing. D-116 recorded that as *"the one part of this that fails quietly"*, and it has
+been quiet ever since.
+
+**An accessor is a property whose value is computed**, so the slot cannot hold what the program
+sees — it holds the pair of functions. Putting the pair in the *slot the property already
+occupies* means the collector traces them exactly as it traces any other property value, with
+nothing added to the heap's idea of what an object holds. The attribute that says which kind of
+property this is rides with the other three.
+
+**The call happens outside the runtime borrow**, for both directions. A getter is JavaScript and
+will reach back in; calling it while the chain walk still holds the borrow is re-entering what
+it is inside — the same failure as D-153, arrived at from the other end. So the walk now answers
+*"a value"* or *"an accessor, here is the pair"*, and the caller does the calling.
+
+Three rules that are each one line and each observable:
+
+- **The receiver is the object the property was reached *through***, not the one it was found
+  on, so an inherited getter sees the instance.
+- **A getter with no setter swallows a write**, silently outside strict mode. That is what makes
+  a read-only computed property read-only.
+- **A setter with no getter reads as `undefined`** — the whole of what a write-only property is.
+
+A descriptor carrying both a value and an accessor is a `TypeError`: they describe two different
+kinds of property and one cannot be both.

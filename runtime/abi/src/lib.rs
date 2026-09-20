@@ -4272,15 +4272,36 @@ extern "C" fn object_define_property(
         };
 
         let existing = own_property(target, &name);
-        let value_key = "value".to_owned();
-        // SAFETY: `value_key` is a live Rust string.
-        let given =
-            unsafe { crisol_property_load(descriptor, value_key.as_ptr(), value_key.len() as u64) };
+        let read_field = |field: &str| -> u64 {
+            let field = field.to_owned();
+            // SAFETY: `field` is a live Rust string.
+            unsafe { crisol_property_load(descriptor, field.as_ptr(), field.len() as u64) }
+        };
+        let given = read_field("value");
         let has_value = Value::from_bits(given).kind() != crisol_value::Kind::Undefined
             || own_property(descriptor, "value").is_some();
 
+        // **An accessor is a property whose value is computed**, so the slot holds the pair of
+        // functions rather than anything the program reads. `get` and `set` are looked for
+        // before `value`, because a descriptor carrying both is a `TypeError` and carrying
+        // either makes this an accessor whatever else is present.
+        let getter = read_field("get");
+        let setter = read_field("set");
+        let is_accessor = is_callable(getter) || is_callable(setter);
+        if is_accessor && has_value {
+            return raise(
+                "a descriptor cannot have both a value and an accessor",
+                "TypeError",
+            );
+        }
+
         // The write goes through the ordinary path so the shape transition happens there once.
-        let stored = if has_value {
+        let stored = if is_accessor {
+            // The pair, in the slot the property already occupies — so the collector traces
+            // them exactly as it traces any other property value, with nothing added to the
+            // heap's idea of what an object holds.
+            with_rooted(&[getter, setter], || array_of_values(&[getter, setter]))
+        } else if has_value {
             given
         } else {
             existing.map_or(Value::UNDEFINED.to_bits(), |(_, value)| value.to_bits())
@@ -4304,6 +4325,7 @@ extern "C" fn object_define_property(
             writable: descriptor_flag(descriptor, "writable").unwrap_or(base.writable),
             enumerable: descriptor_flag(descriptor, "enumerable").unwrap_or(base.enumerable),
             configurable: descriptor_flag(descriptor, "configurable").unwrap_or(base.configurable),
+            accessor: is_accessor,
         };
         with_runtime(|runtime| runtime.heap.set_attributes(handle, slot, attributes));
         target
@@ -4339,13 +4361,29 @@ extern "C" fn object_own_descriptor(
         let attributes = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
 
         let descriptor = crisol_create_object();
-        with_rooted(&[descriptor], || {
+        with_rooted(&[descriptor, value.to_bits()], || {
             let Some(into) = handle_of(descriptor) else {
                 return;
             };
+            // **An accessor descriptor has `get` and `set` where a data one has `value` and
+            // `writable`** — four fields, never mixed, and a caller tells them apart by which
+            // pair is present.
+            if attributes.accessor {
+                let (getter, setter) = elements_of(value.to_bits()).map_or(
+                    (Value::UNDEFINED.to_bits(), Value::UNDEFINED.to_bits()),
+                    |(pair, _)| (element_at(pair, 0), element_at(pair, 1)),
+                );
+                with_runtime(|runtime| {
+                    runtime.define(into, "get", Value::from_bits(getter));
+                    runtime.define(into, "set", Value::from_bits(setter));
+                });
+            } else {
+                with_runtime(|runtime| {
+                    runtime.define(into, "value", value);
+                    runtime.define(into, "writable", boolean(attributes.writable));
+                });
+            }
             with_runtime(|runtime| {
-                runtime.define(into, "value", value);
-                runtime.define(into, "writable", boolean(attributes.writable));
                 runtime.define(into, "enumerable", boolean(attributes.enumerable));
                 runtime.define(into, "configurable", boolean(attributes.configurable));
             });
@@ -5014,6 +5052,7 @@ fn restrict_own_properties(object: u64, writable: bool) {
                     writable: writable && current.writable,
                     enumerable: current.enumerable,
                     configurable: false,
+                    accessor: false,
                 },
             );
         });
@@ -5690,6 +5729,7 @@ impl Runtime {
                     writable: true,
                     enumerable: false,
                     configurable: true,
+                    accessor: false,
                 },
             );
         }
@@ -5724,6 +5764,7 @@ impl Runtime {
                     writable: false,
                     enumerable: false,
                     configurable: true,
+                    accessor: false,
                 },
             );
         }
@@ -5750,6 +5791,7 @@ impl Runtime {
                     writable: true,
                     enumerable: false,
                     configurable: false,
+                    accessor: false,
                 },
             );
         }
@@ -6070,6 +6112,44 @@ pub unsafe extern "C" fn crisol_property_store(
     if own_property(object, &name).is_none() && !is_extensible(object) {
         return Value::UNDEFINED.to_bits();
     }
+
+    // **A write to an accessor calls its setter**, and that is JavaScript — so the pair is
+    // fetched and the call made outside any runtime borrow, for the same reason a getter is
+    // (see `crisol_property_load`). Looked for up the chain, because a setter inherited from a
+    // prototype still receives a write to the instance.
+    let accessor = with_runtime(|runtime| {
+        let mut current = Some(handle);
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let object = current?;
+            let shape = runtime.heap.shape_of(object)?;
+            let found = runtime.shapes.borrow().lookup(shape, &key);
+            if let Some(slot) = found
+                && !runtime.heap.is_deleted(object, slot.index())
+            {
+                return runtime
+                    .heap
+                    .attributes_of(object, slot.index())
+                    .accessor
+                    .then(|| runtime.heap.get(object, slot.index()))
+                    .flatten()
+                    .map(|pair| pair.to_bits());
+            }
+            current = runtime.heap.prototype_of(object);
+        }
+        None
+    });
+    if let Some(pair) = accessor {
+        if let Some((functions, _)) = elements_of(pair) {
+            let setter = element_at(functions, 1);
+            if is_callable(setter) {
+                return call_value(setter, object, &[value]);
+            }
+        }
+        // **A getter with no setter swallows the write**, silently outside strict mode — which
+        // is what makes a read-only computed property read-only.
+        return Value::UNDEFINED.to_bits();
+    }
+
     with_runtime(|runtime| {
         let Some(current) = runtime.heap.shape_of(handle) else {
             return;
@@ -6113,6 +6193,16 @@ pub unsafe extern "C" fn crisol_property_store(
 #[unsafe(no_mangle)]
 #[must_use]
 pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, length: u64) -> u64 {
+    /// What the chain walk found: a value to hand back, or an accessor still to be called.
+    ///
+    /// The distinction has to survive the walk because a getter is JavaScript and will reach
+    /// back into the runtime — calling it while the walk still holds the borrow would be
+    /// re-entering what it is inside.
+    enum Found {
+        Value(u64),
+        Get(u64),
+    }
+
     let Some(handle) = handle_of(object) else {
         // **A number or a boolean is not a cell**, so there is no object to walk from — but
         // `(255).toString(16)` and `true.toString()` still have to find their prototypes. A
@@ -6160,7 +6250,7 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
     };
     let key = PropertyKey::new(&name);
 
-    with_runtime(|runtime| {
+    let found = with_runtime(|runtime| {
         // `length` on an array is not stored anywhere — it *is* the element count, and has to
         // answer correctly after `a[9] = 1` grew the array without any property being written.
         if name == "length"
@@ -6176,7 +6266,7 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
             // `é` is one. This counted bytes, which reads correctly for ASCII and wrongly for
             // everything else.
             let length = units as f64;
-            return Value::number(length).to_bits();
+            return Found::Value(Value::number(length).to_bits());
         }
         if name == "length"
             && let Some(count) = runtime.heap.element_count(handle)
@@ -6186,7 +6276,7 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
                 reason = "an array this long cannot be allocated"
             )]
             let length = count as f64;
-            return Value::number(length).to_bits();
+            return Found::Value(Value::number(length).to_bits());
         }
         // **A string wrapper is indexed by its characters.** `new String("abc")[0]` is `"a"`,
         // and the wrapper holds its text whole rather than one property per character. Reading
@@ -6207,10 +6297,10 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
                 .and_then(|cell| runtime.heap.with_text(cell, ToOwned::to_owned));
             if let Some(text) = held {
                 let units: Vec<u16> = text.encode_utf16().collect();
-                return units.get(index).map_or_else(
+                return Found::Value(units.get(index).map_or_else(
                     || Value::UNDEFINED.to_bits(),
                     |unit| new_string(&String::from_utf16_lossy(&[*unit])),
-                );
+                ));
             }
         }
 
@@ -6232,12 +6322,36 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
                 && !runtime.heap.is_deleted(object, slot.index())
                 && let Some(value) = runtime.heap.get(object, slot.index())
             {
-                return value.to_bits();
+                // **An accessor is read by calling its getter**, with the original receiver —
+                // not the object the property was found on, so a getter inherited from a
+                // prototype sees the instance it was reached through.
+                if runtime.heap.attributes_of(object, slot.index()).accessor {
+                    return Found::Get(value.to_bits());
+                }
+                return Found::Value(value.to_bits());
             }
             current = runtime.heap.prototype_of(object);
         }
-        Value::UNDEFINED.to_bits()
-    })
+        Found::Value(Value::UNDEFINED.to_bits())
+    });
+
+    match found {
+        Found::Value(value) => value,
+        // Called outside the runtime borrow: a getter is JavaScript and will reach back in.
+        Found::Get(pair) => match elements_of(pair) {
+            Some((functions, _)) => {
+                let getter = element_at(functions, 0);
+                if is_callable(getter) {
+                    call_value(getter, object, &[])
+                } else {
+                    // A setter with no getter reads as `undefined`, which is the whole of what
+                    // a write-only property does.
+                    Value::UNDEFINED.to_bits()
+                }
+            }
+            None => Value::UNDEFINED.to_bits(),
+        },
+    }
 }
 
 /// How far a property lookup walks before giving up.

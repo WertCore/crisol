@@ -63,6 +63,13 @@ pub struct Attributes {
     pub enumerable: bool,
     /// Whether it can be deleted or redefined.
     pub configurable: bool,
+    /// Whether the slot holds a getter and setter rather than a value.
+    ///
+    /// **An accessor is a property whose value is computed**, so the slot cannot hold what the
+    /// program sees — it holds the pair of functions that produce and receive it. Reading and
+    /// writing such a property means *calling* something, which is why this has to be known at
+    /// the point of access rather than inferred from what the slot contains.
+    pub accessor: bool,
 }
 
 impl Attributes {
@@ -71,6 +78,7 @@ impl Attributes {
         writable: true,
         enumerable: true,
         configurable: true,
+        accessor: false,
     };
 
     /// What `Object.defineProperty` creates when the descriptor says nothing: nothing
@@ -79,6 +87,7 @@ impl Attributes {
         writable: false,
         enumerable: false,
         configurable: false,
+        accessor: false,
     };
 }
 
