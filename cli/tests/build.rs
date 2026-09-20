@@ -4465,3 +4465,50 @@ fn internal_bookkeeping_is_not_a_property() {
         "1",
     );
 }
+
+/// **`length` is not stored anywhere — it *is* the element count**, so assigning to it has to
+/// resize the array rather than add a property. Without this `a.length = 0` silently did
+/// nothing, and test262's `buildString` helper, which empties a scratch array that way on every
+/// chunk, re-sent everything it had accumulated instead: quadratic growth, and the process
+/// killed on memory rather than any error a test could report.
+#[test]
+fn assigning_to_length_resizes_an_array() {
+    check(
+        "length-truncate",
+        "let a = [1, 2, 3]; a.length = 1; return a.length;",
+        "1",
+    );
+    check(
+        "length-truncate-value",
+        "let a = [1, 2, 3]; a.length = 1; return a[0];",
+        "1",
+    );
+    check(
+        "length-empty",
+        "let a = [1, 2, 3]; a.length = 0; return a.length;",
+        "0",
+    );
+    check(
+        "length-grow",
+        "let a = [1]; a.length = 3; return a.length;",
+        "3",
+    );
+    check(
+        "length-grow-hole",
+        "let a = [1]; a.length = 3; return a[2];",
+        "undefined",
+    );
+    check(
+        "length-unchanged",
+        "let a = [1, 2]; a.length = 2; return a.length;",
+        "2",
+    );
+    // Reusing a scratch array is the pattern that made this matter.
+    check(
+        "length-reuse",
+        "let a = []; let total = 0; \
+         for (let i = 0; i < 3; i = i + 1) { a[0] = i; total = total + a.length; a.length = 0; } \
+         return total;",
+        "3",
+    );
+}

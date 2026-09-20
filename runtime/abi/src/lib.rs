@@ -5941,6 +5941,39 @@ pub unsafe extern "C" fn crisol_property_store(
     };
     let key = PropertyKey::new(&name);
 
+    // **Assigning to an array's `length` resizes it.** `length` is not stored anywhere — it
+    // *is* the element count — so writing it has to change the elements rather than add a
+    // property. Without this `a.length = 0` silently did nothing, and test262's own
+    // `buildString` helper, which empties a scratch array that way each chunk, instead
+    // re-sent everything it had accumulated: quadratic growth, and the process killed on
+    // memory rather than any error a test could report.
+    if name == "length"
+        && let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
+    {
+        let wanted = to_number(value);
+        if wanted.is_finite() && wanted >= 0.0 {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "checked finite and non-negative just above"
+            )]
+            let wanted = wanted as usize;
+            with_runtime(|runtime| {
+                if wanted < count {
+                    runtime.heap.truncate_elements(handle, wanted);
+                } else if wanted > count {
+                    // Growing fills with `undefined`, which is not what the specification
+                    // says — those should be holes (D-64) — and is the same approximation
+                    // array literals already make.
+                    runtime
+                        .heap
+                        .set_element(handle, wanted - 1, Value::UNDEFINED);
+                }
+            });
+        }
+        return Value::UNDEFINED.to_bits();
+    }
+
     // **A non-extensible object refuses a property it does not already have.** Silently,
     // outside strict mode — the same rule a non-writable property follows, and the reason
     // `Object.freeze` is worth anything at all.
@@ -7300,7 +7333,15 @@ pub extern "C" fn crisol_create_array(length: u64) -> u64 {
 #[must_use]
 pub extern "C" fn crisol_computed_load(object: u64, key: u64) -> u64 {
     let Some(handle) = handle_of(object) else {
-        return nullish_access(object);
+        // **A primitive has no elements but may have methods.** `n["toString"]` reaches the
+        // same prototype `n.toString` does, so the named path handles it — this one only has
+        // to stop treating a non-object as nothing at all.
+        let Some(name) = key_of(Value::from_bits(key)) else {
+            return nullish_access(object);
+        };
+        let text = name.as_str().to_owned();
+        // SAFETY: `text` is a live Rust string, so its pointer and length describe UTF-8.
+        return unsafe { crisol_property_load(object, text.as_ptr(), text.len() as u64) };
     };
     let key = Value::from_bits(key);
 

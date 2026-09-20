@@ -4551,3 +4551,22 @@ correct, repeatedly. What finally worked was probes that *partition* — is the 
 populated, does the route through the compiler matter, does `call` bypass it — each of which
 eliminated half the space whatever its answer. Reading found nothing in three attempts because
 the code *was* right; only the order it ran in was wrong.
+
+## D-154
+
+**Assigning to `array.length` resizes the array.**
+
+Status: Accepted
+
+`length` is not a stored property — it *is* the element count, which is why reading it is a
+special case in the property load. Writing it was not, so `a.length = 0` silently added nothing
+and changed nothing.
+
+That surfaced as **three crashes**, not as a wrong answer. test262's own `buildString` helper
+fills a scratch array in chunks and empties it with `codePoints.length = 0` each time. With the
+assignment doing nothing, every chunk re-sent everything accumulated so far: quadratic growth in
+a string being built a code point at a time, and the process killed on memory. The report was a
+signal, with nothing to say which line caused it.
+
+Growing fills with `undefined` where the specification says holes — the same approximation array
+literals already make, and refused rather than faked there (D-133). Shrinking is exact.
