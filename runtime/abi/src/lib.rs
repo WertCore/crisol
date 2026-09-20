@@ -719,21 +719,27 @@ const ITERATOR_POSITION: &str = "__position";
 /// `const it = a.values(); it.next()` does and what most of test262's coverage of these
 /// methods checks.
 fn new_array_iterator(target: u64, kind: f64) -> u64 {
-    let iterator = crisol_create_object();
-    with_rooted(&[iterator, target], || {
-        let Some(handle) = handle_of(iterator) else {
-            return;
-        };
-        with_runtime(|runtime| {
-            runtime.define_hidden(handle, ITERATOR_TARGET, Value::from_bits(target));
-            runtime.define_hidden(handle, ITERATOR_POSITION, Value::number(0.0));
-            runtime.define_hidden(handle, ITERATOR_KIND, Value::number(kind));
-            if let Some(prototype) = ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get) {
-                runtime.heap.set_prototype(handle, Some(prototype));
-            }
+    // **`target` is rooted before anything is allocated.** Every other native roots its
+    // receiver through `live_values` before doing work; these three did not, so the array in
+    // `[7, 8].values()` — a temporary, held by nothing else — could be freed by the very
+    // allocation that made the iterator meant to walk it.
+    with_rooted(&[target], || {
+        let iterator = crisol_create_object();
+        with_rooted(&[iterator, target], || {
+            let Some(handle) = handle_of(iterator) else {
+                return;
+            };
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, ITERATOR_TARGET, Value::from_bits(target));
+                runtime.define_hidden(handle, ITERATOR_POSITION, Value::number(0.0));
+                runtime.define_hidden(handle, ITERATOR_KIND, Value::number(kind));
+                if let Some(prototype) = ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+                    runtime.heap.set_prototype(handle, Some(prototype));
+                }
+            });
         });
-    });
-    iterator
+        iterator
+    })
 }
 
 /// `Array.prototype.keys`.
@@ -4285,13 +4291,24 @@ extern "C" fn array_from(
         let values: Vec<u64> = match elements_of(source) {
             Some((array, length)) => (0..length).map(|index| element_at(array, index)).collect(),
             None if Value::from_bits(source).kind() == crisol_value::Kind::String => {
+                // **The code points are held only by `taken`**, and `array_of_values` below
+                // allocates — so the array of them has to stay rooted until its contents are
+                // somewhere the collector can see. Collecting into a `Vec` first roots
+                // nothing (D-127).
                 let taken = crisol_iterate(source);
-                match elements_of(taken) {
-                    Some((array, length)) => {
-                        (0..length).map(|index| element_at(array, index)).collect()
+                return with_rooted(&[taken], || {
+                    let values: Vec<u64> = match elements_of(taken) {
+                        Some((array, length)) => {
+                            (0..length).map(|index| element_at(array, index)).collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    if is_callable(mapper) {
+                        map_into_array(&values, mapper)
+                    } else {
+                        array_of_values(&values)
                     }
-                    None => Vec::new(),
-                }
+                });
             }
             None => {
                 // Array-like: `length` and indices.
@@ -4316,29 +4333,37 @@ extern "C" fn array_from(
             }
         };
 
-        if !is_callable(mapper) {
-            return array_of_values(&values);
+        if is_callable(mapper) {
+            map_into_array(&values, mapper)
+        } else {
+            array_of_values(&values)
         }
-        // Mapped into a rooted array one at a time: the callback allocates, and a `Vec` of
-        // results is invisible to the collector (D-127).
-        with_new_array(values.len(), |mapped| {
-            for (index, value) in values.iter().enumerate() {
-                let result = call_value(
-                    mapper,
-                    Value::UNDEFINED.to_bits(),
-                    &[*value, index_value(index)],
-                );
-                if Value::from_bits(result).is_exception() {
-                    return result;
-                }
-                with_runtime(|runtime| {
-                    runtime
-                        .heap
-                        .set_element(mapped, index, Value::from_bits(result));
-                });
+    })
+}
+
+/// Maps `values` through `mapper` into a fresh array.
+///
+/// **Into a rooted array one at a time**, because the callback allocates and a `Vec` of
+/// results is invisible to the collector — every result but the newest would be freed under
+/// it (D-127).
+fn map_into_array(values: &[u64], mapper: u64) -> u64 {
+    with_new_array(values.len(), |mapped| {
+        for (index, value) in values.iter().enumerate() {
+            let result = call_value(
+                mapper,
+                Value::UNDEFINED.to_bits(),
+                &[*value, index_value(index)],
+            );
+            if Value::from_bits(result).is_exception() {
+                return result;
             }
-            mapped.to_value().to_bits()
-        })
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(mapped, index, Value::from_bits(result));
+            });
+        }
+        mapped.to_value().to_bits()
     })
 }
 
