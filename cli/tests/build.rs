@@ -5093,3 +5093,15 @@ fn the_legacy_accessor_definers_work() {
         "TypeError",
     );
 }
+
+/// Defining `length` on an array through a descriptor. A test262 case doing this crashed, and
+/// the acceptance harness reports the thrown message where the corpus reports only a signal.
+#[test]
+fn defining_length_through_a_descriptor() {
+    check(
+        "define-length-descriptor",
+        "let a = [0, 1]; Object.defineProperties(a, {length: {value: 1, writable: false}}); \
+         return a.length;",
+        "1",
+    );
+}
