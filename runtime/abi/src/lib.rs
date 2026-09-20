@@ -5996,21 +5996,32 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
         // string does not need this because a string *is* a cell, which is why this gap only
         // showed when the other two grew methods worth reaching.
         let held = Value::from_bits(object);
-        let prototype = match held.kind() {
-            crisol_value::Kind::Boolean => BOOLEAN_PROTOTYPE.with(std::cell::Cell::get),
-            _ if held.as_number().is_some() => NUMBER_PROTOTYPE.with(std::cell::Cell::get),
-            _ => None,
-        };
-        let Some(prototype) = prototype else {
+        if !matches!(held.kind(), crisol_value::Kind::Boolean) && held.as_number().is_none() {
             return nullish_access(object);
-        };
+        }
         // SAFETY: the caller promises `length` readable UTF-8 bytes at `key`.
         let Some(name) = (unsafe { key_text(key, length) }) else {
             return Value::UNDEFINED.to_bits();
         };
-        // The receiver stays the primitive, so a method reached this way still sees the number
-        // or boolean it was called on rather than the prototype.
+        // **The prototype is read *inside* `with_runtime`, and that ordering is the whole
+        // thing.** `with_runtime` is what constructs the runtime on first use, and the
+        // prototypes are filled in during that construction. Reading the cell before entering
+        // it saw `None` in any program whose first act was a property load on a primitive —
+        // `let n = 255; n.toString` allocates nothing beforehand, so nothing had built the
+        // runtime yet. It then fell through to `nullish_access`, which answers `undefined` for
+        // a number rather than raising, so the failure arrived as a missing method rather than
+        // as anything pointing here.
         return with_runtime(|runtime| {
+            let prototype = if held.kind() == crisol_value::Kind::Boolean {
+                BOOLEAN_PROTOTYPE.with(std::cell::Cell::get)
+            } else {
+                NUMBER_PROTOTYPE.with(std::cell::Cell::get)
+            };
+            let Some(prototype) = prototype else {
+                return Value::UNDEFINED.to_bits();
+            };
+            // The receiver stays the primitive, so a method reached this way still sees the
+            // number or boolean it was called on rather than the prototype.
             let found = runtime.heap.shape_of(prototype).and_then(|shape| {
                 let key = PropertyKey::new(&name);
                 runtime.shapes.borrow().lookup(shape, &key)

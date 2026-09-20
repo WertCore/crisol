@@ -4516,3 +4516,38 @@ special case" would have been wrong in exactly one cell of that table, and the t
 and the second asks *"is this the value `NaN`"*. **`parseInt` reads a prefix and stops** where
 `Number` demands the whole string — `parseInt("12abc")` is twelve and `Number("12abc")` is
 `NaN`.
+
+## D-153
+
+**A prototype cell read before `with_runtime` is always empty.**
+
+Status: Accepted
+
+`(255).toString(16)` answered `undefined`. Five CI runs went into finding out why, and the
+answer was an **ordering** the code gave no sign of.
+
+`with_runtime` is what constructs the runtime on first use, and the prototype cells are filled
+in *during* that construction. The new branch in `crisol_property_load` read
+`NUMBER_PROTOTYPE` **before** entering `with_runtime` — so in any program whose first act was a
+property load on a primitive, nothing had built the runtime yet and the cell was still `None`.
+`let n = 255; n.toString` allocates nothing beforehand; there is no earlier call to construct
+anything.
+
+Three things conspired to make it unreadable:
+
+- **`Number.prototype.toString` worked**, because `Number` is a *global* load, which enters
+  `with_runtime` and builds everything before the lookup. So the prototype was demonstrably
+  populated — from inside a program that had already touched the runtime.
+- **`nullish_access` answers `undefined` for a number rather than raising**, correctly, so a
+  `None` prototype surfaced as a missing method rather than as anything pointing at the cell.
+- **`Map` and `Set` were unaffected**, because reaching them requires naming a global first.
+
+The fix is to read the cell inside `with_runtime`. The general rule, which the existing cells
+did not need to state because nothing read them this early: **a thread-local filled during
+construction cannot be read on a path that might be the thing triggering construction.**
+
+**On method, since it cost five runs:** the hypotheses were tested by reading code that looked
+correct, repeatedly. What finally worked was probes that *partition* — is the prototype
+populated, does the route through the compiler matter, does `call` bypass it — each of which
+eliminated half the space whatever its answer. Reading found nothing in three attempts because
+the code *was* right; only the order it ran in was wrong.
