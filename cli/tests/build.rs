@@ -4120,3 +4120,252 @@ fn keys_and_entries_walk_positions_and_pairs() {
         "1",
     );
 }
+
+// ---- Object statics, Number, Boolean and the globals ---------------------------------------
+
+/// **Freezing keeps enumerability** — a frozen object still lists its properties; it is the
+/// writing and the deleting that stop.
+#[test]
+fn freeze_stops_writing_and_extending() {
+    check(
+        "freeze-write",
+        "let o = {a: 1}; Object.freeze(o); o.a = 2; return o.a;",
+        "1",
+    );
+    check(
+        "freeze-extend",
+        "let o = {}; Object.freeze(o); o.b = 1; return o.b;",
+        "undefined",
+    );
+    check(
+        "freeze-is",
+        "let o = {}; Object.freeze(o); return Object.isFrozen(o);",
+        "true",
+    );
+    check("freeze-not", "return Object.isFrozen({a: 1});", "false");
+    check(
+        "freeze-keys",
+        "let o = {a: 1}; Object.freeze(o); return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "freeze-answers",
+        "let o = {}; return Object.freeze(o) === o;",
+        "true",
+    );
+    check(
+        "freeze-delete",
+        "let o = {a: 1}; Object.freeze(o); delete o.a; return o.a;",
+        "1",
+    );
+}
+
+/// **Sealing leaves the values writable** — that is the whole difference from freezing.
+#[test]
+fn seal_stops_extending_but_not_writing() {
+    check(
+        "seal-write",
+        "let o = {a: 1}; Object.seal(o); o.a = 2; return o.a;",
+        "2",
+    );
+    check(
+        "seal-extend",
+        "let o = {}; Object.seal(o); o.b = 1; return o.b;",
+        "undefined",
+    );
+    check(
+        "seal-is",
+        "let o = {}; Object.seal(o); return Object.isSealed(o);",
+        "true",
+    );
+    check(
+        "seal-not-frozen",
+        "let o = {a: 1}; Object.seal(o); return Object.isFrozen(o);",
+        "false",
+    );
+    check(
+        "prevent-extensions",
+        "let o = {}; Object.preventExtensions(o); o.a = 1; return o.a;",
+        "undefined",
+    );
+    check("is-extensible", "return Object.isExtensible({});", "true");
+    check(
+        "is-extensible-after",
+        "let o = {}; Object.preventExtensions(o); return Object.isExtensible(o);",
+        "false",
+    );
+}
+
+#[test]
+fn entries_and_from_entries_are_inverses() {
+    check(
+        "entries-length",
+        "return Object.entries({a: 1, b: 2}).length;",
+        "2",
+    );
+    check("entries-pair", "return Object.entries({a: 1})[0][0];", "a");
+    check("entries-value", "return Object.entries({a: 1})[0][1];", "1");
+    check(
+        "from-entries",
+        "return Object.fromEntries([[\"a\", 1], [\"b\", 2]]).b;",
+        "2",
+    );
+    check(
+        "entries-round-trip",
+        "let o = {a: 1, b: 2}; return Object.fromEntries(Object.entries(o)).a;",
+        "1",
+    );
+}
+
+/// **`Object.is` is neither `===` nor SameValueZero.** It is the only one of the three that
+/// separates the zeroes, and unlike `===` it says `NaN` is itself.
+#[test]
+fn object_is_separates_the_zeroes() {
+    check("is-nan", "return Object.is(0 / 0, 0 / 0);", "true");
+    check("is-zeroes", "return Object.is(0, -0);", "false");
+    check("is-strict-zeroes", "return 0 === -0;", "true");
+    check("is-same", "return Object.is(1, 1);", "true");
+    check("is-different", "return Object.is(1, 2);", "false");
+}
+
+/// **The `Number` predicates do no coercion; the globals do.** That is the whole difference,
+/// and it is why `isNaN("x")` is true while `Number.isNaN("x")` is false.
+#[test]
+fn the_number_predicates_do_not_coerce() {
+    check(
+        "number-isnan-string",
+        "return Number.isNaN(\"x\");",
+        "false",
+    );
+    check("global-isnan-string", "return isNaN(\"x\");", "true");
+    check("number-isnan", "return Number.isNaN(0 / 0);", "true");
+    check(
+        "number-isfinite-string",
+        "return Number.isFinite(\"1\");",
+        "false",
+    );
+    check("global-isfinite-string", "return isFinite(\"1\");", "true");
+    check("number-isinteger", "return Number.isInteger(1);", "true");
+    check(
+        "number-isinteger-fraction",
+        "return Number.isInteger(1.5);",
+        "false",
+    );
+    check(
+        "number-isinteger-string",
+        "return Number.isInteger(\"1\");",
+        "false",
+    );
+    check("number-issafe", "return Number.isSafeInteger(1);", "true");
+}
+
+/// **`parseInt` reads a prefix and stops**, where `Number` demands the whole string.
+#[test]
+fn parse_int_and_parse_float_read_a_prefix() {
+    check("parseint", "return parseInt(\"12\");", "12");
+    check("parseint-trailing", "return parseInt(\"12abc\");", "12");
+    check("number-whole", "return Number(\"12abc\");", "NaN");
+    check("parseint-radix", "return parseInt(\"ff\", 16);", "255");
+    check("parseint-hex-prefix", "return parseInt(\"0x10\");", "16");
+    check(
+        "parseint-hex-decimal",
+        "return parseInt(\"0x10\", 10);",
+        "0",
+    );
+    check("parseint-negative", "return parseInt(\"-42\");", "-42");
+    check("parseint-none", "return parseInt(\"abc\");", "NaN");
+    check("parsefloat", "return parseFloat(\"1.5rest\");", "1.5");
+    check("parsefloat-none", "return parseFloat(\"abc\");", "NaN");
+}
+
+#[test]
+fn number_constants_and_methods() {
+    check(
+        "number-max-safe",
+        "return Number.MAX_SAFE_INTEGER > 9007199254740990;",
+        "true",
+    );
+    check("number-epsilon", "return Number.EPSILON > 0;", "true");
+    check(
+        "number-infinity",
+        "return Number.POSITIVE_INFINITY;",
+        "Infinity",
+    );
+    check("number-tostring", "return (255).toString(16);", "ff");
+    check("number-tostring-binary", "return (5).toString(2);", "101");
+    check("number-tostring-default", "return (12).toString();", "12");
+    check("number-tofixed", "return (1.005).toFixed(2);", "1.00");
+    check("number-tofixed-zero", "return (1.5).toFixed(0);", "2");
+    check("number-valueof", "return (5).valueOf();", "5");
+    check("number-wrapper", "return new Number(7).valueOf();", "7");
+    check(
+        "number-wrapper-tostring",
+        "return new Number(7).toString();",
+        "7",
+    );
+}
+
+#[test]
+fn boolean_methods_and_wrappers() {
+    check("boolean-tostring", "return true.toString();", "true");
+    check("boolean-valueof", "return false.valueOf();", "false");
+    check(
+        "boolean-wrapper",
+        "return new Boolean(true).valueOf();",
+        "true",
+    );
+    check(
+        "boolean-wrapper-false",
+        "return new Boolean(false).toString();",
+        "false",
+    );
+    // A wrapper object is truthy whatever it wraps, which catches everyone once.
+    check(
+        "boolean-wrapper-truthy",
+        "return new Boolean(false) ? 1 : 0;",
+        "1",
+    );
+}
+
+#[test]
+fn string_statics_build_from_code_units_and_points() {
+    check(
+        "from-char-code",
+        "return String.fromCharCode(65, 66);",
+        "AB",
+    );
+    check("from-code-point", "return String.fromCodePoint(65);", "A");
+    // A code point beyond the basic plane is one argument here and two to `fromCharCode`.
+    check(
+        "from-code-point-astral",
+        "return String.fromCodePoint(128512).length;",
+        "2",
+    );
+}
+
+/// **`Date.UTC` answers a time value, not a date** — and a lone argument is a year.
+#[test]
+fn date_utc_and_parse() {
+    check("date-utc", "return Date.UTC(1970, 0, 1);", "0");
+    check("date-utc-day", "return Date.UTC(1970, 0, 2);", "86400000");
+    check(
+        "date-parse-iso",
+        "return Date.parse(\"1970-01-01T00:00:00.000Z\");",
+        "0",
+    );
+    check(
+        "date-parse-date-only",
+        "return Date.parse(\"1970-01-02\");",
+        "86400000",
+    );
+    check(
+        "date-parse-bad",
+        "return Date.parse(\"not a date\");",
+        "NaN",
+    );
+    check(
+        "date-parse-round-trip",
+        "return Date.parse(new Date(86400000).toISOString());",
+        "86400000",
+    );
+}

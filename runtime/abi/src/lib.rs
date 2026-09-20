@@ -597,6 +597,8 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(SET_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(SYMBOL_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(BOOLEAN_PROTOTYPE.with(std::cell::Cell::get));
         // Every registered symbol. `try_borrow` because this runs *during* a collection, which
         // may have been triggered from inside `Symbol.for` while the registry was borrowed —
         // and failing to root is better than panicking in the collector.
@@ -638,6 +640,11 @@ thread_local! {
     static SYMBOL_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The prototype every array iterator inherits from.
     static ARRAY_ITERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// The prototype every number inherits from.
+    static NUMBER_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every boolean inherits from.
+    static BOOLEAN_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// `Symbol.for`'s registry, keyed by the string a symbol was registered under.
     ///
@@ -1476,6 +1483,10 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Number", to_number_global),
     ("Boolean", to_boolean_global),
     ("Function", unconstructable),
+    ("parseInt", global_parse_int),
+    ("parseFloat", global_parse_float),
+    ("isNaN", global_is_nan),
+    ("isFinite", global_is_finite),
     ("RegExp", make_regexp),
     ("Date", make_date_object),
     ("Map", make_map),
@@ -1609,6 +1620,153 @@ extern "C" fn symbol_value_of(
     _argv: *const u64,
 ) -> u64 {
     this_value
+}
+
+/// Methods on `Number.prototype`.
+const NUMBER_NATIVES: &[(&str, Native)] = &[
+    ("toString", number_to_text),
+    ("toLocaleString", number_to_text),
+    ("valueOf", number_value_of),
+    ("toFixed", number_to_fixed),
+];
+
+/// Methods on `Boolean.prototype`.
+const BOOLEAN_NATIVES: &[(&str, Native)] =
+    &[("toString", boolean_to_text), ("valueOf", boolean_value_of)];
+
+/// The number a receiver stands for: itself, or the value its wrapper holds.
+///
+/// **An object receiver is read, not coerced.** `new Number(5).valueOf()` has to find the five
+/// the wrapper was built with, and coercing the wrapper would run its own `valueOf` — which is
+/// this function, and does not end (D-146).
+fn this_number(this_value: u64) -> f64 {
+    if handle_of(this_value).is_some() {
+        return property_number(this_value, STRING_PRIMITIVE).unwrap_or(f64::NAN);
+    }
+    to_number(this_value)
+}
+
+/// `Number.prototype.toString(radix)`.
+extern "C" fn number_to_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = this_number(this_value);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let radix = to_number(unsafe { argument(argc, argv, 0) });
+    if !radix.is_finite() || radix == 10.0 {
+        return new_string(&number_text(value));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked finite, and rejected below unless 2..=36"
+    )]
+    let radix = radix as u32;
+    if !(2..=36).contains(&radix) {
+        return raise("radix must be between 2 and 36", "RangeError");
+    }
+    if !value.is_finite() {
+        return new_string(&number_text(value));
+    }
+
+    // **Whole part only.** A fraction in another radix is a longer story than this needs, and
+    // truncating quietly would be worse than saying so here.
+    let negative = value < 0.0;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the fractional part is deliberately dropped"
+    )]
+    let mut whole = value.abs().trunc() as i64;
+    let mut digits = Vec::new();
+    if whole == 0 {
+        digits.push(b'0');
+    }
+    while whole > 0 {
+        let digit = u32::try_from(whole % i64::from(radix)).unwrap_or(0);
+        digits.push(char::from_digit(digit, radix).unwrap_or('0') as u8);
+        whole /= i64::from(radix);
+    }
+    if negative {
+        digits.push(b'-');
+    }
+    digits.reverse();
+    new_string(&String::from_utf8_lossy(&digits))
+}
+
+/// `Number.prototype.valueOf`.
+extern "C" fn number_value_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    from_number(this_number(this_value))
+}
+
+/// `Number.prototype.toFixed(digits)`.
+extern "C" fn number_to_fixed(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = this_number(this_value);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let digits = to_number(unsafe { argument(argc, argv, 0) });
+    let digits = if digits.is_finite() { digits } else { 0.0 };
+    if !(0.0..=100.0).contains(&digits) {
+        return raise("digits must be between 0 and 100", "RangeError");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "range-checked immediately above"
+    )]
+    let places = digits as usize;
+    if !value.is_finite() {
+        return new_string(&number_text(value));
+    }
+    new_string(&format!("{value:.places$}"))
+}
+
+/// The boolean a receiver stands for.
+fn this_boolean(this_value: u64) -> bool {
+    if handle_of(this_value).is_some() {
+        return property_number(this_value, STRING_PRIMITIVE).is_some_and(|held| held != 0.0);
+    }
+    is_truthy(Value::from_bits(this_value))
+}
+
+/// `Boolean.prototype.toString`.
+extern "C" fn boolean_to_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_string(if this_boolean(this_value) {
+        "true"
+    } else {
+        "false"
+    })
+}
+
+/// `Boolean.prototype.valueOf`.
+extern "C" fn boolean_value_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    boolean(this_boolean(this_value)).to_bits()
 }
 
 /// Methods on `Symbol.prototype`.
@@ -1844,7 +2002,7 @@ extern "C" fn to_string_global(
 /// `Number(value)`.
 extern "C" fn to_number_global(
     _closure: u64,
-    _this: u64,
+    this_value: u64,
     _new_target: u64,
     argc: u64,
     argv: *const u64,
@@ -1855,20 +2013,36 @@ extern "C" fn to_number_global(
     if argc == 0 {
         return Value::number(0.0).to_bits();
     }
-    from_number(to_number(value))
+    // A `new Number(…)` wrapper records what it wraps, so its methods have a value to read
+    // rather than coercing the wrapper and recursing (D-146).
+    let number = to_number(value);
+    if let Some(handle) = handle_of(this_value) {
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, STRING_PRIMITIVE, Value::number(number));
+        });
+    }
+    from_number(number)
 }
 
 /// `Boolean(value)`.
 extern "C" fn to_boolean_global(
     _closure: u64,
-    _this: u64,
+    this_value: u64,
     _new_target: u64,
     argc: u64,
     argv: *const u64,
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
-    crisol_truthy(value)
+    let truth = crisol_truthy(value);
+    // A `new Boolean(…)` wrapper records what it wraps, as the number and string ones do.
+    if let Some(handle) = handle_of(this_value) {
+        let held = f64::from(u8::from(Value::from_bits(truth) == Value::TRUE));
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, STRING_PRIMITIVE, Value::number(held));
+        });
+    }
+    truth
 }
 
 /// Built-ins reachable only as the body of a namespace object, not by any name.
@@ -2532,6 +2706,327 @@ extern "C" fn object_value_of(
     _argv: *const u64,
 ) -> u64 {
     this_value
+}
+
+/// `parseFloat(text)`.
+///
+/// **Reads a prefix and stops**, where `Number("12abc")` is `NaN`. That leniency is the whole
+/// difference between them, and it is why `parseFloat` is the wrong tool for validating input.
+extern "C" fn global_parse_float(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(text) = to_text(unsafe { argument(argc, argv, 0) }) else {
+        return from_number(f64::NAN);
+    };
+    let trimmed = text.trim_start();
+    // The longest prefix that parses. Walking down from the whole string is not the fastest
+    // way and is the one that cannot disagree with `f64`'s own parser about what it accepts.
+    let mut end = trimmed.len();
+    while end > 0 {
+        if let Ok(value) = trimmed[..end].parse::<f64>() {
+            return from_number(value);
+        }
+        end -= 1;
+    }
+    from_number(f64::NAN)
+}
+
+/// `parseInt(text, radix)`.
+extern "C" fn global_parse_int(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(text) = to_text(unsafe { argument(argc, argv, 0) }) else {
+        return from_number(f64::NAN);
+    };
+    // SAFETY: as above.
+    let asked = to_number(unsafe { argument(argc, argv, 1) });
+    let mut body = text.trim_start();
+
+    let negative = body.starts_with('-');
+    if negative || body.starts_with('+') {
+        body = &body[1..];
+    }
+    // **A leading `0x` means sixteen** unless a radix says otherwise, which is the rule that
+    // makes `parseInt("0x10")` sixteen and `parseInt("0x10", 10)` zero.
+    let mut radix = if asked.is_finite() && asked != 0.0 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "checked finite, and rejected below unless 2..=36"
+        )]
+        let given = asked as u32;
+        given
+    } else {
+        10
+    };
+    if (radix == 16 || !asked.is_finite() || asked == 0.0)
+        && (body.starts_with("0x") || body.starts_with("0X"))
+    {
+        body = &body[2..];
+        radix = 16;
+    }
+    if !(2..=36).contains(&radix) {
+        return from_number(f64::NAN);
+    }
+
+    // The longest prefix of digits valid in this radix, which is what makes `parseInt("12ab")`
+    // twelve rather than `NaN`.
+    let digits: String = body.chars().take_while(|c| c.is_digit(radix)).collect();
+    if digits.is_empty() {
+        return from_number(f64::NAN);
+    }
+    let mut value = 0.0_f64;
+    for character in digits.chars() {
+        let digit = character.to_digit(radix).unwrap_or(0);
+        value = value.mul_add(f64::from(radix), f64::from(digit));
+    }
+    from_number(if negative { -value } else { value })
+}
+
+/// `isNaN(value)` — **coerces first**, unlike `Number.isNaN`.
+extern "C" fn global_is_nan(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = to_number(unsafe { argument(argc, argv, 0) });
+    boolean(value.is_nan()).to_bits()
+}
+
+/// `isFinite(value)` — **coerces first**, unlike `Number.isFinite`.
+extern "C" fn global_is_finite(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = to_number(unsafe { argument(argc, argv, 0) });
+    boolean(value.is_finite()).to_bits()
+}
+
+/// `Date.UTC(year, month, …)`.
+///
+/// **Not `new Date(…)` with the same arguments**, though they look alike: this answers a time
+/// *value* rather than a date, and a single argument is a year rather than a time value.
+extern "C" fn date_utc(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let part = |position: usize, fallback: f64| -> f64 {
+        if (position as u64) < argc {
+            // SAFETY: the position was just checked against `argc`.
+            to_number(unsafe { argument(argc, argv, position) })
+        } else {
+            fallback
+        }
+    };
+    let year = part(0, f64::NAN);
+    let month = part(1, 0.0);
+    let day = part(2, 1.0);
+    if !year.is_finite() || !month.is_finite() || !day.is_finite() {
+        return from_number(f64::NAN);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "checked finite just above; TimeClip rejects anything out of range"
+    )]
+    let (year, month, day) = (year as i64, month as i64, day as i64);
+    from_number(crisol_builtins::time_from_civil(
+        year,
+        month,
+        day,
+        part(3, 0.0),
+        part(4, 0.0),
+        part(5, 0.0),
+        part(6, 0.0),
+    ))
+}
+
+/// `Date.parse(text)`.
+///
+/// **Only the ISO form**, which is the one the specification actually requires an
+/// implementation to accept. Everything else is implementation-defined, and answering `NaN` for
+/// a format this does not read is within that — inventing a guess would not be.
+extern "C" fn date_parse(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(text) = to_text(unsafe { argument(argc, argv, 0) }) else {
+        return from_number(f64::NAN);
+    };
+    from_number(parse_iso_date(&text).unwrap_or(f64::NAN))
+}
+
+/// Reads `YYYY-MM-DD` with an optional `THH:MM:SS.sssZ`.
+fn parse_iso_date(text: &str) -> Option<f64> {
+    let (date, time) = text.split_once('T').unwrap_or((text, ""));
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next().map_or(Some(1), |m| m.parse().ok())?;
+    let day: i64 = parts.next().map_or(Some(1), |d| d.parse().ok())?;
+
+    let clock = time.trim_end_matches('Z');
+    let mut fields = clock.split(':');
+    let hour: f64 = fields.next().map_or(Some(0.0), |h| {
+        if h.is_empty() {
+            Some(0.0)
+        } else {
+            h.parse().ok()
+        }
+    })?;
+    let minute: f64 = fields.next().map_or(Some(0.0), |m| m.parse().ok())?;
+    let second: f64 = fields.next().map_or(Some(0.0), |s| s.parse().ok())?;
+
+    // **Months are 1-based in the text and 0-based in the time value**, which is the one
+    // conversion this function exists to get right.
+    Some(crisol_builtins::time_from_civil(
+        year,
+        month - 1,
+        day,
+        hour,
+        minute,
+        second.trunc(),
+        (second.fract() * 1000.0).round(),
+    ))
+}
+
+/// `Number.isInteger`.
+///
+/// **A whole number, not a number that looks whole after coercion.** `Number.isInteger("1")` is
+/// false where `parseInt` would say one — these predicates do no conversion at all, which is
+/// what separates them from the global `isNaN` and `isFinite`.
+extern "C" fn number_is_integer(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = Value::from_bits(unsafe { argument(argc, argv, 0) });
+    boolean(
+        value
+            .as_number()
+            .is_some_and(|n| n.is_finite() && n.fract() == 0.0),
+    )
+    .to_bits()
+}
+
+/// `Number.isSafeInteger`.
+extern "C" fn number_is_safe_integer(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = Value::from_bits(unsafe { argument(argc, argv, 0) });
+    let safe = value.as_number().is_some_and(|n| {
+        n.is_finite() && n.fract() == 0.0 && n.abs() <= crisol_builtins::MAX_SAFE_INTEGER
+    });
+    boolean(safe).to_bits()
+}
+
+/// `Number.isFinite` — no coercion, unlike the global.
+extern "C" fn number_is_finite(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = Value::from_bits(unsafe { argument(argc, argv, 0) });
+    boolean(value.as_number().is_some_and(f64::is_finite)).to_bits()
+}
+
+/// `Number.isNaN` — no coercion, unlike the global.
+extern "C" fn number_is_nan(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = Value::from_bits(unsafe { argument(argc, argv, 0) });
+    boolean(value.as_number().is_some_and(f64::is_nan)).to_bits()
+}
+
+/// `String.fromCharCode(…)` — code *units*, so a surrogate pair takes two arguments.
+extern "C" fn string_from_char_code(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let units: Vec<u16> = (0..argc as usize)
+        .map(|position| {
+            // SAFETY: the convention guarantees `argc` readable values at `argv`.
+            let value = to_number(unsafe { argument(argc, argv, position) });
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the specification truncates to a 16-bit code unit"
+            )]
+            let unit = (value as i64 as u64 & 0xFFFF) as u16;
+            unit
+        })
+        .collect();
+    new_string(&String::from_utf16_lossy(&units))
+}
+
+/// `String.fromCodePoint(…)` — whole code points, so an emoji takes one argument.
+extern "C" fn string_from_code_point(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let mut out = String::new();
+    for position in 0..argc as usize {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        let value = to_number(unsafe { argument(argc, argv, position) });
+        if !value.is_finite() || value < 0.0 || value > 0x0010_FFFF as f64 {
+            return raise("code point is out of range", "RangeError");
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "range-checked immediately above"
+        )]
+        let point = value as u32;
+        match char::from_u32(point) {
+            Some(character) => out.push(character),
+            None => return raise("code point is not a character", "RangeError"),
+        }
+    }
+    new_string(&out)
 }
 
 /// `Date.now()`.
@@ -3562,6 +4057,16 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "getOwnPropertyNames", object_own_names),
     ("Object", "defineProperty", object_define_property),
     ("Date", "now", date_now),
+    ("Date", "UTC", date_utc),
+    ("Date", "parse", date_parse),
+    ("Number", "isInteger", number_is_integer),
+    ("Number", "isSafeInteger", number_is_safe_integer),
+    ("Number", "isFinite", number_is_finite),
+    ("Number", "isNaN", number_is_nan),
+    ("Number", "parseFloat", global_parse_float),
+    ("Number", "parseInt", global_parse_int),
+    ("String", "fromCharCode", string_from_char_code),
+    ("String", "fromCodePoint", string_from_code_point),
     ("JSON", "parse", json_parse),
     ("JSON", "stringify", json_stringify),
     ("Object", "getOwnPropertyDescriptor", object_own_descriptor),
@@ -3571,6 +4076,17 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "setPrototypeOf", object_set_prototype),
     ("Object", "hasOwn", object_has_own),
     ("Object", "assign", object_assign),
+    ("Object", "entries", object_entries),
+    ("Object", "fromEntries", object_from_entries),
+    ("Object", "freeze", object_freeze),
+    ("Object", "isFrozen", object_is_frozen),
+    ("Object", "seal", object_seal),
+    ("Object", "isSealed", object_is_sealed),
+    ("Object", "preventExtensions", object_prevent_extensions),
+    ("Object", "isExtensible", object_is_extensible),
+    ("Object", "defineProperties", object_define_properties),
+    ("Object", "is", object_is),
+    ("Object", "getOwnPropertySymbols", object_own_symbols),
     ("Array", "isArray", array_is_array),
     ("Array", "from", array_from),
     ("Symbol", "for", symbol_for),
@@ -4367,6 +4883,314 @@ fn map_into_array(values: &[u64], mapper: u64) -> u64 {
     })
 }
 
+/// Whether an object refuses new properties.
+///
+/// **Absent means extensible**, so an object nobody has frozen carries nothing. The flag is a
+/// hidden property for the same reason a date's time is (D-126): there is nowhere else to put
+/// one that `Object.keys` will not find.
+const NOT_EXTENSIBLE: &str = "__sealed";
+
+/// Whether `object` still accepts new properties.
+fn is_extensible(object: u64) -> bool {
+    property_number(object, NOT_EXTENSIBLE).is_none()
+}
+
+/// Stops `object` accepting new properties.
+fn prevent_extensions(object: u64) {
+    if let Some(handle) = handle_of(object) {
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, NOT_EXTENSIBLE, Value::number(1.0));
+        });
+    }
+}
+
+/// Applies `attributes` to every own property of `object`.
+fn restrict_own_properties(object: u64, writable: bool) {
+    let Some(handle) = handle_of(object) else {
+        return;
+    };
+    for name in own_keys(object) {
+        let Some((slot, _)) = own_property(object, &name) else {
+            continue;
+        };
+        with_runtime(|runtime| {
+            let current = runtime.heap.attributes_of(handle, slot);
+            runtime.heap.set_attributes(
+                handle,
+                slot,
+                crisol_value::Attributes {
+                    // **Freezing keeps enumerability**, so a frozen object still lists its
+                    // properties — it is the writing and the deleting that stop.
+                    writable: writable && current.writable,
+                    enumerable: current.enumerable,
+                    configurable: false,
+                },
+            );
+        });
+    }
+}
+
+/// `Object.freeze`.
+extern "C" fn object_freeze(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    if handle_of(target).is_some() {
+        restrict_own_properties(target, false);
+        prevent_extensions(target);
+    }
+    // **Answers its argument**, so `const o = Object.freeze({})` is the idiom it is.
+    target
+}
+
+/// `Object.seal` — like freezing, but the values may still change.
+extern "C" fn object_seal(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    if handle_of(target).is_some() {
+        restrict_own_properties(target, true);
+        prevent_extensions(target);
+    }
+    target
+}
+
+/// Whether every own property of `object` satisfies `ready`, and it is not extensible.
+fn all_properties_are(object: u64, ready: impl Fn(crisol_value::Attributes) -> bool) -> bool {
+    let Some(handle) = handle_of(object) else {
+        // **A primitive is frozen and sealed**, vacuously: it has no properties to change.
+        return true;
+    };
+    if is_extensible(object) {
+        return false;
+    }
+    own_keys(object).into_iter().all(|name| {
+        own_property(object, &name).is_none_or(|(slot, _)| {
+            ready(with_runtime(|runtime| {
+                runtime.heap.attributes_of(handle, slot)
+            }))
+        })
+    })
+}
+
+/// `Object.isFrozen`.
+extern "C" fn object_is_frozen(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    boolean(all_properties_are(target, |attributes| {
+        !attributes.writable && !attributes.configurable
+    }))
+    .to_bits()
+}
+
+/// `Object.isSealed`.
+extern "C" fn object_is_sealed(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    boolean(all_properties_are(target, |attributes| {
+        !attributes.configurable
+    }))
+    .to_bits()
+}
+
+/// `Object.preventExtensions`.
+extern "C" fn object_prevent_extensions(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    prevent_extensions(target);
+    target
+}
+
+/// `Object.isExtensible`.
+extern "C" fn object_is_extensible(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    // **A primitive is never extensible**, which is the opposite of it being vacuously frozen.
+    boolean(handle_of(target).is_some() && is_extensible(target)).to_bits()
+}
+
+/// `Object.entries` — `[key, value]` pairs, enumerable own properties only.
+extern "C" fn object_entries(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        let names = enumerable_keys(target);
+        with_new_array(names.len(), |array| {
+            for (index, name) in names.iter().enumerate() {
+                // Built and stored one at a time: each pair allocates twice (D-127).
+                let key = name.clone();
+                // SAFETY: `key` is a live Rust string.
+                let value = unsafe { crisol_property_load(target, key.as_ptr(), key.len() as u64) };
+                let pair = with_rooted(&[value], || {
+                    let text = new_string(name);
+                    with_rooted(&[text], || array_of_values(&[text, value]))
+                });
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(array, index, Value::from_bits(pair));
+                });
+            }
+            array.to_value().to_bits()
+        })
+    })
+}
+
+/// `Object.fromEntries` — the inverse of `entries`.
+extern "C" fn object_from_entries(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let source = unsafe { argument(argc, argv, 0) };
+        let object = crisol_create_object();
+        with_rooted(&[object, source], || {
+            let Some((pairs, length)) = elements_of(source) else {
+                return;
+            };
+            let Some(handle) = handle_of(object) else {
+                return;
+            };
+            for index in 0..length {
+                let pair = element_at(pairs, index);
+                let Some((entry, _)) = elements_of(pair) else {
+                    continue;
+                };
+                let Some(name) = to_text(element_at(entry, 0)) else {
+                    continue;
+                };
+                let value = element_at(entry, 1);
+                with_runtime(|runtime| {
+                    runtime.define(handle, &name, Value::from_bits(value));
+                });
+            }
+        });
+        object
+    })
+}
+
+/// `Object.defineProperties`.
+extern "C" fn object_define_properties(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let descriptors = unsafe { argument(argc, argv, 1) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        for name in enumerable_keys(descriptors) {
+            let key = name.clone();
+            // SAFETY: `key` is a live Rust string.
+            let descriptor =
+                unsafe { crisol_property_load(descriptors, key.as_ptr(), key.len() as u64) };
+            let text = new_string(&name);
+            let arguments = [target, text, descriptor];
+            let outcome = with_rooted(&arguments, || {
+                object_define_property(0, 0, 0, 3, arguments.as_ptr())
+            });
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
+            }
+        }
+        target
+    })
+}
+
+/// `Object.is` — SameValue.
+///
+/// **Not `===` and not SameValueZero.** `Object.is(NaN, NaN)` is true where `===` says false,
+/// and `Object.is(0, -0)` is *false* where both of the others say true. It is the only one of
+/// the three that separates the zeroes.
+extern "C" fn object_is(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let left = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let right = unsafe { argument(argc, argv, 1) };
+    let (a, b) = (Value::from_bits(left), Value::from_bits(right));
+    let same = match (a.as_number(), b.as_number()) {
+        (Some(x), Some(y)) if x.is_nan() && y.is_nan() => true,
+        // The sign is what distinguishes this from SameValueZero.
+        (Some(x), Some(y)) => x == y && x.is_sign_negative() == y.is_sign_negative(),
+        _ => same_value(a, b),
+    };
+    boolean(same).to_bits()
+}
+
+/// `Object.getOwnPropertySymbols`.
+///
+/// **Always empty**, and honestly so: a property key cannot be a symbol yet (D-149), so no
+/// object has a symbol-keyed property for this to find. It exists because a program that calls
+/// it should get an array rather than a `TypeError`.
+extern "C" fn object_own_symbols(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    array_of_values(&[])
+}
+
 /// `Array.isArray(value)`.
 extern "C" fn array_is_array(
     _closure: u64,
@@ -4645,6 +5469,8 @@ impl Runtime {
             ("Map", MAP_PROTOTYPE.with(std::cell::Cell::get)),
             ("Set", SET_PROTOTYPE.with(std::cell::Cell::get)),
             ("Symbol", SYMBOL_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Number", NUMBER_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Boolean", BOOLEAN_PROTOTYPE.with(std::cell::Cell::get)),
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -4673,6 +5499,22 @@ impl Runtime {
         // `Math`'s constants, which are properties rather than functions and so have no table
         // entry. The object itself already exists: naming a method in `NAMESPACE_NATIVES` is
         // what creates it.
+        // `Number`'s constants, which are properties rather than functions.
+        if let Some(number) = self.global_object(globals.handle(), "Number") {
+            for (name, value) in [
+                ("MAX_SAFE_INTEGER", crisol_builtins::MAX_SAFE_INTEGER),
+                ("MIN_SAFE_INTEGER", -crisol_builtins::MAX_SAFE_INTEGER),
+                ("MAX_VALUE", f64::MAX),
+                ("MIN_VALUE", f64::MIN_POSITIVE),
+                ("EPSILON", f64::EPSILON),
+                ("POSITIVE_INFINITY", f64::INFINITY),
+                ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+                ("NaN", f64::NAN),
+            ] {
+                self.define(number, name, Value::number(value));
+            }
+        }
+
         if let Some(math) = self.global_object(globals.handle(), "Math") {
             for (name, value) in [
                 ("PI", std::f64::consts::PI),
@@ -4957,6 +5799,23 @@ impl Runtime {
                 ARRAY_ITERATOR_NATIVES,
                 MAP_NATIVES.len() + SET_NATIVES.len() + SYMBOL_NATIVES.len(),
             ),
+            (
+                &NUMBER_PROTOTYPE,
+                NUMBER_NATIVES,
+                MAP_NATIVES.len()
+                    + SET_NATIVES.len()
+                    + SYMBOL_NATIVES.len()
+                    + ARRAY_ITERATOR_NATIVES.len(),
+            ),
+            (
+                &BOOLEAN_PROTOTYPE,
+                BOOLEAN_NATIVES,
+                MAP_NATIVES.len()
+                    + SET_NATIVES.len()
+                    + SYMBOL_NATIVES.len()
+                    + ARRAY_ITERATOR_NATIVES.len()
+                    + NUMBER_NATIVES.len(),
+            ),
         ] {
             let shape = self.shapes.borrow().root();
             let scope = self.heap.scope();
@@ -5055,6 +5914,12 @@ pub unsafe extern "C" fn crisol_property_store(
     };
     let key = PropertyKey::new(&name);
 
+    // **A non-extensible object refuses a property it does not already have.** Silently,
+    // outside strict mode — the same rule a non-writable property follows, and the reason
+    // `Object.freeze` is worth anything at all.
+    if own_property(object, &name).is_none() && !is_extensible(object) {
+        return Value::UNDEFINED.to_bits();
+    }
     with_runtime(|runtime| {
         let Some(current) = runtime.heap.shape_of(handle) else {
             return;
@@ -6246,7 +7111,15 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + SYMBOL_NATIVES.len();
-        return ARRAY_ITERATOR_NATIVES
+        if let Some((_, function)) = ARRAY_ITERATOR_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + ARRAY_ITERATOR_NATIVES.len();
+        if let Some((_, function)) = NUMBER_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + NUMBER_NATIVES.len();
+        return BOOLEAN_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }

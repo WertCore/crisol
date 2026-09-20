@@ -4470,3 +4470,49 @@ Two gaps, both the same shape and both waiting on symbols as property keys (D-14
 
 `{value, done}` every time, and **`done` stays `true` once reached** — an exhausted iterator does
 not restart, which is what lets a caller loop on `done` without counting.
+
+## D-151
+
+**`Object.freeze` needed somewhere to keep "no new properties".**
+
+Status: Accepted
+
+Descriptors (D-116) already say what a *property* permits. Extensibility is a fact about the
+**object**, and there was nowhere to put it — so it is a hidden property, for the same reason a
+date's time value is one (D-126): internal slots do not exist and `Object.keys` must not see it.
+Absent means extensible, so an object nobody has frozen carries nothing.
+
+A non-extensible object refuses a property it does not already have, **silently** — the same
+rule a non-writable property follows outside strict mode, and the reason `Object.freeze` is
+worth anything at all.
+
+**Freezing keeps enumerability.** A frozen object still lists its properties; it is the writing
+and the deleting that stop. **Sealing leaves the values writable**, which is the whole
+difference between the two.
+
+**A primitive is frozen and sealed vacuously but never extensible** — it has no properties to
+change, and none can be added. Those two answers look contradictory and both follow from the
+same fact.
+
+## D-152
+
+**Three ways to compare, and the differences are the point.**
+
+Status: Accepted
+
+`Object.is` joins `===` and SameValueZero, and no two of the three agree:
+
+| | `NaN, NaN` | `0, -0` |
+|---|---|---|
+| `===` | false | true |
+| SameValueZero (`includes`, `Map`) | true | true |
+| `Object.is` | true | **false** |
+
+`Object.is` is the only one that separates the zeroes. Implementing it as "`===` with a `NaN`
+special case" would have been wrong in exactly one cell of that table, and the test pins it.
+
+**The `Number` predicates do no coercion where the globals do**: `isNaN("x")` is true and
+`Number.isNaN("x")` is false, because the first asks *"is this not a number"* after converting
+and the second asks *"is this the value `NaN`"*. **`parseInt` reads a prefix and stops** where
+`Number` demands the whole string — `parseInt("12abc")` is twelve and `Number("12abc")` is
+`NaN`.
