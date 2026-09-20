@@ -3931,3 +3931,192 @@ fn a_symbol_survives_collection() {
         "true",
     );
 }
+
+// ---- more array methods ----------------------------------------------------------------
+
+/// **The copying counterparts leave the original alone**, which is the whole reason they exist
+/// alongside `reverse`, `sort` and `splice`.
+#[test]
+fn the_copying_array_methods_do_not_mutate() {
+    check(
+        "to-reversed",
+        "return [1, 2, 3].toReversed().join(\",\");",
+        "3,2,1",
+    );
+    check(
+        "to-reversed-original",
+        "let a = [1, 2, 3]; a.toReversed(); return a.join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "to-sorted",
+        "return [3, 1, 2].toSorted().join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "to-sorted-original",
+        "let a = [3, 1, 2]; a.toSorted(); return a.join(\",\");",
+        "3,1,2",
+    );
+    check(
+        "to-sorted-comparator",
+        "return [10, 9].toSorted(function (x, y) { return x - y; }).join(\",\");",
+        "9,10",
+    );
+    check(
+        "to-spliced",
+        "return [1, 2, 3].toSpliced(1, 1).join(\",\");",
+        "1,3",
+    );
+    check(
+        "to-spliced-insert",
+        "return [1, 4].toSpliced(1, 0, 2, 3).join(\",\");",
+        "1,2,3,4",
+    );
+    check(
+        "to-spliced-original",
+        "let a = [1, 2, 3]; a.toSpliced(1, 1); return a.length;",
+        "3",
+    );
+    check(
+        "array-with",
+        "return [1, 2, 3].with(1, 9).join(\",\");",
+        "1,9,3",
+    );
+    check(
+        "array-with-negative",
+        "return [1, 2, 3].with(-1, 9).join(\",\");",
+        "1,2,9",
+    );
+    check(
+        "array-with-original",
+        "let a = [1, 2, 3]; a.with(1, 9); return a.join(\",\");",
+        "1,2,3",
+    );
+}
+
+/// **`with` raises out of range where `at` answers `undefined`** — it builds an array, and
+/// there is no array to build for an index that does not exist.
+#[test]
+fn with_refuses_an_index_that_is_not_there() {
+    check(
+        "with-out-of-range",
+        "let r = \"\"; try { [1, 2].with(5, 0); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check("at-out-of-range-still", "return [1, 2].at(5);", "undefined");
+}
+
+/// **`copyWithin` never changes the length** — a run copied past the end is truncated rather
+/// than growing the array.
+#[test]
+fn copy_within_moves_a_run_without_resizing() {
+    check(
+        "copy-within",
+        "return [1, 2, 3, 4, 5].copyWithin(0, 3).join(\",\");",
+        "4,5,3,4,5",
+    );
+    check(
+        "copy-within-length",
+        "return [1, 2, 3].copyWithin(0, 1).length;",
+        "3",
+    );
+    check(
+        "copy-within-end",
+        "return [1, 2, 3, 4].copyWithin(0, 1, 3).join(\",\");",
+        "2,3,3,4",
+    );
+    // Overlapping runs read before they write.
+    check(
+        "copy-within-overlap",
+        "return [1, 2, 3, 4].copyWithin(1, 0).join(\",\");",
+        "1,1,2,3",
+    );
+}
+
+#[test]
+fn array_from_takes_an_array_like_or_a_string() {
+    check("from-array", "return Array.from([1, 2]).length;", "2");
+    check(
+        "from-string",
+        "return Array.from(\"abc\").join(\",\");",
+        "a,b,c",
+    );
+    check(
+        "from-array-like",
+        "return Array.from({length: 2, 0: \"a\", 1: \"b\"}).join(\",\");",
+        "a,b",
+    );
+    check(
+        "from-mapper",
+        "return Array.from([1, 2], function (x) { return x * 2; }).join(\",\");",
+        "2,4",
+    );
+    check("from-empty", "return Array.from({length: 0}).length;", "0");
+    // A copy, not the same array.
+    check(
+        "from-copies",
+        "let a = [1]; let b = Array.from(a); b.push(2); return a.length;",
+        "1",
+    );
+}
+
+/// **`Array.of` is not `Array`** — `Array(3)` is three elements and `Array.of(3)` is one.
+#[test]
+fn array_of_takes_its_arguments_as_elements() {
+    check("of-one", "return Array.of(3).length;", "1");
+    check("of-many", "return Array.of(1, 2, 3).join(\",\");", "1,2,3");
+    check("of-none", "return Array.of().length;", "0");
+}
+
+/// **`{value, done}` every time, and `done` stays `true` once reached** — an exhausted iterator
+/// does not restart, which is what lets a caller loop on `done` without counting.
+#[test]
+fn an_array_iterator_walks_and_then_stops() {
+    check("values-first", "return [7, 8].values().next().value;", "7");
+    check(
+        "values-not-done",
+        "return [7].values().next().done;",
+        "false",
+    );
+    check(
+        "values-second",
+        "let it = [7, 8].values(); it.next(); return it.next().value;",
+        "8",
+    );
+    check(
+        "values-exhausted",
+        "let it = [7].values(); it.next(); return it.next().done;",
+        "true",
+    );
+    check(
+        "values-stays-done",
+        "let it = [].values(); it.next(); return it.next().done;",
+        "true",
+    );
+    check(
+        "values-exhausted-value",
+        "let it = [7].values(); it.next(); return it.next().value;",
+        "undefined",
+    );
+}
+
+#[test]
+fn keys_and_entries_walk_positions_and_pairs() {
+    check("keys-first", "return [7, 8].keys().next().value;", "0");
+    check(
+        "entries-index",
+        "return [7, 8].entries().next().value[0];",
+        "0",
+    );
+    check(
+        "entries-value",
+        "return [7, 8].entries().next().value[1];",
+        "7",
+    );
+    check(
+        "keys-second",
+        "let it = [7, 8].keys(); it.next(); return it.next().value;",
+        "1",
+    );
+}

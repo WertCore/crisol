@@ -4441,3 +4441,32 @@ wrapper, so `obj[Symbol.iterator]` cannot name a symbol. The well-known symbols 
 so that reading `Symbol.iterator` yields a symbol rather than `undefined` — what most feature
 tests check — and so the values are already the right ones when keys learn about symbols. Until
 then this is also what blocks `Map`/`Set` iterators and user-defined iterables (D-120, D-148).
+
+## D-150
+
+**The rest of `Array.prototype`, and two gaps that are symbol-shaped.**
+
+Status: Accepted
+
+`toReversed`, `toSorted`, `toSpliced` and `with` — **the copying counterparts leave the original
+alone**, which is the whole reason they exist beside `reverse`, `sort` and `splice`. `toSorted`
+routes through the same sort the in-place one uses, so the two cannot drift apart on the default
+text ordering or on where `undefined` lands.
+
+**`with` raises out of range where `at` answers `undefined`**: it builds an array, and there is
+no array to build for an index that does not exist.
+
+**`copyWithin` never changes the length** — a run copied past the end is truncated, not grown —
+and it reads the source run before writing, because source and destination can overlap and
+copying forwards in place would read values it had already overwritten.
+
+Two gaps, both the same shape and both waiting on symbols as property keys (D-149):
+
+- **`Array.from` cannot take a user-defined iterable.** The specification asks for an iterator
+  first and falls back to `length`; with no `Symbol.iterator` to look up there is nothing to
+  ask. An array, a string or any array-like works; something merely *iterable* answers empty.
+- **`keys`, `values` and `entries` return objects with `next`, which `for-of` cannot find.**
+  Calling them directly works, which is what most of test262's coverage of these methods does.
+
+`{value, done}` every time, and **`done` stays `true` once reached** — an exhausted iterator does
+not restart, which is what lets a caller loop on `done` without counting.

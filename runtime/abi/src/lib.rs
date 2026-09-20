@@ -596,6 +596,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(MAP_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(SET_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(SYMBOL_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         // Every registered symbol. `try_borrow` because this runs *during* a collection, which
         // may have been triggered from inside `Symbol.for` while the registry was borrowed —
         // and failing to root is better than panicking in the collector.
@@ -635,6 +636,9 @@ thread_local! {
     static SET_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The prototype every symbol inherits from.
     static SYMBOL_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every array iterator inherits from.
+    static ARRAY_ITERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
     /// `Symbol.for`'s registry, keyed by the string a symbol was registered under.
     ///
     /// Rooted, and that is the specification's design: a registered symbol must come back for
@@ -690,7 +694,326 @@ const NATIVES: &[(&str, Native)] = &[
     ("splice", array_splice),
     ("toString", array_to_text),
     ("toLocaleString", array_to_text),
+    ("copyWithin", array_copy_within),
+    ("toReversed", array_to_reversed),
+    ("toSorted", array_to_sorted),
+    ("toSpliced", array_to_spliced),
+    ("with", array_with),
+    ("keys", array_keys),
+    ("values", array_values),
+    ("entries", array_entries),
 ];
+
+/// What an array iterator walks: its positions, its elements, or both.
+const ITERATOR_KIND: &str = "__kind";
+/// What an array iterator walks over.
+const ITERATOR_TARGET: &str = "__target";
+/// How far an array iterator has got.
+const ITERATOR_POSITION: &str = "__position";
+
+/// Builds an iterator over `target`.
+///
+/// **A real object with a `next`, not a language-level iterator.** `for-of` cannot find it,
+/// because finding it means looking up `Symbol.iterator` and a property key cannot be a symbol
+/// yet (D-149). What it *can* do is be called directly, which is what
+/// `const it = a.values(); it.next()` does and what most of test262's coverage of these
+/// methods checks.
+fn new_array_iterator(target: u64, kind: f64) -> u64 {
+    let iterator = crisol_create_object();
+    with_rooted(&[iterator, target], || {
+        let Some(handle) = handle_of(iterator) else {
+            return;
+        };
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, ITERATOR_TARGET, Value::from_bits(target));
+            runtime.define_hidden(handle, ITERATOR_POSITION, Value::number(0.0));
+            runtime.define_hidden(handle, ITERATOR_KIND, Value::number(kind));
+            if let Some(prototype) = ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+                runtime.heap.set_prototype(handle, Some(prototype));
+            }
+        });
+    });
+    iterator
+}
+
+/// `Array.prototype.keys`.
+extern "C" fn array_keys(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_array_iterator(this_value, 0.0)
+}
+
+/// `Array.prototype.values`.
+extern "C" fn array_values(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_array_iterator(this_value, 1.0)
+}
+
+/// `Array.prototype.entries`.
+extern "C" fn array_entries(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_array_iterator(this_value, 2.0)
+}
+
+/// Methods on the array iterator's prototype.
+const ARRAY_ITERATOR_NATIVES: &[(&str, Native)] = &[("next", array_iterator_next)];
+
+/// `next()` on an array iterator.
+///
+/// **`{value, done}` every time, and `done` stays `true` once reached.** An exhausted iterator
+/// answers `{value: undefined, done: true}` for ever rather than restarting, which is what lets
+/// a caller loop on `done` without counting.
+///
+/// The length is re-read on each step, so an array that shrinks mid-iteration ends the walk
+/// rather than reading past its end.
+extern "C" fn array_iterator_next(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let target = {
+        let key = ITERATOR_TARGET.to_owned();
+        // SAFETY: `key` is a live Rust string.
+        unsafe { crisol_property_load(this_value, key.as_ptr(), key.len() as u64) }
+    };
+    let position = property_number(this_value, ITERATOR_POSITION).unwrap_or(0.0);
+    let kind = property_number(this_value, ITERATOR_KIND).unwrap_or(1.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a position this code wrote, always a non-negative whole number"
+    )]
+    let at = position as usize;
+
+    with_rooted(&[this_value, target], || {
+        let length = elements_of(target).map_or(0, |(_, len)| len);
+        let result = crisol_create_object();
+        with_rooted(&[result], || {
+            let Some(into) = handle_of(result) else {
+                return;
+            };
+            if at >= length {
+                with_runtime(|runtime| {
+                    runtime.define(into, "value", Value::UNDEFINED);
+                    runtime.define(into, "done", Value::TRUE);
+                });
+                return;
+            }
+            let Some((array, _)) = elements_of(target) else {
+                return;
+            };
+            // Built and stored one at a time, because each allocates (D-127).
+            let value = if kind == 0.0 {
+                index_value(at)
+            } else if kind == 2.0 {
+                array_of_values(&[index_value(at), element_at(array, at)])
+            } else {
+                element_at(array, at)
+            };
+            with_runtime(|runtime| {
+                runtime.define(into, "value", Value::from_bits(value));
+                runtime.define(into, "done", Value::FALSE);
+            });
+            #[expect(clippy::cast_precision_loss, reason = "an index into an array")]
+            let next = (at + 1) as f64;
+            if let Some(handle) = handle_of(this_value) {
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, ITERATOR_POSITION, Value::number(next));
+                });
+            }
+        });
+        result
+    })
+}
+
+/// `Array.prototype.copyWithin` — moves a run within the array, in place.
+///
+/// **The length never changes.** A run copied past the end is truncated rather than growing the
+/// array, which is what separates this from `splice`.
+extern "C" fn array_copy_within(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return this_value;
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    // SAFETY: as above.
+    let start = relative_index(unsafe { argument(argc, argv, 1) }, length, 0);
+    // SAFETY: as above.
+    let end = relative_index(unsafe { argument(argc, argv, 2) }, length, length);
+
+    let taken = end.saturating_sub(start).min(length - target);
+    // Read before writing, because the source and destination runs may overlap — copying in
+    // place forwards would read values it had already overwritten.
+    let moved: Vec<u64> = (0..taken).map(|at| element_at(array, start + at)).collect();
+    with_runtime(|runtime| {
+        for (at, value) in moved.iter().enumerate() {
+            runtime
+                .heap
+                .set_element(array, target + at, Value::from_bits(*value));
+        }
+    });
+    this_value
+}
+
+/// `Array.prototype.toReversed` — a reversed copy.
+///
+/// **The copying counterparts leave the original alone**, which is the whole of why they exist
+/// alongside `reverse`, `sort` and `splice`.
+extern "C" fn array_to_reversed(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    with_rooted(&[this_value], || {
+        let reversed: Vec<u64> = (0..length)
+            .rev()
+            .map(|index| element_at(array, index))
+            .collect();
+        array_of_values(&reversed)
+    })
+}
+
+/// `Array.prototype.toSorted` — a sorted copy.
+extern "C" fn array_to_sorted(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    let copy = with_rooted(&live, || {
+        let values: Vec<u64> = (0..length).map(|index| element_at(array, index)).collect();
+        array_of_values(&values)
+    });
+    // Sorted through the same code the in-place sort uses, so the two cannot drift apart on
+    // the default ordering or on where `undefined` lands.
+    with_rooted(&[copy], || {
+        array_sort(0, copy, 0, argc, argv);
+        copy
+    })
+}
+
+/// `Array.prototype.toSpliced` — a copy with a run replaced.
+extern "C" fn array_to_spliced(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    let removing = if argc < 2 {
+        length - start
+    } else {
+        // SAFETY: as above.
+        let asked = Value::from_bits(unsafe { argument(argc, argv, 1) })
+            .as_number()
+            .unwrap_or(0.0);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped into 0..=remaining"
+        )]
+        let count = asked.max(0.0) as usize;
+        count.min(length - start)
+    };
+
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let mut built: Vec<u64> = (0..start).map(|index| element_at(array, index)).collect();
+        for position in 2..argc as usize {
+            // SAFETY: as above.
+            built.push(unsafe { argument(argc, argv, position) });
+        }
+        built.extend((start + removing..length).map(|index| element_at(array, index)));
+        array_of_values(&built)
+    })
+}
+
+/// `Array.prototype.with` — a copy with one index replaced.
+extern "C" fn array_with(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((array, length)) = elements_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) })
+        .as_number()
+        .unwrap_or(0.0);
+    #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+    let span = length as f64;
+    let resolved = if wanted < 0.0 { span + wanted } else { wanted };
+    // **Out of range is a `RangeError`**, where `at` answers `undefined` — this one builds an
+    // array and there is no array to build for an index that does not exist.
+    if resolved < 0.0 || resolved >= span || wanted.is_nan() {
+        return raise("index is out of range", "RangeError");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked against both ends just above"
+    )]
+    let at = resolved as usize;
+    // SAFETY: as above.
+    let replacement = unsafe { argument(argc, argv, 1) };
+
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let values: Vec<u64> = (0..length)
+            .map(|index| {
+                if index == at {
+                    replacement
+                } else {
+                    element_at(array, index)
+                }
+            })
+            .collect();
+        array_of_values(&values)
+    })
+}
 
 /// A stable merge sort over `values`, ordered by `before`.
 ///
@@ -3243,6 +3566,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "hasOwn", object_has_own),
     ("Object", "assign", object_assign),
     ("Array", "isArray", array_is_array),
+    ("Array", "from", array_from),
     ("Symbol", "for", symbol_for),
     ("Symbol", "keyFor", symbol_key_for),
     ("Math", "abs", math_abs),
@@ -3937,6 +4261,87 @@ extern "C" fn math_random(
     })
 }
 
+/// `Array.from(source, mapper?)`.
+///
+/// **Array-like before iterable.** The specification asks for an iterator first and falls back
+/// to `length` — without `Symbol.iterator` usable as a key (D-149) there is nothing to ask, so
+/// this takes what `for-of` takes (an array or a string) and otherwise reads `length` and
+/// indexes, which covers any `{length, 0, 1, …}`. A user-defined iterable that is not
+/// array-like answers an empty array rather than its elements: a gap, not a decision.
+extern "C" fn array_from(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let source = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let mapper = unsafe { argument(argc, argv, 1) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(source, argc, argv) };
+    with_rooted(&live, || {
+        let values: Vec<u64> = match elements_of(source) {
+            Some((array, length)) => (0..length).map(|index| element_at(array, index)).collect(),
+            None if Value::from_bits(source).kind() == crisol_value::Kind::String => {
+                let taken = crisol_iterate(source);
+                match elements_of(taken) {
+                    Some((array, length)) => {
+                        (0..length).map(|index| element_at(array, index)).collect()
+                    }
+                    None => Vec::new(),
+                }
+            }
+            None => {
+                // Array-like: `length` and indices.
+                let count = property_number(source, "length").unwrap_or(0.0);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped to a length no array can exceed"
+                )]
+                let count = count.max(0.0).min(f64::from(u32::MAX)) as usize;
+                (0..count)
+                    .map(|index| {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "an index below the clamp above"
+                        )]
+                        let key = number_text(index as f64);
+                        // SAFETY: `key` is a live Rust string.
+                        unsafe { crisol_property_load(source, key.as_ptr(), key.len() as u64) }
+                    })
+                    .collect()
+            }
+        };
+
+        if !is_callable(mapper) {
+            return array_of_values(&values);
+        }
+        // Mapped into a rooted array one at a time: the callback allocates, and a `Vec` of
+        // results is invisible to the collector (D-127).
+        with_new_array(values.len(), |mapped| {
+            for (index, value) in values.iter().enumerate() {
+                let result = call_value(
+                    mapper,
+                    Value::UNDEFINED.to_bits(),
+                    &[*value, index_value(index)],
+                );
+                if Value::from_bits(result).is_exception() {
+                    return result;
+                }
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(mapped, index, Value::from_bits(result));
+                });
+            }
+            mapped.to_value().to_bits()
+        })
+    })
+}
+
 /// `Array.isArray(value)`.
 extern "C" fn array_is_array(
     _closure: u64,
@@ -4521,6 +4926,11 @@ impl Runtime {
                 &SYMBOL_PROTOTYPE,
                 SYMBOL_NATIVES,
                 MAP_NATIVES.len() + SET_NATIVES.len(),
+            ),
+            (
+                &ARRAY_ITERATOR_PROTOTYPE,
+                ARRAY_ITERATOR_NATIVES,
+                MAP_NATIVES.len() + SET_NATIVES.len() + SYMBOL_NATIVES.len(),
             ),
         ] {
             let shape = self.shapes.borrow().root();
@@ -5807,7 +6217,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + SET_NATIVES.len();
-        return SYMBOL_NATIVES
+        if let Some((_, function)) = SYMBOL_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + SYMBOL_NATIVES.len();
+        return ARRAY_ITERATOR_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
