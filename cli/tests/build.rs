@@ -4722,3 +4722,24 @@ fn index_of_finds_a_string() {
     );
     check("indexof-object-not-equal", "return [{}].indexOf({});", "-1");
 }
+
+/// **2^32 is not a length**, so a method that builds a result sized by it has to say so rather
+/// than try. Walking such a thing is merely slow; building one is four billion allocations, and
+/// that arrived as a killed process rather than an error a program could catch.
+#[test]
+fn an_impossible_length_raises_rather_than_allocating() {
+    check(
+        "map-length-too-big",
+        "let o = {0: 12, length: 4294967296}; let r = \"\"; \
+         try { Array.prototype.map.call(o, function (v) { return v; }); } \
+         catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    // A length an array could have still works.
+    check(
+        "map-length-ok",
+        "let o = {0: 1, 1: 2, length: 2}; \
+         return Array.prototype.map.call(o, function (v) { return v * 2; }).join(\",\");",
+        "2,4",
+    );
+}

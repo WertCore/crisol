@@ -6574,6 +6574,19 @@ fn indexed_length(value: u64) -> usize {
     length
 }
 
+/// Whether an array-like's `length` is one an array could actually have.
+///
+/// **2^32 is not a length**, and a method that builds a result sized by it has to say so rather
+/// than try. `indexed_length` clamps, which is right for walking — it keeps a loop finite — and
+/// wrong for allocating, because the clamped value looks buildable and is not. So the question
+/// is asked separately by the methods that allocate.
+fn indexed_length_is_valid(value: u64) -> bool {
+    if elements_of(value).is_some() {
+        return true;
+    }
+    property_number(value, "length").is_none_or(|length| length < 4_294_967_296.0)
+}
+
 /// The element at `index` of an array-like.
 fn indexed_get(value: u64, index: usize) -> u64 {
     if let Some((array, length)) = elements_of(value) {
@@ -6606,6 +6619,12 @@ extern "C" fn array_map(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
+        // **A length of 2^32 or more is a `RangeError`**, because the result cannot exist.
+        // Walking such a thing is merely slow; building one is four billion allocations, and
+        // that arrived as a killed process rather than an error a program could catch.
+        if !indexed_length_is_valid(this_value) {
+            return raise("invalid array length", "RangeError");
+        }
         let length = indexed_length(this_value);
         // SAFETY: the convention guarantees `argc` readable values at `argv`.
         let callback = unsafe { argument(argc, argv, 0) };
