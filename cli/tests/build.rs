@@ -4379,6 +4379,19 @@ fn date_utc_and_parse() {
 /// a cell — which is why the gap only appeared once the other two grew methods worth reaching.
 #[test]
 fn a_primitive_number_or_boolean_reaches_its_prototype() {
+    // Ordered to separate two causes that look identical from outside: if the prototype itself
+    // is empty the first fails, and if only the primitive cannot reach a prototype that is
+    // fine, the second does.
+    check(
+        "proto-has-tostring",
+        "return typeof Number.prototype.toString;",
+        "function",
+    );
+    check(
+        "primitive-finds-tostring",
+        "return typeof (255).toString;",
+        "function",
+    );
     check(
         "primitive-number-method",
         "return (255).toString(16);",
