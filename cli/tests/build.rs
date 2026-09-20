@@ -6198,3 +6198,55 @@ fn an_error_reports_its_class() {
         "message",
     );
 }
+
+/// `Object.assign` uses the throwing form of `Set`, so a read-only property on the target is
+/// a `TypeError` rather than a write that quietly does nothing.
+#[test]
+fn assign_refuses_a_read_only_target() {
+    check(
+        "assign-read-only",
+        "let t = {}; Object.defineProperty(t, \"x\", {value: 1, writable: false}); \
+         try { Object.assign(t, {x: 2}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A sealed target keeps its properties writable, so assigning to one still works.
+    check(
+        "assign-sealed-target",
+        "let t = Object.seal({x: 1}); Object.assign(t, {x: 2}); return t.x;",
+        "2",
+    );
+    // A setter may accept the write, so an accessor is not refused here.
+    check(
+        "assign-through-a-setter",
+        "let seen = 0; let t = {}; \
+         t.__defineSetter__(\"x\", function (v) { seen = v; }); \
+         Object.assign(t, {x: 5}); return seen;",
+        "5",
+    );
+}
+
+/// **A deleted property is absent**, even though the shape still names its slot — which is
+/// the whole point of the tombstone. Answering from the slot handed back the permissions the
+/// property had before it went.
+#[test]
+fn a_deleted_property_is_gone_from_every_question() {
+    check(
+        "deleted-has-no-descriptor",
+        "let o = {x: 1}; delete o.x; \
+         return typeof Object.getOwnPropertyDescriptor(o, \"x\");",
+        "undefined",
+    );
+    check(
+        "deleted-is-not-own",
+        "let o = {x: 1}; delete o.x; return o.hasOwnProperty(\"x\");",
+        "false",
+    );
+    // A property deleted after being made read-only is not read-only any more: it is nothing.
+    check(
+        "deleted-read-only-can-be-redefined",
+        "let o = {}; \
+         Object.defineProperty(o, \"x\", {value: 1, writable: false, configurable: true}); \
+         delete o.x; o.x = 2; return o.x;",
+        "2",
+    );
+}

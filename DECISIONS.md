@@ -5148,3 +5148,23 @@ prototype chain instead would have been right about every error and wrong about 
 that distinguishes the two — which is the case the tests check, because it is the only one
 where the answer is not obvious. The tag is a hidden property, as the other four internal
 slots are (D-126), and stays out of every enumeration.
+
+## D-182
+
+**A deleted property is absent from every question, not just from enumeration.**
+
+Status: Accepted
+
+`own_property` read the slot the shape still names, because the shape *does* still name it —
+that is what the tombstone is for. Enumeration checked the tombstone separately and everything
+else did not, so a deleted property kept answering with the permissions it had before it went:
+a redefinition validated against a property that is no longer there, and `Object.assign` could
+be refused by a `writable: false` nothing holds any more.
+
+Checking it in the one place that reads slots by name is what makes the rest agree, and it
+tightened three answers that were separately wrong — `getOwnPropertyDescriptor`,
+`hasOwnProperty` through `own_keys`, and the `defineProperty` validation.
+
+**`Object.assign` throws on a read-only target.** It uses the throwing form of `Set`, which is
+one of the few places a program not written in strict mode can see the difference between a
+refused write and a silent one.

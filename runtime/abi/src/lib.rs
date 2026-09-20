@@ -4566,6 +4566,14 @@ fn own_property(object: u64, name: &str) -> Option<(u32, Value)> {
         let shape = runtime.heap.shape_of(handle)?;
         let key = PropertyKey::new(name);
         let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+        // **A deleted property is absent**, and the shape still names its slot — that is what
+        // the tombstone is for. Answering from the slot anyway handed back the attributes the
+        // property had before it was deleted, so a redefinition validated against a property
+        // that is no longer there and an assignment could be refused by a permission nothing
+        // holds any more.
+        if runtime.heap.is_deleted(handle, slot.index()) {
+            return None;
+        }
         runtime
             .heap
             .get(handle, slot.index())
@@ -5590,6 +5598,25 @@ extern "C" fn object_has_own(
     .to_bits()
 }
 
+/// Whether writing `name` on `object` would be refused rather than performed.
+///
+/// An accessor is not refused here: a setter may accept the write, and one without a setter
+/// is refused by the store itself.
+fn refuses_assignment(object: u64, name: &str) -> bool {
+    let Some(handle) = handle_of(object) else {
+        return false;
+    };
+    match own_property(object, name) {
+        Some((slot, _)) => {
+            let attributes = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
+            !attributes.writable && !attributes.accessor
+        }
+        None => {
+            derived_own_property(object, name).is_some_and(|(_, attributes)| !attributes.writable)
+        }
+    }
+}
+
 /// `Object.assign(target, …sources)`.
 extern "C" fn object_assign(
     _closure: u64,
@@ -5613,6 +5640,13 @@ extern "C" fn object_assign(
             // string wrapper's, so copying from either wrote a `length` the target had no
             // business having.
             for name in enumerable_keys(source) {
+                // **A read-only property on the target is a `TypeError` here**, not a write
+                // that quietly does nothing: `Object.assign` uses the throwing form of `Set`.
+                // It is one of the few places the difference is observable from source that
+                // is not in strict mode.
+                if refuses_assignment(target, &name) {
+                    return raise("cannot assign to a read-only property", "TypeError");
+                }
                 // SAFETY: `name` is a live Rust string.
                 let value =
                     unsafe { crisol_property_load(source, name.as_ptr(), name.len() as u64) };
@@ -6055,10 +6089,15 @@ fn set_element_rule(object: u64, index: Option<usize>, attributes: crisol_value:
         return;
     };
     let position = index.map_or(0, |index| index + 1);
-    with_runtime(|runtime| {
-        runtime
-            .heap
-            .set_element(target, position, Value::number(pack_attributes(attributes)));
+    // Rooted through the write: growing the rule array to reach `position` is an allocation,
+    // and the array is reachable only from `object` — which is a bare `u64` here, not
+    // something the collector can see on its own.
+    with_rooted(&[object, rules], || {
+        with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(target, position, Value::number(pack_attributes(attributes)));
+        });
     });
 }
 
@@ -6081,6 +6120,16 @@ fn restrict_own_properties(object: u64, writable: bool) {
     let Some(handle) = handle_of(object) else {
         return;
     };
+    // Rooted for the whole pass: writing the element rules allocates, and `Object.freeze` is
+    // called with its argument in the caller's frame rather than anywhere the collector has
+    // been told to look.
+    with_rooted(&[object], || {
+        restrict_own_properties_rooted(object, handle, writable)
+    });
+}
+
+/// The body of [`restrict_own_properties`], with the receiver already rooted.
+fn restrict_own_properties_rooted(object: u64, handle: GcRef, writable: bool) {
     // **The elements first, and separately**, because they have no slots to carry attributes
     // and the loop below only reaches properties that do. Without this `Object.freeze([1])`
     // froze nothing at all: the array has no stored properties, so the loop ran zero times
