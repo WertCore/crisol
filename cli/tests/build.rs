@@ -5459,3 +5459,175 @@ fn object_reports_every_descriptor_and_finds_accessors() {
         "3",
     );
 }
+
+/// **`null` and `undefined` are the error, not "anything that is not an object".** Every
+/// `Object` static coerces its argument, so a primitive is answered and only a nullish one
+/// throws — and answering one of these with `undefined` is what the caller then reads a field
+/// off.
+#[test]
+fn object_refuses_only_the_nullish() {
+    check(
+        "keys-of-null",
+        "try { Object.keys(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "values-of-undefined",
+        "try { Object.values(undefined); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "entries-of-null",
+        "try { Object.entries(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "own-names-of-null",
+        "try { Object.getOwnPropertyNames(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "get-prototype-of-null",
+        "try { Object.getPrototypeOf(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "assign-to-null",
+        "try { Object.assign(null, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "has-own-property-of-null",
+        "try { Object.prototype.hasOwnProperty.call(null, \"x\"); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A primitive is coerced, which is the other half of the same rule.
+    check("keys-of-number", "return Object.keys(5).length;", "0");
+    check(
+        "get-prototype-of-number",
+        "return Object.getPrototypeOf(1) === Object.getPrototypeOf(2);",
+        "true",
+    );
+    check(
+        "freeze-of-null-is-not-an-error",
+        "return Object.freeze(null);",
+        "null",
+    );
+}
+
+/// A string's characters are its own properties, whether it is wrapped or not.
+#[test]
+fn a_string_owns_its_characters() {
+    check(
+        "string-keys",
+        "return Object.keys(\"ab\").join(\",\");",
+        "0,1",
+    );
+    check(
+        "string-own-names",
+        "return Object.getOwnPropertyNames(\"ab\").join(\",\");",
+        "0,1,length",
+    );
+    check(
+        "string-descriptor",
+        "let d = Object.getOwnPropertyDescriptor(\"ab\", \"0\"); \
+         return d.value + \",\" + d.writable + \",\" + d.enumerable;",
+        "a,false,true",
+    );
+    check(
+        "string-length-descriptor",
+        "let d = Object.getOwnPropertyDescriptor(\"ab\", \"length\"); \
+         return d.value + \",\" + d.enumerable;",
+        "2,false",
+    );
+}
+
+/// **The class tag is what `Object.prototype.toString` is for**, and answering `[object
+/// Object]` for everything that is not an array made it useless for the one job it has.
+#[test]
+fn the_class_tag_names_the_class() {
+    check(
+        "tag-number",
+        "return Object.prototype.toString.call(5);",
+        "[object Number]",
+    );
+    check(
+        "tag-string",
+        "return Object.prototype.toString.call(\"x\");",
+        "[object String]",
+    );
+    check(
+        "tag-null",
+        "return Object.prototype.toString.call(null);",
+        "[object Null]",
+    );
+    check(
+        "tag-undefined",
+        "return Object.prototype.toString.call(undefined);",
+        "[object Undefined]",
+    );
+    check(
+        "tag-array",
+        "return Object.prototype.toString.call([]);",
+        "[object Array]",
+    );
+    check(
+        "tag-function",
+        "return Object.prototype.toString.call(function () {});",
+        "[object Function]",
+    );
+    check(
+        "tag-plain",
+        "return Object.prototype.toString.call({});",
+        "[object Object]",
+    );
+    // A wrapper's class follows from the primitive it holds — which is why a boolean wrapper
+    // now stores a boolean rather than one or zero.
+    check(
+        "tag-string-wrapper",
+        "return Object.prototype.toString.call(new String(\"x\"));",
+        "[object String]",
+    );
+    check(
+        "tag-number-wrapper",
+        "return Object.prototype.toString.call(new Number(1));",
+        "[object Number]",
+    );
+    check(
+        "tag-boolean-wrapper",
+        "return Object.prototype.toString.call(new Boolean(true));",
+        "[object Boolean]",
+    );
+    // The representation change the tag needed must not change what the wrapper reads as.
+    check(
+        "boolean-wrapper-value",
+        "return new Boolean(false).valueOf();",
+        "false",
+    );
+    check(
+        "boolean-wrapper-true",
+        "return new Boolean(true).valueOf();",
+        "true",
+    );
+}
+
+/// An element is enumerable and `length` is not, and neither has a slot to say so.
+#[test]
+fn an_element_answers_for_its_own_enumerability() {
+    check(
+        "element-is-enumerable",
+        "return [1].propertyIsEnumerable(0);",
+        "true",
+    );
+    check(
+        "array-length-is-not-enumerable",
+        "return [1].propertyIsEnumerable(\"length\");",
+        "false",
+    );
+    check(
+        "absent-is-not-enumerable",
+        "return [1].propertyIsEnumerable(3);",
+        "false",
+    );
+}

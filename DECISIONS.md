@@ -4935,3 +4935,41 @@ for internal slots, and an internal slot belongs to one object — reading one u
 That was a prototype doing to its instances something only they can do to themselves. It is
 also cheaper: a shape lookup instead of a chain walk that nearly always misses, on a path every
 `for-in` takes.
+
+## D-170
+
+**`Object`'s statics coerce their argument; only `null` and `undefined` are the error.**
+
+Status: Accepted
+
+`Object.keys(null)` answered `[]`, `Object.getPrototypeOf(1)` answered `null`, and
+`Object.assign(null, {})` did nothing. All three are the same mistake read two ways: treating
+"not an object" as the failure condition, when the specification's failure condition is
+`RequireObjectCoercible` — nullish — and everything else is wrapped first.
+
+The two halves matter separately. Failing to throw loses the 74 corpus cases that check the
+throw. Failing to *coerce* is worse than it looks: `Object.getPrototypeOf(1)` answering `null`
+is not a missing answer but a wrong one, because `null` is itself a legal prototype and says
+the number has none.
+
+`Object.freeze`, `seal`, `preventExtensions` and the three `is…` queries are the exception —
+they take a primitive and hand it straight back, which is ES2015's change and not an oversight.
+
+**A string's characters come with this.** Once a primitive is coerced rather than refused,
+`Object.keys("ab")` has to be `["0", "1"]` — the same properties the wrapper has, from the
+same place, rather than from a second rule that could disagree.
+
+## D-171
+
+**A boolean wrapper stores a boolean.**
+
+Status: Accepted
+
+It stored `1` or `0`, which read back correctly everywhere that asked "true or false" and made
+it **indistinguishable from a `Number` wrapper** — the one distinction
+`Object.prototype.toString` has to make to answer `[object Boolean]`. The tag is not a detail:
+it is the only classification an engine without `Symbol.toStringTag` can offer, and answering
+`[object Object]` for every wrapper is what made the method useless for the job it exists for.
+
+A representation chosen to satisfy one reader is a representation that loses whatever the other
+readers would have asked. Keeping the primitive as the primitive costs nothing and answers both.

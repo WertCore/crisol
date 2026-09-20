@@ -1734,7 +1734,9 @@ extern "C" fn number_to_fixed(
 /// The boolean a receiver stands for.
 fn this_boolean(this_value: u64) -> bool {
     if handle_of(this_value).is_some() {
-        return property_number(this_value, STRING_PRIMITIVE).is_some_and(|held| held != 0.0);
+        return own_property(this_value, STRING_PRIMITIVE)
+            .and_then(|(_, held)| held.as_boolean())
+            .unwrap_or_default();
     }
     is_truthy(Value::from_bits(this_value))
 }
@@ -2031,11 +2033,13 @@ extern "C" fn to_boolean_global(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
     let truth = crisol_truthy(value);
-    // A `new Boolean(…)` wrapper records what it wraps, as the number and string ones do.
+    // A `new Boolean(…)` wrapper records what it wraps, as the number and string ones do —
+    // **as a boolean**, not as one or zero. Stored as a number it was indistinguishable from a
+    // `Number` wrapper, which is the only thing `Object.prototype.toString` has to tell them
+    // apart by.
     if let Some(handle) = handle_of(this_value) {
-        let held = f64::from(u8::from(Value::from_bits(truth) == Value::TRUE));
         with_runtime(|runtime| {
-            runtime.define_hidden(handle, STRING_PRIMITIVE, Value::number(held));
+            runtime.define_hidden(handle, STRING_PRIMITIVE, Value::from_bits(truth));
         });
     }
     truth
@@ -2806,6 +2810,9 @@ extern "C" fn object_has_own_property(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot read a property") {
+        return thrown;
+    }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let Some(name) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return Value::FALSE.to_bits();
@@ -2828,6 +2835,9 @@ extern "C" fn object_property_is_enumerable(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot read a property") {
+        return thrown;
+    }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let Some(name) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return Value::FALSE.to_bits();
@@ -2835,6 +2845,15 @@ extern "C" fn object_property_is_enumerable(
     let Some(handle) = handle_of(this_value) else {
         return Value::FALSE.to_bits();
     };
+    // An element has no slot to ask, so it answers through the derived descriptor — without
+    // which `[1].propertyIsEnumerable(0)` was `false` about the one property it has.
+    if own_property(this_value, &name).is_none() {
+        return boolean(
+            derived_own_property(this_value, &name)
+                .is_some_and(|(_, attributes)| attributes.enumerable),
+        )
+        .to_bits();
+    }
     let found = own_property(this_value, &name).is_some_and(|(slot, _)| {
         with_runtime(|runtime| runtime.heap.attributes_of(handle, slot).enumerable)
     });
@@ -2877,18 +2896,39 @@ extern "C" fn object_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    // **The array tag is the only one distinguished.** A real engine reads
-    // `Symbol.toStringTag` and a class list; without symbols the honest choice is the one
-    // distinction that can be made without guessing.
+    // **`Symbol.toStringTag` is not consulted**, because symbols cannot be property keys yet
+    // (D-149). Everything below is the fallback the specification gives when that lookup finds
+    // nothing, which is what every object in the corpus actually reaches.
     if elements_of(this_value).is_some() {
         return new_string("[object Array]");
     }
-    match Value::from_bits(this_value).kind() {
-        crisol_value::Kind::Undefined => new_string("[object Undefined]"),
-        crisol_value::Kind::Null => new_string("[object Null]"),
-        _ if is_callable(this_value) => new_string("[object Function]"),
-        _ => new_string("[object Object]"),
-    }
+    let held = Value::from_bits(this_value);
+    let tag = match held.kind() {
+        crisol_value::Kind::Undefined => "Undefined",
+        crisol_value::Kind::Null => "Null",
+        // A primitive receiver is wrapped first, and the wrapper's class is what is reported.
+        crisol_value::Kind::Number => "Number",
+        crisol_value::Kind::Boolean => "Boolean",
+        crisol_value::Kind::String => "String",
+        crisol_value::Kind::Symbol => "Symbol",
+        crisol_value::Kind::Object => {
+            if is_callable(this_value) {
+                "Function"
+            } else if own_flag(this_value, DATE_TIME) {
+                "Date"
+            } else {
+                // A wrapper carries the primitive it wraps, and its class follows from what
+                // that primitive is — the one thing distinguishing `new String("")` from `{}`.
+                match own_property(this_value, STRING_PRIMITIVE).map(|(_, value)| value.kind()) {
+                    Some(crisol_value::Kind::String) => "String",
+                    Some(crisol_value::Kind::Number) => "Number",
+                    Some(crisol_value::Kind::Boolean) => "Boolean",
+                    _ => "Object",
+                }
+            }
+        }
+    };
+    new_string(&format!("[object {tag}]"))
 }
 
 /// `Object.prototype.valueOf`.
@@ -2899,6 +2939,9 @@ extern "C" fn object_value_of(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot read the value") {
+        return thrown;
+    }
     this_value
 }
 
@@ -4416,10 +4459,21 @@ fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::A
         ));
     }
 
-    // A string wrapper's characters, which are fixed in every way a property can be.
+    // A string's characters, which are fixed in every way a property can be.
     let text = wrapped_text(object)?;
-    let index = name.parse::<usize>().ok()?;
     let units: Vec<u16> = text.encode_utf16().collect();
+    if name == "length" {
+        return Some((
+            Value::number(index_as_f64(units.len())).to_bits(),
+            crisol_value::Attributes {
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                accessor: false,
+            },
+        ));
+    }
+    let index = name.parse::<usize>().ok()?;
     let unit = units.get(index).filter(|_| canonical(name, index))?;
     Some((
         new_string(&String::from_utf16_lossy(&[*unit])),
@@ -4430,6 +4484,18 @@ fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::A
             accessor: false,
         },
     ))
+}
+
+/// `RequireObjectCoercible` — the check nearly every `Object` static opens with.
+///
+/// **`null` and `undefined` are the error, not "anything that is not an object".** The
+/// specification coerces its argument, so `Object.keys("ab")` answers `["0", "1"]` and only a
+/// nullish one throws. Returning the raised exception rather than a boolean keeps the caller
+/// to one line and makes the message the same wherever it comes from.
+fn reject_nullish(value: u64, what: &str) -> Option<u64> {
+    Value::from_bits(value)
+        .is_nullish()
+        .then(|| raise(&format!("{what} of null or undefined"), "TypeError"))
 }
 
 /// One field of a property descriptor, read as a value.
@@ -4666,31 +4732,35 @@ extern "C" fn object_own_descriptor(
         let target = unsafe { argument(argc, argv, 0) };
         // SAFETY: as above.
         let key = unsafe { argument(argc, argv, 1) };
+        if let Some(thrown) = reject_nullish(target, "cannot read a property descriptor") {
+            return thrown;
+        }
         let Some(name) = to_text(key) else {
             return Value::UNDEFINED.to_bits();
         };
         let Some(handle) = handle_of(target) else {
             return Value::UNDEFINED.to_bits();
         };
+        // **The result object is allocated first**, before the value it will describe, because
+        // a derived value can be a string this call makes — `new String("ab")`'s characters
+        // are materialised on demand — and a value between its allocation and its first store
+        // is invisible to the collector. Made in the other order it was the descriptor's own
+        // allocation that could free it, which under GC stress is a descriptor whose `value`
+        // is garbage and without stress is nothing at all.
+        let descriptor = crisol_create_object();
         // **`undefined` for an absent property**, which is how a caller tells "not there" from
         // "there and not writable".
-        let (value, attributes) = match own_property(target, &name) {
-            Some((slot, value)) => (
+        let found = with_rooted(&[descriptor], || match own_property(target, &name) {
+            Some((slot, value)) => Some((
                 value,
                 with_runtime(|runtime| runtime.heap.attributes_of(handle, slot)),
-            ),
-            None => match derived_own_property(target, &name) {
-                Some((bits, attributes)) => (Value::from_bits(bits), attributes),
-                None => return Value::UNDEFINED.to_bits(),
-            },
+            )),
+            None => derived_own_property(target, &name)
+                .map(|(bits, attributes)| (Value::from_bits(bits), attributes)),
+        });
+        let Some((value, attributes)) = found else {
+            return Value::UNDEFINED.to_bits();
         };
-
-        // **Rooted across the allocation below**, because a derived value can be a string
-        // this call just made — `new String("ab")`'s characters are materialised on demand —
-        // and a value between its allocation and its first store is invisible to the
-        // collector. The symptom would be a descriptor whose `value` is garbage under GC
-        // stress and right without it.
-        let descriptor = with_rooted(&[value.to_bits()], crisol_create_object);
         with_rooted(&[descriptor, value.to_bits()], || {
             let Some(into) = handle_of(descriptor) else {
                 return;
@@ -4791,6 +4861,9 @@ extern "C" fn object_own_names(
     with_rooted(&live, || {
         // SAFETY: as above.
         let target = unsafe { argument(argc, argv, 0) };
+        if let Some(thrown) = reject_nullish(target, "cannot read the property names") {
+            return thrown;
+        }
         names_as_array(&own_keys(target))
     })
 }
@@ -4844,6 +4917,11 @@ fn is_internal_property(name: &str) -> bool {
 /// hidden name, so a `Number` wrapper answers this too — and reading `new Number(12345)`'s
 /// primitive as text would give it five characters and five own properties.
 fn wrapped_text(object: u64) -> Option<String> {
+    // A primitive string *is* the text; `Object.keys("ab")` coerces it to a wrapper and gets
+    // the same properties, so the two answer alike here rather than at each caller.
+    if let Some(text) = text_of(object) {
+        return Some(text);
+    }
     // An own lookup rather than a property read: a wrapper's primitive is its own, and this
     // is asked once per `for-in`, where a chain walk that nearly always misses is not free.
     text_of(own_property(object, STRING_PRIMITIVE)?.1.to_bits())
@@ -4891,7 +4969,7 @@ fn own_keys(object: u64) -> Vec<String> {
         // to say so, and it did not — an array reported its indices and nothing else. It is
         // added last because the specification puts the indices first and the rest after, and
         // it is not enumerable, so `Object.keys` and `for-in` still leave it out.
-        if is_array {
+        if is_array || (wrapped.is_some() && !names.iter().any(|name| name == "length")) {
             names.push("length".to_owned());
         }
         // **Once each.** An index can reach this list twice — as an element and, if something
@@ -4942,6 +5020,9 @@ extern "C" fn object_keys(
     with_rooted(&live, || {
         // SAFETY: as above.
         let target = unsafe { argument(argc, argv, 0) };
+        if let Some(thrown) = reject_nullish(target, "cannot read the keys") {
+            return thrown;
+        }
         // Each string is stored **before the next one is made**. Collecting them into a Rust
         // vector first leaves every earlier string reachable from nothing the collector can
         // see while the next allocates — which under stress returns an array of freed cells.
@@ -4985,6 +5066,9 @@ extern "C" fn object_values(
         // SAFETY: as above.
         let target = unsafe { argument(argc, argv, 0) };
         // As in `object_keys`: read and store one at a time rather than collecting first.
+        if let Some(thrown) = reject_nullish(target, "cannot read the values") {
+            return thrown;
+        }
         let names = enumerable_keys(target);
         with_new_array(names.len(), |array| {
             for (index, name) in names.iter().enumerate() {
@@ -5055,8 +5139,19 @@ extern "C" fn object_get_prototype(
     let _ = argc_or;
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let target = unsafe { argument(argc, argv, 0) };
+    if let Some(thrown) = reject_nullish(target, "cannot read the prototype") {
+        return thrown;
+    }
+    // **A primitive is coerced, not refused.** `Object.getPrototypeOf(1)` is
+    // `Number.prototype`, because the specification wraps its argument first — and answering
+    // `null` instead said the number had no prototype, which is a different claim entirely.
     let Some(handle) = handle_of(target) else {
-        return Value::NULL.to_bits();
+        let prototype = match Value::from_bits(target).kind() {
+            crisol_value::Kind::Number => NUMBER_PROTOTYPE.with(std::cell::Cell::get),
+            crisol_value::Kind::Boolean => BOOLEAN_PROTOTYPE.with(std::cell::Cell::get),
+            _ => None,
+        };
+        return prototype.map_or_else(|| Value::NULL.to_bits(), |p| p.to_value().to_bits());
     };
     with_runtime(|runtime| {
         runtime
@@ -5182,6 +5277,9 @@ extern "C" fn object_assign(
     with_rooted(&live, || {
         // SAFETY: as above.
         let target = unsafe { argument(argc, argv, 0) };
+        if let Some(thrown) = reject_nullish(target, "cannot assign to") {
+            return thrown;
+        }
         for position in 1..argc as usize {
             // SAFETY: as above.
             let source = unsafe { argument(argc, argv, position) };
@@ -5747,6 +5845,9 @@ extern "C" fn object_entries(
     with_rooted(&live, || {
         // SAFETY: as above.
         let target = unsafe { argument(argc, argv, 0) };
+        if let Some(thrown) = reject_nullish(target, "cannot read the entries") {
+            return thrown;
+        }
         let names = enumerable_keys(target);
         with_new_array(names.len(), |array| {
             for (index, name) in names.iter().enumerate() {
@@ -5823,6 +5924,9 @@ extern "C" fn object_define_properties(
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
+        if handle_of(target).is_none() {
+            return raise("cannot define properties on a non-object", "TypeError");
+        }
         for name in enumerable_keys(descriptors) {
             let key = name.clone();
             // SAFETY: `key` is a live Rust string.
