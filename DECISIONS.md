@@ -4623,3 +4623,43 @@ this one; a user function that throws was equally swallowed.
 rule that also catches the sentinel, and the sentinel was introduced later than the rule. Every
 place that tests a value's kind to decide control flow is a place where the exception signal
 needs its own answer first.
+
+## D-157
+
+**The array methods take an array-*like*, not an array.**
+
+Status: Accepted
+
+`Array.prototype.filter.call(new String("abc"), …)` is not an exotic case in test262 — applying
+the array methods to anything with a `length` and indexed properties is a whole family of its
+coverage, and every one of them answered `undefined` because the methods insisted on real
+elements and gave up when there were none.
+
+Length and element access now go through one pair of helpers that ask an array for its element
+count first and fall back to reading `length` and numbered properties. A real array therefore
+costs exactly what it did; only the array-like path is slower, and it did not work at all
+before.
+
+Converted are the read-only methods — `map`, `filter`, `forEach`, `indexOf`, `lastIndexOf`,
+`includes`, `join`, `slice`, `find`, `findIndex`, `findLast`, `every`, `some`, `toString`. The
+mutating ones still require a real array, because writing back through numbered properties is a
+different question and one this has not answered.
+
+## D-158
+
+**A lone surrogate is legal and cannot be represented.**
+
+Status: Accepted, with the limit stated
+
+`String.fromCodePoint(0xD800)` must succeed: JavaScript strings are UTF-16 and may hold an
+unpaired surrogate. These strings are Rust `String`s, which are UTF-8 and may not. Raising a
+`RangeError` was the wrong answer to the right problem — the specification says this succeeds —
+and it accounted for forty failures, all of them introduced by the method that raised.
+
+A replacement character stands in. That is a **visible wrong answer** rather than an error a
+program cannot expect, which is the better of two bad options: a test comparing the string sees
+a mismatch it can report, where a throw stops the test before it can look.
+
+Fixing it properly means WTF-8 or a UTF-16 rope — a representation change, not a patch — and
+this is the second place the UTF-8 choice has shown through (D-115 was the first, where `length`
+had to count code units over a representation that does not store them).

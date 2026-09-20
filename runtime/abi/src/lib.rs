@@ -1213,16 +1213,14 @@ extern "C" fn array_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return new_string("");
-    };
+    let length = indexed_length(this_value);
     with_rooted(&[this_value], || {
         let mut out = String::new();
         for index in 0..length {
             if index > 0 {
                 out.push(',');
             }
-            let element = Value::from_bits(element_at(array, index));
+            let element = Value::from_bits(indexed_get(this_value, index));
             if !matches!(
                 element.kind(),
                 crisol_value::Kind::Null | crisol_value::Kind::Undefined
@@ -1416,16 +1414,14 @@ extern "C" fn array_at(
 
 /// `findLast` and `findLastIndex`, which walk backwards.
 fn find_last_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
-    };
+    let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
         for index in (0..length).rev() {
-            let element = element_at(array, index);
+            let element = indexed_get(this_value, index);
             let verdict = call_value(
                 callback,
                 this_value,
@@ -3023,7 +3019,13 @@ extern "C" fn string_from_code_point(
         let point = value as u32;
         match char::from_u32(point) {
             Some(character) => out.push(character),
-            None => return raise("code point is not a character", "RangeError"),
+            // **A lone surrogate is legal here and cannot be represented.** JavaScript strings
+            // are UTF-16 and may hold an unpaired surrogate; these are Rust `String`s, which
+            // are UTF-8 and cannot. Raising was wrong — the specification says this succeeds —
+            // so the replacement character stands in, and the string is wrong in a way a test
+            // can see rather than an error a program cannot expect. Fixing it properly means
+            // WTF-8 or a UTF-16 rope, which is a representation change, not a patch.
+            None => out.push('\u{FFFD}'),
         }
     }
     new_string(&out)
@@ -6522,6 +6524,47 @@ fn relative_index(value: u64, length: usize, fallback: usize) -> usize {
     index
 }
 
+/// How many elements an **array-like** has.
+///
+/// **Not just an array.** test262 applies the array methods to anything with a `length` and
+/// indexed properties — `Array.prototype.filter.call(new String("abc"), …)` is a whole family
+/// of its cases — and a method that insisted on real elements answered `undefined` for every
+/// one of them. An array answers from its element count, which is why that stays the first
+/// question.
+fn indexed_length(value: u64) -> usize {
+    if let Some((_, length)) = elements_of(value) {
+        return length;
+    }
+    let asked = property_number(value, "length").unwrap_or(0.0);
+    if !asked.is_finite() || asked <= 0.0 {
+        return 0;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to a length no array can exceed"
+    )]
+    let length = asked.min(f64::from(u32::MAX)) as usize;
+    length
+}
+
+/// The element at `index` of an array-like.
+fn indexed_get(value: u64, index: usize) -> u64 {
+    if let Some((array, length)) = elements_of(value) {
+        if index < length {
+            return element_at(array, index);
+        }
+        return Value::UNDEFINED.to_bits();
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an index below the clamp in `indexed_length`"
+    )]
+    let key = number_text(index as f64);
+    // SAFETY: `key` is a live Rust string.
+    unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) }
+}
+
 /// `Array.prototype.map` — a new array of the results.
 ///
 /// The callback gets `(element, index, array)`, which is the specification's signature and not
@@ -6711,13 +6754,11 @@ extern "C" fn array_last_index_of(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
-    };
+    let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
     for index in (0..length).rev() {
-        if same_value(Value::from_bits(element_at(array, index)), wanted) {
+        if same_value(Value::from_bits(indexed_get(this_value, index)), wanted) {
             return index_value(index);
         }
     }
@@ -6735,14 +6776,12 @@ extern "C" fn array_includes(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::FALSE.to_bits();
-    };
+    let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
     let seeking_nan = wanted.as_number().is_some_and(f64::is_nan);
     for index in 0..length {
-        let element = Value::from_bits(element_at(array, index));
+        let element = Value::from_bits(indexed_get(this_value, index));
         let found = if seeking_nan {
             element.as_number().is_some_and(f64::is_nan)
         } else {
@@ -6763,9 +6802,7 @@ extern "C" fn array_join(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
-    };
+    let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let given = unsafe { argument(argc, argv, 0) };
     let separator = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
@@ -6782,7 +6819,7 @@ extern "C" fn array_join(
             if index > 0 {
                 out.push_str(&separator);
             }
-            let element = Value::from_bits(element_at(array, index));
+            let element = Value::from_bits(indexed_get(this_value, index));
             // **`null` and `undefined` join as empty**, not as their names.
             if !matches!(
                 element.kind(),
@@ -6804,9 +6841,7 @@ extern "C" fn array_slice(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
-    };
+    let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
     // SAFETY: as above.
@@ -6818,7 +6853,7 @@ extern "C" fn array_slice(
     with_rooted(&live, || {
         with_new_array(taken, |result| {
             for offset in 0..taken {
-                let element = element_at(array, start + offset);
+                let element = indexed_get(this_value, start + offset);
                 with_runtime(|runtime| {
                     runtime
                         .heap
@@ -6976,16 +7011,14 @@ extern "C" fn array_unshift(
 
 /// `find` and `findIndex`, which differ only in what they answer with.
 fn find_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
-    };
+    let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
         for index in 0..length {
-            let element = element_at(array, index);
+            let element = indexed_get(this_value, index);
             let verdict = call_value(
                 callback,
                 this_value,
@@ -7032,16 +7065,14 @@ extern "C" fn array_find_index(
 
 /// `every` and `some`, which differ only in what stops them.
 fn quantify(this_value: u64, argc: u64, argv: *const u64, want_all: bool) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
-    };
+    let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
         for index in 0..length {
-            let element = element_at(array, index);
+            let element = indexed_get(this_value, index);
             let verdict = call_value(
                 callback,
                 this_value,

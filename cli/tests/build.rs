@@ -4586,3 +4586,76 @@ fn a_constructor_that_throws_is_not_swallowed() {
         "1",
     );
 }
+
+// ---- the array methods work on array-likes -------------------------------------------------
+
+/// **Not just arrays.** test262 applies the array methods to anything with a `length` and
+/// indexed properties — `Array.prototype.filter.call(new String("abc"), …)` is a whole family
+/// of its cases — and a method insisting on real elements answered `undefined` for every one.
+#[test]
+fn the_array_methods_accept_an_array_like() {
+    check(
+        "arraylike-filter",
+        "let o = new String(\"abc\"); \
+         return Array.prototype.filter.call(o, function () { return true; })[0];",
+        "a",
+    );
+    check(
+        "arraylike-map",
+        "return Array.prototype.map.call({length: 2, 0: 1, 1: 2}, function (x) { return x * 2; })\
+         .join(\",\");",
+        "2,4",
+    );
+    check(
+        "arraylike-join",
+        "return Array.prototype.join.call({length: 2, 0: \"a\", 1: \"b\"}, \"-\");",
+        "a-b",
+    );
+    check(
+        "arraylike-indexof",
+        "return Array.prototype.indexOf.call({length: 2, 0: \"a\", 1: \"b\"}, \"b\");",
+        "1",
+    );
+    check(
+        "arraylike-foreach",
+        "let n = 0; Array.prototype.forEach.call({length: 3, 0: 1, 1: 2, 2: 3}, function () { n = n + 1; }); \
+         return n;",
+        "3",
+    );
+    check(
+        "arraylike-slice",
+        "return Array.prototype.slice.call({length: 3, 0: \"a\", 1: \"b\", 2: \"c\"}, 1).join(\",\");",
+        "b,c",
+    );
+    // A real array still takes the element path, which is the first question `indexed_length`
+    // asks.
+    check(
+        "array-still-works",
+        "return [1, 2, 3].filter(function (x) { return x > 1; }).length;",
+        "2",
+    );
+}
+
+/// **A lone surrogate is legal in `fromCodePoint` and cannot be represented here.** JavaScript
+/// strings are UTF-16 and may hold an unpaired surrogate; these are UTF-8. Raising was wrong —
+/// the specification says this succeeds — so it stands in a replacement character, which is a
+/// visible wrong answer rather than an error a program cannot expect.
+#[test]
+fn a_lone_surrogate_does_not_raise() {
+    check(
+        "surrogate-length",
+        "return String.fromCodePoint(0xD800).length;",
+        "1",
+    );
+    check(
+        "surrogate-ok",
+        "return typeof String.fromCodePoint(0xD800);",
+        "string",
+    );
+    // Out of range is still a `RangeError`, which the specification does require.
+    check(
+        "code-point-too-big",
+        "let r = \"\"; try { String.fromCodePoint(0x110000); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
