@@ -4369,3 +4369,64 @@ fn date_utc_and_parse() {
         "86400000",
     );
 }
+
+/// **A number and a boolean are not heap cells**, so property access on them has to find their
+/// prototypes without an object to walk from. A string does not need this because a string *is*
+/// a cell — which is why the gap only appeared once the other two grew methods worth reaching.
+#[test]
+fn a_primitive_number_or_boolean_reaches_its_prototype() {
+    check(
+        "primitive-number-method",
+        "return (255).toString(16);",
+        "ff",
+    );
+    check(
+        "primitive-boolean-method",
+        "return true.toString();",
+        "true",
+    );
+    check("primitive-number-valueof", "return (5).valueOf();", "5");
+    check(
+        "primitive-in-variable",
+        "let n = 7; return n.toString();",
+        "7",
+    );
+    // The receiver stays the primitive, so the method sees the value it was called on.
+    check(
+        "primitive-receiver",
+        "let b = false; return b.toString();",
+        "false",
+    );
+}
+
+/// **The engine's stand-ins for internal slots are not the program's properties.** Each one was
+/// visible to `getOwnPropertyNames` and, worse, to `isFrozen` — which asks whether every own
+/// property is non-writable and found this bookkeeping among them.
+#[test]
+fn internal_bookkeeping_is_not_a_property() {
+    check(
+        "internal-frozen",
+        "let o = {}; Object.freeze(o); return Object.isFrozen(o);",
+        "true",
+    );
+    check(
+        "internal-names",
+        "let o = {}; Object.freeze(o); return Object.getOwnPropertyNames(o).length;",
+        "0",
+    );
+    check(
+        "internal-date",
+        "return Object.getOwnPropertyNames(new Date(0)).length;",
+        "0",
+    );
+    check(
+        "internal-map",
+        "return Object.getOwnPropertyNames(new Map()).length;",
+        "1",
+    );
+    check(
+        "internal-string-wrapper",
+        "return Object.getOwnPropertyNames(new String(\"ab\")).length;",
+        "1",
+    );
+}

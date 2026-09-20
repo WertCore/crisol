@@ -4328,6 +4328,31 @@ fn names_as_array(names: &[String]) -> u64 {
     })
 }
 
+/// The properties this engine keeps on an object because it has no internal slots.
+///
+/// **They are not the program's properties and must not be reported as such.** Each stands in
+/// for something the specification puts in an internal slot — a date's time, a wrapper's
+/// primitive, whether an object is extensible — and every one of them was visible to
+/// `Object.getOwnPropertyNames` and, worse, to `Object.isFrozen`, which asks whether *every*
+/// own property is non-writable and found this bookkeeping among them.
+const INTERNAL_PROPERTIES: &[&str] = &[
+    DATE_TIME,
+    STRING_PRIMITIVE,
+    NOT_EXTENSIBLE,
+    COLLECTION_ENTRIES,
+    BOUND_TARGET,
+    BOUND_THIS,
+    BOUND_ARGS,
+    ITERATOR_TARGET,
+    ITERATOR_POSITION,
+    ITERATOR_KIND,
+];
+
+/// Whether `name` is one of this engine's stand-ins for an internal slot.
+fn is_internal_property(name: &str) -> bool {
+    INTERNAL_PROPERTIES.contains(&name)
+}
+
 /// The own property names of `this`'s first argument.
 fn own_keys(object: u64) -> Vec<String> {
     let Some(handle) = handle_of(object) else {
@@ -4344,7 +4369,9 @@ fn own_keys(object: u64) -> Vec<String> {
         }
         if let Some(shape) = runtime.heap.shape_of(handle) {
             for (key, slot) in runtime.shapes.borrow().properties(shape) {
-                if runtime.heap.is_deleted(handle, slot.index()) {
+                if runtime.heap.is_deleted(handle, slot.index())
+                    || is_internal_property(key.as_str())
+                {
                     continue;
                 }
                 names.push(key.as_str().to_owned());
@@ -5964,7 +5991,34 @@ pub unsafe extern "C" fn crisol_property_store(
 #[must_use]
 pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, length: u64) -> u64 {
     let Some(handle) = handle_of(object) else {
-        return nullish_access(object);
+        // **A number or a boolean is not a cell**, so there is no object to walk from — but
+        // `(255).toString(16)` and `true.toString()` still have to find their prototypes. A
+        // string does not need this because a string *is* a cell, which is why this gap only
+        // showed when the other two grew methods worth reaching.
+        let held = Value::from_bits(object);
+        let prototype = match held.kind() {
+            crisol_value::Kind::Boolean => BOOLEAN_PROTOTYPE.with(std::cell::Cell::get),
+            _ if held.as_number().is_some() => NUMBER_PROTOTYPE.with(std::cell::Cell::get),
+            _ => None,
+        };
+        let Some(prototype) = prototype else {
+            return nullish_access(object);
+        };
+        // SAFETY: the caller promises `length` readable UTF-8 bytes at `key`.
+        let Some(name) = (unsafe { key_text(key, length) }) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        // The receiver stays the primitive, so a method reached this way still sees the number
+        // or boolean it was called on rather than the prototype.
+        return with_runtime(|runtime| {
+            let found = runtime.heap.shape_of(prototype).and_then(|shape| {
+                let key = PropertyKey::new(&name);
+                runtime.shapes.borrow().lookup(shape, &key)
+            });
+            found
+                .and_then(|slot| runtime.heap.get(prototype, slot.index()))
+                .map_or(Value::UNDEFINED.to_bits(), |value| value.to_bits())
+        });
     };
     // SAFETY: as above.
     let Some(name) = (unsafe { key_text(key, length) }) else {
