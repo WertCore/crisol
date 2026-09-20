@@ -2276,6 +2276,18 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Object.prototype", "toLocaleString", 0),
     ("Object.prototype", "toString", 0),
     ("Object.prototype", "valueOf", 0),
+    ("Reflect", "apply", 3),
+    ("Reflect", "defineProperty", 3),
+    ("Reflect", "deleteProperty", 2),
+    ("Reflect", "get", 2),
+    ("Reflect", "getOwnPropertyDescriptor", 2),
+    ("Reflect", "getPrototypeOf", 1),
+    ("Reflect", "has", 2),
+    ("Reflect", "isExtensible", 1),
+    ("Reflect", "ownKeys", 1),
+    ("Reflect", "preventExtensions", 1),
+    ("Reflect", "set", 3),
+    ("Reflect", "setPrototypeOf", 2),
     ("RegExp.prototype", "exec", 1),
     ("RegExp.prototype", "test", 1),
     ("RegExp.prototype", "toString", 0),
@@ -4990,7 +5002,299 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Math", "max", math_max),
     ("Math", "random", math_random),
     ("Array", "of", array_of),
+    ("Reflect", "get", reflect_get),
+    ("Reflect", "set", reflect_set),
+    ("Reflect", "has", reflect_has),
+    ("Reflect", "deleteProperty", reflect_delete_property),
+    ("Reflect", "ownKeys", reflect_own_keys),
+    ("Reflect", "getPrototypeOf", reflect_get_prototype_of),
+    ("Reflect", "setPrototypeOf", reflect_set_prototype_of),
+    ("Reflect", "defineProperty", reflect_define_property),
+    (
+        "Reflect",
+        "getOwnPropertyDescriptor",
+        reflect_own_descriptor,
+    ),
+    ("Reflect", "isExtensible", reflect_is_extensible),
+    ("Reflect", "preventExtensions", reflect_prevent_extensions),
+    ("Reflect", "apply", reflect_apply),
 ];
+
+/// Whether `value` is the exception signal, **clearing the pending throw if it is**.
+///
+/// `Reflect`'s operations answer `false` where `Object`'s throw, so the exception the shared
+/// implementation raised has to be taken back off the runtime — left there, the next `catch`
+/// would receive a throw that nothing performed.
+fn swallow_exception(value: u64) -> bool {
+    if Value::from_bits(value).is_exception() {
+        // Reading it is what clears it, which is why the answer is dropped on purpose.
+        let _ = crisol_pending_exception();
+        return true;
+    }
+    false
+}
+
+/// The receiver `Reflect` requires: an object, and not merely something with a handle.
+fn reflect_target(argc: u64, argv: *const u64) -> Result<u64, u64> {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    if Value::from_bits(target).kind() == crisol_value::Kind::Object {
+        Ok(target)
+    } else {
+        Err(raise("Reflect works on objects", "TypeError"))
+    }
+}
+
+/// `Reflect.get(target, key)`.
+///
+/// **The `receiver` argument is ignored.** It exists so a proxy's trap can read through to a
+/// getter with the original receiver, and there are no proxies here — honouring it would need
+/// the property walk to take a receiver separate from the object, which is a change to the
+/// walk rather than to this.
+extern "C" fn reflect_get(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 1) };
+    crisol_computed_load(target, key)
+}
+
+/// `Reflect.set(target, key, value)` — **`false` where an assignment would be ignored**, which
+/// is the whole difference from writing the property directly.
+extern "C" fn reflect_set(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 1) };
+    // SAFETY: as above.
+    let value = unsafe { argument(argc, argv, 2) };
+    let Some(name) = to_text(key) else {
+        return Value::FALSE.to_bits();
+    };
+    if refuses_assignment(target, &name) {
+        return Value::FALSE.to_bits();
+    }
+    let outcome = crisol_computed_store(target, key, value);
+    boolean(!swallow_exception(outcome)).to_bits()
+}
+
+/// `Reflect.has(target, key)` — the `in` operator as a function.
+extern "C" fn reflect_has(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 1) };
+    crisol_in(key, target)
+}
+
+/// `Reflect.deleteProperty(target, key)` — `delete` as a function.
+extern "C" fn reflect_delete_property(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 1) };
+    crisol_delete(target, key)
+}
+
+/// `Reflect.ownKeys(target)` — every own key, enumerable or not.
+///
+/// **Symbol keys are missing**, not omitted by choice: a `PropertyKey` is a string here
+/// (D-149), so an object cannot have one to report.
+extern "C" fn reflect_own_keys(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let target = match reflect_target(argc, argv) {
+            Ok(target) => target,
+            Err(thrown) => return thrown,
+        };
+        names_as_array(&own_keys(target))
+    })
+}
+
+/// `Reflect.getPrototypeOf(target)` — which refuses a primitive where `Object`'s coerces it.
+extern "C" fn reflect_get_prototype_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    let arguments = [target];
+    object_get_prototype(0, this_value, 0, 1, arguments.as_ptr())
+}
+
+/// `Reflect.setPrototypeOf(target, proto)` — `false` rather than a throw when it is refused.
+extern "C" fn reflect_set_prototype_of(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let proto = unsafe { argument(argc, argv, 1) };
+    let held = Value::from_bits(proto);
+    if held.kind() != crisol_value::Kind::Object && !held.is_null() {
+        return raise("a prototype must be an object or null", "TypeError");
+    }
+    let Some(handle) = handle_of(target) else {
+        return Value::FALSE.to_bits();
+    };
+    boolean(set_prototype_of(handle, proto).is_ok()).to_bits()
+}
+
+/// `Reflect.defineProperty(target, key, descriptor)` — `false` where `Object`'s throws.
+extern "C" fn reflect_define_property(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 1) };
+    // SAFETY: as above.
+    let descriptor = unsafe { argument(argc, argv, 2) };
+    // **A descriptor that is not an object still throws.** The specification's `false` is for
+    // a definition the target refuses, not for an argument that describes nothing — the one
+    // check `Reflect` keeps.
+    if Value::from_bits(descriptor).kind() != crisol_value::Kind::Object {
+        return raise("a property description must be an object", "TypeError");
+    }
+    let arguments = [target, key, descriptor];
+    let outcome = with_rooted(&arguments, || {
+        object_define_property(0, this_value, 0, 3, arguments.as_ptr())
+    });
+    boolean(!swallow_exception(outcome)).to_bits()
+}
+
+/// `Reflect.getOwnPropertyDescriptor(target, key)`.
+extern "C" fn reflect_own_descriptor(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let target = match reflect_target(argc, argv) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 1) };
+    let arguments = [target, key];
+    with_rooted(&arguments, || {
+        object_own_descriptor(0, this_value, 0, 2, arguments.as_ptr())
+    })
+}
+
+/// `Reflect.isExtensible(target)`.
+extern "C" fn reflect_is_extensible(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    match reflect_target(argc, argv) {
+        Ok(target) => boolean(is_extensible(target)).to_bits(),
+        Err(thrown) => thrown,
+    }
+}
+
+/// `Reflect.preventExtensions(target)`.
+extern "C" fn reflect_prevent_extensions(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    match reflect_target(argc, argv) {
+        Ok(target) => {
+            prevent_extensions(target);
+            Value::TRUE.to_bits()
+        }
+        Err(thrown) => thrown,
+    }
+}
+
+/// `Reflect.apply(target, thisArgument, argumentsList)`.
+extern "C" fn reflect_apply(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        if !is_callable(target) {
+            return raise("Reflect.apply needs a function", "TypeError");
+        }
+        // SAFETY: as above.
+        let receiver = unsafe { argument(argc, argv, 1) };
+        // SAFETY: as above.
+        let list = unsafe { argument(argc, argv, 2) };
+        let length = indexed_length(list);
+        let arguments: Vec<u64> = (0..length).map(|index| indexed_get(list, index)).collect();
+        with_rooted(&arguments, || call_value(target, receiver, &arguments))
+    })
+}
 
 /// Writes a property regardless of whether it is writable.
 ///
@@ -6100,9 +6404,13 @@ fn refuses_assignment(object: u64, name: &str) -> bool {
             let attributes = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
             !attributes.writable && !attributes.accessor
         }
-        None => {
-            derived_own_property(object, name).is_some_and(|(_, attributes)| !attributes.writable)
-        }
+        None => match derived_own_property(object, name) {
+            Some((_, attributes)) => !attributes.writable,
+            // **Absent is refused when the object is closed.** The write would *add* a
+            // property, which is exactly what a non-extensible object will not do — and the
+            // store below ignores it silently, so nothing downstream would have noticed.
+            None => !is_extensible(object),
+        },
     }
 }
 

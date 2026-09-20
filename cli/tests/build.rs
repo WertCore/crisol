@@ -6546,3 +6546,116 @@ fn a_date_can_be_set() {
         "3",
     );
 }
+
+/// **`Reflect` is `Object`'s operations with the failures reported rather than thrown.** Every
+/// method here is the machinery a property access already uses, exposed as a function — which
+/// is why it can exist at all without proxies, the other half of what it was designed for.
+#[test]
+fn reflect_exposes_the_object_operations() {
+    check("reflect-get", "return Reflect.get({a: 1}, \"a\");", "1");
+    check(
+        "reflect-set",
+        "let o = {}; let ok = Reflect.set(o, \"a\", 2); return ok + \",\" + o.a;",
+        "true,2",
+    );
+    check("reflect-has", "return Reflect.has({a: 1}, \"a\");", "true");
+    check(
+        "reflect-has-absent",
+        "return Reflect.has({}, \"a\");",
+        "false",
+    );
+    check(
+        "reflect-delete",
+        "let o = {a: 1}; let ok = Reflect.deleteProperty(o, \"a\"); \
+         return ok + \",\" + o.hasOwnProperty(\"a\");",
+        "true,false",
+    );
+    check(
+        "reflect-own-keys",
+        "return Reflect.ownKeys([7]).join(\",\");",
+        "0,length",
+    );
+    check(
+        "reflect-get-prototype-of",
+        "return Reflect.getPrototypeOf({}) === Object.prototype;",
+        "true",
+    );
+    check(
+        "reflect-define-property",
+        "let o = {}; let ok = Reflect.defineProperty(o, \"x\", {value: 1}); \
+         return ok + \",\" + o.x;",
+        "true,1",
+    );
+    check(
+        "reflect-own-descriptor",
+        "return Reflect.getOwnPropertyDescriptor({a: 1}, \"a\").value;",
+        "1",
+    );
+    check(
+        "reflect-is-extensible",
+        "return Reflect.isExtensible({});",
+        "true",
+    );
+    check(
+        "reflect-prevent-extensions",
+        "let o = {}; let ok = Reflect.preventExtensions(o); \
+         return ok + \",\" + Reflect.isExtensible(o);",
+        "true,false",
+    );
+    check(
+        "reflect-apply",
+        "return Reflect.apply(function (a, b) { return a + b; }, undefined, [2, 3]);",
+        "5",
+    );
+    check(
+        "reflect-set-prototype-of",
+        "let a = {x: 1}; let o = {}; let ok = Reflect.setPrototypeOf(o, a); \
+         return ok + \",\" + o.x;",
+        "true,1",
+    );
+}
+
+/// **The failures are reported, not thrown** — which is the whole reason to reach for
+/// `Reflect` over the `Object` method that does the same thing.
+#[test]
+fn reflect_answers_false_where_object_throws() {
+    check(
+        "reflect-set-on-a-frozen-object",
+        "let o = Object.freeze({a: 1}); return Reflect.set(o, \"a\", 2);",
+        "false",
+    );
+    check(
+        "reflect-set-a-new-property-on-a-closed-object",
+        "let o = Object.preventExtensions({}); return Reflect.set(o, \"a\", 2);",
+        "false",
+    );
+    check(
+        "reflect-define-on-a-closed-object",
+        "let o = Object.preventExtensions({}); \
+         return Reflect.defineProperty(o, \"x\", {value: 1});",
+        "false",
+    );
+    check(
+        "reflect-set-prototype-of-a-cycle",
+        "let a = {}; let b = Object.create(a); return Reflect.setPrototypeOf(a, b);",
+        "false",
+    );
+    // A swallowed refusal must not be left on the runtime for the next `catch` to find.
+    check(
+        "reflect-refusal-leaves-nothing-pending",
+        "let o = Object.preventExtensions({}); Reflect.defineProperty(o, \"x\", {value: 1}); \
+         try { return \"clean\"; } catch (e) { return \"leaked\"; }",
+        "clean",
+    );
+    // A primitive target is still an error: `Reflect` refuses where `Object` coerces.
+    check(
+        "reflect-get-prototype-of-a-number",
+        "try { Reflect.getPrototypeOf(1); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "reflect-get-on-a-primitive",
+        "try { Reflect.get(\"ab\", \"0\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}

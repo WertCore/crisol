@@ -5266,3 +5266,34 @@ obvious.
 `MakeDay` bounds the year before converting to the integer calendar arithmetic. A year of 1e20
 would otherwise wrap into a plausible date rather than the `NaN` that `TimeClip` would have
 produced anyway.
+
+## D-187
+
+**`Reflect` is `Object`'s operations with the failures reported rather than thrown.**
+
+Status: Accepted
+
+Every method is machinery a property access already uses, exposed as a function — which is why
+it can exist here at all without proxies, the other half of what `Reflect` was designed for.
+Seventeen corpus cases were failing on `Reflect is not defined` and nothing else.
+
+The interesting part is the failure convention. `Object.defineProperty` throws where
+`Reflect.defineProperty` answers `false`, and both run the same code — so the exception the
+shared implementation raised has to be taken back off the runtime. Left there, the next `catch`
+in the program would receive a throw that nothing performed, which is a far worse bug than the
+one being papered over. `swallow_exception` is that, and it is the only place the pending throw
+is read for a reason other than reporting it.
+
+**Two things `Reflect` still throws for**, because they are not refusals: a target that is not
+an object, and a descriptor that describes nothing. The specification's `false` is for a
+definition the target declines, not for an argument that was never a request.
+
+**`Reflect.get`'s `receiver` is ignored**, and `ownKeys` reports no symbols (D-149). The first
+exists so a proxy trap can read through to a getter with the original receiver; honouring it
+means giving the property walk a receiver separate from the object it is walking, which is a
+change to the walk rather than to this.
+
+**`refuses_assignment` learned about extensibility**, which `Reflect.set` needed and
+`Object.assign` had wanted all along: a write to an absent property on a non-extensible object
+adds one, which is exactly what it will not do — and the store ignores it silently, so nothing
+downstream would have noticed.
