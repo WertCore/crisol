@@ -7174,13 +7174,14 @@ extern "C" fn array_index_of(
         for index in 0..length {
             let element = Value::from_bits(indexed_get(this_value, index));
             // `indexOf` uses strict equality, so `NaN` is never found — `[NaN].indexOf(NaN)` is
-            // `-1`. Comparing the numbers rather than the bits is what gets that right.
-            let same = match (element.as_number(), wanted.as_number()) {
-                (Some(left), Some(right)) => left == right,
-                (None, None) => element == wanted,
-                _ => false,
-            };
-            if same {
+            // `-1`. That much this always had right.
+            //
+            // **Strings compare by their characters, and this compared bits.** Two cells
+            // holding `"b"` are different values, so `["a", "b"].indexOf("b")` answered `-1`
+            // for as long as this method has existed — no test looked for a string, and every
+            // test that did look used numbers, where comparing bits happens to agree.
+            // `same_value` is the shared rule (D-114) this predates and never adopted.
+            if same_value(element, wanted) {
                 return index_value(index);
             }
         }

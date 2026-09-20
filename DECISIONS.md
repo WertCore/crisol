@@ -4684,3 +4684,28 @@ implementation answered when it could not find real elements. The specification 
 boolean has no `length`, so the search runs over zero elements and reports not-found. The test
 was written to lock in an answer rather than to check one, and it took a change that made the
 behaviour *correct* to expose that.
+
+## D-160
+
+**`indexOf` compared bits where it had to compare characters.**
+
+Status: Accepted — a bug older than everything that found it
+
+`["a", "b"].indexOf("b")` answered `-1`, and had for as long as the method existed. The
+comparison was written inline:
+
+    (None, None) => element == wanted,
+
+which is identity, and two cells holding `"b"` are not the same cell. `same_value` — the shared
+rule that compares string *text* — was written later for `lastIndexOf` and `includes` (D-114),
+and `indexOf` never adopted it.
+
+**Every test of `indexOf` used numbers**, where comparing bits happens to agree with comparing
+values, so nothing caught it. What finally did was a test of something else entirely: an
+array-*like* whose elements were strings (D-157). The array-like work was not looking for this
+and could not have been; it just happened to be the first `indexOf` test written with a string
+in it.
+
+That is the argument for varying the *types* in a test and not only the shapes. A method that
+takes any value and was only ever tested with one kind of value has been tested for one kind of
+value.

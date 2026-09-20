@@ -4684,3 +4684,41 @@ fn a_string_wrapper_is_indexed() {
     // A plain object with a numbered property is unaffected.
     check("plain-index", "let o = {0: \"z\"}; return o[0];", "z");
 }
+
+/// **`indexOf` compares strings by their characters.** It compared bits, so two cells holding
+/// `"b"` were different values and `["a", "b"].indexOf("b")` answered `-1` for as long as the
+/// method has existed. Every existing test used numbers, where comparing bits happens to agree.
+#[test]
+fn index_of_finds_a_string() {
+    check(
+        "indexof-string",
+        "return [\"a\", \"b\"].indexOf(\"b\");",
+        "1",
+    );
+    check(
+        "indexof-string-first",
+        "return [\"a\", \"b\"].indexOf(\"a\");",
+        "0",
+    );
+    check(
+        "indexof-string-missing",
+        "return [\"a\"].indexOf(\"z\");",
+        "-1",
+    );
+    // Built rather than written, so the two cells cannot be the same allocation.
+    check(
+        "indexof-string-built",
+        "let needle = \"a\" + \"b\"; return [\"x\", \"ab\"].indexOf(needle);",
+        "1",
+    );
+    // The rules it already had right stay right.
+    check("indexof-nan-still", "return [0 / 0].indexOf(0 / 0);", "-1");
+    check("indexof-number-still", "return [1, 2].indexOf(2);", "1");
+    // An object compares by identity, which is what the fallback is for.
+    check(
+        "indexof-object-identity",
+        "let o = {}; return [o, {}].indexOf(o);",
+        "0",
+    );
+    check("indexof-object-not-equal", "return [{}].indexOf({});", "-1");
+}
