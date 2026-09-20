@@ -4387,8 +4387,14 @@ fn a_primitive_number_or_boolean_reaches_its_prototype() {
         "return typeof Number.prototype.toString;",
         "function",
     );
-    // Narrowing further: a variable receiver and a computed key reach the same prototype by
-    // different routes through the compiler, which separates lowering from runtime.
+    // The decisive one: `call` hands the primitive to the method directly and never asks the
+    // primitive for a property. If this works, the method and the prototype are both fine and
+    // only the lookup from a primitive receiver is broken.
+    check(
+        "primitive-via-call",
+        "return Number.prototype.toString.call(255, 16);",
+        "ff",
+    );
     check(
         "primitive-var-tostring",
         "let n = 255; return typeof n.toString;",
