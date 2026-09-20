@@ -2144,14 +2144,67 @@ extern "C" fn construct_plain_object(
     _closure: u64,
     this_value: u64,
     _new_target: u64,
-    _argc: u64,
-    _argv: *const u64,
+    argc: u64,
+    argv: *const u64,
 ) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    // **`Object(o) === o`.** Given something that is already an object, this is the identity —
+    // it answered a fresh empty object instead, which is the same shape of answer and a
+    // different object, so every identity test on it failed while every property test passed.
+    if let Some(wrapped) = to_object(value) {
+        return wrapped;
+    }
     // `new Object()` already has a receiver; a plain call does not.
     if handle_of(this_value).is_some() {
         return this_value;
     }
     crisol_create_object()
+}
+
+/// `ToObject` — an object argument unchanged, a primitive wrapped, nullish refused.
+///
+/// The wrapper is built here rather than by calling `String`, `Number` or `Boolean`, because
+/// those are reached through the globals and a program can replace them; `ToObject` is an
+/// internal operation and must not be reroutable. What it stores is what those constructors
+/// store, so a method reached through either wrapper reads the same primitive back.
+fn to_object(value: u64) -> Option<u64> {
+    let held = Value::from_bits(value);
+    let prototype = match held.kind() {
+        crisol_value::Kind::Object => return Some(value),
+        crisol_value::Kind::Undefined | crisol_value::Kind::Null => return None,
+        crisol_value::Kind::String => STRING_PROTOTYPE.with(std::cell::Cell::get),
+        crisol_value::Kind::Number => NUMBER_PROTOTYPE.with(std::cell::Cell::get),
+        crisol_value::Kind::Boolean => BOOLEAN_PROTOTYPE.with(std::cell::Cell::get),
+        crisol_value::Kind::Symbol => SYMBOL_PROTOTYPE.with(std::cell::Cell::get),
+    };
+    // The primitive stays rooted across the allocation: a string and a symbol are heap cells,
+    // and one held only in a Rust local while something else allocates is invisible.
+    Some(with_rooted(&[value], || {
+        let wrapper = crisol_create_object();
+        with_rooted(&[wrapper, value], || {
+            let Some(handle) = handle_of(wrapper) else {
+                return;
+            };
+            with_runtime(|runtime| {
+                runtime.heap.set_prototype(handle, prototype);
+                runtime.define_hidden(handle, STRING_PRIMITIVE, held);
+            });
+            // A string wrapper's `length` is a real property, because nothing else would
+            // find it — the same reason `String` defines one at construction.
+            if let Some(text) = text_of(value) {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a string this long cannot be allocated"
+                )]
+                let units = text.encode_utf16().count() as f64;
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, "length", Value::number(units));
+                });
+            }
+        });
+        wrapper
+    }))
 }
 
 /// Methods that hang off a global object rather than being one.
@@ -4548,6 +4601,12 @@ extern "C" fn object_define_property(
         let Some(name) = to_text(key) else {
             return raise("a property key must be a name", "TypeError");
         };
+        // **A descriptor has to be an object.** A number has no `value` and no `writable`, so
+        // reading fields off it found nothing and the call quietly defined the property as
+        // `undefined` — a wrong answer where the specification has an error.
+        if handle_of(descriptor).is_none() {
+            return raise("a property description must be an object", "TypeError");
+        }
 
         // **An array's `length` is its element count, not a property**, so defining it has to
         // resize rather than store. Storing left the array reporting two lengths at once — the
@@ -4956,14 +5015,32 @@ fn own_keys(object: u64) -> Vec<String> {
             false
         };
         if let Some(shape) = runtime.heap.shape_of(handle) {
+            // **An integer-like key is an index, and every index comes before every name, in
+            // ascending order** — whatever order they were inserted in. That is the
+            // specification's ordering and it is observable: `Object.keys({b: 1, 2: 1, 1: 1})`
+            // is `["1", "2", "b"]`, not insertion order. Storing them in one list gave
+            // insertion order, which is right for the names and wrong for the rest.
+            let mut indices: Vec<(usize, String)> = Vec::new();
+            let mut strings: Vec<String> = Vec::new();
             for (key, slot) in runtime.shapes.borrow().properties(shape) {
                 if runtime.heap.is_deleted(handle, slot.index())
                     || is_internal_property(key.as_str())
                 {
                     continue;
                 }
-                names.push(key.as_str().to_owned());
+                let name = key.as_str().to_owned();
+                // The canonical spelling only: `"01"` parses as one and is not an index, so
+                // it stays where it was written.
+                match name.parse::<usize>() {
+                    Ok(index) if number_text(index_as_f64(index)) == name => {
+                        indices.push((index, name));
+                    }
+                    _ => strings.push(name),
+                }
             }
+            indices.sort_unstable_by_key(|(index, _)| *index);
+            names.extend(indices.into_iter().map(|(_, name)| name));
+            names.extend(strings);
         }
         // **An array owns `length`**, even though nothing stores it. `getOwnPropertyNames` has
         // to say so, and it did not — an array reported its indices and nothing else. It is
@@ -8797,9 +8874,7 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
         // load, and a property load enters the runtime itself.
         let configurable = elements_are_configurable(object);
         let handled = with_runtime(|runtime| {
-            let Some(count) = runtime.heap.element_count(handle) else {
-                return None;
-            };
+            let count = runtime.heap.element_count(handle)?;
             if index >= count {
                 return Some(true);
             }

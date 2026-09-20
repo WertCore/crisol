@@ -5631,3 +5631,78 @@ fn an_element_answers_for_its_own_enumerability() {
         "false",
     );
 }
+
+/// **Every index comes before every name, in ascending order**, whatever order they were
+/// written in. That is the specification's enumeration order and it is observable.
+#[test]
+fn keys_come_out_indices_first() {
+    check(
+        "key-order",
+        "return Object.keys({b: 1, 2: 1, 1: 1, a: 1}).join(\",\");",
+        "1,2,b,a",
+    );
+    check(
+        "key-order-forin",
+        "let s = \"\"; for (let k in {b: 1, 2: 1, 1: 1, a: 1}) { s = s + k; } return s;",
+        "12ba",
+    );
+    // Only the canonical spelling is an index: `"01"` is a name and stays where it was put.
+    check(
+        "key-order-non-canonical",
+        "let o = {}; o[\"01\"] = 1; o[\"1\"] = 1; return Object.keys(o).join(\",\");",
+        "1,01",
+    );
+    check(
+        "key-order-names-keep-insertion",
+        "return Object.keys({z: 1, a: 1, m: 1}).join(\",\");",
+        "z,a,m",
+    );
+}
+
+/// `Object(x)` is `ToObject(x)`: an object unchanged, a primitive wrapped, nothing at all for
+/// nothing at all.
+#[test]
+fn the_object_constructor_coerces() {
+    check(
+        "object-of-object-is-identity",
+        "let o = {x: 1}; return Object(o) === o;",
+        "true",
+    );
+    check("object-of-number", "return Object(5).valueOf();", "5");
+    check(
+        "object-of-string-length",
+        "return Object(\"ab\").length;",
+        "2",
+    );
+    check(
+        "object-of-string-tag",
+        "return Object.prototype.toString.call(Object(\"ab\"));",
+        "[object String]",
+    );
+    check(
+        "object-of-boolean-tag",
+        "return Object.prototype.toString.call(Object(true));",
+        "[object Boolean]",
+    );
+    check(
+        "object-of-nothing",
+        "return Object.keys(Object()).length;",
+        "0",
+    );
+    check(
+        "object-of-null",
+        "return Object.prototype.toString.call(Object(null));",
+        "[object Object]",
+    );
+    // A descriptor has to be able to hold fields; a number quietly defined `undefined`.
+    check(
+        "define-property-bad-descriptor",
+        "try { Object.defineProperty({}, \"x\", 5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "define-properties-bad-target",
+        "try { Object.defineProperties(5, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}

@@ -4973,3 +4973,31 @@ it is the only classification an engine without `Symbol.toStringTag` can offer, 
 
 A representation chosen to satisfy one reader is a representation that loses whatever the other
 readers would have asked. Keeping the primitive as the primitive costs nothing and answers both.
+
+## D-172
+
+**Enumeration order is indices first, ascending, then names in insertion order.**
+
+Status: Accepted
+
+Every own key went into one list in the order the shape recorded it, which is right for the
+names and wrong for everything else: `Object.keys({b: 1, 2: 1, 1: 1})` answered
+`["b", "2", "1"]` where the specification fixes `["1", "2", "b"]`. The order is observable
+through `Object.keys`, `Object.values`, `Object.entries`, `for-in` and `JSON.stringify`, so one
+wrong list is five wrong answers.
+
+Only the **canonical** spelling is an index. `"01"` parses as one and is not an array index, so
+it stays among the names — a parse alone is not the test, and using one would have moved keys a
+program wrote as text.
+
+## D-173
+
+**`Object(x)` is `ToObject(x)`.**
+
+Status: Accepted
+
+It answered a fresh empty object for every argument, so `Object(o) === o` was false and
+`Object(5)` had no `valueOf`. The wrapper is built here rather than by calling the `String`,
+`Number` or `Boolean` globals, because a program can replace those and `ToObject` is an
+internal operation that must not be reroutable — but it stores exactly what those constructors
+store, so a method reached through either wrapper reads the same primitive back.
