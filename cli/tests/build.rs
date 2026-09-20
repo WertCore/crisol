@@ -3512,9 +3512,7 @@ fn an_uncaught_error_reports_its_name_and_message() {
     let binary = directory.join("main");
     crisol::build::build(&file, &binary, &runtime).expect("should build");
 
-    let output = std::process::Command::new(&binary)
-        .output()
-        .expect("run the binary");
+    let output = Command::new(&binary).output().expect("run the binary");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("TypeError") && stderr.contains("bad thing"),
