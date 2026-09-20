@@ -5085,3 +5085,53 @@ addition", so defining an index past the end is refused and defining one below i
 directly, which would have gone straight past the refusal that freezing is for; it now defers
 to the generic path whenever the elements are not ordinary, and that path reads their
 attributes from the derived answer (D-169).
+
+## D-179
+
+**An element carries its own attributes, in a rule array beside the run.**
+
+Status: Accepted
+
+Elements are a dense `Vec` with no room for attributes, so the first version of this carried
+two flags for the whole run (D-169) — exact for `freeze` and `seal`, which restrict every
+element at once, and unable to express `Object.defineProperty(a, 0, {writable: false})` at all.
+That matters more than it sounds: `defineProperty` and `defineProperties` are **more than half**
+of test262's `Object` directory, and a sixth of those target arrays.
+
+The rule array has two levels. Position 0 is the rule for every element; position `i + 1`
+overrides it for element `i`; a position holding `undefined` is not an override. Two levels
+rather than one entry per element because the two writers want different things — freezing a
+million-element array must not cost a million entries, and `defineProperty` restricts exactly
+one. **Absent means ordinary**, so an array nobody restricts carries nothing and the write path
+pays the one shape lookup it already paid.
+
+**`defineProperty` now has one path.** The array-index case used to be a separate shortcut that
+only handled unrestricted descriptors; the current attributes come from `derived_own_property`
+either way, and only the two *writes* differ. An accessor is still the exception — the place
+the pair of functions would live *is* the element — and falls through to the slot path.
+
+## D-180
+
+**A thrown error is an instance of what threw it.**
+
+Status: Accepted
+
+`raise` built a plain object with `name` and `message` on it. Every check a program makes about
+what it caught — `e instanceof TypeError`, `e.constructor`, `Object.prototype.toString.call(e)`
+— therefore said `Object`, for an engine that had thrown exactly the right thing.
+
+This was invisible until `constructor` existed (D-176). Before that, test262's `assert.throws`
+read `thrown.constructor.name` off `undefined` and failed with a different message; the fix to
+one hole made the other one legible. **55 corpus cases changed their complaint the moment
+`constructor` landed, and none of them changed their outcome** — which is the useful kind of
+regression: the same failures, finally saying what they are.
+
+The prototype is read off the global constructor rather than from a cell of its own, so
+replacing `TypeError.prototype` changes what the engine throws. That is wrong for an internal
+operation and right against the alternative, which is five more thread-locals kept in step by
+hand.
+
+**`name` moved to the prototype**, where one string serves every instance, and `message` became
+non-enumerable — so `Object.keys(new TypeError("x"))` is empty, as it is everywhere else.
+`Error.prototype.toString` exists; errors inherited `Object.prototype.toString` and described
+themselves as `[object Object]`.

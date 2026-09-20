@@ -6046,3 +6046,127 @@ fn defining_respects_extensibility() {
         "TypeError",
     );
 }
+
+/// **A thrown error has to be an instance of what threw it.** `catch (e) { e instanceof
+/// TypeError }` is how a program asks what it caught, and test262's `assert.throws` compares
+/// `thrown.constructor` — both answered `Object` for an engine that had thrown exactly the
+/// right thing.
+#[test]
+fn an_error_is_an_instance_of_its_constructor() {
+    check(
+        "error-instanceof",
+        "return new TypeError(\"x\") instanceof TypeError;",
+        "true",
+    );
+    // Every kind of error is an `Error`, which is what most code that catches one checks.
+    check(
+        "error-instanceof-error",
+        "return new TypeError(\"x\") instanceof Error;",
+        "true",
+    );
+    check(
+        "error-constructor",
+        "return new RangeError(\"x\").constructor === RangeError;",
+        "true",
+    );
+    // Called without `new`, a constructor still constructs.
+    check(
+        "error-called-plainly",
+        "return Error(\"x\") instanceof Error;",
+        "true",
+    );
+    // And the errors the engine itself raises are the same kind of object.
+    check(
+        "raised-error-instanceof",
+        "try { null.x; return \"no\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    check(
+        "raised-error-constructor",
+        "try { null.x; return \"no\"; } catch (e) { return e.constructor === TypeError; }",
+        "true",
+    );
+    // The kind lives on the prototype, so the instance carries nothing a program can list.
+    check(
+        "error-keys",
+        "return Object.keys(new TypeError(\"x\")).length;",
+        "0",
+    );
+    check(
+        "error-prototype-name",
+        "return Error.prototype.name;",
+        "Error",
+    );
+    check(
+        "error-to-string",
+        "return new TypeError(\"x\").toString();",
+        "TypeError: x",
+    );
+    // Either half being empty takes the separator with it.
+    check(
+        "error-to-string-bare",
+        "return new Error().toString();",
+        "Error",
+    );
+    check(
+        "error-to-string-message-only",
+        "let e = new Error(\"x\"); e.name = \"\"; return e.toString();",
+        "x",
+    );
+}
+
+/// **An element can be restricted on its own.** Elements share a dense `Vec` with no room for
+/// attributes, so a rule array beside them carries the exceptions: one entry for the whole run
+/// and one per element that differs.
+#[test]
+fn an_element_can_carry_its_own_attributes() {
+    check(
+        "define-element-unwritable",
+        "let a = [1]; Object.defineProperty(a, \"0\", {writable: false}); a[0] = 9; return a[0];",
+        "1",
+    );
+    check(
+        "define-element-unwritable-descriptor",
+        "let a = [1]; Object.defineProperty(a, \"0\", {writable: false}); \
+         return Object.getOwnPropertyDescriptor(a, \"0\").writable;",
+        "false",
+    );
+    // A defined property defaults to none of the three, elements included.
+    check(
+        "define-new-element-defaults",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 7}); \
+         let d = Object.getOwnPropertyDescriptor(a, \"0\"); \
+         return a.length + \",\" + d.value + \",\" + d.writable + \",\" + d.enumerable;",
+        "1,7,false,false",
+    );
+    check(
+        "define-non-enumerable-element",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 7}); return Object.keys(a).length;",
+        "0",
+    );
+    check(
+        "define-non-configurable-element-refuses-delete",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 7}); return delete a[0];",
+        "false",
+    );
+    // One element's rule does not become every element's.
+    check(
+        "element-rules-are-per-element",
+        "let a = [1, 2]; Object.defineProperty(a, \"0\", {writable: false}); \
+         a[0] = 8; a[1] = 9; return a[0] + \",\" + a[1];",
+        "1,9",
+    );
+    // Sealing narrows what is already narrow rather than widening it.
+    check(
+        "seal-keeps-an-unwritable-element",
+        "let a = [1]; Object.defineProperty(a, \"0\", {writable: false}); \
+         Object.seal(a); a[0] = 9; return a[0];",
+        "1",
+    );
+    check(
+        "seal-leaves-other-elements-writable",
+        "let a = [1, 2]; Object.defineProperty(a, \"0\", {writable: false}); \
+         Object.seal(a); a[1] = 9; return a[1];",
+        "9",
+    );
+}
