@@ -4729,3 +4729,27 @@ now does (D-154).
 The constructor is re-pointed after the globals are built rather than special-cased inside
 `ensure_global_object`: that helper's job is to make a namespace exist, and which body one of
 them runs is a different question.
+
+## D-162
+
+**Elements are dense; the specification's arrays are not.**
+
+Status: Accepted, as an approximation with a stated cost
+
+`a[4294967294] = 2` is legal JavaScript — 2^32-2 is the highest array index — and a dense `Vec`
+answers it by asking for every slot below as well. That is not a slow answer but a dead process,
+and it arrived as the last crash in the corpus.
+
+Past four million, an index becomes a **named property** instead of an element. The value is
+still stored and still readable by the same key; what it is not is an element, so `length` does
+not count it. **That is wrong**, and the reason to do it anyway is that it is wrong in a way a
+test can report rather than a way that kills the run — the same trade already made for lone
+surrogates (D-158).
+
+Four million keeps a worst case near thirty megabytes, which is an array somebody might really
+build. Below the cap nothing changes: an ordinary index is an element and stays fast.
+
+Doing this properly means sparse element storage, which is a representation change of the same
+size as the UTF-16 one (D-158) and the hash-table one (D-148). Three approximations now point at
+the same conclusion — the heap's value representations were chosen for the common case, and
+test262 is mostly not the common case.

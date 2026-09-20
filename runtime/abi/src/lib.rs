@@ -2060,6 +2060,15 @@ const BOUND_CALL: usize = 1;
 /// The index within [`ANONYMOUS_NATIVES`] of the array constructor.
 const CONSTRUCT_ARRAY: usize = 2;
 
+/// The highest index stored as an array *element* rather than as a named property.
+///
+/// **Elements are dense and the specification's arrays are not.** Writing `a[4294967294] = 1`
+/// is legal JavaScript and asks a dense store for four billion slots, which is not a slow
+/// answer but a dead process. Four million keeps a worst case around thirty megabytes, which
+/// is a real array somebody might build; past that the value becomes a named property, still
+/// stored and still readable, but not counted by `length`.
+const DENSE_ELEMENT_LIMIT: usize = 4_194_303;
+
 /// `Array(…)` and `new Array(…)`.
 ///
 /// **One number is a length and anything else is an element.** `Array(3)` is three empty slots
@@ -7523,11 +7532,21 @@ pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) -> u6
     let key = Value::from_bits(key);
 
     let stored = with_runtime(|runtime| {
-        as_index(key).is_some_and(|index| {
-            runtime
-                .heap
-                .set_element(handle, index, Value::from_bits(value))
-        })
+        as_index(key)
+            // **A sparse index becomes a named property rather than four billion slots.**
+            // Elements are a dense `Vec`, so `a[4294967294] = 2` — a legal array index — asks
+            // for every slot below it as well. The specification's arrays are sparse; these
+            // are not, and the honest approximation is to stop pretending past the point where
+            // the memory would be absurd. Beyond the cap the value is still *stored*, and still
+            // readable by the same key; what it is not is an element, so `length` does not
+            // count it. That is wrong, and it is wrong in a way a test can report rather than
+            // a way that kills the process.
+            .filter(|index| *index <= DENSE_ELEMENT_LIMIT)
+            .is_some_and(|index| {
+                runtime
+                    .heap
+                    .set_element(handle, index, Value::from_bits(value))
+            })
     });
     if stored {
         return Value::UNDEFINED.to_bits();

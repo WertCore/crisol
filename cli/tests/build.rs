@@ -4779,3 +4779,34 @@ fn the_array_constructor_refuses_an_impossible_length() {
         "RangeError",
     );
 }
+
+/// **A sparse index becomes a named property rather than four billion slots.** Elements are a
+/// dense `Vec`, so `a[4294967294] = 2` — a legal array index — asks for every slot below it as
+/// well. The value is still stored and still readable by the same key; what it is not is an
+/// element, so `length` does not count it. That is wrong, and wrong in a way a test can report
+/// rather than a way that kills the process.
+#[test]
+fn a_sparse_index_does_not_exhaust_memory() {
+    check(
+        "sparse-read-back",
+        "let a = []; a[4294967294] = 2; return a[4294967294];",
+        "2",
+    );
+    check(
+        "sparse-length",
+        "let a = [0, 1]; a[4294967294] = 2; return a.length;",
+        "2",
+    );
+    check(
+        "sparse-survives",
+        "let a = []; a[4294967294] = 2; return typeof a;",
+        "object",
+    );
+    // An ordinary index is still an element, which is the case that has to stay fast.
+    check(
+        "dense-still-element",
+        "let a = []; a[3] = 7; return a.length;",
+        "4",
+    );
+    check("dense-read-back", "let a = []; a[3] = 7; return a[3];", "7");
+}
