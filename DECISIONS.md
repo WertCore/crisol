@@ -4709,3 +4709,23 @@ in it.
 That is the argument for varying the *types* in a test and not only the shapes. A method that
 takes any value and was only ever tested with one kind of value has been tested for one kind of
 value.
+
+## D-161
+
+**`Array(3)` is three elements; `Array("3")` is one.**
+
+Status: Accepted, closing a gap the code had already admitted to
+
+`ensure_global_object` gives every namespace the plain-object body, and a comment beside it had
+said for some time that this is *"right for `Object` and wrong for `Array`"*. It was: `new
+Array(10)` answered `{}`, so every test that built an array that way then called a method on it
+found nothing to iterate.
+
+**One number is a length and anything else is an element.** That is the most surprising rule in
+the constructor and the reason `Array.of` exists to mean the other thing (D-150). A length that
+is negative, fractional, or 2^32 or more is a `RangeError`, matching what assigning to `length`
+now does (D-154).
+
+The constructor is re-pointed after the globals are built rather than special-cased inside
+`ensure_global_object`: that helper's job is to make a namespace exist, and which body one of
+them runs is a different question.

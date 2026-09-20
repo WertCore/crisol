@@ -2046,17 +2046,69 @@ extern "C" fn to_boolean_global(
 /// Numbered last, after [`NATIVES`], [`GLOBAL_NATIVES`] and [`NAMESPACE_NATIVES`]. A table of
 /// its own because the index space is shared: the first version of this pointed at index 0 of
 /// the *first* table, so calling `Object()` ran `Array.prototype.map`.
-const ANONYMOUS_NATIVES: &[Native] = &[construct_plain_object, bound_call];
+const ANONYMOUS_NATIVES: &[Native] = &[construct_plain_object, bound_call, construct_array];
 
 /// The index within [`ANONYMOUS_NATIVES`] of the plain-object constructor.
 ///
-/// `Object()` and `Array()` both answer with a plain object, which is right for `Object` and
-/// wrong for `Array` — `Array(3)` should give a three-element array. Recorded rather than left
-/// to be discovered.
+/// `Object()` answers a plain object. `Array()` has its own, because `Array(3)` is a
+/// three-element array and `Array(1, 2)` is a two-element one — see [`CONSTRUCT_ARRAY`].
 const CONSTRUCT_PLAIN_OBJECT: usize = 0;
 
 /// The index within [`ANONYMOUS_NATIVES`] of the body every bound function runs.
 const BOUND_CALL: usize = 1;
+
+/// The index within [`ANONYMOUS_NATIVES`] of the array constructor.
+const CONSTRUCT_ARRAY: usize = 2;
+
+/// `Array(…)` and `new Array(…)`.
+///
+/// **One number is a length and anything else is an element.** `Array(3)` is three empty slots
+/// and `Array("3")` is one string — the single most surprising rule in the constructor, and the
+/// reason `Array.of` exists to mean the other thing (D-150).
+extern "C" fn construct_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if argc == 1 {
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        let only = Value::from_bits(unsafe { argument(argc, argv, 0) });
+        if let Some(length) = only.as_number() {
+            if !length.is_finite()
+                || length < 0.0
+                || length.fract() != 0.0
+                || length > 4_294_967_295.0
+            {
+                return raise("invalid array length", "RangeError");
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "range-checked immediately above"
+            )]
+            let length = length as usize;
+            return with_new_array(length, |array| {
+                // Filled with `undefined` where the specification says holes, which is the
+                // approximation array literals already make (D-133).
+                if length > 0 {
+                    with_runtime(|runtime| {
+                        runtime
+                            .heap
+                            .set_element(array, length - 1, Value::UNDEFINED);
+                    });
+                }
+                array.to_value().to_bits()
+            });
+        }
+    }
+    let given: Vec<u64> = (0..argc as usize)
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        .map(|position| unsafe { argument(argc, argv, position) })
+        .collect();
+    with_rooted(&given, || array_of_values(&given))
+}
 
 /// Where a bound function keeps what it was bound to.
 ///
@@ -5485,6 +5537,23 @@ impl Runtime {
             let function = self.native_function(NATIVES.len() + GLOBAL_NATIVES.len() + index);
             self.define_method(owner, method, function.to_value());
         }
+        // **`Array` runs its own constructor.** `ensure_global_object` gives every namespace the
+        // plain-object body, which is right for `Object` and wrong here — `Array(3)` has to be
+        // three elements long. Re-pointed rather than special-cased in that helper, because the
+        // helper's job is to make a namespace exist and this is about what one of them does.
+        if let Some(array) = self.global_object(globals.handle(), "Array") {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "there are a handful of built-ins"
+            )]
+            let encoded = -((NATIVES.len()
+                + GLOBAL_NATIVES.len()
+                + NAMESPACE_NATIVES.len()
+                + CONSTRUCT_ARRAY) as f64
+                + 1.0);
+            self.heap.set_internal(array, 0, Value::number(encoded));
+        }
+
         // Each constructor's `prototype` is the object its instances already inherit from, not
         // a new one — otherwise `[].map === Array.prototype.map` would be false, and the same
         // for every other pair.

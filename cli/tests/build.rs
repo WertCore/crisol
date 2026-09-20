@@ -4743,3 +4743,39 @@ fn an_impossible_length_raises_rather_than_allocating() {
         "2,4",
     );
 }
+
+/// **One number is a length and anything else is an element.** `Array(3)` is three empty slots
+/// and `Array("3")` is one string — the most surprising rule in the constructor, and the reason
+/// `Array.of` exists to mean the other thing.
+#[test]
+fn the_array_constructor_reads_one_number_as_a_length() {
+    check("array-ctor-length", "return new Array(3).length;", "3");
+    check("array-ctor-length-plain", "return Array(3).length;", "3");
+    check("array-ctor-string", "return Array(\"3\").length;", "1");
+    check("array-ctor-string-value", "return Array(\"3\")[0];", "3");
+    check("array-ctor-many", "return Array(1, 2, 3).length;", "3");
+    check("array-ctor-none", "return Array().length;", "0");
+    check("array-ctor-zero", "return Array(0).length;", "0");
+    // `Array.of` means the other thing, which is why both exist.
+    check("array-of-contrast", "return Array.of(3).length;", "1");
+}
+
+/// A length the constructor cannot honour is a `RangeError`, as it is for an assignment.
+#[test]
+fn the_array_constructor_refuses_an_impossible_length() {
+    check(
+        "array-ctor-too-big",
+        "let r = \"\"; try { Array(4294967296); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "array-ctor-fraction",
+        "let r = \"\"; try { Array(1.5); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "array-ctor-negative",
+        "let r = \"\"; try { Array(-1); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
