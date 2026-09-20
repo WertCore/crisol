@@ -5001,3 +5001,24 @@ It answered a fresh empty object for every argument, so `Object(o) === o` was fa
 `Number` or `Boolean` globals, because a program can replace those and `ToObject` is an
 internal operation that must not be reroutable — but it stores exactly what those constructors
 store, so a method reached through either wrapper reads the same primitive back.
+
+## D-174
+
+**An index names an element, even spelled as text.**
+
+Status: Accepted
+
+`a[0]` reached the elements and `a["0"]` did not. They are the same property, so the second
+answered `undefined` for every element an array has — and it is the spelling every path that
+works by *name* uses. `Object.values([7, 8])` was `[undefined, undefined]`,
+`Object.entries` the same, and `Object.assign({}, [7, 8])` copied two undefineds and a
+`length`.
+
+The computed path handled a number key; nothing handled the string one. Both spellings now go
+through one `store_element` on the way in and one branch of the named load on the way out, so
+they cannot disagree again. A primitive string reads its characters there too, rather than
+only through a wrapper it never made.
+
+**`Object.assign` copies the enumerable ones.** It walked every own key, which includes an
+array's `length` and a wrapper's — so the target gained a `length` it had no business having.
+That was invisible while the values it copied were all `undefined` anyway.

@@ -4476,12 +4476,6 @@ fn own_property(object: u64, name: &str) -> Option<(u32, Value)> {
 ///
 /// A string wrapper's characters are the same shape of problem, for the same reason (D-157).
 fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::Attributes)> {
-    /// Whether `name` is the canonical spelling of `index`, so `"01"` and `"1.0"` are not
-    /// element keys however they parse.
-    fn canonical(name: &str, index: usize) -> bool {
-        number_text(index_as_f64(index)) == name
-    }
-
     let handle = handle_of(object)?;
     if let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle)) {
         if name == "length" {
@@ -4497,8 +4491,8 @@ fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::A
                 },
             ));
         }
-        let index = name.parse::<usize>().ok()?;
-        if index >= count || !canonical(name, index) {
+        let index = canonical_index(name)?;
+        if index >= count {
             return None;
         }
         return Some((
@@ -4526,8 +4520,8 @@ fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::A
             },
         ));
     }
-    let index = name.parse::<usize>().ok()?;
-    let unit = units.get(index).filter(|_| canonical(name, index))?;
+    let index = canonical_index(name)?;
+    let unit = units.get(index)?;
     Some((
         new_string(&String::from_utf16_lossy(&[*unit])),
         crisol_value::Attributes {
@@ -4537,6 +4531,56 @@ fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::A
             accessor: false,
         },
     ))
+}
+
+/// Writes `value` at `index`, saying whether `object` was something that keeps elements.
+///
+/// **The refusals are the element ones, not the slot ones.** An existing element may be
+/// written on a non-extensible object and a new one may not, because growing the run *is* the
+/// addition that being non-extensible refuses — and `set_element` grows to fit, so the
+/// question has to be asked before the write rather than inside it.
+///
+/// **A sparse index is not an element.** Elements are a dense `Vec`, so `a[4294967294] = 2` —
+/// a legal array index — asks for every slot below it as well. The specification's arrays are
+/// sparse; these are not, and the honest approximation is to stop pretending past the point
+/// where the memory would be absurd. Beyond the cap this answers `false` and the value becomes
+/// a named property: still stored, still readable by the same key, but not counted by
+/// `length`. That is wrong in a way a test can report rather than one that kills the process.
+fn store_element(object: u64, index: usize, value: u64) -> bool {
+    if index > DENSE_ELEMENT_LIMIT {
+        return false;
+    }
+    let Some(handle) = handle_of(object) else {
+        return false;
+    };
+    let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle)) else {
+        return false;
+    };
+    let refused = if index < count {
+        !elements_are_writable(object)
+    } else {
+        !is_extensible(object)
+    };
+    if refused {
+        // Handled, and silently — outside strict mode, as every other refused write is.
+        return true;
+    }
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .set_element(handle, index, Value::from_bits(value))
+    })
+}
+
+/// The index `name` spells, if it spells one.
+///
+/// **Only the canonical spelling.** `"01"` parses as one and `"1.0"` as one, and neither is an
+/// array index — a program that writes `o["01"] = 1` has written a property called `"01"`, and
+/// treating it as element one would put the value somewhere the program cannot read it back
+/// from. Round-tripping through the number's own spelling is the test the specification makes.
+fn canonical_index(name: &str) -> Option<usize> {
+    let index = name.parse::<usize>().ok()?;
+    (number_text(index_as_f64(index)) == name).then_some(index)
 }
 
 /// `RequireObjectCoercible` — the check nearly every `Object` static opens with.
@@ -4664,8 +4708,7 @@ extern "C" fn object_define_property(
         // per-element one. A restrictive define falls through to the slot path below, which
         // stores it somewhere readable rather than dropping it (D-168).
         if let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
-            && let Ok(index) = name.parse::<usize>()
-            && number_text(index_as_f64(index)) == name
+            && let Some(index) = canonical_index(&name)
             && index <= DENSE_ELEMENT_LIMIT
         {
             let getter = read_descriptor_field(descriptor, "get");
@@ -5360,7 +5403,10 @@ extern "C" fn object_assign(
         for position in 1..argc as usize {
             // SAFETY: as above.
             let source = unsafe { argument(argc, argv, position) };
-            for name in own_keys(source) {
+            // **Only the enumerable ones.** `own_keys` includes an array's `length` and a
+            // string wrapper's, so copying from either wrote a `length` the target had no
+            // business having.
+            for name in enumerable_keys(source) {
                 // SAFETY: `name` is a live Rust string.
                 let value =
                     unsafe { crisol_property_load(source, name.as_ptr(), name.len() as u64) };
@@ -6855,6 +6901,16 @@ pub unsafe extern "C" fn crisol_property_store(
         return Value::UNDEFINED.to_bits();
     }
 
+    // **An index names an element, even spelled as text** — see `crisol_property_load`. Before
+    // the extensibility check below, because that one asks about *slots*: an element has none,
+    // so it read as absent and a non-extensible array refused a write to an element it
+    // already had.
+    if let Some(index) = canonical_index(&name)
+        && store_element(object, index, value)
+    {
+        return Value::UNDEFINED.to_bits();
+    }
+
     // **A non-extensible object refuses a property it does not already have.** Silently,
     // outside strict mode — the same rule a non-writable property follows, and the reason
     // `Object.freeze` is worth anything at all.
@@ -7054,6 +7110,16 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
             let length = count as f64;
             return Found::Value(Value::number(length).to_bits());
         }
+        // **An index names an element, even spelled as text.** `a["0"]` and `a[0]` are the
+        // same property and only the second reached the elements, so every path that reads by
+        // name — `Object.values`, `Object.entries`, `Object.assign` — saw `undefined` for
+        // every element an array has. The computed path handles a *number* key; nothing
+        // handled the string one, and the two spellings have to agree.
+        if let Some(index) = canonical_index(&name)
+            && let Some(value) = runtime.heap.element(handle, index)
+        {
+            return Found::Value(value.to_bits());
+        }
         // **A string wrapper is indexed by its characters.** `new String("abc")[0]` is `"a"`,
         // and the wrapper holds its text whole rather than one property per character. Reading
         // a character out on demand costs nothing for the wrappers nobody indexes, where
@@ -7070,7 +7136,10 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
                 .and_then(|slot| runtime.heap.get(handle, slot.index()))
                 .and_then(|value| value.as_address())
                 .map(GcRef::from_address)
-                .and_then(|cell| runtime.heap.with_text(cell, ToOwned::to_owned));
+                .and_then(|cell| runtime.heap.with_text(cell, ToOwned::to_owned))
+                // A *primitive* string is the cell itself, so `"ab"["0"]` reads here rather
+                // than through a wrapper it never made.
+                .or_else(|| runtime.heap.with_text(handle, ToOwned::to_owned));
             if let Some(text) = held {
                 let units: Vec<u16> = text.encode_utf16().collect();
                 return Found::Value(units.get(index).map_or_else(
@@ -8432,46 +8501,14 @@ pub extern "C" fn crisol_computed_load(object: u64, key: u64) -> u64 {
 /// `object[key] = value`.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) -> u64 {
-    let Some(handle) = handle_of(object) else {
+    if handle_of(object).is_none() {
         return nullish_access(object);
-    };
+    }
     let key = Value::from_bits(key);
 
-    // **Frozen elements refuse a write, and a non-extensible one refuses a new index.** Asked
-    // before the store rather than inside it, because `set_element` grows the array to fit
-    // and growing *is* the addition a non-extensible object is supposed to refuse.
     if let Some(index) = as_index(key)
-        && let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
+        && store_element(object, index, value)
     {
-        let refused = if index < count {
-            !elements_are_writable(object)
-        } else {
-            !is_extensible(object)
-        };
-        if refused {
-            // Silently, outside strict mode — as every other refused write is.
-            return Value::UNDEFINED.to_bits();
-        }
-    }
-
-    let stored = with_runtime(|runtime| {
-        as_index(key)
-            // **A sparse index becomes a named property rather than four billion slots.**
-            // Elements are a dense `Vec`, so `a[4294967294] = 2` — a legal array index — asks
-            // for every slot below it as well. The specification's arrays are sparse; these
-            // are not, and the honest approximation is to stop pretending past the point where
-            // the memory would be absurd. Beyond the cap the value is still *stored*, and still
-            // readable by the same key; what it is not is an element, so `length` does not
-            // count it. That is wrong, and it is wrong in a way a test can report rather than
-            // a way that kills the process.
-            .filter(|index| *index <= DENSE_ELEMENT_LIMIT)
-            .is_some_and(|index| {
-                runtime
-                    .heap
-                    .set_element(handle, index, Value::from_bits(value))
-            })
-    });
-    if stored {
         return Value::UNDEFINED.to_bits();
     }
     let Some(name) = key_of(key) else {

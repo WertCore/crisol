@@ -3600,12 +3600,23 @@ fn a_string_wrapper_answers_its_methods() {
 }
 
 /// The wrapped text is not enumerable, for the same reason a date's time value is not.
+///
+/// **Asserted by name, not by a total.** The first version of this counted the wrapper's keys
+/// and expected none, which encoded a second wrong belief while testing the first thing
+/// correctly: a string wrapper owns one enumerable property per character. A count is a bad
+/// assertion for "X is absent" — it passes for the wrong reason whenever the total is wrong
+/// for another one.
 #[test]
 fn a_string_wrappers_value_is_hidden() {
     check(
         "wrapper-keys",
-        "return Object.keys(new String(\"ab\")).length;",
-        "0",
+        "return Object.keys(new String(\"ab\")).indexOf(\"__primitive\");",
+        "-1",
+    );
+    check(
+        "wrapper-own-names-hide-the-primitive",
+        "return Object.getOwnPropertyNames(new String(\"ab\")).indexOf(\"__primitive\");",
+        "-1",
     );
 }
 
@@ -4478,10 +4489,12 @@ fn internal_bookkeeping_is_not_a_property() {
         "return Object.getOwnPropertyNames(new Map()).length;",
         "1",
     );
+    // By name rather than by a total: a wrapper owns its characters and its `length`, so the
+    // total is three and says nothing about whether the flag is among them.
     check(
         "internal-string-wrapper",
-        "return Object.getOwnPropertyNames(new String(\"ab\")).length;",
-        "1",
+        "return Object.getOwnPropertyNames(new String(\"ab\")).indexOf(\"__primitive\");",
+        "-1",
     );
 }
 
@@ -5704,5 +5717,57 @@ fn the_object_constructor_coerces() {
         "define-properties-bad-target",
         "try { Object.defineProperties(5, {}); return \"no\"; } catch (e) { return e.name; }",
         "TypeError",
+    );
+}
+
+/// **An index names an element, even spelled as text.** `a["0"]` and `a[0]` are the same
+/// property; only the second reached the elements, so everything that reads an object by name
+/// — `Object.values`, `Object.entries`, `Object.assign` — saw `undefined` for every element an
+/// array has.
+#[test]
+fn an_index_spelled_as_text_is_still_an_element() {
+    check("index-as-text-read", "return [7, 8][\"1\"];", "8");
+    check(
+        "index-as-text-write",
+        "let a = [7]; a[\"0\"] = 9; return a[0];",
+        "9",
+    );
+    check(
+        "index-as-text-grows",
+        "let a = [7]; a[\"1\"] = 9; return a.length + \",\" + a[1];",
+        "2,9",
+    );
+    // Only the canonical spelling: `"01"` is a property, not element one.
+    check(
+        "index-non-canonical-is-a-name",
+        "let a = [7]; a[\"01\"] = 9; return a.length + \",\" + a[0];",
+        "1,7",
+    );
+    check("string-index-as-text", "return \"ab\"[\"1\"];", "b");
+    check(
+        "object-values-of-array",
+        "return Object.values([7, 8]).join(\",\");",
+        "7,8",
+    );
+    check(
+        "object-entries-of-array",
+        "return Object.entries([7])[0].join(\",\");",
+        "0,7",
+    );
+    check(
+        "object-assign-from-array",
+        "let o = Object.assign({}, [7, 8]); return o[0] + \",\" + o[1] + \",\" + Object.keys(o).join(\"|\");",
+        "7,8,0|1",
+    );
+    // `length` is not enumerable, so it is not copied — `own_keys` would have brought it.
+    check(
+        "object-assign-skips-length",
+        "return Object.keys(Object.assign({}, \"ab\")).join(\",\");",
+        "0,1",
+    );
+    check(
+        "object-values-of-string",
+        "return Object.values(\"ab\").join(\",\");",
+        "a,b",
     );
 }
