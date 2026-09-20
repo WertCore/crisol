@@ -4785,3 +4785,22 @@ Three rules that are each one line and each observable:
 
 A descriptor carrying both a value and an accessor is a `TypeError`: they describe two different
 kinds of property and one cannot be both.
+
+## D-164
+
+**A non-configurable property is nearly immutable, and `defineProperty` now says so.**
+
+Status: Accepted
+
+`Object.defineProperty` wrote whatever it was given. That is not a missing check but a
+contradiction: a property made non-configurable, or an object passed to `Object.freeze`, could
+be quietly thawed by redefining it. The guarantee existed only until somebody asked again.
+
+The specification allows **exactly one** change to a non-configurable property: a writable data
+property may be made non-writable, and while it is still writable its value may be set.
+Everything else is a `TypeError` — turning enumerability on or off, making it configurable
+again, swapping a data property for an accessor, or changing the value of one already
+non-writable.
+
+The asymmetry is worth keeping in view: writability may go **down** and never up, because every
+other direction would hand back something the object had already promised not to allow.

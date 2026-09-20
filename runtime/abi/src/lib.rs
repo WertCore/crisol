@@ -4295,6 +4295,35 @@ extern "C" fn object_define_property(
             );
         }
 
+        // **A non-configurable property is nearly immutable.** The specification allows exactly
+        // one change to one: a writable data property may be made non-writable, and its value
+        // may still be set. Everything else — turning enumerability on or off, making it
+        // configurable again, swapping a data property for an accessor, or changing the value
+        // of one already non-writable — is a `TypeError`.
+        //
+        // Without this, `Object.defineProperty` would undo its own guarantees: a property
+        // frozen by `Object.freeze` could be quietly thawed by redefining it.
+        if let Some((slot, current_value)) = existing {
+            let current = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
+            if !current.configurable {
+                let asked_configurable = descriptor_flag(descriptor, "configurable");
+                let asked_enumerable = descriptor_flag(descriptor, "enumerable");
+                let asked_writable = descriptor_flag(descriptor, "writable");
+                let changes_kind = is_accessor != current.accessor;
+                let unwritable_value_change = !current.writable
+                    && has_value
+                    && !same_value(Value::from_bits(given), current_value);
+                if asked_configurable == Some(true)
+                    || asked_enumerable.is_some_and(|wanted| wanted != current.enumerable)
+                    || asked_writable.is_some_and(|wanted| wanted && !current.writable)
+                    || changes_kind
+                    || unwritable_value_change
+                {
+                    return raise("cannot redefine a non-configurable property", "TypeError");
+                }
+            }
+        }
+
         // The write goes through the ordinary path so the shape transition happens there once.
         let stored = if is_accessor {
             // The pair, in the slot the property already occupies — so the collector traces

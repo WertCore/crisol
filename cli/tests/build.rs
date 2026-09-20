@@ -4928,3 +4928,83 @@ fn a_descriptor_cannot_be_both_kinds() {
         "TypeError",
     );
 }
+
+/// **A non-configurable property is nearly immutable.** The specification allows exactly one
+/// change: a writable data property may be made non-writable. Everything else is a `TypeError` —
+/// and without that, `defineProperty` would undo its own guarantees, since a frozen property
+/// could be quietly thawed by redefining it.
+#[test]
+fn a_non_configurable_property_cannot_be_redefined() {
+    check(
+        "redefine-configurable",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {configurable: true}); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-enumerable",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {enumerable: true}); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-writable-up",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {writable: true}); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-value",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {value: 2}); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-kind",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {get: function () { return 2; }}); } \
+         catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    // Freezing must actually hold against a redefinition.
+    check(
+        "freeze-holds",
+        "let r = \"\"; let o = {a: 1}; Object.freeze(o); \
+         try { Object.defineProperty(o, \"a\", {value: 2}); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// **The one change that is allowed**: a writable property may be made non-writable, and the
+/// same value may be redefined. A configurable property may still be changed freely.
+#[test]
+fn the_permitted_redefinitions_still_work() {
+    check(
+        "redefine-writable-down",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, writable: true}); \
+         Object.defineProperty(o, \"x\", {writable: false}); \
+         return Object.getOwnPropertyDescriptor(o, \"x\").writable;",
+        "false",
+    );
+    check(
+        "redefine-same-value",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         Object.defineProperty(o, \"x\", {value: 1}); return o.x;",
+        "1",
+    );
+    check(
+        "redefine-configurable-freely",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
+         Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+    // An ordinary assigned property is configurable, so it redefines without complaint.
+    check(
+        "redefine-plain",
+        "let o = {a: 1}; Object.defineProperty(o, \"a\", {value: 2}); return o.a;",
+        "2",
+    );
+}
