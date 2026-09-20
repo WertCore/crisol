@@ -3777,3 +3777,150 @@ fn an_object_key_is_its_own_key() {
         "7",
     );
 }
+
+// ---- Symbol --------------------------------------------------------------------------------
+
+/// **Every symbol is unique**, which falls out of a symbol being a heap cell rather than being
+/// arranged: two `Symbol("x")` are different symbols however alike they read.
+#[test]
+fn a_symbol_is_unique_and_reports_its_type() {
+    check("symbol-typeof", "return typeof Symbol();", "symbol");
+    check(
+        "symbol-unique",
+        "return Symbol(\"x\") === Symbol(\"x\");",
+        "false",
+    );
+    check(
+        "symbol-self",
+        "let s = Symbol(\"x\"); return s === s;",
+        "true",
+    );
+    check(
+        "symbol-typeof-described",
+        "return typeof Symbol(\"x\");",
+        "symbol",
+    );
+}
+
+#[test]
+fn a_symbol_carries_its_description() {
+    check(
+        "symbol-description",
+        "return Symbol(\"hello\").description;",
+        "hello",
+    );
+    check(
+        "symbol-tostring",
+        "return Symbol(\"hello\").toString();",
+        "Symbol(hello)",
+    );
+    check(
+        "symbol-no-description",
+        "return Symbol().toString();",
+        "Symbol()",
+    );
+    check(
+        "symbol-valueof",
+        "let s = Symbol(\"x\"); return s.valueOf() === s;",
+        "true",
+    );
+}
+
+/// **`Symbol.for` is a registry and `Symbol()` is not.** The same key gives the same symbol
+/// back, which is the whole point of it.
+#[test]
+fn the_symbol_registry_returns_the_same_symbol() {
+    check(
+        "symbol-for",
+        "return Symbol.for(\"k\") === Symbol.for(\"k\");",
+        "true",
+    );
+    check(
+        "symbol-for-differs",
+        "return Symbol.for(\"a\") === Symbol.for(\"b\");",
+        "false",
+    );
+    check(
+        "symbol-for-vs-plain",
+        "return Symbol.for(\"k\") === Symbol(\"k\");",
+        "false",
+    );
+    check(
+        "symbol-keyfor",
+        "return Symbol.keyFor(Symbol.for(\"k\"));",
+        "k",
+    );
+}
+
+/// **Only a registered symbol has a key.** One made by `Symbol("x")` answers `undefined` even
+/// though its description is `"x"` — the description is not the key.
+#[test]
+fn key_for_distinguishes_registered_from_described() {
+    check(
+        "symbol-keyfor-plain",
+        "return Symbol.keyFor(Symbol(\"x\"));",
+        "undefined",
+    );
+    check(
+        "symbol-description-still",
+        "return Symbol(\"x\").description;",
+        "x",
+    );
+}
+
+/// The well-known symbols exist as values. **They are not yet usable as property keys** — a
+/// `PropertyKey` is a string — so this checks they are symbols, not that they index anything.
+#[test]
+fn the_well_known_symbols_are_symbols() {
+    check(
+        "symbol-iterator",
+        "return typeof Symbol.iterator;",
+        "symbol",
+    );
+    check(
+        "symbol-async-iterator",
+        "return typeof Symbol.asyncIterator;",
+        "symbol",
+    );
+    check(
+        "symbol-has-instance",
+        "return typeof Symbol.hasInstance;",
+        "symbol",
+    );
+    check(
+        "symbol-to-primitive",
+        "return typeof Symbol.toPrimitive;",
+        "symbol",
+    );
+    check(
+        "symbol-to-string-tag",
+        "return typeof Symbol.toStringTag;",
+        "symbol",
+    );
+    // Stable across reads, rather than freshly made each time.
+    check(
+        "symbol-iterator-stable",
+        "return Symbol.iterator === Symbol.iterator;",
+        "true",
+    );
+}
+
+/// A symbol survives a collection, which is the reason it is a heap cell rather than a bare
+/// payload — every path that turns a value into a reference would otherwise have traced a
+/// number as though it addressed one.
+#[test]
+fn a_symbol_survives_collection() {
+    check(
+        "symbol-survives",
+        "let s = Symbol(\"keep\"); let junk = []; \
+         for (let i = 0; i < 50; i = i + 1) { junk.push({n: i}); } return s.description;",
+        "keep",
+    );
+    check(
+        "symbol-registry-survives",
+        "let s = Symbol.for(\"reg\"); let junk = []; \
+         for (let i = 0; i < 50; i = i + 1) { junk.push({n: i}); } \
+         return Symbol.for(\"reg\") === s;",
+        "true",
+    );
+}

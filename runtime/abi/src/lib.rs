@@ -595,6 +595,20 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(OBJECT_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(MAP_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(SET_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(SYMBOL_PROTOTYPE.with(std::cell::Cell::get));
+        // Every registered symbol. `try_borrow` because this runs *during* a collection, which
+        // may have been triggered from inside `Symbol.for` while the registry was borrowed —
+        // and failing to root is better than panicking in the collector.
+        SYMBOL_REGISTRY.with(|registry| {
+            if let Ok(entries) = registry.try_borrow() {
+                roots.extend(
+                    entries
+                        .values()
+                        .filter_map(|value| Value::from_bits(*value).as_address())
+                        .map(GcRef::from_address),
+                );
+            }
+        });
         roots
     }));
 }
@@ -619,6 +633,14 @@ thread_local! {
     static MAP_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The prototype every `Set` inherits from.
     static SET_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// The prototype every symbol inherits from.
+    static SYMBOL_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
+    /// `Symbol.for`'s registry, keyed by the string a symbol was registered under.
+    ///
+    /// Rooted, and that is the specification's design: a registered symbol must come back for
+    /// the same key however long later, so it cannot be collected.
+    static SYMBOL_REGISTRY: RefCell<std::collections::HashMap<String, u64>> =
+        RefCell::new(std::collections::HashMap::new());
     /// Compiled patterns, keyed by their source and flags.
     ///
     /// **A memo, not ownership.** The authoritative `lastIndex` is a property on the JavaScript
@@ -1129,7 +1151,140 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Date", make_date_object),
     ("Map", make_map),
     ("Set", make_set),
+    ("Symbol", make_symbol),
 ];
+
+/// Where a symbol keeps its description.
+const SYMBOL_DESCRIPTION: &str = "description";
+
+/// `Symbol(description)`.
+///
+/// **A symbol is a heap cell wearing a different tag.** It could have been a bare payload —
+/// symbols are not objects and have no properties a program can add — but `as_address` answers
+/// for `TAG_SYMBOL` as readily as for an object, so every place that turns a value into a
+/// `GcRef` (the root walk among them) would have traced that payload as though it pointed at a
+/// cell. Making it *actually* point at one costs an allocation per symbol and makes the hazard
+/// impossible rather than avoided by convention.
+///
+/// Identity is the cell's: two `Symbol("x")` are different symbols, and that falls out rather
+/// than being arranged.
+extern "C" fn make_symbol(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    let description = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
+        None
+    } else {
+        to_text(given)
+    };
+    new_symbol(description.as_deref())
+}
+
+/// Makes a symbol with an optional description.
+fn new_symbol(description: Option<&str>) -> u64 {
+    let cell = with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        let scope = runtime.heap.scope();
+        let cell = scope.alloc(shape, 0);
+        if let Some(prototype) = SYMBOL_PROTOTYPE.with(std::cell::Cell::get) {
+            runtime.heap.set_prototype(cell.handle(), Some(prototype));
+        }
+        cell.handle()
+    });
+    // Re-tagged: the same cell, described as a symbol rather than an object, which is what
+    // makes `typeof` answer `"symbol"` while the collector still sees a cell it understands.
+    let symbol = cell.to_value().as_address().map_or_else(
+        || Value::UNDEFINED.to_bits(),
+        |at| Value::symbol(at).to_bits(),
+    );
+
+    if let Some(text) = description {
+        with_rooted(&[symbol], || {
+            let described = new_string(text);
+            with_runtime(|runtime| {
+                runtime.define_hidden(cell, SYMBOL_DESCRIPTION, Value::from_bits(described));
+            });
+        });
+    }
+    symbol
+}
+
+/// `Symbol.for(key)` — the cross-realm registry.
+///
+/// **Deliberately immortal.** A registered symbol has to come back for the same key however
+/// long later, so the registry is a root and its entries are never collected. That is the
+/// specification's design rather than a leak, which is the difference between this and the
+/// registry `Map` was not given (D-148).
+extern "C" fn symbol_for(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
+    if let Some(existing) = SYMBOL_REGISTRY.with(|registry| registry.borrow().get(&key).copied()) {
+        return existing;
+    }
+    let symbol = new_symbol(Some(&key));
+    SYMBOL_REGISTRY.with(|registry| registry.borrow_mut().insert(key, symbol));
+    symbol
+}
+
+/// `Symbol.keyFor(symbol)` — the key a registered symbol was made with, or `undefined`.
+extern "C" fn symbol_key_for(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let symbol = unsafe { argument(argc, argv, 0) };
+    // **Only a registered symbol has a key.** One made by `Symbol("x")` answers `undefined`
+    // even though its description is `"x"` — the description is not the key.
+    let found = SYMBOL_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .iter()
+            .find(|(_, value)| **value == symbol)
+            .map(|(key, _)| key.clone())
+    });
+    found.map_or_else(|| Value::UNDEFINED.to_bits(), |key| new_string(&key))
+}
+
+/// `Symbol.prototype.toString`.
+extern "C" fn symbol_to_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let description = property_text(this_value, SYMBOL_DESCRIPTION).unwrap_or_default();
+    new_string(&format!("Symbol({description})"))
+}
+
+/// `Symbol.prototype.valueOf`.
+extern "C" fn symbol_value_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_value
+}
+
+/// Methods on `Symbol.prototype`.
+const SYMBOL_NATIVES: &[(&str, Native)] =
+    &[("toString", symbol_to_text), ("valueOf", symbol_value_of)];
 
 /// Where a `Map` or `Set` keeps its contents.
 ///
@@ -3088,6 +3243,8 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "hasOwn", object_has_own),
     ("Object", "assign", object_assign),
     ("Array", "isArray", array_is_array),
+    ("Symbol", "for", symbol_for),
+    ("Symbol", "keyFor", symbol_key_for),
     ("Math", "abs", math_abs),
     ("Math", "floor", math_floor),
     ("Math", "ceil", math_ceil),
@@ -4033,6 +4190,7 @@ impl Runtime {
             ("Object", OBJECT_PROTOTYPE.with(std::cell::Cell::get)),
             ("Map", MAP_PROTOTYPE.with(std::cell::Cell::get)),
             ("Set", SET_PROTOTYPE.with(std::cell::Cell::get)),
+            ("Symbol", SYMBOL_PROTOTYPE.with(std::cell::Cell::get)),
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -4040,6 +4198,24 @@ impl Runtime {
                 self.define(constructor, "prototype", prototype.to_value());
             }
         }
+        // The well-known symbols, as values on `Symbol`. **Present but not yet usable as
+        // property keys**: a `PropertyKey` is a string, so `obj[Symbol.iterator]` cannot name
+        // one. They exist so a program that reads `Symbol.iterator` gets a symbol rather than
+        // `undefined`, which is what most feature tests check — and so that when keys learn
+        // about symbols, the values are already the right ones.
+        if let Some(symbol) = self.global_object(globals.handle(), "Symbol") {
+            for name in [
+                "iterator",
+                "asyncIterator",
+                "hasInstance",
+                "toPrimitive",
+                "toStringTag",
+            ] {
+                let value = new_symbol(Some(&format!("Symbol.{name}")));
+                self.define_named(symbol, name, Value::from_bits(value));
+            }
+        }
+
         // `Math`'s constants, which are properties rather than functions and so have no table
         // entry. The object itself already exists: naming a method in `NAMESPACE_NATIVES` is
         // what creates it.
@@ -4317,6 +4493,11 @@ impl Runtime {
         for (cell, natives, offset) in [
             (&MAP_PROTOTYPE, MAP_NATIVES, 0),
             (&SET_PROTOTYPE, SET_NATIVES, MAP_NATIVES.len()),
+            (
+                &SYMBOL_PROTOTYPE,
+                SYMBOL_NATIVES,
+                MAP_NATIVES.len() + SET_NATIVES.len(),
+            ),
         ] {
             let shape = self.shapes.borrow().root();
             let scope = self.heap.scope();
@@ -5598,7 +5779,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + MAP_NATIVES.len();
-        return SET_NATIVES
+        if let Some((_, function)) = SET_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + SET_NATIVES.len();
+        return SYMBOL_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }

@@ -4409,3 +4409,35 @@ Three behaviours worth pinning, each of which looks like a mistake until you kno
 `size` is a plain property maintained on every mutation, because the specification makes it an
 accessor and there are no accessors here. Iterators (`keys`, `values`, `entries`) are absent for
 the same reason `for-of` is partial (D-120): there is no `Symbol.iterator` to hang them on.
+
+## D-149
+
+**A symbol is a heap cell, because `as_address` does not check the tag.**
+
+Status: Accepted
+
+Symbols are not objects and hold nothing a program can add, so the obvious representation is a
+tagged payload with no allocation behind it. That would have been a live hazard:
+`Value::as_address` answers for `TAG_SYMBOL` exactly as for an object, and the root walk is
+`value.as_address().map(GcRef::from_address)` with **no kind check**. A bare payload would have
+been traced as though it addressed a cell, on the first collection after any symbol reached a
+frame.
+
+Allocating a real cell costs one allocation per symbol and makes that impossible rather than
+avoided by convention — every existing path that turns a value into a reference stays correct
+without knowing symbols exist. **Identity then falls out**: two `Symbol("x")` differ because two
+cells differ, rather than because anything arranged it.
+
+**`Symbol.for`'s registry is rooted and immortal, and that is correct.** A registered symbol must
+come back for the same key however long later. That is the opposite verdict to `Map` (D-148),
+where an immortal registry would have been a leak — the same mechanism, judged by what the
+specification asks the lifetime to be rather than by what is convenient.
+
+`Symbol.keyFor` answers `undefined` for `Symbol("x")` even though its description is `"x"`:
+**the description is not the key**, and only registration makes one.
+
+**Not usable as property keys**, which is the limit worth stating: a `PropertyKey` is a string
+wrapper, so `obj[Symbol.iterator]` cannot name a symbol. The well-known symbols exist as values
+so that reading `Symbol.iterator` yields a symbol rather than `undefined` — what most feature
+tests check — and so the values are already the right ones when keys learn about symbols. Until
+then this is also what blocks `Map`/`Set` iterators and user-defined iterables (D-120, D-148).
