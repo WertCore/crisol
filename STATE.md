@@ -34,22 +34,20 @@ sampled. An uncaught throw exits non-zero (D-106), which is what makes the numbe
 anything — a case reports failure by throwing, and before that every failing case exited
 successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
 
-**Open, and the top issue: the collector is wrong on Linux x86-64 (D-142).** 103 of 238
-acceptance cases fail there and **every one only under GC stress**; all 238 pass without it, and
-all 238 pass on macOS arm64 in both modes. Found only once compiled programs could link on
-Linux at all (D-140) — before that the suite had never run there.
+**CI is green, and the corpus number is real.** 1361 cases attempted of a 1500 sample:
+**252 passed, 1066 failed, 0 crashed, 43 refused.** Measured on Linux x86-64, which is the
+platform whose collector was broken until D-143 — every earlier figure in this file was
+macOS-only.
 
-test262 numbers below are from macOS and are not a cross-platform claim.
+**Crashes are zero and the job asserts they stay that way.** All twelve were `new String(…)`
+recursing into its own `toString` (D-146).
 
-**56 passed, 309 failed, 0 crashed, 14 refused.** `arguments` (D-135), bound lazily so a
-function that never names it keeps the slot numbering it had before — declaring it eagerly
-shifted every parameter down by one and broke closures under GC stress.
+The failures are legible for the first time (D-145): `is not a function` (211),
+`cannot read a property of undefined` (125), `Expected SameValue(«undefined», …)` (88),
+`Symbol` (79), `Proxy` (40), `Promise` (29), `Set` (25), `Map` (18).
 
-It is an array and a copy, where the specification has an array-*like* that aliases its
-parameters. Both differences are asserted in tests rather than left to be found.
-
-Still unshipped from `crisol-builtins` (D-122): `Symbol` (28), `Proxy` (14), `Set` (7). Spread
-in a **call** — `f(...args)` — still needs a dynamic argument count a call site does not have.
+**Linux arm64 remains red and non-blocking** (D-144): 64 failures, all under GC stress, a second
+fault distinct from the frame-pointer one that fixed x86-64.
 
 What is still refused: `delete` (59), regular expression literals (26), computed property keys
 (21), template literals (20), `for-in` (14), array holes (11).
@@ -85,7 +83,7 @@ while still in use.
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 1217 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1235 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure
