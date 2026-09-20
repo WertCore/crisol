@@ -48,6 +48,8 @@ const SAMPLE: usize = 400;
 fn sample_size() -> usize {
     std::env::var("CRISOL_TEST262_SAMPLE")
         .ok()
+        // An empty or unparseable value falls back rather than failing: this is a dial on a
+        // measurement, and a typo in it should not stop the measurement happening.
         .and_then(|value| value.parse().ok())
         .unwrap_or(SAMPLE)
 }
@@ -236,7 +238,12 @@ fn the_suite_is_attempted_and_the_result_reported() {
 
     let cases = discover(&root);
     assert!(!cases.is_empty(), "the suite root has no cases");
-    let limit = if std::env::var("CRISOL_TEST262_ALL").is_ok() {
+    // **Empty counts as unset.** `std::env::var` answers `Ok("")` for a variable set to
+    // nothing, and a workflow that computes this value writes an empty string when it means
+    // "no" — so `is_ok()` alone would read that as a request for all twelve thousand cases,
+    // which is the one outcome the sample size exists to avoid.
+    let all = std::env::var("CRISOL_TEST262_ALL").is_ok_and(|value| !value.is_empty());
+    let limit = if all {
         cases.len()
     } else {
         sample_size().min(cases.len())
