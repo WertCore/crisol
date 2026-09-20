@@ -4387,6 +4387,18 @@ fn a_primitive_number_or_boolean_reaches_its_prototype() {
         "return typeof Number.prototype.toString;",
         "function",
     );
+    // Narrowing further: a variable receiver and a computed key reach the same prototype by
+    // different routes through the compiler, which separates lowering from runtime.
+    check(
+        "primitive-var-tostring",
+        "let n = 255; return typeof n.toString;",
+        "function",
+    );
+    check(
+        "primitive-computed",
+        "let n = 255; return typeof n[\"toString\"];",
+        "function",
+    );
     check(
         "primitive-finds-tostring",
         "return typeof (255).toString;",
