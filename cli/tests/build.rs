@@ -1746,14 +1746,29 @@ fn a_write_to_a_non_writable_property_is_ignored() {
     );
 }
 
-/// `defineProperty` redefines rather than assigns, so it writes past a non-writable property
-/// that an assignment could not.
+/// `defineProperty` redefines rather than assigns, so it writes past a **non-writable**
+/// property that an assignment could not — provided the property is still **configurable**.
+///
+/// This test used to define `{value: 1}` and then redefine it, which a reading of
+/// `defineProperty` alone makes look reasonable. It is not: a descriptor that says nothing
+/// about `configurable` creates a property that is not, and redefining one of those is a
+/// `TypeError` (D-164). The test was pinning what the engine did rather than what is required,
+/// and it took the check that makes `Object.freeze` hold to expose it.
 #[test]
 fn define_property_can_redefine_a_non_writable_property() {
     check(
         "descriptor-redefine",
-        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
          Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+    // Writable is not the same question as configurable: this one is non-writable throughout,
+    // and `defineProperty` still writes past it where an assignment would be ignored.
+    check(
+        "descriptor-redefine-unwritable",
+        "let o = {}; \
+         Object.defineProperty(o, \"x\", {value: 1, writable: false, configurable: true}); \
+         o.x = 9; Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
         "2",
     );
 }
