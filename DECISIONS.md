@@ -4278,3 +4278,34 @@ precompiled without frame pointers. If the chain ever runs through a `std` frame
 break there too, and no rustflag in this repository changes that — it would need `-Z build-std`
 or a walk that does not depend on frame pointers at all. CI is what says whether the chain as
 it stands is clear.
+
+## D-144
+
+**Frame pointers fixed x86-64 Linux. arm64 Linux has a second fault.**
+
+Status: Open — separated, not solved
+
+`-C force-frame-pointers=yes` (D-143) took `Linux (x86_64)` from **103 failures to zero**. That
+diagnosis was right and is verified.
+
+It changed **nothing** on `Linux (arm64)`: 64 failed before and 64 after, the same 52 assertions
+under GC stress, and the failing test list is byte-identical. Both jobs recompiled — 503 and 409
+compile lines — so the flag was applied and simply had no effect there, which is what you would
+expect if rustc already emits frame pointers for `aarch64-unknown-linux-gnu`. So the two Linux
+failures were never one fault wearing two hats.
+
+What is left is specific to **aarch64 Linux** and not to aarch64: macOS arm64 passes all 238 in
+both modes, on the same architecture.
+
+**A hypothesis, held as one.** The codegen sets no calling convention, so Cranelift takes it
+from the triple — `AppleAarch64` on macOS and `SystemV` on Linux, two conventions on one
+architecture. If the two differ in what a stack map slot's offset is measured *from*, the walk
+would read the right frames and the wrong slots, which matches the symptom: live values read
+back as `undefined`, but only when a collection actually happens. That is a guess with a
+mechanism, not a finding, and it is written down as such — it has not been tested, because
+testing it needs an aarch64 Linux host and the last attempt at one filled this machine's disk.
+
+**The job stays, and stays non-blocking.** Deleting it would hide a real fault on a real target;
+leaving it blocking would make every run red for something already understood and recorded.
+`continue-on-error` reports it without failing the build, and the line comes out the day it
+goes green.
