@@ -5212,3 +5212,23 @@ or an older `.length ===` assertion; the rest are the specification's and unambi
 (`Math.pow` is two, `Math.random` is zero). Transcribing 180 arities from memory would have put
 wrong numbers where there had been none, which is worse than the gap — and there is no way to
 derive one from a `Native`, whose signature is the same five operands for every built-in.
+
+## D-185
+
+**`this` at the top of a script is the global object.**
+
+Status: Accepted
+
+The entry point passed `undefined`, which is what `this` is inside a strict function and never
+what it is at the top of a sloppy script. So `this.x = 1` did nothing, `this === globalThis`
+was false, and every test that reaches a global through `this` — test262 has a lot of them —
+read a property of `undefined` instead.
+
+The entry point asks the runtime for it rather than being handed a constant, which means the
+runtime is built before the program starts. That is safe in the one way it needs to be: the
+stack maps are registered first, so a collection during construction has everything it needs to
+walk.
+
+**`Object.assign` coerces its target too.** `Object.assign(true, {a: 1})` answers a `Boolean`
+wrapper carrying the assignment; the primitive was handed straight back, unable to carry
+anything. That is the same rule as D-170 in the one static that had been missed.

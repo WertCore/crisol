@@ -6396,3 +6396,57 @@ fn a_built_in_declares_how_many_arguments_it_takes() {
         "0",
     );
 }
+
+/// **`this` at the top of a script is the global object.** The entry point passed `undefined`,
+/// which is what it is inside a strict function and never what it is here — so `this.x = 1`
+/// did nothing and every test that reaches a global through `this` read a property of nothing.
+#[test]
+fn top_level_this_is_the_global_object() {
+    check("this-is-global", "return this === globalThis;", "true");
+    check(
+        "this-reaches-a-global",
+        "return typeof this.Object;",
+        "function",
+    );
+    check(
+        "this-can-be-written",
+        "this.answer = 42; return answer;",
+        "42",
+    );
+    check(
+        "a-global-is-visible-through-this",
+        "var declared = 7; return this.declared;",
+        "7",
+    );
+}
+
+/// `Object.assign` coerces its target like every other static's argument: a primitive is
+/// wrapped and the wrapper is what comes back carrying the assignments.
+#[test]
+fn assign_coerces_its_target() {
+    check(
+        "assign-to-boolean",
+        "return typeof Object.assign(true, {a: 1});",
+        "object",
+    );
+    check(
+        "assign-to-boolean-value",
+        "return Object.assign(true, {a: 1}).valueOf();",
+        "true",
+    );
+    check(
+        "assign-to-boolean-copies",
+        "return Object.assign(true, {a: 1}).a;",
+        "1",
+    );
+    check(
+        "assign-to-number",
+        "return Object.assign(5, {}).valueOf();",
+        "5",
+    );
+    check(
+        "assign-to-nullish",
+        "try { Object.assign(undefined, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}

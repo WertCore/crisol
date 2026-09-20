@@ -5883,33 +5883,40 @@ extern "C" fn object_assign(
     with_rooted(&live, || {
         // SAFETY: as above.
         let target = unsafe { argument(argc, argv, 0) };
-        if let Some(thrown) = reject_nullish(target, "cannot assign to") {
-            return thrown;
-        }
-        for position in 1..argc as usize {
-            // SAFETY: as above.
-            let source = unsafe { argument(argc, argv, position) };
-            // **Only the enumerable ones.** `own_keys` includes an array's `length` and a
-            // string wrapper's, so copying from either wrote a `length` the target had no
-            // business having.
-            for name in enumerable_keys(source) {
-                // **A read-only property on the target is a `TypeError` here**, not a write
-                // that quietly does nothing: `Object.assign` uses the throwing form of `Set`.
-                // It is one of the few places the difference is observable from source that
-                // is not in strict mode.
-                if refuses_assignment(target, &name) {
-                    return raise("cannot assign to a read-only property", "TypeError");
-                }
-                // SAFETY: `name` is a live Rust string.
-                let value =
-                    unsafe { crisol_property_load(source, name.as_ptr(), name.len() as u64) };
+        // **Coerced, like every other static's argument.** `Object.assign(true, …)` answers a
+        // `Boolean` wrapper carrying the assignments, not the primitive `true` — which cannot
+        // carry them and was handed straight back.
+        let Some(target) = to_object(target) else {
+            return raise("cannot assign to null or undefined", "TypeError");
+        };
+        // Rooted for the copy: a coerced target is a wrapper this call just made, and every
+        // read and write below allocates.
+        with_rooted(&[target], || {
+            for position in 1..argc as usize {
                 // SAFETY: as above.
-                unsafe {
-                    crisol_property_store(target, name.as_ptr(), name.len() as u64, value);
+                let source = unsafe { argument(argc, argv, position) };
+                // **Only the enumerable ones.** `own_keys` includes an array's `length` and a
+                // string wrapper's, so copying from either wrote a `length` the target had no
+                // business having.
+                for name in enumerable_keys(source) {
+                    // **A read-only property on the target is a `TypeError` here**, not a write
+                    // that quietly does nothing: `Object.assign` uses the throwing form of `Set`.
+                    // It is one of the few places the difference is observable from source that
+                    // is not in strict mode.
+                    if refuses_assignment(target, &name) {
+                        return raise("cannot assign to a read-only property", "TypeError");
+                    }
+                    // SAFETY: `name` is a live Rust string.
+                    let value =
+                        unsafe { crisol_property_load(source, name.as_ptr(), name.len() as u64) };
+                    // SAFETY: as above.
+                    unsafe {
+                        crisol_property_store(target, name.as_ptr(), name.len() as u64, value);
+                    }
                 }
             }
-        }
-        target
+            target
+        })
     })
 }
 
@@ -7581,6 +7588,27 @@ pub fn with_runtime<R>(f: impl FnOnce(&Runtime) -> R) -> R {
 /// The handle a boxed value names, if it names one.
 fn handle_of(bits: u64) -> Option<GcRef> {
     Value::from_bits(bits).as_address().map(GcRef::from_address)
+}
+
+/// The object every unresolved name is looked up in, as a value.
+///
+/// **What `this` is at the top level of a script.** The entry point passed `undefined`, which
+/// is what `this` is inside a strict function and never what it is at the top of a sloppy
+/// script — so `this.x = 1` did nothing and `this === globalThis` was false, and the tests
+/// that use `this` to reach a global all read a property of `undefined` instead.
+///
+/// Calling this builds the runtime if nothing has yet, which is why the entry point can call
+/// it before the program starts: the stack maps are already registered by then, so a
+/// collection during construction has everything it needs.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_global_object() -> u64 {
+    with_runtime(|_| {
+        GLOBALS.with(std::cell::Cell::get).map_or_else(
+            || Value::UNDEFINED.to_bits(),
+            |globals| globals.to_value().to_bits(),
+        )
+    })
 }
 
 /// Allocates `{}` — an object at the root shape, with no properties.
