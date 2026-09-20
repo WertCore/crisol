@@ -4245,3 +4245,36 @@ asserted its absence rather than running; the link would have failed anyway for 
 libraries; and the failure was reported as the word `link` with the message discarded. Each of
 those looked like a small infrastructure annoyance. Together they hid a real defect in the one
 subsystem the project's own notes call the hardest to test.
+
+## D-143
+
+**The Rust frames had no frame pointers on Linux, and macOS hid it.**
+
+Status: Accepted — the cause behind D-142
+
+The bisect named the variable. A `Linux (arm64)` job was added for exactly this: the two known
+points, `macOS (arm64)` passing and `Linux (x86_64)` failing, differ in *two* things at once.
+Holding the architecture fixed against macOS and the system fixed against x86-64 leaves one
+answer, and it came back **Linux (arm64): 64 failed, every one under GC stress, none without** —
+the same signature as x86-64 (103 failed). So the operating system is the variable and the
+architecture is not.
+
+The cause: `preserve_frame_pointers` was set for **Cranelift's output only**. The collector
+walks the stack by following frame pointers, and the frames between the allocation that
+triggers a collection and the JavaScript frame whose roots it is looking for —
+`crisol_create_object` → `Heap::alloc` → `collect` → `walk_frames` — are ordinary Rust.
+**rustc omits the frame pointer on Linux by default.** The walk lost the chain before reaching
+any compiled JavaScript, found none of its roots, and freed values that were live.
+
+**macOS hid this for the life of the project**, and not by luck that anyone chose: Apple's ABI
+*mandates* the frame pointer on arm64, so rustc emits it there whatever the flags say. Every
+local run, and the only passing CI job, was on the one platform where the bug cannot appear.
+
+Fixed with `-C force-frame-pointers=yes` in `.cargo/config.toml`, workspace-wide — the chain
+runs through several crates and a gap anywhere in it breaks the walk at that point.
+
+**One limit, stated rather than discovered later:** this does not cover `std`, which ships
+precompiled without frame pointers. If the chain ever runs through a `std` frame the walk will
+break there too, and no rustflag in this repository changes that — it would need `-Z build-std`
+or a walk that does not depend on frame pointers at all. CI is what says whether the chain as
+it stands is clear.
