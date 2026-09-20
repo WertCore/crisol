@@ -262,10 +262,17 @@ fn objects_survive_a_collection_at_every_allocation() {
 }
 
 #[test]
-fn this_at_the_top_level_is_undefined() {
-    // A module's `this` is `undefined`, not the global object. The entry point passes it
-    // explicitly, so this checks the value actually arrives rather than defaulting.
-    check("this-toplevel", "return this;", "undefined");
+fn this_at_the_top_level_is_the_global_object() {
+    // **This asserted `undefined`, and its reason named the right rule about the wrong thing.**
+    // A *module*'s `this` is `undefined`; a script's is the global object, and scripts are all
+    // this engine compiles — the test262 runner skips the module flag outright. The entry point
+    // passes the value explicitly, so this still checks that it arrives rather than defaulting.
+    check("this-toplevel", "return typeof this;", "object");
+    check(
+        "this-toplevel-is-global",
+        "return this === globalThis;",
+        "true",
+    );
 }
 
 // ---- closures and calls ----------------------------------------------------------------
