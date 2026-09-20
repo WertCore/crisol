@@ -100,6 +100,13 @@ fn check(name: &str, source: &str, expected: &str) {
         expected,
         "{name} under GC stress: {source}"
     );
+
+    // **Removed once it has passed, and kept when it has not.** A case that fails leaves its
+    // directory for reading; one that passes leaves nothing. Without this a full run left a
+    // scratch directory per case — a compiled binary each — and they accumulated across every
+    // run until the disk filled, which took out several test262 runs and a virtual machine
+    // before anyone connected the two.
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]

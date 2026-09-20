@@ -4093,6 +4093,30 @@ impl Runtime {
     ///
     /// Not `new_string`, which goes through `with_runtime` — during construction that would
     /// re-enter the thread-local currently being initialised.
+    /// A symbol, made during construction.
+    ///
+    /// The same distinction as [`Runtime::string`] and for the same reason: the free
+    /// `new_symbol` goes through `with_runtime`, and calling it while the runtime is being
+    /// built re-enters the thread-local currently being initialised. That does not fail
+    /// gracefully — every compiled program died on startup, before `main` reached any of its
+    /// own code.
+    fn symbol(&self, description: Option<&str>) -> Value {
+        let shape = self.shapes.borrow().root();
+        let scope = self.heap.scope();
+        let cell = scope.alloc(shape, 0);
+        if let Some(prototype) = SYMBOL_PROTOTYPE.with(std::cell::Cell::get) {
+            self.heap.set_prototype(cell.handle(), Some(prototype));
+        }
+        if let Some(text) = description {
+            let described = self.string(text);
+            self.define_hidden(cell.handle(), SYMBOL_DESCRIPTION, described);
+        }
+        cell.handle()
+            .to_value()
+            .as_address()
+            .map_or(Value::UNDEFINED, Value::symbol)
+    }
+
     fn string(&self, text: &str) -> Value {
         let shape = self.shapes.borrow().root();
         let scope = self.heap.scope();
@@ -4211,8 +4235,8 @@ impl Runtime {
                 "toPrimitive",
                 "toStringTag",
             ] {
-                let value = new_symbol(Some(&format!("Symbol.{name}")));
-                self.define_named(symbol, name, Value::from_bits(value));
+                let value = self.symbol(Some(&format!("Symbol.{name}")));
+                self.define_named(symbol, name, value);
             }
         }
 
