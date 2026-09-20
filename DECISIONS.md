@@ -4804,3 +4804,22 @@ non-writable.
 
 The asymmetry is worth keeping in view: writability may go **down** and never up, because every
 other direction would hand back something the object had already promised not to allow.
+
+## D-165
+
+**`Object.create`'s second argument, and the accessor definers that predate `defineProperty`.**
+
+Status: Accepted
+
+`Object.create(proto, descriptors)` ignored everything after the prototype. **The second
+argument is a map of descriptors, not of values** — `Object.create(p, {x: {value: 1}})` gives
+`x` the value one, and `Object.create(p, {x: 1})` gives it none, because `1` describes nothing.
+It is handed to `defineProperties` rather than reimplemented, so the two cannot disagree about
+what a descriptor means.
+
+`__defineGetter__` and `__defineSetter__` are older than `defineProperty` and still covered by
+test262, because they were the only way a program written before ES5 could make an accessor.
+They route through `defineProperty` for the same reason — with one difference that is theirs
+and not a mistake: **they make an enumerable, configurable property**, where `defineProperty`'s
+defaults are the opposite (D-116). Two functions that do the same thing with opposite defaults
+is the sort of difference that is only safe to have written down.

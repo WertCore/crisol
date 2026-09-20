@@ -5023,3 +5023,73 @@ fn the_permitted_redefinitions_still_work() {
         "2",
     );
 }
+
+/// **`Object.create`'s second argument is a map of descriptors, not of values.**
+/// `Object.create(p, {x: {value: 1}})` gives `x` the value one; `Object.create(p, {x: 1})`
+/// gives it no value at all, because `1` describes nothing.
+#[test]
+fn object_create_takes_descriptors() {
+    check(
+        "create-descriptors",
+        "let o = Object.create(null, {x: {value: 1, enumerable: true}}); return o.x;",
+        "1",
+    );
+    check(
+        "create-descriptors-enumerable",
+        "let o = Object.create(null, {x: {value: 1, enumerable: true}}); \
+         return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "create-descriptors-default-hidden",
+        "let o = Object.create(null, {x: {value: 1}}); return Object.keys(o).length;",
+        "0",
+    );
+    check(
+        "create-descriptors-accessor",
+        "let o = Object.create(null, {x: {get: function () { return 5; }}}); return o.x;",
+        "5",
+    );
+    // A value that is not a descriptor describes nothing.
+    check(
+        "create-not-a-descriptor",
+        "let o = Object.create(null, {x: {}}); return o.x;",
+        "undefined",
+    );
+    // The prototype still works, with or without a second argument.
+    check(
+        "create-prototype-still",
+        "let base = {greet: 1}; let o = Object.create(base, {x: {value: 2}}); return o.greet;",
+        "1",
+    );
+}
+
+/// **`__defineGetter__` is older than `defineProperty` and still in use** — the only way a
+/// program written before ES5 could make an accessor. It makes an **enumerable, configurable**
+/// property, where `defineProperty`'s defaults are the opposite.
+#[test]
+fn the_legacy_accessor_definers_work() {
+    check(
+        "define-getter",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); return o.x;",
+        "7",
+    );
+    check(
+        "define-setter",
+        "let seen = 0; let o = {}; o.__defineSetter__(\"x\", function (v) { seen = v; }); \
+         o.x = 4; return seen;",
+        "4",
+    );
+    check(
+        "define-getter-enumerable",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 1; }); \
+         return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "define-getter-not-function",
+        "let r = \"\"; let o = {}; try { o.__defineGetter__(\"x\", 1); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+}

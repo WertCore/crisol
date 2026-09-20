@@ -2650,6 +2650,8 @@ extern "C" fn set_for_each(
 
 /// Methods on `Object.prototype`, which every object inherits.
 const OBJECT_NATIVES: &[(&str, Native)] = &[
+    ("__defineGetter__", object_define_getter),
+    ("__defineSetter__", object_define_setter),
     ("hasOwnProperty", object_has_own_property),
     ("propertyIsEnumerable", object_property_is_enumerable),
     ("isPrototypeOf", object_is_prototype_of),
@@ -2657,6 +2659,67 @@ const OBJECT_NATIVES: &[(&str, Native)] = &[
     ("toLocaleString", object_to_text),
     ("valueOf", object_value_of),
 ];
+
+/// `Object.prototype.__defineGetter__` and `__defineSetter__`.
+///
+/// **Older than `defineProperty` and still in use**, which is why they are here: they are the
+/// only way a program written before ES5 could make an accessor, and test262 covers them.
+/// Both route through `defineProperty` so the three cannot disagree about what an accessor is.
+fn define_accessor(this_value: u64, argc: u64, argv: *const u64, as_getter: bool) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let function = unsafe { argument(argc, argv, 1) };
+    if !is_callable(function) {
+        return raise("an accessor needs a function", "TypeError");
+    }
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let descriptor = crisol_create_object();
+        with_rooted(&[descriptor, function], || {
+            if let Some(into) = handle_of(descriptor) {
+                with_runtime(|runtime| {
+                    runtime.define(
+                        into,
+                        if as_getter { "get" } else { "set" },
+                        Value::from_bits(function),
+                    );
+                    // **Enumerable and configurable**, which is what these two make and
+                    // `defineProperty` does not — its defaults are the opposite.
+                    runtime.define(into, "enumerable", Value::TRUE);
+                    runtime.define(into, "configurable", Value::TRUE);
+                });
+            }
+            let arguments = [this_value, key, descriptor];
+            with_rooted(&arguments, || {
+                object_define_property(0, 0, 0, 3, arguments.as_ptr())
+            })
+        })
+    })
+}
+
+/// `Object.prototype.__defineGetter__`.
+extern "C" fn object_define_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    define_accessor(this_value, argc, argv, true)
+}
+
+/// `Object.prototype.__defineSetter__`.
+extern "C" fn object_define_setter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    define_accessor(this_value, argc, argv, false)
+}
 
 /// `Object.prototype.hasOwnProperty`.
 ///
@@ -4625,6 +4688,22 @@ extern "C" fn object_create(
             // `Object.create(null)` is the one way to get an object with no prototype at all.
             if let Some(object) = handle_of(created) {
                 with_runtime(|runtime| runtime.heap.set_prototype(object, None));
+            }
+        }
+
+        // **The second argument is a map of descriptors**, not of values —
+        // `Object.create(p, {x: {value: 1}})` gives `x` the value one, and
+        // `Object.create(p, {x: 1})` gives it no value at all, because `1` describes nothing.
+        // Handed to `defineProperties` so the two agree by construction.
+        // SAFETY: the convention guarantees `argc` readable values at `argv`.
+        let descriptors = unsafe { argument(argc, argv, 1) };
+        if handle_of(descriptors).is_some() {
+            let arguments = [created, descriptors];
+            let outcome = with_rooted(&arguments, || {
+                object_define_properties(0, 0, 0, 2, arguments.as_ptr())
+            });
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
             }
         }
         created
