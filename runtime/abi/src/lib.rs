@@ -1935,40 +1935,52 @@ extern "C" fn make_error(
         // `Error("x") instanceof Error` is true: called without `new`, the constructor still
         // constructs.
         let plain = handle_of(this_value).is_none();
-        let target = handle_of(this_value).map_or_else(|| handle_of(crisol_create_object()), Some);
-        let Some(target) = target else {
-            return Value::UNDEFINED.to_bits();
+        let receiver = if plain {
+            crisol_create_object()
+        } else {
+            this_value
         };
-        if plain {
-            let prototype = handle_of(closure).and_then(|closure| {
-                with_runtime(|runtime| {
-                    let key = PropertyKey::new("prototype");
-                    let shape = runtime.heap.shape_of(closure)?;
-                    let slot = runtime.shapes.borrow().lookup(shape, &key)?;
-                    runtime
-                        .heap
-                        .get(closure, slot.index())
-                        .and_then(|value| value.as_address())
-                        .map(GcRef::from_address)
-                })
-            });
-            if let Some(prototype) = prototype {
-                with_runtime(|runtime| runtime.heap.set_prototype(target, Some(prototype)));
-            }
-        }
-        // **`message` is not enumerable**, which `Object.keys(new Error("x"))` reports and
-        // `JSON.stringify` copies. `name` is not set here at all: it belongs to the
-        // prototype, where one string serves every instance of the kind.
-        if Value::from_bits(message).kind() != crisol_value::Kind::Undefined {
-            let text = to_text(message).unwrap_or_default();
-            let held = new_string(&text);
-            with_rooted(&[held], || {
-                with_runtime(|runtime| {
-                    runtime.define_hidden(target, "message", Value::from_bits(held));
+        // **Rooted before anything else allocates.** The receiver a plain call makes is
+        // reachable from nothing until it is returned, and the message below allocates a
+        // string — under GC stress the error was collected between the two, and what came
+        // back was a stale handle whose prototype nothing had managed to set. The symptom
+        // was `Error("x") instanceof Error` answering `false` under stress and `true`
+        // without, which is the shape every one of these bugs has had.
+        with_rooted(&[receiver], || {
+            let Some(target) = handle_of(receiver) else {
+                return Value::UNDEFINED.to_bits();
+            };
+            if plain {
+                let prototype = handle_of(closure).and_then(|closure| {
+                    with_runtime(|runtime| {
+                        let key = PropertyKey::new("prototype");
+                        let shape = runtime.heap.shape_of(closure)?;
+                        let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+                        runtime
+                            .heap
+                            .get(closure, slot.index())
+                            .and_then(|value| value.as_address())
+                            .map(GcRef::from_address)
+                    })
                 });
-            });
-        }
-        target.to_value().to_bits()
+                if let Some(prototype) = prototype {
+                    with_runtime(|runtime| runtime.heap.set_prototype(target, Some(prototype)));
+                }
+            }
+            // **`message` is not enumerable**, which `Object.keys(new Error("x"))` reports
+            // and `JSON.stringify` copies. `name` is not set here at all: it belongs to the
+            // prototype, where one string serves every instance of the kind.
+            if Value::from_bits(message).kind() != crisol_value::Kind::Undefined {
+                let text = to_text(message).unwrap_or_default();
+                let held = new_string(&text);
+                with_rooted(&[held], || {
+                    with_runtime(|runtime| {
+                        runtime.define_hidden(target, "message", Value::from_bits(held));
+                    });
+                });
+            }
+            receiver
+        })
     })
 }
 
@@ -9200,6 +9212,10 @@ fn describe_error(thrown: u64) -> Option<String> {
         (Value::from_bits(bits).kind() == crisol_value::Kind::String)
             .then(|| to_text(bits))
             .flatten()
+            // **Empty counts as absent too.** `Error.prototype.message` is the empty string,
+            // which every error without one of its own now inherits — kept, it described a
+            // bare `new TypeError()` as `"TypeError: "` with nothing after the colon.
+            .filter(|text| !text.is_empty())
     };
     match (read("name"), read("message")) {
         (Some(name), Some(message)) => Some(format!("{name}: {message}")),
