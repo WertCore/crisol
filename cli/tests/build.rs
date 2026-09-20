@@ -61,11 +61,15 @@ fn execute(name: &str, binary: &Path, stress: bool) -> String {
         command.env("CRISOL_GC_STRESS", "1");
     }
     let output = command.output().expect("run the binary");
+    // **The program's own stderr, which is where it says why.** Without it a failure reads as
+    // `exited with Some(1)` — true, and silent about the uncaught throw that caused it. The
+    // entry point prints `uncaught: …` precisely so somebody can read it.
     assert!(
         output.status.success(),
-        "{name} exited with {:?}{}",
+        "{name} exited with {:?}{}: {}",
         output.status.code(),
-        if stress { " under GC stress" } else { "" }
+        if stress { " under GC stress" } else { "" },
+        String::from_utf8_lossy(&output.stderr).trim()
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
