@@ -5143,11 +5143,52 @@ fn defining_length_through_a_descriptor_resizes() {
          return r;",
         "RangeError",
     );
-    // The flag is bookkeeping, not a property the program can see.
+    // The flag is bookkeeping, not a property the program can see. Asserted by name rather
+    // than by a total, because the total was itself wrong — an array owns its indices *and*
+    // `length`, so `[0]` has two own names and the first version of this expected none.
     check(
         "define-length-flag-hidden",
         "let a = [0]; Object.defineProperty(a, \"length\", {value: 1, writable: false}); \
-         return Object.getOwnPropertyNames(a).length;",
-        "0",
+         return Object.getOwnPropertyNames(a).indexOf(\"__fixedLength\");",
+        "-1",
+    );
+}
+
+/// **An array owns `length`**, even though nothing stores it — `getOwnPropertyNames` has to
+/// say so. It is **not enumerable**, so `Object.keys` and `for-in` still leave it out, and that
+/// difference is the whole reason the two lists are not the same list.
+#[test]
+fn an_array_owns_its_indices_and_its_length() {
+    check(
+        "array-own-names",
+        "return Object.getOwnPropertyNames([7, 8]).join(\",\");",
+        "0,1,length",
+    );
+    check(
+        "array-own-names-empty",
+        "return Object.getOwnPropertyNames([]).join(\",\");",
+        "length",
+    );
+    // Enumeration leaves `length` out, which is why `Object.keys` is shorter.
+    check(
+        "array-keys",
+        "return Object.keys([7, 8]).join(\",\");",
+        "0,1",
+    );
+    check(
+        "array-forin",
+        "let s = \"\"; for (let k in [7, 8]) { s = s + k; } return s;",
+        "01",
+    );
+    // A plain object is unaffected: it has no derived length to report or hide.
+    check(
+        "object-own-names-plain",
+        "return Object.getOwnPropertyNames({a: 1}).join(\",\");",
+        "a",
+    );
+    check(
+        "object-length-property",
+        "return Object.keys({length: 2}).join(\",\");",
+        "length",
     );
 }

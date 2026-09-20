@@ -4609,11 +4609,14 @@ fn own_keys(object: u64) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         // **Indices come first and in numeric order**, before the string-named properties, which
         // is the enumeration order the specification fixes rather than insertion order.
-        if let Some(count) = runtime.heap.element_count(handle) {
+        let is_array = if let Some(count) = runtime.heap.element_count(handle) {
             for index in 0..count {
                 names.push(number_text(index_as_f64(index)));
             }
-        }
+            true
+        } else {
+            false
+        };
         if let Some(shape) = runtime.heap.shape_of(handle) {
             for (key, slot) in runtime.shapes.borrow().properties(shape) {
                 if runtime.heap.is_deleted(handle, slot.index())
@@ -4623,6 +4626,13 @@ fn own_keys(object: u64) -> Vec<String> {
                 }
                 names.push(key.as_str().to_owned());
             }
+        }
+        // **An array owns `length`**, even though nothing stores it. `getOwnPropertyNames` has
+        // to say so, and it did not — an array reported its indices and nothing else. It is
+        // added last because the specification puts the indices first and the rest after, and
+        // it is not enumerable, so `Object.keys` and `for-in` still leave it out.
+        if is_array {
+            names.push("length".to_owned());
         }
         names
     })
@@ -4683,6 +4693,10 @@ fn enumerable_keys(object: u64) -> Vec<String> {
     };
     own_keys(object)
         .into_iter()
+        // **An array's `length` is not enumerable**, and it has no slot whose attributes could
+        // say so — the filter below asks a property for its attributes and a derived length
+        // has none, which would have made it answer "enumerable" by default.
+        .filter(|name| name != "length" || elements_of(object).is_none())
         .filter(|name| {
             own_property(object, name).is_none_or(|(slot, _)| {
                 with_runtime(|runtime| runtime.heap.attributes_of(handle, slot).enumerable)

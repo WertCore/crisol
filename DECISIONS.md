@@ -4849,3 +4849,25 @@ Reproducing the same call as an acceptance case reported a *wrong answer* instea
 `1` was wanted — which is what the harness difference is for: one reports a signal and the
 other prints what the program said. The crash was downstream of the disagreement, in a helper
 that trusted the two answers to match.
+
+## D-167
+
+**An array owns `length`, and `getOwnPropertyNames` has to say so.**
+
+Status: Accepted
+
+`Object.getOwnPropertyNames([0])` answered `["0"]`. An array owns its indices **and** `length`,
+even though nothing stores the latter — it is derived from the element count, which is why it
+was missing from a list built by walking what is stored.
+
+It is added after the indices, because the specification fixes that order, and it is **kept out
+of enumeration**: `Object.keys` and `for-in` must not see it. That needed its own filter rather
+than falling out of the attribute check, because the attribute check asks a property for its
+permissions and a derived length has none — so it would have answered "enumerable" by default.
+The two lists differ in exactly this one name, which is the whole reason they are two lists.
+
+**A test of mine asserted the total was zero.** It was checking that an internal flag stays
+hidden, and reached for the easiest observable — a count — which encoded a second wrong belief
+about arrays while testing the first thing correctly. It now asserts the flag *by name*. A
+count is a bad assertion for "X is absent": it passes for the wrong reason whenever the total
+is wrong for another one.
