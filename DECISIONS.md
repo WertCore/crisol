@@ -4871,3 +4871,67 @@ hidden, and reached for the easiest observable — a count — which encoded a s
 about arrays while testing the first thing correctly. It now asserts the flag *by name*. A
 count is a bad assertion for "X is absent": it passes for the wrong reason whenever the total
 is wrong for another one.
+
+## D-168
+
+**`__proto__` is an accessor on `Object.prototype`, answered where the walk reaches it.**
+
+Status: Accepted
+
+`o.__proto__` read `undefined` and `o.__proto__ = p` stored a property called `__proto__`
+without re-parenting anything. Both are load-bearing: the read is how most code still asks for
+a prototype, and the write is what `{__proto__: p}` in an object literal lowers to.
+
+The obvious fix — check the name at the top of `crisol_property_load` — is shorter and wrong
+twice over. An own `__proto__` (which `Object.defineProperty` can still make) could no longer
+shadow it, and `Object.create(null)` would grow one, when the whole point of a null prototype
+is that the chain never reaches the object that publishes the accessor. So the check sits
+**inside the chain walk**, at the step that arrives at `Object.prototype`, and answers with the
+receiver the walk started from. That is what an accessor does, expressed in the walk rather
+than in a pair of functions the bootstrap would have to allocate before it can allocate
+functions.
+
+**The two refusals are shared.** `Object.setPrototypeOf`, the `__proto__` setter and (when it
+exists) `Reflect.setPrototypeOf` all route through one `set_prototype_of`, which refuses a
+cycle and refuses to re-parent a non-extensible object. A cycle is the one that matters: every
+lookup that misses would walk it, and the bound that stops that being a hang
+(`PROTOTYPE_CHAIN_LIMIT`) is a backstop, not a licence to build one. `Object.setPrototypeOf`
+also previously accepted a number as a prototype and quietly set `null`.
+
+## D-169
+
+**An array's elements are own properties, so every question asked of a descriptor must answer
+for them.**
+
+Status: Accepted
+
+`own_property` reads the shape. An array's elements are not in the shape — they are a dense
+`Vec` beside it — so everything built on that function answered "absent" for exactly the
+properties an array is made of:
+
+- `Object.getOwnPropertyDescriptor([1], 0)` was `undefined`. test262's `propertyHelper` reads a
+  field off that, which made it **the single largest failure reason in the corpus** (119 cases
+  of "cannot read a property of undefined"), from a method that looked finished.
+- `Object.freeze([1])` froze nothing. The loop it runs visits stored properties; an array has
+  none, so the call ran zero iterations and looked like it had worked.
+- `Object.isFrozen(Object.preventExtensions([1]))` was `true`, because an unslotted key was
+  *passed over* rather than asked about.
+- `Object.defineProperty(a, "0", …)` added a slot beside the element, so the array held two
+  answers for one key — the element reads use, the slot descriptors use.
+
+`derived_own_property` is the one place that answers for them, and the three callers that used
+to shrug at a missing slot now ask it. Elements share **one** set of attributes for the whole
+run, carried as two hidden flags, because there is nowhere per-element to put them; that is
+exact for `freeze`, `seal` and `preventExtensions`, which set them for every element at once,
+and approximate for a `defineProperty` that restricts a single index — which still falls
+through to the slot path rather than being dropped.
+
+**A string wrapper's characters are the same problem.** They are materialised on demand
+(D-157), so nothing lists them either; `Object.keys(new String("ab"))` answered without them.
+
+**The bookkeeping flags are now read as own properties, not as property reads.** They stand in
+for internal slots, and an internal slot belongs to one object — reading one up the chain meant
+`Object.freeze(proto)` made every object later created from it report itself non-extensible.
+That was a prototype doing to its instances something only they can do to themselves. It is
+also cheaper: a shape lookup instead of a chain walk that nearly always misses, on a path every
+`for-in` takes.

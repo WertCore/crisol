@@ -2658,6 +2658,8 @@ extern "C" fn set_for_each(
 const OBJECT_NATIVES: &[(&str, Native)] = &[
     ("__defineGetter__", object_define_getter),
     ("__defineSetter__", object_define_setter),
+    ("__lookupGetter__", object_lookup_getter),
+    ("__lookupSetter__", object_lookup_setter),
     ("hasOwnProperty", object_has_own_property),
     ("propertyIsEnumerable", object_property_is_enumerable),
     ("isPrototypeOf", object_is_prototype_of),
@@ -2703,6 +2705,72 @@ fn define_accessor(this_value: u64, argc: u64, argv: *const u64, as_getter: bool
             })
         })
     })
+}
+
+/// `Object.prototype.__lookupGetter__` and `__lookupSetter__`.
+///
+/// **Inherited, unlike `getOwnPropertyDescriptor`.** These walk the chain, which is the whole
+/// reason they still exist beside it: they answer "what would reading this call", and the
+/// answer can live on a prototype.
+fn lookup_accessor(this_value: u64, argc: u64, argv: *const u64, as_getter: bool) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    let Some(name) = to_text(key) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let Some(handle) = handle_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let key = PropertyKey::new(&name);
+    let pair = with_runtime(|runtime| {
+        let mut current = Some(handle);
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let object = current?;
+            let shape = runtime.heap.shape_of(object)?;
+            let found = runtime.shapes.borrow().lookup(shape, &key);
+            if let Some(slot) = found
+                && !runtime.heap.is_deleted(object, slot.index())
+            {
+                // Found, accessor or not — a data property shadows an inherited accessor, so
+                // the walk stops here either way and answers `undefined` for the data case.
+                return runtime
+                    .heap
+                    .attributes_of(object, slot.index())
+                    .accessor
+                    .then(|| runtime.heap.get(object, slot.index()))
+                    .flatten()
+                    .map(|pair| pair.to_bits());
+            }
+            current = runtime.heap.prototype_of(object);
+        }
+        None
+    });
+    pair.and_then(elements_of)
+        .map_or(Value::UNDEFINED.to_bits(), |(functions, _)| {
+            element_at(functions, usize::from(!as_getter))
+        })
+}
+
+/// `Object.prototype.__lookupGetter__`.
+extern "C" fn object_lookup_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    lookup_accessor(this_value, argc, argv, true)
+}
+
+/// `Object.prototype.__lookupSetter__`.
+extern "C" fn object_lookup_setter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    lookup_accessor(this_value, argc, argv, false)
 }
 
 /// `Object.prototype.__defineGetter__`.
@@ -4219,6 +4287,11 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "defineProperties", object_define_properties),
     ("Object", "is", object_is),
     ("Object", "getOwnPropertySymbols", object_own_symbols),
+    (
+        "Object",
+        "getOwnPropertyDescriptors",
+        object_own_descriptors,
+    ),
     ("Array", "isArray", array_is_array),
     ("Array", "from", array_from),
     ("Symbol", "for", symbol_for),
@@ -4294,6 +4367,76 @@ fn own_property(object: u64, name: &str) -> Option<(u32, Value)> {
             .get(handle, slot.index())
             .map(|value| (slot.index(), value))
     })
+}
+
+/// The own property `name` names when nothing stores it.
+///
+/// **An array's elements and its `length` are own properties with no slot.** They live beside
+/// the object rather than in its shape, so [`own_property`] — which reads the shape — cannot
+/// see them, and everything asked through it answered "absent" for exactly the properties an
+/// array is made of. `Object.getOwnPropertyDescriptor([1], 0)` was `undefined`, and test262's
+/// `propertyHelper` then read a field off it: the largest single source of "cannot read a
+/// property of undefined" in the corpus, from a method that looked complete.
+///
+/// A string wrapper's characters are the same shape of problem, for the same reason (D-157).
+fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::Attributes)> {
+    /// Whether `name` is the canonical spelling of `index`, so `"01"` and `"1.0"` are not
+    /// element keys however they parse.
+    fn canonical(name: &str, index: usize) -> bool {
+        number_text(index_as_f64(index)) == name
+    }
+
+    let handle = handle_of(object)?;
+    if let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle)) {
+        if name == "length" {
+            return Some((
+                Value::number(index_as_f64(count)).to_bits(),
+                crisol_value::Attributes {
+                    // **Writable, and neither enumerable nor configurable** — the one
+                    // attribute set no ordinary property has.
+                    writable: !own_flag(object, FIXED_LENGTH),
+                    enumerable: false,
+                    configurable: false,
+                    accessor: false,
+                },
+            ));
+        }
+        let index = name.parse::<usize>().ok()?;
+        if index >= count || !canonical(name, index) {
+            return None;
+        }
+        return Some((
+            indexed_get(object, index),
+            crisol_value::Attributes {
+                writable: elements_are_writable(object),
+                enumerable: true,
+                configurable: elements_are_configurable(object),
+                accessor: false,
+            },
+        ));
+    }
+
+    // A string wrapper's characters, which are fixed in every way a property can be.
+    let text = wrapped_text(object)?;
+    let index = name.parse::<usize>().ok()?;
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let unit = units.get(index).filter(|_| canonical(name, index))?;
+    Some((
+        new_string(&String::from_utf16_lossy(&[*unit])),
+        crisol_value::Attributes {
+            writable: false,
+            enumerable: true,
+            configurable: false,
+            accessor: false,
+        },
+    ))
+}
+
+/// One field of a property descriptor, read as a value.
+fn read_descriptor_field(descriptor: u64, name: &str) -> u64 {
+    let field = name.to_owned();
+    // SAFETY: `field` is a live Rust string.
+    unsafe { crisol_property_load(descriptor, field.as_ptr(), field.len() as u64) }
 }
 
 /// Whether a descriptor field is present and truthy.
@@ -4387,12 +4530,43 @@ extern "C" fn object_define_property(
             return target;
         }
 
+        // **An array index is an element, not a slot.** Defining one has to write the element
+        // or the array ends up holding two answers for the same key — the element the reads
+        // use and the slot the descriptor questions use — which disagree from then on.
+        //
+        // Only the unrestricted case is handled here, because elements share one set of
+        // attributes for the whole run (see `SEALED_ELEMENTS`) and there is nowhere to put a
+        // per-element one. A restrictive define falls through to the slot path below, which
+        // stores it somewhere readable rather than dropping it (D-168).
+        if let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
+            && let Ok(index) = name.parse::<usize>()
+            && number_text(index_as_f64(index)) == name
+            && index <= DENSE_ELEMENT_LIMIT
+        {
+            let getter = read_descriptor_field(descriptor, "get");
+            let setter = read_descriptor_field(descriptor, "set");
+            let unrestricted = !is_callable(getter)
+                && !is_callable(setter)
+                && descriptor_flag(descriptor, "writable") != Some(false)
+                && descriptor_flag(descriptor, "enumerable") != Some(false)
+                && descriptor_flag(descriptor, "configurable") != Some(false);
+            if unrestricted {
+                let given = read_descriptor_field(descriptor, "value");
+                let has_value = Value::from_bits(given).kind() != crisol_value::Kind::Undefined
+                    || own_property(descriptor, "value").is_some();
+                if has_value || index >= count {
+                    with_runtime(|runtime| {
+                        runtime
+                            .heap
+                            .set_element(handle, index, Value::from_bits(given));
+                    });
+                }
+                return target;
+            }
+        }
+
         let existing = own_property(target, &name);
-        let read_field = |field: &str| -> u64 {
-            let field = field.to_owned();
-            // SAFETY: `field` is a live Rust string.
-            unsafe { crisol_property_load(descriptor, field.as_ptr(), field.len() as u64) }
-        };
+        let read_field = |field: &str| -> u64 { read_descriptor_field(descriptor, field) };
         let given = read_field("value");
         let has_value = Value::from_bits(given).kind() != crisol_value::Kind::Undefined
             || own_property(descriptor, "value").is_some();
@@ -4500,12 +4674,23 @@ extern "C" fn object_own_descriptor(
         };
         // **`undefined` for an absent property**, which is how a caller tells "not there" from
         // "there and not writable".
-        let Some((slot, value)) = own_property(target, &name) else {
-            return Value::UNDEFINED.to_bits();
+        let (value, attributes) = match own_property(target, &name) {
+            Some((slot, value)) => (
+                value,
+                with_runtime(|runtime| runtime.heap.attributes_of(handle, slot)),
+            ),
+            None => match derived_own_property(target, &name) {
+                Some((bits, attributes)) => (Value::from_bits(bits), attributes),
+                None => return Value::UNDEFINED.to_bits(),
+            },
         };
-        let attributes = with_runtime(|runtime| runtime.heap.attributes_of(handle, slot));
 
-        let descriptor = crisol_create_object();
+        // **Rooted across the allocation below**, because a derived value can be a string
+        // this call just made — `new String("ab")`'s characters are materialised on demand —
+        // and a value between its allocation and its first store is invisible to the
+        // collector. The symptom would be a descriptor whose `value` is garbage under GC
+        // stress and right without it.
+        let descriptor = with_rooted(&[value.to_bits()], crisol_create_object);
         with_rooted(&[descriptor, value.to_bits()], || {
             let Some(into) = handle_of(descriptor) else {
                 return;
@@ -4534,6 +4719,57 @@ extern "C" fn object_own_descriptor(
             });
         });
         descriptor
+    })
+}
+
+/// `Object.getOwnPropertyDescriptors(target)` — all of them, in one object.
+///
+/// **What makes a faithful copy possible.** `Object.assign` reads values and drops attributes,
+/// so the only way to duplicate an object without flattening its accessors and its
+/// non-writables is to pair this with `defineProperties`.
+extern "C" fn object_own_descriptors(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        if Value::from_bits(target).is_nullish() {
+            return raise(
+                "cannot read the properties of null or undefined",
+                "TypeError",
+            );
+        }
+        let into = crisol_create_object();
+        with_rooted(&[into, target], || {
+            for name in own_keys(target) {
+                let key = new_string(&name);
+                let descriptor = with_rooted(&[key], || {
+                    let arguments = [target, key];
+                    object_own_descriptor(0, 0, 0, 2, arguments.as_ptr())
+                });
+                if Value::from_bits(descriptor).is_exception() {
+                    return descriptor;
+                }
+                // A key with no descriptor gets no entry, rather than an entry saying
+                // `undefined` — the two are how a caller tells absence from an empty answer.
+                if Value::from_bits(descriptor).kind() == crisol_value::Kind::Undefined {
+                    continue;
+                }
+                with_rooted(&[descriptor], || {
+                    // SAFETY: `name` is a live Rust string.
+                    unsafe {
+                        crisol_property_store(into, name.as_ptr(), name.len() as u64, descriptor)
+                    }
+                });
+            }
+            into
+        })
     })
 }
 
@@ -4586,6 +4822,8 @@ const INTERNAL_PROPERTIES: &[&str] = &[
     STRING_PRIMITIVE,
     NOT_EXTENSIBLE,
     FIXED_LENGTH,
+    SEALED_ELEMENTS,
+    FROZEN_ELEMENTS,
     COLLECTION_ENTRIES,
     BOUND_TARGET,
     BOUND_THIS,
@@ -4600,11 +4838,25 @@ fn is_internal_property(name: &str) -> bool {
     INTERNAL_PROPERTIES.contains(&name)
 }
 
+/// The text a string wrapper holds, if `object` is one.
+///
+/// **The kind is checked, not assumed.** Every wrapper keeps its primitive under the same
+/// hidden name, so a `Number` wrapper answers this too — and reading `new Number(12345)`'s
+/// primitive as text would give it five characters and five own properties.
+fn wrapped_text(object: u64) -> Option<String> {
+    // An own lookup rather than a property read: a wrapper's primitive is its own, and this
+    // is asked once per `for-in`, where a chain walk that nearly always misses is not free.
+    text_of(own_property(object, STRING_PRIMITIVE)?.1.to_bits())
+}
+
 /// The own property names of `this`'s first argument.
 fn own_keys(object: u64) -> Vec<String> {
     let Some(handle) = handle_of(object) else {
         return Vec::new();
     };
+    // Read before the borrow below: a hidden property is read by a property load, and a
+    // property load enters the runtime itself.
+    let wrapped = wrapped_text(object);
     with_runtime(|runtime| {
         let mut names: Vec<String> = Vec::new();
         // **Indices come first and in numeric order**, before the string-named properties, which
@@ -4615,6 +4867,14 @@ fn own_keys(object: u64) -> Vec<String> {
             }
             true
         } else {
+            // **A string wrapper owns one property per character.** They are materialised on
+            // demand rather than stored (D-157), so the shape lists none of them and
+            // `Object.keys(new String("ab"))` answered without them.
+            if let Some(text) = &wrapped {
+                for index in 0..text.encode_utf16().count() {
+                    names.push(number_text(index_as_f64(index)));
+                }
+            }
             false
         };
         if let Some(shape) = runtime.heap.shape_of(handle) {
@@ -4634,6 +4894,11 @@ fn own_keys(object: u64) -> Vec<String> {
         if is_array {
             names.push("length".to_owned());
         }
+        // **Once each.** An index can reach this list twice — as an element and, if something
+        // defined it as an ordinary property, as a slot — and a key listed twice is visited
+        // twice by everything built on this.
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|name| seen.insert(name.clone()));
         names
     })
 }
@@ -4693,14 +4958,15 @@ fn enumerable_keys(object: u64) -> Vec<String> {
     };
     own_keys(object)
         .into_iter()
-        // **An array's `length` is not enumerable**, and it has no slot whose attributes could
-        // say so — the filter below asks a property for its attributes and a derived length
-        // has none, which would have made it answer "enumerable" by default.
-        .filter(|name| name != "length" || elements_of(object).is_none())
-        .filter(|name| {
-            own_property(object, name).is_none_or(|(slot, _)| {
+        .filter(|name| match own_property(object, name) {
+            Some((slot, _)) => {
                 with_runtime(|runtime| runtime.heap.attributes_of(handle, slot).enumerable)
-            })
+            }
+            // **An array's `length` is not enumerable**, and it has no slot to say so — which
+            // is why the derived answer has to be asked for rather than assumed. Defaulting
+            // an unslotted key to enumerable put `length` in `Object.keys([1])`.
+            None => derived_own_property(object, name)
+                .is_some_and(|(_, attributes)| attributes.enumerable),
         })
         .collect()
 }
@@ -4800,6 +5066,57 @@ extern "C" fn object_get_prototype(
     })
 }
 
+/// Re-parents `target`, or says why it may not be.
+///
+/// Shared by `Object.setPrototypeOf`, `Reflect.setPrototypeOf` and the `__proto__` setter,
+/// because the three are the same operation and disagreeing about the two refusals below
+/// would mean a program could reach through whichever one checked least.
+///
+/// **A cycle is the refusal that matters.** `a.__proto__ = b; b.__proto__ = a` makes every
+/// lookup that misses walk the pair forever. The walk is bounded (see
+/// [`PROTOTYPE_CHAIN_LIMIT`]) so it returns rather than hangs, but absorbing a cycle at every
+/// lookup is a worse deal than refusing to build one here. The other refusal is extensibility:
+/// `Object.preventExtensions` freezes the prototype link too, which is what stops a sealed
+/// object being re-parented out from under its own guarantees.
+///
+/// `Ok(false)` means the request was not a change worth making — `proto` was neither an object
+/// nor `null`, which the specification ignores rather than faults.
+fn set_prototype_of(handle: GcRef, proto: u64) -> Result<bool, &'static str> {
+    let held = Value::from_bits(proto);
+    let parent = if held.is_null() {
+        None
+    } else if held.kind() == crisol_value::Kind::Object {
+        handle_of(proto)
+    } else {
+        return Ok(false);
+    };
+
+    let current = with_runtime(|runtime| runtime.heap.prototype_of(handle));
+    if current == parent {
+        // Setting the prototype it already has is not a change, so neither refusal applies —
+        // a frozen object may be re-parented to where it already is.
+        return Ok(true);
+    }
+    // Asked outside the borrow below: extensibility is a hidden *property*, so reading it is
+    // a property load, and a property load enters the runtime itself.
+    if !is_extensible(handle.to_value().to_bits()) {
+        return Err("cannot change the prototype of a non-extensible object");
+    }
+
+    with_runtime(|runtime| {
+        let mut walk = parent;
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let Some(step) = walk else { break };
+            if step == handle {
+                return Err("cyclic prototype chain");
+            }
+            walk = runtime.heap.prototype_of(step);
+        }
+        runtime.heap.set_prototype(handle, parent);
+        Ok(true)
+    })
+}
+
 /// `Object.setPrototypeOf(o, proto)`.
 extern "C" fn object_set_prototype(
     _closure: u64,
@@ -4812,11 +5129,19 @@ extern "C" fn object_set_prototype(
     let target = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let proto = unsafe { argument(argc, argv, 1) };
-    if let Some(handle) = handle_of(target) {
-        let parent = handle_of(proto);
-        with_runtime(|runtime| runtime.heap.set_prototype(handle, parent));
+    // **`null` and `undefined` are the error**, not "anything that is not an object": the
+    // specification coerces the target, so `Object.setPrototypeOf(1, null)` answers `1` and
+    // only a nullish one throws.
+    if Value::from_bits(target).is_nullish() {
+        return raise("cannot set the prototype of null or undefined", "TypeError");
     }
-    target
+    let Some(handle) = handle_of(target) else {
+        return target;
+    };
+    match set_prototype_of(handle, proto) {
+        Ok(_) => target,
+        Err(message) => raise(message, "TypeError"),
+    }
 }
 
 /// `Object.hasOwn(o, key)`.
@@ -5187,6 +5512,13 @@ fn map_into_array(values: &[u64], mapper: u64) -> u64 {
     })
 }
 
+/// The name of the accessor `Object.prototype` publishes for the prototype link.
+///
+/// **Deprecated in Annex B and universally shipped**, so it is not optional. It is a constant
+/// rather than a literal because it is checked in two places that have to agree — the load
+/// walk and the store walk — and neither may report it as a property anything owns.
+const PROTO_ACCESSOR: &str = "__proto__";
+
 /// Whether an object refuses new properties.
 ///
 /// **Absent means extensible**, so an object nobody has frozen carries nothing. The flag is a
@@ -5194,9 +5526,42 @@ fn map_into_array(values: &[u64], mapper: u64) -> u64 {
 /// one that `Object.keys` will not find.
 const NOT_EXTENSIBLE: &str = "__sealed";
 
+/// Marks an object whose *elements* may no longer be deleted.
+///
+/// **Elements have no attributes of their own.** They live in a dense `Vec` beside the
+/// object's slots, not in the shape, so there is no per-element place to record
+/// configurability — and `Object.seal([1, 2])` has to record it somewhere or the seal is a
+/// no-op on exactly the objects people seal most. One flag for the whole run of elements is
+/// coarse and correct for every case reachable today, because the only things that set it
+/// set it for all of them at once.
+const SEALED_ELEMENTS: &str = "__sealedElements";
+
+/// Marks an object whose elements may no longer be written. See [`SEALED_ELEMENTS`].
+const FROZEN_ELEMENTS: &str = "__frozenElements";
+
+/// Whether `object` itself carries the bookkeeping flag `name`.
+///
+/// **Own, not inherited**, which a plain property read is not. These flags stand in for
+/// internal slots, and an internal slot belongs to one object — reading one up the chain made
+/// `Object.freeze(proto)` freeze every object created from it afterwards, which is a
+/// prototype doing something only its own instances should be able to do to themselves.
+fn own_flag(object: u64, name: &str) -> bool {
+    own_property(object, name).is_some()
+}
+
+/// Whether `object`'s elements may still be written.
+fn elements_are_writable(object: u64) -> bool {
+    !own_flag(object, FROZEN_ELEMENTS)
+}
+
+/// Whether `object`'s elements may still be deleted.
+fn elements_are_configurable(object: u64) -> bool {
+    !own_flag(object, SEALED_ELEMENTS)
+}
+
 /// Whether `object` still accepts new properties.
 fn is_extensible(object: u64) -> bool {
-    property_number(object, NOT_EXTENSIBLE).is_none()
+    !own_flag(object, NOT_EXTENSIBLE)
 }
 
 /// Stops `object` accepting new properties.
@@ -5213,6 +5578,21 @@ fn restrict_own_properties(object: u64, writable: bool) {
     let Some(handle) = handle_of(object) else {
         return;
     };
+    // **The elements first, and separately**, because they have no slots to carry attributes
+    // and the loop below only reaches properties that do. Without this `Object.freeze([1])`
+    // froze nothing at all: the array has no stored properties, so the loop ran zero times
+    // and the call looked like it had worked.
+    if with_runtime(|runtime| runtime.heap.element_count(handle)).is_some() {
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, SEALED_ELEMENTS, Value::number(1.0));
+            if !writable {
+                runtime.define_hidden(handle, FROZEN_ELEMENTS, Value::number(1.0));
+                // A frozen array's `length` is not writable either, and that flag already
+                // exists for the one place a length's permissions can live.
+                runtime.define_hidden(handle, FIXED_LENGTH, Value::number(1.0));
+            }
+        });
+    }
     for name in own_keys(object) {
         let Some((slot, _)) = own_property(object, &name) else {
             continue;
@@ -5280,11 +5660,17 @@ fn all_properties_are(object: u64, ready: impl Fn(crisol_value::Attributes) -> b
         return false;
     }
     own_keys(object).into_iter().all(|name| {
-        own_property(object, &name).is_none_or(|(slot, _)| {
-            ready(with_runtime(|runtime| {
+        match own_property(object, &name) {
+            Some((slot, _)) => ready(with_runtime(|runtime| {
                 runtime.heap.attributes_of(handle, slot)
-            }))
-        })
+            })),
+            // Unslotted keys were passed over, which made every array vacuously frozen the
+            // moment it stopped being extensible — `Object.isFrozen([1])` said yes with the
+            // element still writable.
+            None => {
+                derived_own_property(object, &name).is_none_or(|(_, attributes)| ready(attributes))
+            }
+        }
     })
 }
 
@@ -6251,7 +6637,7 @@ pub unsafe extern "C" fn crisol_property_store(
         // **A length made non-writable ignores an assignment**, silently outside strict mode,
         // exactly as a non-writable property does. Checked here because the length has no slot
         // whose attributes the ordinary path could consult.
-        if property_number(object, FIXED_LENGTH).is_some() {
+        if own_flag(object, FIXED_LENGTH) {
             return Value::UNDEFINED.to_bits();
         }
         let wanted = to_number(value);
@@ -6299,11 +6685,23 @@ pub unsafe extern "C" fn crisol_property_store(
     // fetched and the call made outside any runtime borrow, for the same reason a getter is
     // (see `crisol_property_load`). Looked for up the chain, because a setter inherited from a
     // prototype still receives a write to the instance.
-    let accessor = with_runtime(|runtime| {
+    /// What the chain walk decided a write should do.
+    enum Write {
+        /// Call this accessor pair's setter.
+        Accessor(u64),
+        /// Re-parent the receiver: the key was `__proto__` and nothing shadowed it.
+        Prototype,
+        /// Nothing found; store it ordinarily.
+        Store,
+    }
+
+    let action = with_runtime(|runtime| {
         let mut current = Some(handle);
         for _ in 0..PROTOTYPE_CHAIN_LIMIT {
-            let object = current?;
-            let shape = runtime.heap.shape_of(object)?;
+            let Some(object) = current else { break };
+            let Some(shape) = runtime.heap.shape_of(object) else {
+                break;
+            };
             let found = runtime.shapes.borrow().lookup(shape, &key);
             if let Some(slot) = found
                 && !runtime.heap.is_deleted(object, slot.index())
@@ -6314,22 +6712,37 @@ pub unsafe extern "C" fn crisol_property_store(
                     .accessor
                     .then(|| runtime.heap.get(object, slot.index()))
                     .flatten()
-                    .map(|pair| pair.to_bits());
+                    .map_or(Write::Store, |pair| Write::Accessor(pair.to_bits()));
+            }
+            // The setter half of the `__proto__` accessor — found the same way its getter is,
+            // and for the same reasons. See `crisol_property_load`.
+            if name == PROTO_ACCESSOR && Some(object) == OBJECT_PROTOTYPE.with(std::cell::Cell::get)
+            {
+                return Write::Prototype;
             }
             current = runtime.heap.prototype_of(object);
         }
-        None
+        Write::Store
     });
-    if let Some(pair) = accessor {
-        if let Some((functions, _)) = elements_of(pair) {
-            let setter = element_at(functions, 1);
-            if is_callable(setter) {
-                return call_value(setter, object, &[value]);
+    match action {
+        Write::Accessor(pair) => {
+            if let Some((functions, _)) = elements_of(pair) {
+                let setter = element_at(functions, 1);
+                if is_callable(setter) {
+                    return call_value(setter, object, &[value]);
+                }
             }
+            // **A getter with no setter swallows the write**, silently outside strict mode —
+            // which is what makes a read-only computed property read-only.
+            return Value::UNDEFINED.to_bits();
         }
-        // **A getter with no setter swallows the write**, silently outside strict mode — which
-        // is what makes a read-only computed property read-only.
-        return Value::UNDEFINED.to_bits();
+        Write::Prototype => {
+            return match set_prototype_of(handle, value) {
+                Ok(_) => Value::UNDEFINED.to_bits(),
+                Err(message) => raise(message, "TypeError"),
+            };
+        }
+        Write::Store => {}
     }
 
     with_runtime(|runtime| {
@@ -6511,6 +6924,22 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
                     return Found::Get(value.to_bits());
                 }
                 return Found::Value(value.to_bits());
+            }
+            // **`__proto__` is an accessor on `Object.prototype`**, not a property anything
+            // stores — so it is answered here, at the point the walk arrives at the object
+            // that owns it, with the receiver the walk started from. Answering it at the top
+            // of the lookup instead would be shorter and wrong twice over: an own `__proto__`
+            // could no longer shadow it, and `Object.create(null)` would grow one, when the
+            // whole point of a null prototype is that the chain never reaches here.
+            if name == PROTO_ACCESSOR && Some(object) == OBJECT_PROTOTYPE.with(std::cell::Cell::get)
+            {
+                return Found::Value(
+                    runtime
+                        .heap
+                        .prototype_of(handle)
+                        .map_or(Value::NULL, GcRef::to_value)
+                        .to_bits(),
+                );
             }
             current = runtime.heap.prototype_of(object);
         }
@@ -7827,6 +8256,23 @@ pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) -> u6
     };
     let key = Value::from_bits(key);
 
+    // **Frozen elements refuse a write, and a non-extensible one refuses a new index.** Asked
+    // before the store rather than inside it, because `set_element` grows the array to fit
+    // and growing *is* the addition a non-extensible object is supposed to refuse.
+    if let Some(index) = as_index(key)
+        && let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
+    {
+        let refused = if index < count {
+            !elements_are_writable(object)
+        } else {
+            !is_extensible(object)
+        };
+        if refused {
+            // Silently, outside strict mode — as every other refused write is.
+            return Value::UNDEFINED.to_bits();
+        }
+    }
+
     let stored = with_runtime(|runtime| {
         as_index(key)
             // **A sparse index becomes a named property rather than four billion slots.**
@@ -8243,22 +8689,29 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
     // as `undefined` — a hole and an `undefined` element differ (D-64) and nothing here can say
     // which it is yet.
     if let Some(index) = as_index(key_value) {
+        // Read before the borrow below: this is a hidden property, so asking is a property
+        // load, and a property load enters the runtime itself.
+        let configurable = elements_are_configurable(object);
         let handled = with_runtime(|runtime| {
             let Some(count) = runtime.heap.element_count(handle) else {
-                return false;
+                return None;
             };
             if index >= count {
-                return true;
+                return Some(true);
+            }
+            if !configurable {
+                // **Non-configurable answers `false`**, as a sealed named property does.
+                return Some(false);
             }
             if index + 1 == count {
                 runtime.heap.truncate_elements(handle, index);
             } else {
                 runtime.heap.set_element(handle, index, Value::UNDEFINED);
             }
-            true
+            Some(true)
         });
-        if handled {
-            return Value::TRUE.to_bits();
+        if let Some(gone) = handled {
+            return boolean(gone).to_bits();
         }
     }
 

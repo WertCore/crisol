@@ -5192,3 +5192,270 @@ fn an_array_owns_its_indices_and_its_length() {
         "length",
     );
 }
+
+/// **`__proto__` is an accessor on `Object.prototype`**, not a property anything stores — so
+/// it is shadowable by an own property, absent from an object with no prototype, and reached
+/// through the ordinary chain walk rather than by a name check at the top of it.
+#[test]
+fn the_prototype_link_is_readable_and_writable_by_name() {
+    check(
+        "proto-read",
+        "let o = {}; return o.__proto__ === Object.prototype;",
+        "true",
+    );
+    check(
+        "proto-write",
+        "let a = {x: 1}; let b = {}; b.__proto__ = a; return b.x;",
+        "1",
+    );
+    // The literal form is the same operation, which is why it needs no separate lowering.
+    check(
+        "proto-literal",
+        "let a = {x: 2}; let o = {__proto__: a}; return o.x;",
+        "2",
+    );
+    // **An object with no prototype has no `__proto__`.** The accessor lives on
+    // `Object.prototype`, and this object's chain never reaches it.
+    check(
+        "proto-null-prototype",
+        "let o = Object.create(null); return typeof o.__proto__;",
+        "undefined",
+    );
+    check(
+        "proto-end-of-chain",
+        "return Object.prototype.__proto__;",
+        "null",
+    );
+    // Assigning something that is neither an object nor `null` is ignored, not an error.
+    check(
+        "proto-write-primitive",
+        "let o = {}; o.__proto__ = 5; return o.__proto__ === Object.prototype;",
+        "true",
+    );
+    check(
+        "proto-write-null",
+        "let o = {}; o.__proto__ = null; return o.__proto__;",
+        "undefined",
+    );
+}
+
+/// **A cycle is refused**, by every route into `[[SetPrototypeOf]]` — and so is re-parenting an
+/// object that has stopped being extensible.
+#[test]
+fn a_prototype_may_not_be_made_cyclic() {
+    check(
+        "proto-cycle",
+        "let a = {}; let b = Object.create(a); \
+         try { a.__proto__ = b; return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proto-cycle-set-prototype-of",
+        "let a = {}; let b = Object.create(a); \
+         try { Object.setPrototypeOf(a, b); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proto-non-extensible",
+        "let o = Object.preventExtensions({}); \
+         try { Object.setPrototypeOf(o, {x: 1}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Setting the prototype it already has is not a change, so nothing refuses it.
+    check(
+        "proto-non-extensible-same",
+        "let o = Object.preventExtensions({}); \
+         return Object.setPrototypeOf(o, Object.prototype) === o;",
+        "true",
+    );
+    check(
+        "proto-set-prototype-of-primitive",
+        "return Object.setPrototypeOf(5, null);",
+        "5",
+    );
+    check(
+        "proto-set-prototype-of-nullish",
+        "try { Object.setPrototypeOf(null, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **An array's elements and its `length` are own properties with no slot**, so every question
+/// asked of a descriptor has to answer for them too. `getOwnPropertyDescriptor` returning
+/// `undefined` for them is what test262's `propertyHelper` then read a field off.
+#[test]
+fn an_element_has_a_descriptor() {
+    check(
+        "descriptor-element-value",
+        "return Object.getOwnPropertyDescriptor([7, 8], \"0\").value;",
+        "7",
+    );
+    check(
+        "descriptor-element-flags",
+        "let d = Object.getOwnPropertyDescriptor([7], \"0\"); \
+         return d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "true,true,true",
+    );
+    // A length is writable and neither enumerable nor configurable — an attribute set no
+    // ordinary property has.
+    check(
+        "descriptor-array-length",
+        "let d = Object.getOwnPropertyDescriptor([7, 8], \"length\"); \
+         return d.value + \",\" + d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "2,true,false,false",
+    );
+    check(
+        "descriptor-element-absent",
+        "return typeof Object.getOwnPropertyDescriptor([7], \"3\");",
+        "undefined",
+    );
+    // A string wrapper's characters are the same shape of problem: materialised on demand, so
+    // nothing in the shape lists them.
+    check(
+        "descriptor-string-character",
+        "return Object.getOwnPropertyDescriptor(new String(\"ab\"), \"1\").value;",
+        "b",
+    );
+    check(
+        "string-wrapper-own-names",
+        "return Object.getOwnPropertyNames(new String(\"ab\")).join(\",\");",
+        "0,1,length",
+    );
+    check(
+        "string-wrapper-keys",
+        "return Object.keys(new String(\"ab\")).join(\",\");",
+        "0,1",
+    );
+    // A `Number` wrapper keeps its primitive under the same hidden name and must not be read
+    // as text — otherwise `12345` would have five characters and five own properties.
+    check(
+        "number-wrapper-keys",
+        "return Object.keys(new Number(12345)).length;",
+        "0",
+    );
+}
+
+/// **Freezing an array has to freeze its elements**, which have no attributes of their own —
+/// so the flag is carried for the whole run of them. Without it `Object.freeze` froze nothing
+/// on exactly the objects people freeze most, and looked like it had worked.
+#[test]
+fn freezing_an_array_stops_its_elements_changing() {
+    check(
+        "freeze-array-write",
+        "let a = Object.freeze([1]); a[0] = 9; return a[0];",
+        "1",
+    );
+    check(
+        "freeze-array-grow",
+        "let a = Object.freeze([1]); a[1] = 2; return a.length;",
+        "1",
+    );
+    check(
+        "freeze-array-length",
+        "let a = Object.freeze([1]); a.length = 0; return a.length;",
+        "1",
+    );
+    check(
+        "freeze-array-is-frozen",
+        "return Object.isFrozen(Object.freeze([1]));",
+        "true",
+    );
+    // Not extensible is not frozen: the element is still writable, and the answer used to be
+    // `true` because an unslotted key was passed over rather than asked about.
+    check(
+        "prevent-extensions-array-is-not-frozen",
+        "return Object.isFrozen(Object.preventExtensions([1]));",
+        "false",
+    );
+    // Sealing leaves the values writable and stops the deleting, which is the whole difference.
+    check(
+        "seal-array",
+        "let a = Object.seal([1]); a[0] = 9; return a[0] + \",\" + (delete a[0]);",
+        "9,false",
+    );
+    check(
+        "seal-array-is-sealed",
+        "return Object.isSealed(Object.seal([1]));",
+        "true",
+    );
+    check(
+        "seal-array-is-not-frozen",
+        "return Object.isFrozen(Object.seal([1]));",
+        "false",
+    );
+    // An empty array has no elements to freeze, so it is frozen as soon as it is closed.
+    check(
+        "freeze-empty-array",
+        "return Object.isFrozen(Object.freeze([]));",
+        "true",
+    );
+}
+
+/// **Defining an array index writes the element.** Storing it as an ordinary property instead
+/// left the array holding two answers for one key — the element the reads use and the slot the
+/// descriptors use — which disagree from then on.
+#[test]
+fn defining_an_index_writes_the_element() {
+    check(
+        "define-index-existing",
+        "let a = [1]; Object.defineProperty(a, \"0\", {value: 5}); return a[0];",
+        "5",
+    );
+    check(
+        "define-index-new",
+        "let a = [1]; \
+         Object.defineProperty(a, \"1\", {value: 7, writable: true, enumerable: true, configurable: true}); \
+         return a.length + \",\" + a[1];",
+        "2,7",
+    );
+    // Once, however it got there.
+    check(
+        "define-index-not-listed-twice",
+        "let a = [1]; Object.defineProperty(a, \"0\", {value: 5}); \
+         return Object.getOwnPropertyNames(a).join(\",\");",
+        "0,length",
+    );
+}
+
+/// The rest of `Object`: the descriptors in bulk, and the two lookups that pair with
+/// `__defineGetter__`.
+#[test]
+fn object_reports_every_descriptor_and_finds_accessors() {
+    check(
+        "own-descriptors",
+        "let d = Object.getOwnPropertyDescriptors({a: 1, b: 2}); \
+         return d.a.value + \",\" + d.b.value + \",\" + d.a.enumerable;",
+        "1,2,true",
+    );
+    check(
+        "own-descriptors-array",
+        "let d = Object.getOwnPropertyDescriptors([7]); \
+         return d[0].value + \",\" + d.length.value;",
+        "7,1",
+    );
+    check(
+        "own-descriptors-empty",
+        "return Object.keys(Object.getOwnPropertyDescriptors({})).length;",
+        "0",
+    );
+    check(
+        "lookup-getter",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         return o.__lookupGetter__(\"x\")();",
+        "7",
+    );
+    // A getter with no setter has nothing to find, which is how the pair is told apart.
+    check(
+        "lookup-setter-absent",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         return typeof o.__lookupSetter__(\"x\");",
+        "undefined",
+    );
+    // Inherited, unlike `getOwnPropertyDescriptor` — which is why both still exist.
+    check(
+        "lookup-getter-inherited",
+        "let a = {}; a.__defineGetter__(\"x\", function () { return 3; }); \
+         let b = Object.create(a); return b.__lookupGetter__(\"x\")();",
+        "3",
+    );
+}

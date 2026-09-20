@@ -264,6 +264,7 @@ fn the_suite_is_attempted_and_the_result_reported() {
     let mut failures: BTreeMap<String, usize> = BTreeMap::new();
     let mut areas: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut by_case: Vec<(PathBuf, String)> = Vec::new();
 
     for (index, case) in cases.iter().step_by(step).enumerate() {
         let Some(outcome) = attempt(&root, case, &work, index) else {
@@ -280,7 +281,11 @@ fn the_suite_is_attempted_and_the_result_reported() {
                 let reason_key = reason.clone();
                 *failures.entry(reason).or_default() += 1;
                 *areas.entry(area_of(case)).or_default() += 1;
-                examples.entry(reason_key).or_default().push(case.clone());
+                examples
+                    .entry(reason_key.clone())
+                    .or_default()
+                    .push(case.clone());
+                by_case.push((case.clone(), reason_key));
             }
             Outcome::Crashed => crashed.push(case.clone()),
             Outcome::Refused(reason) => *refusals.entry(reason).or_default() += 1,
@@ -313,17 +318,37 @@ fn the_suite_is_attempted_and_the_result_reported() {
     by_area.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
     // A count says how much and a path says what. The thrown message cannot name the method
     // that was missing — the callee is a value by then — so the cases themselves have to.
-    if let Some((reason, _)) = by_reason.first()
-        && let Some(cases) = examples.get(*reason)
-    {
-        println!("examples of the most common failure ({reason}):");
-        for case in cases.iter().take(8) {
-            println!("  {}", case.display());
+    //
+    // **Several reasons rather than only the first.** One reason's examples answer one
+    // question and the run costs an hour, so the next question waits an hour for its own
+    // answer. Printing the top handful is free and removes that round trip.
+    println!("examples, by failure:");
+    for (reason, _) in by_reason.iter().take(8) {
+        let Some(cases) = examples.get(*reason) else {
+            continue;
+        };
+        println!("  {reason}");
+        for case in cases.iter().take(6) {
+            println!("    {}", case.display());
         }
     }
     println!("which built-ins those failures are testing:");
     for (area, count) in by_area.iter().take(20) {
         println!("  {count:>5}  {area}");
+    }
+    // The same cases again, cut the other way. An area is what gets worked on — "Object" is a
+    // morning's work and "cannot read a property of undefined" is a symptom of six unrelated
+    // things — so the areas need their own examples, each with what it threw.
+    println!("examples, by area:");
+    for (area, _) in by_area.iter().take(6) {
+        println!("  {area}");
+        for (case, reason) in by_case
+            .iter()
+            .filter(|(case, _)| area_of(case) == **area)
+            .take(10)
+        {
+            println!("    {}: {reason}", case.display());
+        }
     }
     // Named rather than counted, so a fall in the number can be read as "these stopped
     // passing" rather than taken on trust. A fix that makes a case *correctly* fail looks
