@@ -5168,3 +5168,24 @@ tightened three answers that were separately wrong — `getOwnPropertyDescriptor
 **`Object.assign` throws on a read-only target.** It uses the throwing form of `Set`, which is
 one of the few places a program not written in strict mode can see the difference between a
 refused write and a silent one.
+
+## D-183
+
+**A descriptor has to describe something, and a namespace's constants are not enumerable.**
+
+Status: Accepted
+
+Three refusals `defineProperty` was not making, all found by reading what the corpus still
+complained about rather than by guessing:
+
+- **A primitive descriptor.** The check asked for a *handle*, and a string has one without
+  being an object — so `Object.create({}, {p: "abc"})` defined `p` as `undefined` where the
+  specification throws. The same mistake as the target check, in the line below it.
+- **A `get` that is present and not callable.** Treating it as "not an accessor" made
+  `{get: "string"}` a data descriptor with no value, which is a quiet wrong answer where there
+  is an error to report.
+- **`Math.PI` and `Number.MAX_VALUE` were enumerable.** That is visible in
+  `Object.keys(Math)`, and load-bearing in `Object.defineProperties(o, Math)` — which walks
+  the enumerable own properties and reads each one as a descriptor, so a constant became
+  `3.14159…` where a descriptor was wanted. The constants are now readable and nothing else,
+  which is the attribute set the specification gives them.

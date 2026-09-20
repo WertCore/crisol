@@ -4764,10 +4764,11 @@ extern "C" fn object_define_property(
         let Some(name) = to_text(key) else {
             return raise("a property key must be a name", "TypeError");
         };
-        // **A descriptor has to be an object.** A number has no `value` and no `writable`, so
-        // reading fields off it found nothing and the call quietly defined the property as
-        // `undefined` — a wrong answer where the specification has an error.
-        if handle_of(descriptor).is_none() {
+        // **A descriptor has to be an object**, and a string is a cell without being one. A
+        // primitive has no `value` and no `writable`, so reading fields off it found nothing
+        // and the call quietly defined the property as `undefined` — a wrong answer where the
+        // specification has an error.
+        if Value::from_bits(descriptor).kind() != crisol_value::Kind::Object {
             return raise("a property description must be an object", "TypeError");
         }
 
@@ -4842,6 +4843,23 @@ extern "C" fn object_define_property(
         // either makes this an accessor whatever else is present.
         let getter = read_field("get");
         let setter = read_field("set");
+        // **Present and not callable is an error**, not "not an accessor". A descriptor
+        // carrying `get: "string"` describes nothing the engine can do, and treating it as a
+        // data descriptor defined the property as `undefined` instead of saying so.
+        for (field, value) in [("get", getter), ("set", setter)] {
+            if Value::from_bits(value).kind() != crisol_value::Kind::Undefined
+                && !is_callable(value)
+            {
+                return raise(
+                    if field == "get" {
+                        "a getter must be a function"
+                    } else {
+                        "a setter must be a function"
+                    },
+                    "TypeError",
+                );
+            }
+        }
         let is_accessor = is_callable(getter) || is_callable(setter);
         if is_accessor && has_value {
             return raise(
@@ -6878,7 +6896,11 @@ impl Runtime {
                 ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
                 ("NaN", f64::NAN),
             ] {
-                self.define(number, name, Value::number(value));
+                // **Not enumerable, and neither writable nor configurable.** Defined as
+                // ordinary properties they turned up in `Object.keys(Number)`, and — worse —
+                // `Object.defineProperties(o, Math)` read `3.14159…` as a property
+                // descriptor, because a namespace's constants are exactly what that walks.
+                self.define_frozen(number, name, Value::number(value));
             }
         }
 
@@ -6893,7 +6915,7 @@ impl Runtime {
                 ("SQRT2", std::f64::consts::SQRT_2),
                 ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
             ] {
-                self.define(math, name, Value::number(value));
+                self.define_frozen(math, name, Value::number(value));
             }
         }
         self.define(globals.handle(), "globalThis", globals.to_value());
@@ -7011,6 +7033,33 @@ impl Runtime {
                     writable: true,
                     enumerable: false,
                     configurable: true,
+                    accessor: false,
+                },
+            );
+        }
+    }
+
+    /// Defines a constant: readable, and nothing else.
+    ///
+    /// The attribute set the specification gives `Math.PI` and `Number.MAX_VALUE` — none of
+    /// writable, enumerable or configurable. It is not [`Runtime::define_hidden`], which is
+    /// writable, because these are not bookkeeping but values a program is meant to read and
+    /// not meant to change.
+    fn define_frozen(&self, object: GcRef, name: &str, value: Value) {
+        self.define(object, name, value);
+        let key = PropertyKey::new(name);
+        let slot = self
+            .heap
+            .shape_of(object)
+            .and_then(|shape| self.shapes.borrow().lookup(shape, &key));
+        if let Some(slot) = slot {
+            self.heap.set_attributes(
+                object,
+                slot.index(),
+                crisol_value::Attributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
                     accessor: false,
                 },
             );

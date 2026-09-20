@@ -6302,3 +6302,55 @@ fn a_deleted_property_can_be_defined_again() {
         "2,false,false",
     );
 }
+
+/// A descriptor has to describe something. A primitive is not an object however cell-shaped it
+/// is, and a `get` that is present and not callable describes nothing the engine can do.
+#[test]
+fn a_descriptor_has_to_describe_something() {
+    check(
+        "descriptor-is-a-string",
+        "try { Object.create({}, {p: \"abc\"}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "getter-is-a-string",
+        "try { Object.defineProperty({}, \"p\", {get: \"abc\"}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "setter-is-a-number",
+        "try { Object.defineProperty({}, \"p\", {set: 5}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `undefined` is allowed, and means the half that is missing.
+    check(
+        "getter-only",
+        "let o = {}; \
+         Object.defineProperty(o, \"p\", {get: function () { return 3; }, set: undefined}); \
+         return o.p;",
+        "3",
+    );
+}
+
+/// A namespace's constants are not enumerable, which is what `Object.defineProperties(o, Math)`
+/// depends on: it walks the enumerable own properties and reads each as a descriptor.
+#[test]
+fn a_namespaces_constants_are_not_enumerable() {
+    check("math-keys", "return Object.keys(Math).length;", "0");
+    check("number-keys", "return Object.keys(Number).length;", "0");
+    check("math-pi-still-reads", "return Math.PI > 3.14;", "true");
+    // Frozen, so an assignment is ignored rather than changing what every later read sees.
+    check(
+        "math-pi-is-read-only",
+        "Math.PI = 1; return Math.PI > 3.14;",
+        "true",
+    );
+    check(
+        "define-properties-from-a-namespace",
+        "let o = {}; Math.prop = {value: 12}; Object.defineProperties(o, Math); \
+         return o.prop;",
+        "12",
+    );
+}
