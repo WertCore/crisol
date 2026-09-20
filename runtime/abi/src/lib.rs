@@ -4806,23 +4806,23 @@ extern "C" fn object_define_property(
             None => derived_own_property(target, &name)
                 .map(|(bits, attributes)| (attributes, Value::from_bits(bits))),
         };
-        if let Some((current, current_value)) = current_state {
-            if !current.configurable {
-                let asked_configurable = descriptor_flag(descriptor, "configurable");
-                let asked_enumerable = descriptor_flag(descriptor, "enumerable");
-                let asked_writable = descriptor_flag(descriptor, "writable");
-                let changes_kind = is_accessor != current.accessor;
-                let unwritable_value_change = !current.writable
-                    && has_value
-                    && !same_value(Value::from_bits(given), current_value);
-                if asked_configurable == Some(true)
-                    || asked_enumerable.is_some_and(|wanted| wanted != current.enumerable)
-                    || asked_writable.is_some_and(|wanted| wanted && !current.writable)
-                    || changes_kind
-                    || unwritable_value_change
-                {
-                    return raise("cannot redefine a non-configurable property", "TypeError");
-                }
+        if let Some((current, current_value)) = current_state
+            && !current.configurable
+        {
+            let asked_configurable = descriptor_flag(descriptor, "configurable");
+            let asked_enumerable = descriptor_flag(descriptor, "enumerable");
+            let asked_writable = descriptor_flag(descriptor, "writable");
+            let changes_kind = is_accessor != current.accessor;
+            let unwritable_value_change = !current.writable
+                && has_value
+                && !same_value(Value::from_bits(given), current_value);
+            if asked_configurable == Some(true)
+                || asked_enumerable.is_some_and(|wanted| wanted != current.enumerable)
+                || asked_writable.is_some_and(|wanted| wanted && !current.writable)
+                || changes_kind
+                || unwritable_value_change
+            {
+                return raise("cannot redefine a non-configurable property", "TypeError");
             }
         }
 
