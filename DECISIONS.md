@@ -5022,3 +5022,18 @@ only through a wrapper it never made.
 **`Object.assign` copies the enumerable ones.** It walked every own key, which includes an
 array's `length` and a wrapper's — so the target gained a `length` it had no business having.
 That was invisible while the values it copied were all `undefined` anyway.
+
+## D-175
+
+**`Object.groupBy` walks by index, and says so.**
+
+Status: Accepted
+
+The specification iterates its argument. This engine cannot iterate a user-defined iterable —
+a `PropertyKey` is a string, so `Symbol.iterator` cannot be looked up (D-149) — so this walks
+`length` and the indices instead. That is exact for arrays, strings and array-likes, which is
+what the corpus passes it, and groups *nothing* for anything else rather than grouping it
+wrongly. When keys learn about symbols this becomes a real iteration and nothing else changes.
+
+The result has **no prototype**, which is the method's whole design: the keys come out of the
+data, so a group named `"toString"` has to be a group and not the inherited method.

@@ -5771,3 +5771,64 @@ fn an_index_spelled_as_text_is_still_an_element() {
         "a,b",
     );
 }
+
+/// `Object.groupBy` files items under what the callback answers, in an object with **no
+/// prototype** — so a group called `"toString"` collides with nothing.
+#[test]
+fn group_by_files_items_under_their_key() {
+    check(
+        "group-by",
+        "let g = Object.groupBy([1, 2, 3, 4], function (n) { return n % 2 ? \"odd\" : \"even\"; }); \
+         return g.odd.join(\",\") + \"|\" + g.even.join(\",\");",
+        "1,3|2,4",
+    );
+    check(
+        "group-by-has-no-prototype",
+        "return Object.getPrototypeOf(Object.groupBy([], function () { return \"x\"; }));",
+        "null",
+    );
+    check(
+        "group-by-inherited-name",
+        "let g = Object.groupBy([1], function () { return \"toString\"; }); \
+         return g.toString.length;",
+        "1",
+    );
+    check(
+        "group-by-index-argument",
+        "let g = Object.groupBy([9, 9], function (v, i) { return i; }); \
+         return Object.keys(g).join(\",\");",
+        "0,1",
+    );
+    check(
+        "group-by-needs-a-function",
+        "try { Object.groupBy([], 5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// A prototype is an object or `null`, and a receiver that is nullish is an error rather than
+/// a `false`.
+#[test]
+fn create_and_is_prototype_of_check_what_they_are_given() {
+    check(
+        "create-bad-prototype",
+        "try { Object.create(5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "create-null-prototype",
+        "return Object.getPrototypeOf(Object.create(null));",
+        "null",
+    );
+    check(
+        "is-prototype-of-nullish",
+        "try { Object.prototype.isPrototypeOf.call(null, {}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "is-prototype-of-primitive-argument",
+        "return Object.prototype.isPrototypeOf.call(Object.prototype, 5);",
+        "false",
+    );
+}

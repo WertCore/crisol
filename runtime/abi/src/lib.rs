@@ -2921,6 +2921,9 @@ extern "C" fn object_is_prototype_of(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot ask about the prototype") {
+        return thrown;
+    }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let other = unsafe { argument(argc, argv, 0) };
     let Some(wanted) = handle_of(this_value) else {
@@ -4388,6 +4391,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
         "getOwnPropertyDescriptors",
         object_own_descriptors,
     ),
+    ("Object", "groupBy", object_group_by),
     ("Array", "isArray", array_is_array),
     ("Array", "from", array_from),
     ("Symbol", "for", symbol_for),
@@ -4894,6 +4898,82 @@ extern "C" fn object_own_descriptor(
     })
 }
 
+/// `Object.groupBy(items, classify)` — the items, filed under what `classify` answers.
+///
+/// The result has **no prototype**, which is the point of the method: the keys come from the
+/// data, so a group called `"toString"` must not collide with anything inherited.
+///
+/// **Walked by index, not by the iterator protocol.** The specification iterates, and this
+/// engine cannot yet iterate a user-defined iterable (D-149 — a symbol cannot be a property
+/// key, so `Symbol.iterator` cannot be looked up). Arrays, strings and array-likes are what
+/// the corpus passes it, and those this walks correctly; anything else groups nothing rather
+/// than grouping wrongly.
+extern "C" fn object_group_by(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let items = unsafe { argument(argc, argv, 0) };
+        // SAFETY: as above.
+        let classify = unsafe { argument(argc, argv, 1) };
+        if let Some(thrown) = reject_nullish(items, "cannot group") {
+            return thrown;
+        }
+        if !is_callable(classify) {
+            return raise("a grouping needs a function", "TypeError");
+        }
+        let groups = crisol_create_object();
+        with_rooted(&[groups, items, classify], || {
+            if let Some(handle) = handle_of(groups) {
+                with_runtime(|runtime| runtime.heap.set_prototype(handle, None));
+            }
+            let length = indexed_length(items);
+            for index in 0..length {
+                let value = indexed_get(items, index);
+                let arguments = [value, Value::number(index_as_f64(index)).to_bits()];
+                let key = with_rooted(&arguments, || {
+                    call_value(classify, Value::UNDEFINED.to_bits(), &arguments)
+                });
+                if Value::from_bits(key).is_exception() {
+                    return key;
+                }
+                let Some(name) = with_rooted(&[value, key], || to_text(key)) else {
+                    continue;
+                };
+                // The group is read back and extended rather than rebuilt, so two items with
+                // the same key land in one array instead of the second replacing the first.
+                let existing = with_rooted(&[value], || {
+                    // SAFETY: `name` is a live Rust string.
+                    unsafe { crisol_property_load(groups, name.as_ptr(), name.len() as u64) }
+                });
+                let group = if elements_of(existing).is_some() {
+                    existing
+                } else {
+                    let made = with_rooted(&[value], || crisol_create_array(0));
+                    with_rooted(&[made, value], || {
+                        // SAFETY: `name` is a live Rust string.
+                        unsafe {
+                            crisol_property_store(groups, name.as_ptr(), name.len() as u64, made);
+                        }
+                    });
+                    made
+                };
+                with_rooted(&[group, value], || {
+                    let at = indexed_length(group);
+                    store_element(group, at, value);
+                });
+            }
+            groups
+        })
+    })
+}
+
 /// `Object.getOwnPropertyDescriptors(target)` — all of them, in one object.
 ///
 /// **What makes a faithful copy possible.** `Object.assign` reads values and drops attributes,
@@ -5219,6 +5299,13 @@ extern "C" fn object_create(
     with_rooted(&live, || {
         // SAFETY: as above.
         let proto = unsafe { argument(argc, argv, 0) };
+        // **A prototype is an object or `null`, and nothing else.** A number was neither
+        // accepted nor refused — the object came back with `Object.prototype` still on it,
+        // which is a third answer the specification does not have.
+        if handle_of(proto).is_none() && Value::from_bits(proto).kind() != crisol_value::Kind::Null
+        {
+            return raise("a prototype must be an object or null", "TypeError");
+        }
         let created = crisol_create_object();
         if let (Some(object), Some(parent)) = (handle_of(created), handle_of(proto)) {
             with_runtime(|runtime| runtime.heap.set_prototype(object, Some(parent)));
