@@ -3523,3 +3523,58 @@ fn an_uncaught_error_reports_its_name_and_message() {
         "an uncaught error should not describe itself as a plain object, got: {stderr}"
     );
 }
+
+/// **A `String` wrapper carries its own text.** Without it, a method reached through the
+/// wrapper asks the object for text, which calls `String.prototype.toString`, which asks
+/// again — `new String("x").slice(0, 1)` overflowed the stack rather than answering, and
+/// twelve test262 cases crashed on exactly that.
+#[test]
+fn a_string_wrapper_answers_its_methods() {
+    check(
+        "wrapper-slice",
+        "return new String(\"undefined\").slice(0, 3);",
+        "und",
+    );
+    check("wrapper-length", "return new String(\"abc\").length;", "3");
+    check(
+        "wrapper-indexof",
+        "return new String(\"hello\").indexOf(\"l\");",
+        "2",
+    );
+    check(
+        "wrapper-upper",
+        "return new String(\"ab\").toUpperCase();",
+        "AB",
+    );
+    check(
+        "wrapper-tostring",
+        "return new String(\"ab\").toString();",
+        "ab",
+    );
+    check(
+        "wrapper-charat",
+        "return new String(\"abc\").charAt(1);",
+        "b",
+    );
+    // A plain call is not a wrapper and still answers a primitive.
+    check(
+        "wrapper-plain-call",
+        "return typeof String(\"a\");",
+        "string",
+    );
+    check(
+        "wrapper-is-object",
+        "return typeof new String(\"a\");",
+        "object",
+    );
+}
+
+/// The wrapped text is not enumerable, for the same reason a date's time value is not.
+#[test]
+fn a_string_wrappers_value_is_hidden() {
+    check(
+        "wrapper-keys",
+        "return Object.keys(new String(\"ab\")).length;",
+        "0",
+    );
+}

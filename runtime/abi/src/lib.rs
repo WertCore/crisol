@@ -1230,7 +1230,30 @@ extern "C" fn to_string_global(
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || match to_text(value) {
-        Some(text) => new_string(&text),
+        Some(text) => {
+            // Called with `new`, the receiver is a fresh object that will be the result, so
+            // the text it wraps is recorded on it. Called plainly, the receiver is not an
+            // object and this does nothing.
+            if let Some(handle) = handle_of(this_value) {
+                let wrapped = new_string(&text);
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, STRING_PRIMITIVE, Value::from_bits(wrapped));
+                });
+                // **`length` has to be a real property here.** On a primitive it is answered by
+                // the property load itself, which has a string cell to measure; a wrapper is an
+                // ordinary object, so nothing would find it. Fixed at construction because the
+                // text it wraps cannot change.
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a string this long cannot be allocated"
+                )]
+                let units = text.encode_utf16().count() as f64;
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, "length", Value::number(units));
+                });
+            }
+            new_string(&text)
+        }
         // An object needs `ToPrimitive`, which calls user code.
         None => new_string("[object Object]"),
     })
@@ -1320,6 +1343,14 @@ extern "C" fn construct_plain_object(
 /// `for-in` do not see it and a program cannot delete it — but it is still readable by name,
 /// which a real internal slot would not be.
 const DATE_TIME: &str = "__time";
+
+/// Where a `new String(…)` wrapper keeps the text it wraps.
+///
+/// **A wrapper has to carry its own value.** Without it, a method reached through the wrapper
+/// asks the object for text, which calls `String.prototype.toString`, which asks again — and
+/// `new String("x").slice(0, 1)` overflows the stack instead of answering. Hidden for the same
+/// reason a date's time value is (D-126): internal slot zero already means "callable".
+const STRING_PRIMITIVE: &str = "__primitive";
 
 /// Methods on `Date.prototype`.
 ///
@@ -2124,6 +2155,16 @@ fn code_units(text: &str) -> Vec<u16> {
 
 /// The receiver of a string method, as text.
 fn this_text(this_value: u64) -> Option<String> {
+    // **An object receiver is read, not asked.** Asking would call `to_text`, which calls the
+    // object's `toString`, which for a string wrapper is this function again — unbounded
+    // recursion, and `new String("x").slice(0, 1)` overflowed the stack rather than answering.
+    // A wrapper carries its text in a hidden property; anything else object-shaped has no text
+    // to give.
+    if handle_of(this_value).is_some()
+        && Value::from_bits(this_value).kind() != crisol_value::Kind::String
+    {
+        return property_text(this_value, STRING_PRIMITIVE);
+    }
     // `String.prototype.slice.call(5)` coerces, which is why this is `to_text` and not a
     // string-only read.
     to_text(this_value)

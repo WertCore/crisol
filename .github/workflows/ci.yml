@@ -397,7 +397,11 @@ jobs:
             if [ -f "$log" ]; then
               # The counts and the reason breakdown, which is the part worth reading — a pass
               # rate says how much and the reasons say what to do next.
-              sed -n '/attempted of/,$p' "$log" | head -60
+              #
+              # `|| true` because `head` closes the pipe once it has its sixty lines, `sed`
+              # takes SIGPIPE, and `pipefail` turns that into a failed step — so the summary
+              # was lost exactly when the run had something to say.
+              { sed -n '/attempted of/,$p' "$log" | head -60; } || true
             else
               echo "no log: the run did not get far enough to produce one"
             fi

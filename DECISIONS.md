@@ -4338,3 +4338,41 @@ Two things worth keeping from how this was found:
   this broke; what moved was 581 failures collapsing into one indistinguishable bucket. Reading
   the *reasons* is what caught it, and the reason it was worth reading is that they had been
   informative before.
+
+## D-146
+
+**A `String` wrapper carries its own text, because asking it recursed.**
+
+Status: Accepted — the twelve crashes
+
+The corpus run reported **12 crashed**, and the runner's assertion that crashes must be zero is
+what turned that into a failing job. It is the right assertion: a case that built and then died
+is a bug here, not a missing feature.
+
+All twelve were `new String(…)`. The wrapper is an ordinary object, so a method reached through
+it called `this_text`, which called `to_text`, which — since D-137 taught it to ask an object —
+called `String.prototype.toString`, which called `this_text`. `new String("x").slice(0, 1)`
+overflowed the stack instead of answering.
+
+Two fixes, and both are about a wrapper being a thing in its own right rather than a view:
+
+- **It stores the text it wraps**, in a hidden property, and `this_text` *reads* an object
+  receiver rather than asking it. Asking is what recursed.
+- **It stores its own `length`.** On a primitive that is answered by the property load, which
+  has a string cell to measure; on a wrapper nothing would find it. Fixed at construction,
+  because the text cannot change.
+
+**This is the third consequence of D-137** — after `String([1,2])` being fixed and uncaught
+errors being broken (D-145). Teaching one function to ask objects for text reached further than
+it looked: into error reporting, and into anything whose `toString` leads back to the asker.
+
+## D-147
+
+**The summary step lost its output exactly when there was something to say.**
+
+Status: Accepted
+
+`sed … | head -60` under `set -euo pipefail`: `head` closes the pipe once it has its lines,
+`sed` takes SIGPIPE, and `pipefail` turns that into a failed step. So the job summary — the
+counts and the reason breakdown — was published only when the run was short enough not to need
+truncating.
