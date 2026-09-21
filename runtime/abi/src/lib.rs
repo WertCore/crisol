@@ -706,7 +706,7 @@ thread_local! {
     /// The microtask queue. Drained to empty, and jobs queued by jobs run in the same drain,
     /// which is what "microtasks run to completion" means.
     static PROMISE_JOBS: RefCell<std::collections::VecDeque<PromiseJob>> =
-        RefCell::new(std::collections::VecDeque::new());
+        const { RefCell::new(std::collections::VecDeque::new()) };
     /// Every symbol that has been used as a property key.
     ///
     /// **Rooted for the life of the program**, which is a leak and the right one. A key lives
@@ -6450,6 +6450,7 @@ fn own_keys(object: u64) -> Vec<String> {
             }
             false
         };
+        let count_before_properties = names.len();
         if let Some(shape) = runtime.heap.shape_of(handle) {
             // **An integer-like key is an index, and every index comes before every name, in
             // ascending order** — whatever order they were inserted in. That is the
@@ -6483,6 +6484,8 @@ fn own_keys(object: u64) -> Vec<String> {
             names.extend(indices.into_iter().map(|(_, name)| name));
             names.extend(strings);
         }
+        // Whether the shape contributed anything, which is the only way a name can repeat.
+        let stored_any = names.len() > count_before_properties;
         // **An array owns `length`**, even though nothing stores it. `getOwnPropertyNames` has
         // to say so, and it did not — an array reported its indices and nothing else. It is
         // added last because the specification puts the indices first and the rest after, and
@@ -6493,8 +6496,22 @@ fn own_keys(object: u64) -> Vec<String> {
         // **Once each.** An index can reach this list twice — as an element and, if something
         // defined it as an ordinary property, as a slot — and a key listed twice is visited
         // twice by everything built on this.
-        let mut seen = std::collections::HashSet::new();
-        names.retain(|name| seen.insert(name.clone()));
+        //
+        // Only an array can produce that pair, and only if it also carries stored properties,
+        // so everything else skips the pass entirely: this runs on every `for-in` and every
+        // `Object.keys`, and a `HashSet` allocation per call is a poor trade for a case most
+        // objects cannot reach. The scan is quadratic and deliberately so — it runs only for
+        // an array with named properties, where the list is short.
+        if is_array && stored_any {
+            let mut at = 0;
+            while at < names.len() {
+                if names[..at].contains(&names[at]) {
+                    names.remove(at);
+                } else {
+                    at += 1;
+                }
+            }
+        }
         names
     })
 }
@@ -9642,6 +9659,17 @@ fn symbol_property_store(object: u64, key: &PropertyKey, value: u64) -> u64 {
     if symbol_own_slot(object, key).is_none() && !is_extensible(object) {
         return Value::UNDEFINED.to_bits();
     }
+    // **Rooted here, where the shape is about to hold the address**, rather than on every
+    // read of a symbol key. A shape outlives the objects using it, so the cell has to survive
+    // as long as the shape names it (D-192) — but a read that stores nothing has no such
+    // claim, and rooting there grew the set for symbols the heap never recorded.
+    if let Some(address) = key.symbol_address() {
+        KEY_SYMBOLS.with(|symbols| {
+            if let Ok(mut entries) = symbols.try_borrow_mut() {
+                entries.insert(Value::symbol(address).to_bits());
+            }
+        });
+    }
     with_runtime(|runtime| {
         let Some(current) = runtime.heap.shape_of(handle) else {
             return;
@@ -10650,19 +10678,15 @@ fn key_of(key: Value) -> Option<PropertyKey> {
             // **A symbol names a property by identity, not by spelling.** `None` here read as
             // a missing property, which is why `obj[Symbol.iterator]` could neither be set
             // nor found and every iterator protocol was out of reach (D-149).
-            crisol_value::Kind::Symbol => key.as_address().map(|address| {
-                // Rooted from here on: the shape will hold this address for the rest of the
-                // program, and nothing else promises to keep the cell alive.
-                KEY_SYMBOLS.with(|symbols| {
-                    if let Ok(mut entries) = symbols.try_borrow_mut() {
-                        entries.insert(key.to_bits());
-                    }
-                });
-                // The description is carried for `Debug` only — two symbols described alike
-                // are still different keys, because the address is what is compared.
-                let described = property_text(key.to_bits(), SYMBOL_DESCRIPTION);
-                PropertyKey::symbol(address, described.as_deref().unwrap_or(""))
-            }),
+            // **Nothing is read and nothing is recorded here.** This runs on every computed
+            // access, and the two obvious conveniences are both real costs: reading the
+            // description allocates a `String` for something only `Debug` ever prints, and
+            // rooting the symbol on a *read* grows a permanent set for a key that may never
+            // reach a shape. The root is taken where a shape actually gains the key — see
+            // `symbol_property_store`.
+            crisol_value::Kind::Symbol => key
+                .as_address()
+                .map(|address| PropertyKey::symbol(address, "")),
             _ => None,
         },
         |number| Some(PropertyKey::new(&number_text(number))),
@@ -11387,9 +11411,7 @@ fn promise_then(id: u32, on_fulfilled: u64, on_rejected: u64) -> u32 {
     let derived = new_promise_record();
     let settled = PROMISES.with(|promises| {
         let mut entries = promises.borrow_mut();
-        let Some(record) = entries.get_mut(id as usize) else {
-            return None;
-        };
+        let record = entries.get_mut(id as usize)?;
         match record.state {
             Settled::Pending => {
                 record.waiting.push((on_fulfilled, derived, false));
@@ -11516,9 +11538,28 @@ fn raise_value(message: &str, kind: &str) -> u64 {
     thrown
 }
 
+thread_local! {
+    /// `Symbol.iterator`'s key, built once.
+    ///
+    /// **`for-of` asks for this every time a loop starts**, and building it meant a globals
+    /// lookup, two shape lookups and a heap read — per loop, not per iteration, but a loop
+    /// inside a hot function pays it every call. The symbol is made once during construction
+    /// and never replaced, so the key can be too; cloning it is an `Arc` bump.
+    static ITERATOR_KEY: RefCell<Option<PropertyKey>> = const { RefCell::new(None) };
+}
+
 /// The key `Symbol.iterator` names, if the runtime has got that far.
 fn iterator_key() -> Option<PropertyKey> {
-    key_of(Value::from_bits(well_known_symbol("iterator")?))
+    if let Some(cached) = ITERATOR_KEY.with(|key| key.borrow().clone()) {
+        return Some(cached);
+    }
+    let key = key_of(Value::from_bits(well_known_symbol("iterator")?))?;
+    ITERATOR_KEY.with(|cached| {
+        if let Ok(mut slot) = cached.try_borrow_mut() {
+            *slot = Some(key.clone());
+        }
+    });
+    Some(key)
 }
 
 /// The value a well-known symbol names, read off the `Symbol` global.

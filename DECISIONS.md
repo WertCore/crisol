@@ -5554,3 +5554,38 @@ all. What is asserted is everything observable before the return (ordering, that
 answers a promise, the errors) plus a clean exit, which does catch a drain that faults or
 hangs. Observing the asynchronous half needs a harness that can read state *after* the drain,
 and that is a change to the harness rather than to this.
+
+## D-198
+
+**The cost of the symbol and promise work, paid down.**
+
+Status: Accepted
+
+Four costs the first versions carried, found by reading the hot paths rather than by profiling
+— each is on a path every program takes, so none of them needed a benchmark to be worth
+fixing.
+
+- **`key_of` allocated a `String` per symbol-keyed access.** It read the symbol's description
+  so a key could carry it, and the description is only ever printed by `Debug`. Now it carries
+  the empty string and the allocation is gone.
+- **`key_of` rooted the symbol on every *read*.** A permanent set grew for keys the heap never
+  recorded. The root belongs where a shape actually gains the address — the store path — which
+  is also the only place D-192's argument applies.
+- **`for-of` rebuilt `Symbol.iterator`'s key on every loop.** A globals lookup, two shape
+  lookups and a heap read, per entry to a loop rather than per iteration, so a loop inside a
+  hot function paid it every call. The symbol is made once and never replaced, so the key is
+  cached and cloning it is an `Arc` bump.
+- **`own_keys` allocated a `HashSet` per call** to remove duplicates that only an array with
+  stored properties can produce — on a function every `for-in` and every `Object.keys` runs.
+  It now skips the pass unless that case is actually present, and scans linearly when it is,
+  because the list is short exactly when the scan happens.
+
+**And `PropertyKey` lost a word.** `Option<Address>` costs two, because `Address` wraps a plain
+`u64` and leaves Rust no niche; a sentinel outside the 48 bits an address can hold costs one.
+A key sits in every shape transition and every property list, so that is eight bytes per
+property of every object in the heap.
+
+**One cost is recorded rather than fixed.** `PROMISES` grows for the life of the program: a
+record cannot be freed while its promise object might still be reached, and nothing tells the
+runtime when that stops being true. Closing it needs the collector to report unreachable
+promise objects, which is a larger change than the machinery it would serve.
