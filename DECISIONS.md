@@ -5589,3 +5589,23 @@ property of every object in the heap.
 record cannot be freed while its promise object might still be reached, and nothing tells the
 runtime when that stops being true. Closing it needs the collector to report unreachable
 promise objects, which is a larger change than the machinery it would serve.
+
+## D-199
+
+**The eighth rooting bug, and the one the convention exists to prevent.**
+
+Status: Accepted
+
+`make_promise` allocated the promise object before rooting the executor it had been handed.
+Under GC stress the executor — still sitting in the argument buffer — was collected, so the
+closure never ran and the promise was born pending with nothing to settle it. Silent without
+stress, wrong with it, exactly like the seven before.
+
+What makes this one worth recording separately is that **every other native opens with
+`live_values` and this one did not**. The convention is not decoration and it is not advice:
+it is the only thing standing between an argument and the first allocation. A native that
+skips it is not saving a line, it is opting out of the rule — and the failure it buys is
+invisible to every run that does not collect at the wrong moment.
+
+The body moved into a second function so the rooting is the whole of the entry point and
+cannot be stepped around by a later edit adding work above it.

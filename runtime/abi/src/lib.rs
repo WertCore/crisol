@@ -3233,12 +3233,23 @@ extern "C" fn promise_finally(
 /// `new Promise(executor)`.
 extern "C" fn make_promise(
     _closure: u64,
-    _this_value: u64,
+    this_value: u64,
     _new_target: u64,
     argc: u64,
     argv: *const u64,
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    // **Rooted before the first allocation**, which every other native does and this one did
+    // not. `new_promise_object` allocates, and under GC stress that collected the executor
+    // still sitting in the argument buffer — so the closure never ran and the promise was
+    // born pending with nothing to settle it. Silent without stress, and wrong with it.
+    with_rooted(&live, || make_promise_rooted(argc, argv))
+}
+
+/// The body of [`make_promise`], with the arguments already rooted.
+fn make_promise_rooted(argc: u64, argv: *const u64) -> u64 {
+    // SAFETY: the caller guarantees `argc` readable values at `argv`.
     let executor = unsafe { argument(argc, argv, 0) };
     if !is_callable(executor) {
         return raise("a promise needs an executor function", "TypeError");
