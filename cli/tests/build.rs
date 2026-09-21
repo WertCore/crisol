@@ -6880,3 +6880,68 @@ fn a_position_argument_is_coerced() {
         "--a",
     );
 }
+
+/// **A symbol names a property by identity, not by spelling** — so two symbols described
+/// alike are different properties, and neither is the string that describes them.
+#[test]
+fn a_symbol_can_be_a_property_key() {
+    check(
+        "symbol-key-round-trip",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 7; return o[s];",
+        "7",
+    );
+    check(
+        "symbol-keys-are-distinct",
+        "let a = Symbol(\"k\"); let b = Symbol(\"k\"); let o = {}; \
+         o[a] = 1; o[b] = 2; return o[a] + \",\" + o[b];",
+        "1,2",
+    );
+    check(
+        "symbol-is-not-its-description",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 1; o.k = 2; return o[s] + \",\" + o.k;",
+        "1,2",
+    );
+    // A symbol-keyed property is not an own *name*.
+    check(
+        "symbol-key-is-not-a-name",
+        "let s = Symbol(\"k\"); let o = {a: 1}; o[s] = 2; \
+         return Object.keys(o).join(\",\") + \"|\" + Object.getOwnPropertyNames(o).join(\",\");",
+        "a|a",
+    );
+    check(
+        "symbol-key-not-in-for-in",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 1; \
+         let seen = 0; for (let x in o) { seen = seen + 1; } return seen;",
+        "0",
+    );
+    // It is reported by the list that exists for it, and nowhere else.
+    check(
+        "own-property-symbols",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 1; \
+         let found = Object.getOwnPropertySymbols(o); \
+         return found.length + \",\" + (found[0] === s);",
+        "1,true",
+    );
+    check(
+        "own-property-symbols-empty",
+        "return Object.getOwnPropertySymbols({a: 1}).length;",
+        "0",
+    );
+    // `in` and `delete` work through one too.
+    check(
+        "symbol-key-in",
+        "let s = Symbol(); let o = {}; o[s] = 1; return s in o;",
+        "true",
+    );
+    check(
+        "symbol-key-delete",
+        "let s = Symbol(); let o = {}; o[s] = 1; delete o[s]; return s in o;",
+        "false",
+    );
+    // A well-known symbol is a key like any other.
+    check(
+        "well-known-symbol-key",
+        "let o = {}; o[Symbol.iterator] = 5; return o[Symbol.iterator];",
+        "5",
+    );
+}

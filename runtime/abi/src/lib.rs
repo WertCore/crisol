@@ -599,6 +599,17 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BOOLEAN_PROTOTYPE.with(std::cell::Cell::get));
+        // Every symbol a shape names. `try_borrow` for the same reason as the registry below.
+        KEY_SYMBOLS.with(|symbols| {
+            if let Ok(entries) = symbols.try_borrow() {
+                roots.extend(
+                    entries
+                        .iter()
+                        .filter_map(|value| Value::from_bits(*value).as_address())
+                        .map(GcRef::from_address),
+                );
+            }
+        });
         // Every registered symbol. `try_borrow` because this runs *during* a collection, which
         // may have been triggered from inside `Symbol.for` while the registry was borrowed —
         // and failing to root is better than panicking in the collector.
@@ -646,6 +657,16 @@ thread_local! {
     /// The prototype every boolean inherits from.
     static BOOLEAN_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
+    /// Every symbol that has been used as a property key.
+    ///
+    /// **Rooted for the life of the program**, which is a leak and the right one. A key lives
+    /// in the *shape* table, which outlives any object that holds the property — so a
+    /// collected symbol would leave a shape naming an address that no longer means anything,
+    /// and `getOwnPropertySymbols` would hand that back as a value. The specification's own
+    /// `Symbol.for` registry is permanent for exactly this reason; this is the same bargain
+    /// over a smaller set, and the alternative is teaching the collector to trace shapes.
+    static KEY_SYMBOLS: RefCell<std::collections::HashSet<u64>> =
+        RefCell::new(std::collections::HashSet::new());
     /// `Symbol.for`'s registry, keyed by the string a symbol was registered under.
     ///
     /// Rooted, and that is the specification's design: a registered symbol must come back for
@@ -6140,7 +6161,12 @@ fn own_keys(object: u64) -> Vec<String> {
             let mut indices: Vec<(usize, String)> = Vec::new();
             let mut strings: Vec<String> = Vec::new();
             for (key, slot) in runtime.shapes.borrow().properties(shape) {
+                // **A symbol-keyed property is not an own *name*.** `Object.keys`,
+                // `getOwnPropertyNames` and `for-in` report strings; symbols are reported
+                // only by `getOwnPropertySymbols`, and mixing them would put a description
+                // where a property name was expected.
                 if runtime.heap.is_deleted(handle, slot.index())
+                    || key.is_symbol()
                     || is_internal_property(key.as_str())
                 {
                     continue;
@@ -7348,12 +7374,41 @@ extern "C" fn object_is(
 /// it should get an array rather than a `TypeError`.
 extern "C" fn object_own_symbols(
     _closure: u64,
-    _this_value: u64,
+    this_value: u64,
     _new_target: u64,
-    _argc: u64,
-    _argv: *const u64,
+    argc: u64,
+    argv: *const u64,
 ) -> u64 {
-    array_of_values(&[])
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        let Some(handle) = handle_of(target) else {
+            return array_of_values(&[]);
+        };
+        // The symbols the shape names, in the order it names them — the counterpart of
+        // `own_keys`, which reports every key that is *not* one of these.
+        let symbols = with_runtime(|runtime| {
+            let Some(shape) = runtime.heap.shape_of(handle) else {
+                return Vec::new();
+            };
+            runtime
+                .shapes
+                .borrow()
+                .properties(shape)
+                .into_iter()
+                .filter(|(key, slot)| {
+                    key.is_symbol() && !runtime.heap.is_deleted(handle, slot.index())
+                })
+                .filter_map(|(key, _)| {
+                    key.symbol_address()
+                        .map(|address| Value::symbol(address).to_bits())
+                })
+                .collect::<Vec<u64>>()
+        });
+        with_rooted(&symbols, || array_of_values(&symbols))
+    })
 }
 
 /// `Array.isArray(value)`.
@@ -10051,8 +10106,22 @@ fn key_of(key: Value) -> Option<PropertyKey> {
                     "false"
                 }))
             }
-            // A symbol has no spelling, and `None` reads as a missing property — which beats
-            // naming the wrong one.
+            // **A symbol names a property by identity, not by spelling.** `None` here read as
+            // a missing property, which is why `obj[Symbol.iterator]` could neither be set
+            // nor found and every iterator protocol was out of reach (D-149).
+            crisol_value::Kind::Symbol => key.as_address().map(|address| {
+                // Rooted from here on: the shape will hold this address for the rest of the
+                // program, and nothing else promises to keep the cell alive.
+                KEY_SYMBOLS.with(|symbols| {
+                    if let Ok(mut entries) = symbols.try_borrow_mut() {
+                        entries.insert(key.to_bits());
+                    }
+                });
+                // The description is carried for `Debug` only — two symbols described alike
+                // are still different keys, because the address is what is compared.
+                let described = property_text(key.to_bits(), SYMBOL_DESCRIPTION);
+                PropertyKey::symbol(address, described.as_deref().unwrap_or(""))
+            }),
             _ => None,
         },
         |number| Some(PropertyKey::new(&number_text(number))),

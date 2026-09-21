@@ -5395,3 +5395,33 @@ fixes three separate things at once:
 
 `charAt(NaN)` was separately wrong in the other direction — it took the `!is_finite` branch and
 answered `""` where the specification says the first character.
+
+## D-192
+
+**A symbol can be a property key, and it is the address that identifies it.**
+
+Status: Accepted, superseding the limitation recorded in D-149
+
+`PropertyKey` was an `Arc<str>`, so `obj[Symbol.iterator]` could be neither set nor found:
+`key_of` answered `None` for a symbol, which reads as a missing property. That was the ceiling
+on the iterator protocol, on `for-of` over a user-defined iterable, and on most of what is
+left in `RegExp.prototype`, where `Symbol.match`, `Symbol.replace` and `Symbol.split` are how
+the methods are reached at all.
+
+A key now carries an optional address, and **that is what equality compares**. Two symbols
+described alike stay different properties, and neither is the string that describes them. The
+description rides along for `Debug` only, which the type says in as many words — anything
+deciding behaviour from `as_str` has to ask `is_symbol` first, or a symbol described
+`"length"` becomes the property of that name.
+
+**A symbol used as a key is rooted for the life of the program.** A key lives in the *shape*
+table, which outlives any object holding the property, so a collected symbol would leave a
+shape naming an address that no longer means anything — and `getOwnPropertySymbols` would hand
+that back as a value. That is a leak, and it is the same bargain the specification makes for
+`Symbol.for`'s registry. The alternative is teaching the collector to trace shapes, which is a
+larger change than this one and buys only the memory back.
+
+**Symbols are not names.** `Object.keys`, `getOwnPropertyNames` and `for-in` report strings;
+`getOwnPropertySymbols` reports symbols and now actually has something to report. Mixing them
+would put a description where a property name was expected, which is the failure the type's
+documentation exists to prevent.
