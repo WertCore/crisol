@@ -5733,3 +5733,24 @@ This is the third cluster of the same shape, after the length read (D-189) and t
 arguments (D-191): a conversion written as `as_number().unwrap_or(…)` is a silent default
 wherever the specification has a coercion, and the tests that catch it are the ones asserting
 that a throwing `valueOf` is *reached*, not the ones checking the ordinary value.
+
+## D-204
+
+**A string the engine will not build is an error, not an attempt.**
+
+Status: Accepted
+
+Coercing the count (D-203) turned a silent wrong answer into a real request for a gigabyte.
+`"a".repeat("1e9")` used to read the count as zero, because `as_number` on a string answered
+`None`; once it actually converted, `String::repeat` was asked for a billion characters and
+the acceptance run **hung rather than failed** — forty-five minutes in a step that takes
+ninety seconds.
+
+`MAX_STRING_UNITS` is V8's limit, which is the number everything in the wild is written
+against. Every engine has one; the difference is whether it says so before trying or dies
+after. `repeat` and `padStart`/`padEnd` now check before allocating.
+
+**A hang is the worst failure a test run can have**, worse than a wrong answer: it reports
+nothing, holds a runner, and looks like infrastructure. The lesson is narrower than "add
+limits" — it is that a conversion which starts *working* makes previously unreachable code
+reachable, and the code on the other side had never been asked for anything absurd before.

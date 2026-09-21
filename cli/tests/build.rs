@@ -7538,3 +7538,36 @@ fn a_relative_index_is_coerced() {
         "bc",
     );
 }
+
+/// **A string longer than the engine will build is an error, not an attempt.** Until the
+/// count was actually coerced this was unreachable from a string argument — `"a".repeat("1e9")`
+/// read as zero — so coercing it turned a silent wrong answer into a real request for a
+/// gigabyte, and the acceptance run hung rather than failed.
+#[test]
+fn a_string_cannot_be_asked_to_grow_without_limit() {
+    check(
+        "repeat-absurd-count",
+        "try { \"a\".repeat(1e9); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "repeat-absurd-string-count",
+        "try { \"a\".repeat(\"1e9\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "pad-absurd-length",
+        "try { \"a\".padStart(1e9, \"-\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // The ordinary sizes still work, and zero is not an error.
+    check("repeat-small", "return \"ab\".repeat(3);", "ababab");
+    check("repeat-zero", "return \"ab\".repeat(0).length;", "0");
+    check("repeat-coerced", "return \"ab\".repeat(\"2\");", "abab");
+    check("pad-small", "return \"a\".padStart(3, \"-\");", "--a");
+    check(
+        "repeat-negative",
+        "try { \"a\".repeat(-1); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}

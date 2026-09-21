@@ -2593,6 +2593,16 @@ const COMBINE_CALL: usize = 6;
 /// its attributes — the flag has to live beside it.
 const FIXED_LENGTH: &str = "__fixedLength";
 
+/// The longest string this engine will build.
+///
+/// **Every engine has one**; the difference is whether it says so before or after trying. A
+/// count comes from a program, so `"a".repeat(n)` is a request for `n` characters of memory
+/// and `n` is whatever arithmetic produced it — the specification makes the limit
+/// implementation-defined precisely so an engine can refuse rather than die.
+///
+/// This is V8's, which is the number everything in the wild is written against.
+const MAX_STRING_UNITS: usize = (1 << 29) - 24;
+
 /// The highest index stored as an array *element* rather than as a named property.
 ///
 /// **Elements are dense and the specification's arrays are not.** Writing `a[4294967294] = 1`
@@ -5035,11 +5045,19 @@ fn pad_with(this_value: u64, argc: u64, argv: *const u64, at_start: bool) -> u64
         Err(thrown) => return thrown,
     };
     #[expect(
+        clippy::cast_precision_loss,
+        reason = "a limit far below 2^53, compared rather than stored"
+    )]
+    let ceiling = MAX_STRING_UNITS as f64;
+    if target > ceiling {
+        return raise("padded length is out of range", "RangeError");
+    }
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "clamped to a length no string can exceed"
+        reason = "checked against the ceiling just above"
     )]
-    let target = target.clamp(0.0, f64::from(u32::MAX)) as usize;
+    let target = target.max(0.0) as usize;
     if target <= units.len() {
         return new_string(&text);
     }
@@ -5514,9 +5532,21 @@ extern "C" fn string_repeat(
         return raise("repeat count is out of range", "RangeError");
     }
     #[expect(
+        clippy::cast_precision_loss,
+        reason = "a limit far below 2^53, compared rather than stored"
+    )]
+    let ceiling = MAX_STRING_UNITS as f64;
+    // **A length no string can have is an error, not an attempt.** Until the count was
+    // actually coerced this was unreachable from a string argument — `"a".repeat("1e9")`
+    // read as zero — and coercing it turned a silent wrong answer into a real request for a
+    // gigabyte. Every engine has this limit; the difference is whether it says so.
+    if count * index_as_f64(text.len().max(1)) > ceiling {
+        return raise("repeat count is out of range", "RangeError");
+    }
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "checked non-negative and finite"
+        reason = "checked against the ceiling just above"
     )]
     let times = count as usize;
     new_string(&text.repeat(times))
