@@ -198,12 +198,14 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
              extern void crisol_print(unsigned long long);\n\
              extern void crisol_report_uncaught(void);\n\
              extern unsigned long long crisol_global_object(void);\n\
+             extern void crisol_run_microtasks(void);\n\
              int main(void) {{\n\
                  unsigned long long argv[{slots}] = {{ {undefined}ULL }};\n\
                  crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
                  crisol_register_functions(&crisol_functions[1], crisol_functions[0]);\n\
                  unsigned long long result =\n\
                      crisol_program(0ULL, crisol_global_object(), {undefined}ULL, 0ULL, argv);\n\
+                 crisol_run_microtasks();\n\
                  if (result == {exception}ULL) {{\n\
                      crisol_report_uncaught();\n\
                      return 1;\n\

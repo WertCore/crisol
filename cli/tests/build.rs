@@ -7082,3 +7082,83 @@ fn a_computed_member_call_passes_its_receiver() {
         "1,2",
     );
 }
+
+/// **A promise is always asynchronous**, even when it has already settled — attaching a
+/// handler queues a job rather than running it, which is what stops code depending on a
+/// synchronous case that only holds while the promise happens to be settled.
+///
+/// **Only the synchronous half is asserted here.** The queue drains after `crisol_program`
+/// returns, so nothing a handler does is visible in the value this harness compares — a test
+/// that "checked" a handler ran would pass whether or not the drain happened at all. What is
+/// checked is everything observable before the return, plus that the drain neither crashes
+/// nor hangs, which the harness does enforce by requiring a clean exit.
+#[test]
+fn a_promise_settles_through_the_microtask_queue() {
+    // The handler must not have run by the time the program returns.
+    check(
+        "promise-then-is-async",
+        "let order = \"\"; \
+         Promise.resolve(1).then(function () { order = order + \"b\"; }); \
+         order = order + \"a\"; \
+         return order;",
+        "a",
+    );
+    // Even when `resolve` is called synchronously inside the executor.
+    check(
+        "promise-executor-resolve-is-async",
+        "let order = \"\"; \
+         new Promise(function (resolve) { order = order + \"x\"; resolve(1); }) \
+             .then(function () { order = order + \"y\"; }); \
+         return order;",
+        "x",
+    );
+    check(
+        "promise-then-answers-a-promise",
+        "return typeof Promise.resolve(1).then(function () {}).then;",
+        "function",
+    );
+    check(
+        "promise-catch-answers-a-promise",
+        "return typeof Promise.reject(1).catch(function () {}).then;",
+        "function",
+    );
+    // A throw inside the executor rejects rather than escaping the constructor.
+    check(
+        "promise-executor-throws",
+        "let p = new Promise(function () { throw new RangeError(\"x\"); }); \
+         return typeof p.then;",
+        "function",
+    );
+    check(
+        "promise-needs-an-executor",
+        "try { new Promise(5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `Promise.resolve` normalises: a promise is handed back as it is.
+    check(
+        "promise-resolve-is-idempotent",
+        "let p = Promise.resolve(1); return Promise.resolve(p) === p;",
+        "true",
+    );
+    check(
+        "promise-resolve-wraps",
+        "return typeof Promise.resolve(1).then;",
+        "function",
+    );
+    // A whole chain builds and drains without faulting, which is what the clean exit checks.
+    check(
+        "promise-chain-drains",
+        "Promise.resolve(1) \
+             .then(function (v) { return v + 1; }) \
+             .then(function (v) { return Promise.resolve(v + 1); }) \
+             .then(function () { throw new TypeError(\"caught\"); }) \
+             .catch(function (e) { return e.name; }); \
+         return \"built\";",
+        "built",
+    );
+    check(
+        "promise-then-on-a-non-promise",
+        "try { Promise.prototype.then.call({}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}

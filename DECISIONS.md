@@ -5522,3 +5522,35 @@ object is obeyed, a plain array stays live, and a user-defined iterable still wo
 is that replacing `Array.prototype[Symbol.iterator]` wholesale is not obeyed for arrays —
 recorded rather than hidden, and it closes when `for-of` steps an iterator instead of walking
 an index.
+
+## D-197
+
+**Promises, with the queue held as data rather than as closures.**
+
+Status: Accepted
+
+`crisol-builtins::promise` has a complete agent — states, microtask ordering, `adopt`, its own
+tests — and it cannot be wired to the ABI as it stands. Its queue holds
+`Box<dyn FnOnce(&mut Agent, …)>`, so a reaction that calls a JavaScript handler needs the
+agent while the drain loop already holds it exclusively, and every workaround reduces to two
+live `&mut` to the same object. That is not a Rust obstacle to route around; it is the design
+saying the host cannot drive it.
+
+So the machinery here holds **data**: a job is `(handler, value, derived, rejected)`, and the
+drain pops one under a short borrow, **drops it**, calls the handler, and takes a fresh borrow
+to record the outcome. The handler can attach more reactions, settle other promises or throw,
+and none of it re-enters a live borrow.
+
+Holding data rather than closures pays a second time: **the collector can walk it**. A
+`Box<dyn FnOnce>` hides its captures, so a settled value reachable only from a queued job
+would be freed under the queue. The root walk now covers both structures directly.
+
+The queue drains once, from the entry point, after the program body returns.
+
+**The acceptance suite can only see the synchronous half.** The drain happens after
+`crisol_program` returns, so nothing a handler does reaches the value the harness compares —
+a test claiming to check that a handler ran would pass whether or not the drain happened at
+all. What is asserted is everything observable before the return (ordering, that `then`
+answers a promise, the errors) plus a clean exit, which does catch a drain that faults or
+hangs. Observing the asynchronous half needs a harness that can read state *after* the drain,
+and that is a change to the harness rather than to this.
