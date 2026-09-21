@@ -6717,10 +6717,14 @@ fn sort_takes_a_comparator_or_nothing() {
 /// `NaN` and be clamped to an empty walk.
 #[test]
 fn a_length_that_cannot_convert_is_an_error() {
+    // **Not `fill`**, though that is the case test262 uses: a mutating method still requires
+    // a real array here (D-157) and returns before it reads a length at all, so the case
+    // would have been testing that gap rather than this one.
     check(
         "length-is-a-symbol",
         "let o = {}; o.length = Symbol(1); \
-         try { [].fill.call(o, 1); return \"no\"; } catch (e) { return e.name; }",
+         try { [].every.call(o, function () { return true; }); return \"no\"; } \
+         catch (e) { return e.name; }",
         "TypeError",
     );
     check(
