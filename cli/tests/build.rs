@@ -6659,3 +6659,55 @@ fn reflect_answers_false_where_object_throws() {
         "TypeError",
     );
 }
+
+/// **A callback is checked before a single element is read.** Without that, calling a
+/// non-function reached `crisol_not_a_function` once per element — which answers `undefined`,
+/// so `[1, 2].map(5)` produced `[undefined, undefined]` and looked like a working call.
+#[test]
+fn an_iteration_method_needs_a_real_callback() {
+    for (name, program) in [
+        ("map", "[1].map(5)"),
+        ("for-each", "[1].forEach(undefined)"),
+        ("filter", "[1].filter(null)"),
+        ("every", "[1].every(1)"),
+        ("some", "[1].some({})"),
+        ("find", "[1].find(\"x\")"),
+        ("find-index", "[1].findIndex(true)"),
+        ("reduce", "[1].reduce(5)"),
+        ("reduce-right", "[1].reduceRight(5)"),
+        ("flat-map", "[1].flatMap(5)"),
+        ("map-for-each", "new Map().forEach(5)"),
+        ("set-for-each", "new Set().forEach(5)"),
+    ] {
+        check(
+            &format!("callback-required-{name}"),
+            &format!("try {{ {program}; return \"no\"; }} catch (e) {{ return e.name; }}"),
+            "TypeError",
+        );
+    }
+}
+
+/// A comparator is **optional**, and only wrong when it is present and not callable.
+#[test]
+fn sort_takes_a_comparator_or_nothing() {
+    check(
+        "sort-bad-comparator",
+        "try { [3, 1].sort(5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "sort-no-comparator",
+        "return [3, 1].sort().join(\",\");",
+        "1,3",
+    );
+    check(
+        "sort-undefined-comparator",
+        "return [3, 1].sort(undefined).join(\",\");",
+        "1,3",
+    );
+    check(
+        "sort-real-comparator",
+        "return [3, 1].sort(function (a, b) { return b - a; }).join(\",\");",
+        "3,1",
+    );
+}

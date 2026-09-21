@@ -5297,3 +5297,30 @@ change to the walk rather than to this.
 `Object.assign` had wanted all along: a write to an absent property on a non-extensible object
 adds one, which is exactly what it will not do — and the store ignores it silently, so nothing
 downstream would have noticed.
+
+## D-188
+
+**An iteration method checks its callback before it reads an element.**
+
+Status: Accepted
+
+None of them checked. `Array.prototype.map`, `filter`, `forEach`, `every`, `some`, `find`,
+`findIndex`, `findLast`, `findLastIndex`, `reduce`, `reduceRight`, `flatMap`, `sort` and both
+collection `forEach`es went straight to calling what they were handed — which reaches
+`crisol_not_a_function`, and that answers `undefined` by design (it exists so a bad callee
+costs a wasted call rather than a jump through a null pointer).
+
+The result was that `[1, 2].map(5)` answered `[undefined, undefined]`. Not an error, not a
+crash: a plausible array of the right length, which is the worst of the three. Twelve call
+sites, and the check is the same at all of them.
+
+**A comparator is the exception**: `sort` takes one or nothing, so only a present
+non-callable is refused. Without that check every comparison answered `undefined`, which
+compares as neither less nor greater — so `[3, 1].sort(5)` silently kept its input order and
+looked like a stable sort of an already-sorted array.
+
+**Found by reading what the corpus still complained about**, not by inspection: "Expected a
+TypeError to be thrown but no" was 62 cases and the six examples the runner prints named three
+distinct causes, of which this was the most common. The other two — `ToNumber(symbol)` and a
+`ToPrimitive` whose `valueOf` and `toString` both answer objects — need a fallible coercion
+path that can propagate, which the current `to_number` (returning a bare `f64`) cannot.

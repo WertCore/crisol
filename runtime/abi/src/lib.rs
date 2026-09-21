@@ -1096,6 +1096,13 @@ extern "C" fn array_sort(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let comparator = unsafe { argument(argc, argv, 0) };
+    // **A comparator is optional and, when given, has to be callable.**
+    // `[3, 1].sort(5)` is a `TypeError` before anything is compared; without
+    // the check every comparison reached `crisol_not_a_function`, which
+    // answers `undefined`, and the sort silently kept its input order.
+    if !Value::from_bits(comparator).is_undefined() && !is_callable(comparator) {
+        return raise("a comparator must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -1250,6 +1257,13 @@ extern "C" fn array_reduce_right(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
+    // **Checked before a single element is read.** `[1, 2].map(5)` throws
+    // rather than calling nothing twice and answering `[undefined,
+    // undefined]` — which is what reaching `crisol_not_a_function` per
+    // element produced, and it looked like a working call every time.
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -1343,6 +1357,13 @@ extern "C" fn array_flat_map(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
+    // **Checked before a single element is read.** `[1, 2].map(5)` throws
+    // rather than calling nothing twice and answering `[undefined,
+    // undefined]` — which is what reaching `crisol_not_a_function` per
+    // element produced, and it looked like a working call every time.
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -1417,6 +1438,13 @@ fn find_last_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool
     let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
+    // **Checked before a single element is read.** `[1, 2].map(5)` throws
+    // rather than calling nothing twice and answering `[undefined,
+    // undefined]` — which is what reaching `crisol_not_a_function` per
+    // element produced, and it looked like a working call every time.
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -3146,6 +3174,13 @@ extern "C" fn map_for_each(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
+    // **Checked before a single element is read.** `[1, 2].map(5)` throws
+    // rather than calling nothing twice and answering `[undefined,
+    // undefined]` — which is what reaching `crisol_not_a_function` per
+    // element produced, and it looked like a working call every time.
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -3245,6 +3280,13 @@ extern "C" fn set_for_each(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
+    // **Checked before a single element is read.** `[1, 2].map(5)` throws
+    // rather than calling nothing twice and answering `[undefined,
+    // undefined]` — which is what reaching `crisol_not_a_function` per
+    // element produced, and it looked like a working call every time.
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -9060,6 +9102,13 @@ extern "C" fn array_map(
         let length = indexed_length(this_value);
         // SAFETY: the convention guarantees `argc` readable values at `argv`.
         let callback = unsafe { argument(argc, argv, 0) };
+        // **Checked before a single element is read.** `[1, 2].map(5)` throws
+        // rather than calling nothing twice and answering `[undefined,
+        // undefined]` — which is what reaching `crisol_not_a_function` per
+        // element produced, and it looked like a working call every time.
+        if !is_callable(callback) {
+            return raise("a callback must be a function", "TypeError");
+        }
 
         with_new_array(length, |result| {
             for index in 0..length {
@@ -9094,6 +9143,13 @@ extern "C" fn array_filter(
         let length = indexed_length(this_value);
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
+        // **Checked before a single element is read.** `[1, 2].map(5)` throws
+        // rather than calling nothing twice and answering `[undefined,
+        // undefined]` — which is what reaching `crisol_not_a_function` per
+        // element produced, and it looked like a working call every time.
+        if !is_callable(callback) {
+            return raise("a callback must be a function", "TypeError");
+        }
 
         // Allocated at full length and shortened after, because the result is rooted through the
         // whole loop and the count is not known until the end.
@@ -9137,6 +9193,13 @@ extern "C" fn array_for_each(
         let length = indexed_length(this_value);
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
+        // **Checked before a single element is read.** `[1, 2].map(5)` throws
+        // rather than calling nothing twice and answering `[undefined,
+        // undefined]` — which is what reaching `crisol_not_a_function` per
+        // element produced, and it looked like a working call every time.
+        if !is_callable(callback) {
+            return raise("a callback must be a function", "TypeError");
+        }
         for index in 0..length {
             let element = indexed_get(this_value, index);
             call_value(
@@ -9170,6 +9233,13 @@ extern "C" fn array_reduce(
         };
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
+        // **Checked before a single element is read.** `[1, 2].map(5)` throws
+        // rather than calling nothing twice and answering `[undefined,
+        // undefined]` — which is what reaching `crisol_not_a_function` per
+        // element produced, and it looked like a working call every time.
+        if !is_callable(callback) {
+            return raise("a callback must be a function", "TypeError");
+        }
 
         let (mut accumulator, start) = if argc >= 2 {
             // SAFETY: as above.
@@ -9485,6 +9555,13 @@ fn find_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> 
     let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
+    // **Checked before a single element is read.** `[1, 2].map(5)` throws
+    // rather than calling nothing twice and answering `[undefined,
+    // undefined]` — which is what reaching `crisol_not_a_function` per
+    // element produced, and it looked like a working call every time.
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -9539,6 +9616,13 @@ fn quantify(this_value: u64, argc: u64, argv: *const u64, want_all: bool) -> u64
     let length = indexed_length(this_value);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
+    // **Checked before a single element is read.** `[1, 2].map(5)` throws
+    // rather than calling nothing twice and answering `[undefined,
+    // undefined]` — which is what reaching `crisol_not_a_function` per
+    // element produced, and it looked like a working call every time.
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
