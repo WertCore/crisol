@@ -1220,7 +1220,10 @@ extern "C" fn array_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     with_rooted(&[this_value], || {
         let mut out = String::new();
         for index in 0..length {
@@ -1435,7 +1438,10 @@ extern "C" fn array_at(
 
 /// `findLast` and `findLastIndex`, which walk backwards.
 fn find_last_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
     // **Checked before a single element is read.** `[1, 2].map(5)` throws
@@ -5332,7 +5338,10 @@ extern "C" fn reflect_apply(
         let receiver = unsafe { argument(argc, argv, 1) };
         // SAFETY: as above.
         let list = unsafe { argument(argc, argv, 2) };
-        let length = indexed_length(list);
+        let length = match indexed_length(list) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
         let arguments: Vec<u64> = (0..length).map(|index| indexed_get(list, index)).collect();
         with_rooted(&arguments, || call_value(target, receiver, &arguments))
     })
@@ -5895,7 +5904,10 @@ extern "C" fn object_group_by(
             if let Some(handle) = handle_of(groups) {
                 with_runtime(|runtime| runtime.heap.set_prototype(handle, None));
             }
-            let length = indexed_length(items);
+            let length = match indexed_length(items) {
+                Ok(length) => length,
+                Err(thrown) => return thrown,
+            };
             for index in 0..length {
                 let value = indexed_get(items, index);
                 let arguments = [value, Value::number(index_as_f64(index)).to_bits()];
@@ -5926,8 +5938,14 @@ extern "C" fn object_group_by(
                     });
                     made
                 };
+                // The group is an array this function made, so its length is its element
+                // count and cannot throw — but it is read through the same fallible path as
+                // every other length, because a second way to ask is a second answer.
+                let at = match indexed_length(group) {
+                    Ok(at) => at,
+                    Err(thrown) => return thrown,
+                };
                 with_rooted(&[group, value], || {
-                    let at = indexed_length(group);
                     store_element(group, at, value);
                 });
             }
@@ -9031,13 +9049,20 @@ fn relative_index(value: u64, length: usize, fallback: usize) -> usize {
 /// of its cases — and a method that insisted on real elements answered `undefined` for every
 /// one of them. An array answers from its element count, which is why that stays the first
 /// question.
-fn indexed_length(value: u64) -> usize {
+fn indexed_length(value: u64) -> Result<usize, u64> {
     if let Some((_, length)) = elements_of(value) {
-        return length;
+        return Ok(length);
     }
-    let asked = property_number(value, "length").unwrap_or(0.0);
+    let key = "length".to_owned();
+    // SAFETY: `key` is a live Rust string.
+    let asked = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
+    if Value::from_bits(asked).is_exception() {
+        // A getter threw. Its exception is the answer, not a length of zero.
+        return Err(asked);
+    }
+    let asked = coerce_number(asked)?;
     if !asked.is_finite() || asked <= 0.0 {
-        return 0;
+        return Ok(0);
     }
     #[expect(
         clippy::cast_possible_truncation,
@@ -9045,7 +9070,62 @@ fn indexed_length(value: u64) -> usize {
         reason = "clamped to a length no array can exceed"
     )]
     let length = asked.min(f64::from(u32::MAX)) as usize;
-    length
+    Ok(length)
+}
+
+/// `ToPrimitive` — an object as the primitive it stands for, or the reason it has none.
+///
+/// **Both methods answering objects is an error**, not a value. The older `to_primitive` hands
+/// the object back instead, which turns a reportable `TypeError` into arithmetic on `NaN` —
+/// and test262 checks both that the throw happens *and* that `valueOf` and `toString` were
+/// each tried, so answering wrongly and answering without asking are separately caught.
+fn coerce_primitive(value: u64, prefer_string: bool) -> Result<u64, u64> {
+    if Value::from_bits(value).kind() != crisol_value::Kind::Object {
+        return Ok(value);
+    }
+    let order = if prefer_string {
+        ["toString", "valueOf"]
+    } else {
+        ["valueOf", "toString"]
+    };
+    for name in order {
+        let key = name.to_owned();
+        // SAFETY: `key` is a live Rust string.
+        let method = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
+        if !is_callable(method) {
+            continue;
+        }
+        let result = with_rooted(&[value], || call_value(method, value, &[]));
+        if Value::from_bits(result).is_exception() {
+            return Err(result);
+        }
+        if Value::from_bits(result).kind() != crisol_value::Kind::Object {
+            return Ok(result);
+        }
+    }
+    Err(raise(
+        "cannot convert an object to a primitive",
+        "TypeError",
+    ))
+}
+
+/// `ToNumber`, with the two conversions that are errors rather than `NaN`.
+///
+/// **A symbol refuses to be a number.** `+Symbol()` is a `TypeError`, not `NaN`, and the
+/// reason is the point of symbols: one exists to be unequal to everything, and a number it
+/// could be compared as would defeat that. `to_number` answers `NaN`, which is what every
+/// caller that cannot throw still gets.
+fn coerce_number(bits: u64) -> Result<f64, u64> {
+    match Value::from_bits(bits).kind() {
+        crisol_value::Kind::Symbol => Err(raise("a symbol is not a number", "TypeError")),
+        crisol_value::Kind::Object => {
+            let primitive = coerce_primitive(bits, false)?;
+            // One step only: `coerce_primitive` answers a primitive or an error, so this
+            // cannot reach the object arm again.
+            coerce_number(primitive)
+        }
+        _ => Ok(to_number(bits)),
+    }
 }
 
 /// Whether an array-like's `length` is one an array could actually have.
@@ -9099,7 +9179,10 @@ extern "C" fn array_map(
         if !indexed_length_is_valid(this_value) {
             return raise("invalid array length", "RangeError");
         }
-        let length = indexed_length(this_value);
+        let length = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
         // SAFETY: the convention guarantees `argc` readable values at `argv`.
         let callback = unsafe { argument(argc, argv, 0) };
         // **Checked before a single element is read.** `[1, 2].map(5)` throws
@@ -9140,7 +9223,10 @@ extern "C" fn array_filter(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let length = indexed_length(this_value);
+        let length = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
         // **Checked before a single element is read.** `[1, 2].map(5)` throws
@@ -9190,7 +9276,10 @@ extern "C" fn array_for_each(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let length = indexed_length(this_value);
+        let length = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
         // **Checked before a single element is read.** `[1, 2].map(5)` throws
@@ -9295,7 +9384,10 @@ extern "C" fn array_last_index_of(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
     for index in (0..length).rev() {
@@ -9317,7 +9409,10 @@ extern "C" fn array_includes(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
     let seeking_nan = wanted.as_number().is_some_and(f64::is_nan);
@@ -9343,7 +9438,10 @@ extern "C" fn array_join(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let given = unsafe { argument(argc, argv, 0) };
     let separator = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
@@ -9382,7 +9480,10 @@ extern "C" fn array_slice(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
     // SAFETY: as above.
@@ -9552,7 +9653,10 @@ extern "C" fn array_unshift(
 
 /// `find` and `findIndex`, which differ only in what they answer with.
 fn find_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
     // **Checked before a single element is read.** `[1, 2].map(5)` throws
@@ -9613,7 +9717,10 @@ extern "C" fn array_find_index(
 
 /// `every` and `some`, which differ only in what stops them.
 fn quantify(this_value: u64, argc: u64, argv: *const u64, want_all: bool) -> u64 {
-    let length = indexed_length(this_value);
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
     // **Checked before a single element is read.** `[1, 2].map(5)` throws
@@ -9703,7 +9810,10 @@ extern "C" fn array_index_of(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let length = indexed_length(this_value);
+        let length = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
         // SAFETY: as above.
         let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
         for index in 0..length {

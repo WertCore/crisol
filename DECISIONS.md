@@ -5324,3 +5324,31 @@ TypeError to be thrown but no" was 62 cases and the six examples the runner prin
 distinct causes, of which this was the most common. The other two — `ToNumber(symbol)` and a
 `ToPrimitive` whose `valueOf` and `toString` both answer objects — need a fallible coercion
 path that can propagate, which the current `to_number` (returning a bare `f64`) cannot.
+
+## D-189
+
+**A length that cannot become a number is an error, not a zero.**
+
+Status: Accepted
+
+`indexed_length` read `length` through `property_number`, which answers `None` for anything
+that is not already a number — so a symbol, or an object whose `valueOf` and `toString` both
+answer objects, became a length of zero and the method walked nothing. The specification
+throws in both cases, and test262 checks each against several methods.
+
+Two conversions fail where the rest answer `NaN`:
+
+- **A symbol refuses to be a number.** That is the point of symbols: one exists to be unequal
+  to everything, and a number it could be compared as would defeat it.
+- **`ToPrimitive` with no primitive to reach.** The older `to_primitive` hands the object back
+  instead, which turns a reportable error into arithmetic on `NaN`.
+
+`coerce_number` and `coerce_primitive` are the fallible pair; `to_number` and `to_primitive`
+stay for the callers that cannot throw — `==` among them, because its result is a value the
+codegen does not check for the exception sentinel. **That is a real split and the wrong one
+long-term**: two ways to ask a question are two answers. It is recorded rather than hidden
+because closing it means giving the operators an exception path, which is its own change.
+
+**The tests assert the order, not just the throw.** An engine that never called `valueOf` at
+all would pass a test that only checks for a `TypeError`, so the case that matters records
+`"vs"` and would catch a conversion that skipped straight to failing.

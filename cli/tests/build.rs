@@ -6711,3 +6711,58 @@ fn sort_takes_a_comparator_or_nothing() {
         "3,1",
     );
 }
+
+/// **A length that cannot become a number is an error, not a zero.** Reading `length` off an
+/// array-like coerces it, and the two coercions that fail have to say so rather than answer
+/// `NaN` and be clamped to an empty walk.
+#[test]
+fn a_length_that_cannot_convert_is_an_error() {
+    check(
+        "length-is-a-symbol",
+        "let o = {}; o.length = Symbol(1); \
+         try { [].fill.call(o, 1); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "length-is-an-unconvertible-object",
+        "let o = {length: {valueOf: function () { return {}; }, \
+                           toString: function () { return {}; }}}; \
+         try { [].every.call(o, function () { return true; }); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // **Both are tried, in order.** A test that only checks the throw passes an engine that
+    // never asked, so the order is what is asserted here.
+    check(
+        "length-tries-value-of-then-to-string",
+        "let seen = \"\"; \
+         let o = {length: {valueOf: function () { seen = seen + \"v\"; return {}; }, \
+                           toString: function () { seen = seen + \"s\"; return {}; }}}; \
+         try { [].every.call(o, function () { return true; }); } catch (e) {} \
+         return seen;",
+        "vs",
+    );
+    // A `valueOf` that answers a primitive is used, and the walk proceeds.
+    check(
+        "length-from-value-of",
+        "let o = {0: 7, 1: 8, length: {valueOf: function () { return 2; }}}; \
+         return [].join.call(o, \",\");",
+        "7,8",
+    );
+    // A getter that throws hands its own exception on rather than being read as a zero.
+    check(
+        "length-getter-throws",
+        "let o = {}; \
+         Object.defineProperty(o, \"length\", \
+             {get: function () { throw new RangeError(\"nope\"); }}); \
+         try { [].join.call(o, \",\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A symbol refuses to be a number wherever it is asked.
+    check(
+        "symbol-is-not-a-number",
+        "let o = {length: Symbol()}; \
+         try { [].slice.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
