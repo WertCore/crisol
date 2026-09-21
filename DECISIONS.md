@@ -6057,3 +6057,94 @@ is where they throw. Returning early skipped it.
 there is no value to answer with, and inventing one makes the mistake quiet where the
 specification is loud. `reduceRight` already did this, which is how the disagreement was
 spotted.
+
+## D-215
+
+**The methods that were simply absent.**
+
+Status: Accepted
+
+"TypeError: is not a function" is the largest single reason in the corpus report, and it is
+not one problem: it is a list. These are the ones on it that are small.
+
+`String.prototype.codePointAt` is **what `charCodeAt` is not** — the whole character rather
+than half of a surrogate pair, which is the difference between counting storage and counting
+text. `substr`'s second argument is a *count*, where `substring`'s is an end and `slice`'s is
+an end that may be negative; three methods that look alike and disagree at every edge, so each
+is tested against the others rather than alone.
+
+`localeCompare` answers **code-unit order**, which the specification permits and this note
+exists to stop anyone believing otherwise: a real collation is locale data the engine does not
+carry. What the corpus checks is that the answer is consistent and correctly signed.
+
+`isWellFormed` is always `true` and `toWellFormed` is the identity, and that is **a property
+of the representation rather than an optimisation**: a string is a Rust `str`, which is UTF-8
+and cannot hold a lone surrogate, so there is no ill-formed string for either to find. The
+place this becomes interesting is a UTF-16 string type, which is a much larger change.
+
+`Map.groupBy` differs from `Object.groupBy` in exactly one way and it is the reason both
+exist: **its keys are values**, so grouping by `1` and by `"1"` collides in an object and not
+in a map, and grouping by an object is only possible through this one.
+
+`Error.isError` reads the mark an error was made with rather than asking `instanceof`, which
+gets a cross-realm error wrong in one direction and a re-prototyped one wrong in the other.
+
+## D-216
+
+**`split` looks at its separator.**
+
+Status: Accepted
+
+`"a1b".split(/[0-9]/)` answered `["a1b"]`. The separator went through `ToString` whatever it
+was, so a regular expression became the literal text `/[0-9]/` — which is never in the
+subject, so the method answered the whole string and looked like a working call. That is the
+worst shape of wrong: no error, a plausible result, and a program that only notices when the
+data changes.
+
+Three things the walk has to get right, and each is a test rather than a comment because each
+is a place another engine and this one could quietly differ:
+
+- **The captures go into the result.** `"a1b".split(/([0-9])/)` is three elements, and a group
+  that did not participate is `undefined` rather than `""`.
+- **A zero-width match where the cursor already is contributes nothing**, and a match starting
+  at the end is past the last position the specification looks at. Without both,
+  `"ab".split(/(?:)/)` gains a trailing `""`.
+- **An empty subject is decided by whether the pattern matches it**, not by the walk — which
+  never runs. `"".split(/x/)` is `[""]` and `"".split(/(?:)/)` is `[]`.
+
+`limit` was not read at all. It truncates, and zero is an empty array rather than everything.
+
+**What is still missing, and is the next piece of work**: `RegExp.prototype[Symbol.split]`,
+and the same for `match`, `replace` and `search`. The string methods do the work themselves
+rather than delegating to the pattern, so a `RegExp` subclass that overrides one is ignored
+and a user-supplied `exec` is never called. That is most of what remains in the `RegExp`
+areas of the corpus report.
+
+## D-217
+
+**A walk over an array-like is bounded by `ToLength`, and stops when a getter throws.**
+
+Status: Accepted
+
+Making the array methods generic (D-214) made one of them hang. `Array.prototype.reverse` on
+`{length: 2 ** 53 + 2}` walked two billion positions and was killed by the case timeout —
+which reported it as a crash, and one crash fails the corpus job.
+
+Two things were wrong and only together do they explain it.
+
+**The clamp was an array's, not an object's.** `indexed_length` stops at 2^32-1 because no
+array can be longer; a plain object's `length` is whatever it says, and `ToLength` stops at
+2^53-1. test262's case puts a throwing getter at index 2^53-2 precisely so that the *first*
+step of the reverse reaches it — a walk clamped to four billion never gets there, and reads
+`undefined` two billion times instead. `walk_length` is the second question asked separately:
+it bounds a walk, where `indexed_length` bounds an allocation and the smaller clamp is the
+whole point.
+
+**And a throwing getter did not stop the loop.** `indexed_get` answers the exception signal
+like any other value, which is right for a caller that stores it and wrong for a loop that
+keeps going. `indexed_get_checked` is the same read with the answer the walkers need.
+
+So the bound on these loops is no longer arithmetic — a length of 2^53 that never throws does
+not finish. That is what the specification says to do, and what every engine does; the case
+timeout (D-205) is the backstop, and it is the thing that turned this from a held runner into
+a named failure.

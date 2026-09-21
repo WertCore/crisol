@@ -739,6 +739,98 @@ fn reduce_seeds_from_the_first_element_when_given_no_initial_value() {
     );
 }
 
+/// The string methods that were simply missing, which is a `TypeError` rather than a wrong
+/// answer — and the largest single reason in the corpus report.
+#[test]
+fn the_remaining_string_methods_exist() {
+    // **`codePointAt` is what `charCodeAt` is not**: the whole character rather than half of
+    // a surrogate pair.
+    check("code-point-at", "return \"abc\".codePointAt(1);", "98");
+    check(
+        "code-point-at-astral",
+        "return \"\\u{1f4a9}\".codePointAt(0);",
+        "128169",
+    );
+    check(
+        "char-code-at-astral",
+        "return \"\\u{1f4a9}\".charCodeAt(0);",
+        "55357",
+    );
+    check(
+        "code-point-at-past-end",
+        "return \"a\".codePointAt(5);",
+        "undefined",
+    );
+    check(
+        "locale-compare-less",
+        "return \"a\".localeCompare(\"b\");",
+        "-1",
+    );
+    check(
+        "locale-compare-same",
+        "return \"a\".localeCompare(\"a\");",
+        "0",
+    );
+    check(
+        "locale-compare-more",
+        "return \"b\".localeCompare(\"a\");",
+        "1",
+    );
+    // **`substr`'s second argument is a count**, where `substring`'s is an end and `slice`'s
+    // is an end that may be negative. Three methods that look alike and disagree everywhere.
+    check("substr", "return \"abcdef\".substr(1, 3);", "bcd");
+    check(
+        "substr-negative-start",
+        "return \"abcdef\".substr(-2);",
+        "ef",
+    );
+    check("substr-no-count", "return \"abcdef\".substr(4);", "ef");
+    check(
+        "substring-differs",
+        "return \"abcdef\".substring(1, 3);",
+        "bc",
+    );
+    check("is-well-formed", "return \"ab\".isWellFormed();", "true");
+    check("to-well-formed", "return \"ab\".toWellFormed();", "ab");
+    check(
+        "to-locale-upper",
+        "return \"ab\".toLocaleUpperCase();",
+        "AB",
+    );
+}
+
+/// `Map.groupBy` and `Error.isError`.
+#[test]
+fn the_remaining_collection_and_error_statics_exist() {
+    // **The key is a value, not a name**, which is the whole difference from
+    // `Object.groupBy`: grouping by `1` and by `"1"` collides there and not here.
+    check(
+        "map-group-by",
+        "let m = Map.groupBy([1, 2, 3, 4], function (n) { return n % 2 === 0; }); \
+         return m.get(true).join(\",\") + \"|\" + m.get(false).join(\",\");",
+        "2,4|1,3",
+    );
+    check(
+        "map-group-by-keys-are-values",
+        "let m = Map.groupBy([1, \"1\"], function (v) { return v; }); return m.size;",
+        "2",
+    );
+    // **Not `instanceof`**: this reads the mark an error was made with, so a replaced
+    // prototype does not change the answer.
+    check(
+        "is-error-yes",
+        "return Error.isError(new TypeError(\"x\"));",
+        "true",
+    );
+    check("is-error-no", "return Error.isError({});", "false");
+    check("is-error-primitive", "return Error.isError(1);", "false");
+    check(
+        "is-error-reprototyped",
+        "let e = new Error(\"x\"); Object.setPrototypeOf(e, null); return Error.isError(e);",
+        "true",
+    );
+}
+
 /// **A getter is called on read; a data property holding a function is not.**
 ///
 /// `{get x() { return 1; }}` was lowered as a property named `x` holding the function, so
@@ -868,6 +960,18 @@ fn the_array_methods_work_on_anything_with_a_length() {
     check(
         "generic-throwing-length",
         "let o = {get length() { throw new RangeError(\"x\"); }}; \
+         try { Array.prototype.reverse.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // **A getter that throws stops the walk**, which is not politeness: `{length: 2 ** 53}`
+    // is two quadrillion positions, and a loop that swallows the throw is not slow but
+    // stuck. test262 reverses exactly this and expects the first step to reach the getter,
+    // which needs `ToLength`'s clamp rather than an array's.
+    check(
+        "generic-huge-length-throwing-getter",
+        "let o = {length: Math.pow(2, 53) + 2}; \
+         Object.defineProperty(o, \"9007199254740990\", \
+             {get: function () { throw new RangeError(\"stop\"); }}); \
          try { Array.prototype.reverse.call(o); return \"no\"; } catch (e) { return e.name; }",
         "RangeError",
     );
@@ -1910,6 +2014,59 @@ fn split_handles_its_separator_cases() {
     check("str-split-piece", "return \"a,b,c\".split(\",\")[1];", "b");
     check("str-split-empty", "return \"abc\".split(\"\").length;", "3");
     check("str-split-none", "return \"abc\".split().length;", "1");
+    // **A regular expression separator.** Without one, the pattern went through `ToString`
+    // and `"a1b".split(/[0-9]/)` looked for the literal text `/[0-9]/` — never there, so it
+    // answered the whole string and looked like a working call.
+    check(
+        "str-split-regexp",
+        "return \"a1b2c\".split(/[0-9]/).join(\"|\");",
+        "a|b|c",
+    );
+    // **The captures go into the result too**, which is what makes this five elements.
+    check(
+        "str-split-regexp-captures",
+        "return \"a1b\".split(/([0-9])/).join(\"|\");",
+        "a|1|b",
+    );
+    // A group that did not participate is `undefined`, not `""`.
+    check(
+        "str-split-regexp-absent-group",
+        "let out = \"ab\".split(/(x)|b/); return out.length + \":\" + (out[1] === undefined);",
+        "3:true",
+    );
+    check(
+        "str-split-regexp-empty",
+        "return \"ab\".split(/(?:)/).join(\"|\");",
+        "a|b",
+    );
+    check(
+        "str-split-regexp-no-match",
+        "return \"ab\".split(/x/).join(\"|\");",
+        "ab",
+    );
+    // An empty subject is decided by whether the pattern matches it, which the walk cannot
+    // say because it never runs.
+    check(
+        "str-split-empty-subject",
+        "return \"\".split(/x/).length;",
+        "1",
+    );
+    check(
+        "str-split-empty-subject-empty-pattern",
+        "return \"\".split(/(?:)/).length;",
+        "0",
+    );
+    // `limit` truncates, and zero is an empty array rather than everything.
+    check(
+        "str-split-limit",
+        "return \"a,b,c\".split(\",\", 2).join(\"|\");",
+        "a|b",
+    );
+    check(
+        "str-split-limit-zero",
+        "return \"a,b,c\".split(\",\", 0).length;",
+        "0",
+    );
 }
 
 /// A method reached through a variable, so the receiver is not a literal.

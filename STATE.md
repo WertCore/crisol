@@ -1893,9 +1893,13 @@ Both mutation-tested.
 ## Where the corpus stands
 
 The number that matters is `cargo test -p crisol --test test262` on CI, at the default sample
-of 1500. **490 passed at the start of the `Object` work and 767 by the end of the run that
-followed it**, with crashes at zero throughout; the sample is identical between runs, so they
-are comparable. D-168 to D-205 are that work.
+of 1500. **490 → 767 → 809 → 847**, the last three measured at `e8fea2d`, `0c0076a` and
+`dbd57fb`; the sample is identical between runs, so they are comparable. D-168 to D-217 are
+that work.
+
+**One crashed case fails the whole job**, which is the design (D-205) and is worth knowing
+before reading a red corpus run as a regression: `dbd57fb` passed 847 and still reported
+failure, for a single case the timeout killed.
 
 **The matrix jobs use a sample of 400 and the dispatch uses 1500, and they are different
 subsets.** Comparing one against the other reads as a regression that is not there.
@@ -1910,24 +1914,23 @@ The list that used to be here — `Proxy`, `Promise`, `Reflect`, symbols as prop
 is done (D-187 to D-201). What the report says now is different in kind: almost nothing is
 refused any more (43 of 1500), and the failures are behaviour.
 
-**The histogram below is from `e8fea2d` and is already partly stale**, which is the thing to
-check first rather than to discover halfway through a fix: the `return-abrupt-from-*` family
-it lists was the relative-index coercion (D-203), landed a commit later. A measurement is a
-dispatch away and is worth taking before picking from a list.
+**Check which commit a histogram came from before working off it.** The one that named the
+`return-abrupt-from-*` family was three commits stale and that family was already fixed. A
+measurement is one dispatch away.
 
-The two largest reasons, and they overlap:
+At `dbd57fb` the largest reasons were "is not a function" and "expected a TypeError, got
+none", and by area `Array.prototype`, `RegExp` + `RegExp.prototype`, `Object` and
+`String.prototype`. **The `RegExp` half is the most concentrated thing left**: the
+`Symbol.match`/`replace`/`search`/`split` protocol does not exist, so the string methods do
+the work themselves — a `RegExp` subclass that overrides one is ignored and a user-supplied
+`exec` is never called (D-216).
 
-- **"Expected a TypeError to be thrown but no" (65).** Mostly one family: `not-a-constructor`,
-  which test262 writes once per built-in method. D-207 is that.
-- **"TypeError: is not a function" (63).** Methods that do not exist —
-  `Reflect.construct`, `String.prototype.match`, `Date.prototype.toUTCString`, `Error.isError`,
-  `Map.groupBy`, `RegExp.escape`, `RegExp.prototype[Symbol.match]`. Each is small and there are
-  many; the report names them and is the list to work from.
-
-By area the weight is `Array.prototype` (148), `RegExp` and `RegExp.prototype` (96 together),
-`Object` (71), `String.prototype` (57), `Promise` (28). The `RegExp` half is the least
-explored and the most concentrated: the `Symbol.match`/`replace`/`search`/`split` protocol and
-the flag accessors account for most of it.
+"TypeError: is not a function" is not one problem — it is a list, and the report prints it.
+Working through it is the cheapest thing available: `Reflect.construct`,
+`String.prototype.match`, `Date.prototype.toUTCString`, `Error.isError` and `Map.groupBy` were
+all on it and are all in (D-207, D-209, D-210, D-215). `RegExp.escape`,
+`String.prototype.matchAll`, `Error.prototype.stack` and the `RegExp.prototype[Symbol.*]`
+family are what is left of it.
 
 Two things are deliberately not done. The regular-expression `v` flag is refused rather than
 accepted as `u`, because accepting it turns a correct `SyntaxError` into wrong match results

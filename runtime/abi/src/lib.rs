@@ -937,9 +937,15 @@ extern "C" fn array_copy_within(
     let taken = end.saturating_sub(start).min(length - target);
     // Read before writing, because the source and destination runs may overlap — copying in
     // place forwards would read values it had already overwritten.
-    let moved: Vec<u64> = (0..taken)
-        .map(|at| indexed_get(this_value, start + at))
-        .collect();
+    let mut moved: Vec<u64> = Vec::with_capacity(taken);
+    for at in 0..taken {
+        // A getter may throw, and a walk that swallowed it would keep going over a length
+        // the receiver only claims to have.
+        match with_rooted(&moved, || indexed_get_checked(this_value, start + at)) {
+            Ok(value) => moved.push(value),
+            Err(thrown) => return thrown,
+        }
+    }
     with_rooted(&moved, || {
         for (at, value) in moved.iter().enumerate() {
             indexed_set(this_value, target + at, *value);
@@ -1357,11 +1363,18 @@ extern "C" fn array_reduce_right(
             );
         } else {
             position -= 1;
-            indexed_get(this_value, position)
+            match indexed_get_checked(this_value, position) {
+                Ok(last) => last,
+                Err(thrown) => return thrown,
+            }
         };
         while position > 0 {
             position -= 1;
-            let element = with_rooted(&[total], || indexed_get(this_value, position));
+            let element = match with_rooted(&[total], || indexed_get_checked(this_value, position))
+            {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
             total = with_rooted(&[total, element], || {
                 call_value(
                     callback,
@@ -2423,6 +2436,8 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("global", "Proxy", 2),
     ("Reflect", "apply", 3),
     ("Reflect", "construct", 2),
+    ("Map", "groupBy", 2),
+    ("Error", "isError", 1),
     ("Reflect", "defineProperty", 3),
     ("Reflect", "deleteProperty", 2),
     ("Reflect", "get", 2),
@@ -2458,6 +2473,11 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("String.prototype", "replace", 2),
     ("String.prototype", "replaceAll", 2),
     ("String.prototype", "match", 1),
+    ("String.prototype", "codePointAt", 1),
+    ("String.prototype", "localeCompare", 1),
+    ("String.prototype", "substr", 2),
+    ("String.prototype", "isWellFormed", 0),
+    ("String.prototype", "toWellFormed", 0),
     ("String.prototype", "search", 1),
     ("String.prototype", "slice", 2),
     ("String.prototype", "split", 2),
@@ -4260,6 +4280,37 @@ pub unsafe extern "C" fn crisol_define_accessor(
     })
 }
 
+/// `Error.isError(value)`.
+///
+/// **Not `instanceof`.** An object from another realm, or one whose prototype has been
+/// replaced, is still an error; `instanceof` answers the first question wrong and the second
+/// one wrong in the other direction. This reads the mark the error was made with.
+extern "C" fn error_is_error(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    let Some(handle) = handle_of(value) else {
+        return Value::FALSE.to_bits();
+    };
+    if Value::from_bits(value).kind() != crisol_value::Kind::Object {
+        return Value::FALSE.to_bits();
+    }
+    let marked = with_runtime(|runtime| {
+        let key = PropertyKey::new(ERROR_DATA);
+        runtime
+            .heap
+            .shape_of(handle)
+            .and_then(|shape| runtime.shapes.borrow().lookup(shape, &key))
+            .is_some()
+    });
+    boolean(marked).to_bits()
+}
+
 /// `Object.prototype.__lookupGetter__` and `__lookupSetter__`.
 ///
 /// **Inherited, unlike `getOwnPropertyDescriptor`.** These walk the chain, which is the whole
@@ -5075,6 +5126,13 @@ const STRING_NATIVES: &[(&str, Native)] = &[
     ("replaceAll", string_replace_all),
     ("match", string_match),
     ("search", string_search),
+    ("codePointAt", string_code_point_at),
+    ("localeCompare", string_locale_compare),
+    ("substr", string_substr),
+    ("isWellFormed", string_is_well_formed),
+    ("toWellFormed", string_to_well_formed),
+    ("toLocaleUpperCase", string_to_upper),
+    ("toLocaleLowerCase", string_to_lower),
 ];
 
 /// `String.prototype.at`.
@@ -5474,6 +5532,164 @@ fn pattern_argument(value: u64) -> Option<(crisol_builtins::JsRegExp, String)> {
     let flags = crisol_builtins::Flags::parse(&flags_text).ok()?;
     let compiled = crisol_builtins::JsRegExp::new(&source, flags).ok()?;
     Some((compiled, flags_text))
+}
+
+/// `String.prototype.codePointAt` — the whole code point, not half of a surrogate pair.
+///
+/// **This is what `charCodeAt` is not.** `"\u{1f4a9}".charCodeAt(0)` is the leading surrogate
+/// and `codePointAt(0)` is the character, which is the difference between counting storage
+/// and counting text.
+extern "C" fn string_code_point_at(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let units = code_units(&text);
+    let position = match integer_argument(argc, argv, 0) {
+        Ok(position) => position,
+        Err(thrown) => return thrown,
+    };
+    #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+    let span = units.len() as f64;
+    if position < 0.0 || position >= span {
+        return Value::UNDEFINED.to_bits();
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked against both ends just above"
+    )]
+    let at = position as usize;
+    let first = units[at];
+    // A leading surrogate followed by a trailing one is one character; anything else — an
+    // unpaired surrogate included — is the unit itself, which is what the specification says
+    // rather than an error.
+    if (0xd800..0xdc00).contains(&first)
+        && let Some(second) = units.get(at + 1).copied()
+        && (0xdc00..0xe000).contains(&second)
+    {
+        let combined =
+            0x1_0000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00);
+        return Value::number(f64::from(combined)).to_bits();
+    }
+    Value::number(f64::from(first)).to_bits()
+}
+
+/// `String.prototype.localeCompare`.
+///
+/// **Code-unit order, and the specification allows it.** A real collation is locale data this
+/// engine does not carry; what the corpus checks is that the answer is consistent and
+/// correctly signed, which this is. A wrong *order* for accented text is a worse answer than
+/// no method at all only if somebody believes it is localised — hence this note.
+extern "C" fn string_locale_compare(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot compare") {
+        return thrown;
+    }
+    let Some(text) = this_text(this_value) else {
+        return Value::number(0.0).to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let other = unsafe { argument(argc, argv, 0) };
+    let Some(other) = to_text(other) else {
+        return Value::number(0.0).to_bits();
+    };
+    let order = match code_units(&text).cmp(&code_units(&other)) {
+        std::cmp::Ordering::Less => -1.0,
+        std::cmp::Ordering::Equal => 0.0,
+        std::cmp::Ordering::Greater => 1.0,
+    };
+    Value::number(order).to_bits()
+}
+
+/// `String.prototype.substr(start, length)`.
+///
+/// **Not `substring` and not `slice`.** The second argument is a *count*, and a negative start
+/// counts from the end where `substring` would clamp it to zero — three methods that look
+/// alike and disagree on every edge.
+extern "C" fn string_substr(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return new_string("");
+    };
+    let units = code_units(&text);
+    let start = match integer_argument(argc, argv, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
+    #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+    let span = units.len() as f64;
+    let from = if start < 0.0 {
+        (span + start).max(0.0)
+    } else {
+        start.min(span)
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 1) };
+    let count = if Value::from_bits(given).is_undefined() {
+        span - from
+    } else {
+        match integer_argument(argc, argv, 1) {
+            Ok(count) => count.clamp(0.0, span - from),
+            Err(thrown) => return thrown,
+        }
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "both clamped into 0..=length just above"
+    )]
+    let (from, count) = (from as usize, count as usize);
+    new_string(&String::from_utf16_lossy(&units[from..from + count]))
+}
+
+/// `String.prototype.isWellFormed`.
+///
+/// **Always `true` here, and that is a property of the representation rather than an
+/// optimisation.** A string is stored as Rust `str`, which is UTF-8 and cannot hold a lone
+/// surrogate at all — so there is no ill-formed string for this to find. The honest answer is
+/// this one; the alternative is a UTF-16 string type, which is a much larger change and the
+/// place this would become interesting.
+extern "C" fn string_is_well_formed(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot inspect") {
+        return thrown;
+    }
+    boolean(true).to_bits()
+}
+
+/// `String.prototype.toWellFormed` — the identity, for the reason above.
+extern "C" fn string_to_well_formed(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = reject_nullish(this_value, "cannot convert") {
+        return thrown;
+    }
+    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(&text))
 }
 
 /// `String.prototype.match`.
@@ -5968,28 +6184,135 @@ extern "C" fn string_split(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let given = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
+    let limit = unsafe { argument(argc, argv, 1) };
+    let cap = if Value::from_bits(limit).is_undefined() {
+        usize::MAX
+    } else {
+        match coerce_number(limit) {
+            Ok(number) if number.is_finite() && number > 0.0 => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "checked finite and positive"
+                )]
+                let cap = number.min(f64::from(u32::MAX)) as usize;
+                cap
+            }
+            Ok(_) => 0,
+            Err(thrown) => return thrown,
+        }
+    };
+    // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let pieces: Vec<String> = match to_text(given) {
+        if cap == 0 {
+            return with_new_array(0, |array| array.to_value().to_bits());
+        }
+        // **A regular expression separator, recognised by its `source`.** Without this the
+        // pattern went through `ToString` and `"a1b".split(/[0-9]/)` looked for the literal
+        // text `/[0-9]/` — which is never there, so it answered the whole string and looked
+        // like a working call.
+        if let Some(source) = property_text(given, "source") {
+            let flags = property_text(given, "flags").unwrap_or_default();
+            let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
+                return one_piece_array(&text);
+            };
+            let Ok(mut compiled) = crisol_builtins::JsRegExp::new(&source, parsed) else {
+                return one_piece_array(&text);
+            };
+            // **An empty subject is decided by whether the pattern matches it**, not by the
+            // walk: `"".split(/x/)` is `[""]` and `"".split(/(?:)/)` is `[]`, and the loop
+            // below cannot tell those apart because it never runs.
+            if text.is_empty() {
+                if compiled.exec("").is_some() {
+                    return with_new_array(0, |array| array.to_value().to_bits());
+                }
+                return one_piece_array(&text);
+            }
+            let mut pieces: Vec<Option<String>> = Vec::new();
+            let mut cursor = 0;
+            for found in compiled.all_matches(&text) {
+                // A match starting at the end is past the last position the specification
+                // looks at, and a zero-width one where the cursor already is contributes
+                // nothing — without both, `"ab".split(/(?:)/)` gains a trailing `""`.
+                if found.start >= text.len() {
+                    break;
+                }
+                if found.end == cursor {
+                    continue;
+                }
+                pieces.push(Some(
+                    text.get(cursor..found.start).unwrap_or_default().to_owned(),
+                ));
+                // **The captures go into the result too**, which is what makes
+                // `"a1b".split(/([0-9])/)` three elements rather than two.
+                for group in &found.groups {
+                    pieces.push(
+                        group.map(|(start, end)| {
+                            text.get(start..end).unwrap_or_default().to_owned()
+                        }),
+                    );
+                }
+                cursor = found.end;
+                if pieces.len() >= cap {
+                    break;
+                }
+            }
+            if pieces.len() < cap {
+                pieces.push(Some(text.get(cursor..).unwrap_or_default().to_owned()));
+            }
+            pieces.truncate(cap);
+            return pieces_array(&pieces);
+        }
+
+        let pieces: Vec<Option<String>> = match to_text(given) {
             // **An empty separator splits into characters**, and no separator at all gives a
             // one-element array holding the whole string — not an empty one.
             Some(separator) if separator.is_empty() => {
-                text.chars().map(|c| c.to_string()).collect()
+                text.chars().map(|c| Some(c.to_string())).collect()
             }
-            Some(separator) => text.split(&separator).map(ToOwned::to_owned).collect(),
-            None => vec![text.clone()],
+            Some(separator) => text
+                .split(&separator)
+                .map(|piece| Some(piece.to_owned()))
+                .collect(),
+            None => vec![Some(text.clone())],
         };
-        with_new_array(pieces.len(), |array| {
-            for (index, piece) in pieces.iter().enumerate() {
-                let value = new_string(piece);
-                with_runtime(|runtime| {
-                    runtime
-                        .heap
-                        .set_element(array, index, Value::from_bits(value))
-                });
-            }
-            array.to_value().to_bits()
-        })
+        let mut pieces = pieces;
+        pieces.truncate(cap);
+        pieces_array(&pieces)
+    })
+}
+
+/// A one-element array holding `text`, which is what a separator that never matches gives.
+fn one_piece_array(text: &str) -> u64 {
+    with_new_array(1, |array| {
+        let value = new_string(text);
+        with_runtime(|runtime| {
+            runtime.heap.set_element(array, 0, Value::from_bits(value));
+        });
+        array.to_value().to_bits()
+    })
+}
+
+/// The pieces of a split, with `None` for a capture that did not participate.
+///
+/// **A group that did not match is `undefined`, not `""`.** `"ab".split(/(x)|b/)` has a hole
+/// in it, and filling the hole with an empty string is the kind of difference a test written
+/// against another engine notices and a reader does not.
+fn pieces_array(pieces: &[Option<String>]) -> u64 {
+    with_new_array(pieces.len(), |array| {
+        for (index, piece) in pieces.iter().enumerate() {
+            let value = match piece {
+                Some(text) => new_string(text),
+                None => Value::UNDEFINED.to_bits(),
+            };
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(array, index, Value::from_bits(value));
+            });
+        }
+        array.to_value().to_bits()
     })
 }
 
@@ -6258,6 +6581,8 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Reflect", "preventExtensions", reflect_prevent_extensions),
     ("Reflect", "apply", reflect_apply),
     ("Reflect", "construct", reflect_construct),
+    ("Map", "groupBy", map_group_by),
+    ("Error", "isError", error_is_error),
 ];
 
 /// Whether `value` is the exception signal, **clearing the pending throw if it is**.
@@ -7143,6 +7468,73 @@ extern "C" fn object_own_descriptor(
             });
         });
         descriptor
+    })
+}
+
+/// `Map.groupBy(items, classify)` — the same grouping, keyed by the value rather than a name.
+///
+/// **That is the whole difference from `Object.groupBy`**, and it is the reason both exist: an
+/// object's keys are strings, so grouping by `1` and by `"1"` collides there and does not
+/// here. Grouping by an object is only possible through this one.
+extern "C" fn map_group_by(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let items = unsafe { argument(argc, argv, 0) };
+        // SAFETY: as above.
+        let classify = unsafe { argument(argc, argv, 1) };
+        if let Some(thrown) = reject_nullish(items, "cannot group") {
+            return thrown;
+        }
+        if !is_callable(classify) {
+            return raise("a grouping needs a function", "TypeError");
+        }
+        let groups = new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get));
+        with_rooted(&[groups, items, classify], || {
+            let length = match indexed_length(items) {
+                Ok(length) => length,
+                Err(thrown) => return thrown,
+            };
+            for index in 0..length {
+                let value = indexed_get(items, index);
+                let arguments = [value, Value::number(index_as_f64(index)).to_bits()];
+                let key = with_rooted(&arguments, || {
+                    call_value(classify, Value::UNDEFINED.to_bits(), &arguments)
+                });
+                if Value::from_bits(key).is_exception() {
+                    return key;
+                }
+                // The group is read back and extended rather than rebuilt, so two items with
+                // the same key land in one array instead of the second replacing the first.
+                let read = [key];
+                let existing =
+                    with_rooted(&[value, key], || map_get(0, groups, 0, 1, read.as_ptr()));
+                let list = if elements_of(existing).is_some() {
+                    existing
+                } else {
+                    with_rooted(&[value, key], || crisol_create_array(0))
+                };
+                with_rooted(&[list, key, value], || {
+                    if let Some((array, count)) = elements_of(list) {
+                        with_runtime(|runtime| {
+                            runtime
+                                .heap
+                                .set_element(array, count, Value::from_bits(value));
+                        });
+                    }
+                    let write = [key, list];
+                    map_set(0, groups, 0, 2, write.as_ptr());
+                });
+            }
+            groups
+        })
     })
 }
 
@@ -10967,6 +11359,56 @@ fn indexed_get(value: u64, index: usize) -> u64 {
     unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) }
 }
 
+/// How many positions a method that *walks* an array-like has to visit.
+///
+/// **`ToLength`, which clamps at 2^53-1, not at 2^32-1.** The smaller clamp is right for an
+/// array — no array can be longer — and wrong for a plain object, whose `length` is whatever
+/// it says. The difference is observable rather than theoretical: test262 reverses
+/// `{length: 2 ** 53 + 2}` with a getter at the top and expects the *first* step to reach it,
+/// which a walk that clamped to four billion never does. It read `undefined` two billion
+/// times instead and was killed by the harness.
+///
+/// Separate from [`indexed_length`] because the two answer different questions. This one
+/// bounds a walk, and a walk of 2^53 steps that never throws does not finish — which the
+/// case timeout exists to name (D-205). `indexed_length` bounds an *allocation*, where the
+/// four-billion clamp is the point.
+fn walk_length(value: u64) -> Result<usize, u64> {
+    if let Some((_, length)) = elements_of(value) {
+        return Ok(length);
+    }
+    let key = "length";
+    // SAFETY: `key` is a live Rust string.
+    let asked = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
+    if Value::from_bits(asked).is_exception() {
+        return Err(asked);
+    }
+    let asked = coerce_number(asked)?;
+    if !asked.is_finite() || asked <= 0.0 {
+        return Ok(0);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to the largest integer a length may be"
+    )]
+    let length = asked.min(crisol_builtins::MAX_SAFE_INTEGER) as usize;
+    Ok(length)
+}
+
+/// The element at `index`, or the exception a getter raised reaching for it.
+///
+/// **A getter can throw, and the walkers have to stop when one does.** `indexed_get` answers
+/// the signal like any other value, which is right for a caller that stores it and wrong for
+/// a loop that keeps going — and "keeps going" over a length of 2^53 is not slow, it is
+/// stuck.
+fn indexed_get_checked(value: u64, index: usize) -> Result<u64, u64> {
+    let element = indexed_get(value, index);
+    if Value::from_bits(element).is_exception() {
+        return Err(element);
+    }
+    Ok(element)
+}
+
 /// Writes the element at `index` of an array-like.
 ///
 /// The counterpart of [`indexed_get`], and it exists for the same reason: **test262 applies
@@ -11215,11 +11657,18 @@ extern "C" fn array_reduce(
                 "TypeError",
             );
         } else {
-            (indexed_get(this_value, 0), 1)
+            match indexed_get_checked(this_value, 0) {
+                Ok(first) => (first, 1),
+                Err(thrown) => return thrown,
+            }
         };
 
         for index in start..length {
-            let element = with_rooted(&[accumulator], || indexed_get(this_value, index));
+            let element =
+                match with_rooted(&[accumulator], || indexed_get_checked(this_value, index)) {
+                    Ok(element) => element,
+                    Err(thrown) => return thrown,
+                };
             accumulator = with_rooted(&[accumulator, element], || {
                 call_value(
                     callback,
@@ -11451,14 +11900,24 @@ extern "C" fn array_reverse(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    let length = match indexed_length(this_value) {
+    let length = match walk_length(this_value) {
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
     for index in 0..length / 2 {
         let mirror = length - 1 - index;
-        let left = indexed_get(this_value, index);
-        let right = with_rooted(&[this_value, left], || indexed_get(this_value, mirror));
+        // **Lower then upper, which is the specification's order and is observable**: both
+        // may be getters, and which one throws first decides what the program sees.
+        let left = match indexed_get_checked(this_value, index) {
+            Ok(left) => left,
+            Err(thrown) => return thrown,
+        };
+        let right = match with_rooted(&[this_value, left], || {
+            indexed_get_checked(this_value, mirror)
+        }) {
+            Ok(right) => right,
+            Err(thrown) => return thrown,
+        };
         with_rooted(&[this_value, left, right], || {
             indexed_set(this_value, index, right);
             indexed_set(this_value, mirror, left);
@@ -11533,7 +11992,11 @@ extern "C" fn array_shift(
     let first = indexed_get(this_value, 0);
     with_rooted(&[this_value, first], || {
         for index in 1..length {
-            let moved = indexed_get(this_value, index);
+            let Ok(moved) = indexed_get_checked(this_value, index) else {
+                // A getter threw. The move stops here rather than reading past it; the
+                // signal reaches the caller through the value this answers.
+                break;
+            };
             with_rooted(&[moved], || indexed_set(this_value, index - 1, moved));
         }
         indexed_delete(this_value, length - 1);
@@ -11589,7 +12052,9 @@ extern "C" fn array_unshift(
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
         for index in (0..length).rev() {
-            let moved = indexed_get(this_value, index);
+            let Ok(moved) = indexed_get_checked(this_value, index) else {
+                break;
+            };
             with_rooted(&[moved], || indexed_set(this_value, index + added, moved));
         }
         for position in 0..added {
