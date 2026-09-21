@@ -5374,3 +5374,24 @@ argument count rather than by the value — and they were not. The consequence w
 wrong string: `new String()` wrapped nine characters, so it had nine own enumerable properties
 and behaved as an array-like of letters. That is what `Object.create({}, new String())` tripped
 over, and the reason it surfaced as a descriptor error three layers away.
+
+## D-191
+
+**A numeric argument is coerced, truncated, and able to refuse.**
+
+Status: Accepted
+
+Ten methods read a positional argument with `Value::as_number().unwrap_or(0.0)`, which answers
+zero for a string, a symbol and an object alike. So `"abc".charCodeAt("1")` read character
+zero — and looked like a working call, because the answer was a plausible character code.
+
+`integer_argument` is `ToIntegerOrInfinity` built on the fallible coercion (D-189), and it
+fixes three separate things at once:
+
+- **A string or an object converts**, rather than reading as zero.
+- **It truncates.** `"abc".charAt(1.7)` is `"b"`; indexing with the raw number left whatever
+  the cast did with the fraction, which is right for every whole number anybody tests by hand.
+- **`NaN` is zero and a symbol is an error**, which were the same answer before.
+
+`charAt(NaN)` was separately wrong in the other direction — it took the `!is_finite` branch and
+answered `""` where the specification says the first character.

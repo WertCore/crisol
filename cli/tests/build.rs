@@ -6828,3 +6828,55 @@ fn string_with_no_argument_is_empty() {
         "7",
     );
 }
+
+/// **A numeric argument is coerced, truncated, and able to refuse.** Reading it with
+/// `as_number` answered zero for a string, a symbol and an object alike — so
+/// `"abc".charCodeAt("1")` read character zero and looked like a working call.
+#[test]
+fn a_position_argument_is_coerced() {
+    check(
+        "char-at-string-position",
+        "return \"abc\".charAt(\"1\");",
+        "b",
+    );
+    check(
+        "char-code-at-string-position",
+        "return \"abc\".charCodeAt(\"1\");",
+        "98",
+    );
+    // `NaN` is zero, which is what makes a missing argument mean the first character.
+    check("char-at-no-argument", "return \"abc\".charAt();", "a");
+    check("char-at-nan", "return \"abc\".charAt(NaN);", "a");
+    check("char-code-at-nan", "return \"abc\".charCodeAt(NaN);", "97");
+    // And it truncates rather than indexing with the fraction.
+    check("char-at-fraction", "return \"abc\".charAt(1.7);", "b");
+    check("string-at-fraction", "return \"abc\".at(1.9);", "b");
+    check("array-at-fraction", "return [7, 8, 9].at(1.7);", "8");
+    // An object converts through `valueOf`.
+    check(
+        "char-at-object-position",
+        "return \"abc\".charAt({valueOf: function () { return 2; }});",
+        "c",
+    );
+    // A symbol refuses, wherever a number was wanted.
+    check(
+        "char-at-symbol-position",
+        "try { \"abc\".charAt(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "array-at-symbol-position",
+        "try { [1].at(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "repeat-symbol-count",
+        "try { \"a\".repeat(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "pad-start-string-length",
+        "return \"a\".padStart(\"3\", \"-\");",
+        "--a",
+    );
+}

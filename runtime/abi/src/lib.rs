@@ -1414,13 +1414,10 @@ extern "C" fn array_at(
     let Some((array, length)) = elements_of(this_value) else {
         return Value::UNDEFINED.to_bits();
     };
-    // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) })
-        .as_number()
-        .unwrap_or(0.0);
-    if wanted.is_nan() {
-        return element_at(array, 0);
-    }
+    let wanted = match integer_argument(argc, argv, 0) {
+        Ok(wanted) => wanted,
+        Err(thrown) => return thrown,
+    };
     #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
     let span = length as f64;
     let resolved = if wanted < 0.0 { span + wanted } else { wanted };
@@ -4270,11 +4267,10 @@ extern "C" fn string_at(
         return Value::UNDEFINED.to_bits();
     };
     let units = code_units(&text);
-    // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) })
-        .as_number()
-        .unwrap_or(0.0);
-    let wanted = if wanted.is_nan() { 0.0 } else { wanted };
+    let wanted = match integer_argument(argc, argv, 0) {
+        Ok(wanted) => wanted,
+        Err(thrown) => return thrown,
+    };
     #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
     let span = units.len() as f64;
     let resolved = if wanted < 0.0 { span + wanted } else { wanted };
@@ -4318,10 +4314,10 @@ fn pad_with(this_value: u64, argc: u64, argv: *const u64, at_start: bool) -> u64
         return new_string("");
     };
     let units = code_units(&text);
-    // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let target = Value::from_bits(unsafe { argument(argc, argv, 0) })
-        .as_number()
-        .unwrap_or(0.0);
+    let target = match integer_argument(argc, argv, 0) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -4499,10 +4495,10 @@ extern "C" fn string_char_at(
         return new_string("");
     };
     let units = code_units(&text);
-    // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let index = Value::from_bits(unsafe { argument(argc, argv, 0) })
-        .as_number()
-        .unwrap_or(0.0);
+    let index = match integer_argument(argc, argv, 0) {
+        Ok(index) => index,
+        Err(thrown) => return thrown,
+    };
     // **Out of range is the empty string, not `undefined`**, which is what distinguishes
     // `charAt` from indexing.
     if index < 0.0 || !index.is_finite() {
@@ -4532,10 +4528,10 @@ extern "C" fn string_char_code_at(
         return from_number(f64::NAN);
     };
     let units = code_units(&text);
-    // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let index = Value::from_bits(unsafe { argument(argc, argv, 0) })
-        .as_number()
-        .unwrap_or(0.0);
+    let index = match integer_argument(argc, argv, 0) {
+        Ok(index) => index,
+        Err(thrown) => return thrown,
+    };
     if index < 0.0 || !index.is_finite() {
         return from_number(f64::NAN);
     }
@@ -4786,10 +4782,10 @@ extern "C" fn string_repeat(
     let Some(text) = this_text(this_value) else {
         return new_string("");
     };
-    // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let count = Value::from_bits(unsafe { argument(argc, argv, 0) })
-        .as_number()
-        .unwrap_or(0.0);
+    let count = match integer_argument(argc, argv, 0) {
+        Ok(count) => count,
+        Err(thrown) => return thrown,
+    };
     // A negative or infinite count is a `RangeError`, which is worth raising rather than
     // silently producing an empty string that reads like a legitimate answer.
     if count < 0.0 || !count.is_finite() {
@@ -9094,6 +9090,25 @@ fn indexed_length(value: u64) -> Result<usize, u64> {
     )]
     let length = asked.min(f64::from(u32::MAX)) as usize;
     Ok(length)
+}
+
+/// `ToIntegerOrInfinity` on argument `position`, or the reason it has no number.
+///
+/// **Absent is zero, and so is `NaN`** — the rule that makes `"abc".charAt()` the first
+/// character rather than an error. A symbol is neither, and neither is an object whose
+/// conversion fails, so the answer has to be able to say so.
+///
+/// **And it truncates.** `"abc".charAt(1.7)` is `"b"`; reading the argument as a raw number
+/// and indexing with it gave whatever the cast did with the fraction, which was right for
+/// every whole number anybody tests by hand.
+fn integer_argument(argc: u64, argv: *const u64, position: usize) -> Result<f64, u64> {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, position) };
+    let number = coerce_number(value)?;
+    if number.is_nan() {
+        return Ok(0.0);
+    }
+    Ok(number.trunc())
 }
 
 /// `ToPrimitive` — an object as the primitive it stands for, or the reason it has none.
