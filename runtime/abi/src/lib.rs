@@ -2953,9 +2953,7 @@ fn date_set(this_value: u64, argc: u64, argv: *const u64, first: usize, count: u
             // set the date to `NaN` — and a `valueOf` that threw was swallowed. Every
             // argument is converted, in order, before any of them is used: the specification
             // says so, and it is observable whenever two of them have effects.
-            if let Err(thrown) = coerce_number(value).map(|number| *slot = number) {
-                return Err(thrown);
-            }
+            *slot = coerce_number(value)?;
         }
         Ok(())
     });
