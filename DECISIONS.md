@@ -5712,3 +5712,24 @@ is dropped there and belongs to `getOwnPropertySymbols`, exactly as for an ordin
 `Object.preventExtensions` *natives*, not on the `is_extensible` and `prevent_extensions`
 helpers — those are on the element-write path, where the cost is one shape lookup and has to
 stay that way. A proxy never reaches them: `proxy_store` answers first.
+
+## D-203
+
+**A relative index is coerced, and a throw from the coercion is the answer.**
+
+Status: Accepted
+
+`relative_index` — shared by `slice`, `splice`, `toSpliced`, `copyWithin`, `fill` and
+`String.prototype.slice` — read its argument with `as_number` and fell back to the default
+when that answered `None`. `None` covers `undefined`, but it also covers a string, an object
+and a symbol, so `[1, 2, 3].slice("1")` started at zero and a `valueOf` that throws never ran
+at all.
+
+**Only `undefined` takes the default.** That is what makes `slice(1)` and `slice(1, undefined)`
+the same call, and it is the whole of the rule — `null` is zero, a string converts, and a
+symbol is an error. The same applied to `splice`'s delete count beside it.
+
+This is the third cluster of the same shape, after the length read (D-189) and the positional
+arguments (D-191): a conversion written as `as_number().unwrap_or(…)` is a silent default
+wherever the specification has a coercion, and the tests that catch it are the ones asserting
+that a throwing `valueOf` is *reached*, not the ones checking the ordinary value.

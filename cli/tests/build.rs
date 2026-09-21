@@ -7468,3 +7468,73 @@ fn a_proxy_reports_which_of_its_keys_enumerate() {
         "x",
     );
 }
+
+/// **A relative index is coerced, and a throw from the coercion is the answer.** Reading it
+/// with `as_number` and falling back on `None` swallowed a string, an object and a symbol
+/// alike — so `[1, 2, 3].slice("1")` started at zero and a throwing `valueOf` never ran.
+#[test]
+fn a_relative_index_is_coerced() {
+    check(
+        "slice-string-start",
+        "return [1, 2, 3].slice(\"1\").join(\",\");",
+        "2,3",
+    );
+    check(
+        "slice-object-start",
+        "return [1, 2, 3].slice({valueOf: function () { return 2; }}).join(\",\");",
+        "3",
+    );
+    // Only `undefined` takes the default, which is what makes these the same call.
+    check(
+        "slice-undefined-end",
+        "return [1, 2, 3].slice(1, undefined).join(\",\");",
+        "2,3",
+    );
+    check(
+        "slice-no-end",
+        "return [1, 2, 3].slice(1).join(\",\");",
+        "2,3",
+    );
+    // `null` is zero, not the default.
+    check(
+        "slice-null-end",
+        "return [1, 2, 3].slice(0, null).length;",
+        "0",
+    );
+    // A throw from the coercion reaches the program.
+    check(
+        "slice-throwing-start",
+        "try { [1, 2].slice({valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "copy-within-throwing-end",
+        "try { [1, 2, 3].copyWithin(0, 0, \
+                 {valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "splice-throwing-count",
+        "try { [1, 2, 3].splice(0, {valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "fill-symbol-start",
+        "try { [1, 2].fill(0, Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // And the ordinary cases still work.
+    check(
+        "splice-count-coerced",
+        "return [1, 2, 3].splice(0, \"2\").join(\",\");",
+        "1,2",
+    );
+    check(
+        "string-slice-coerced",
+        "return \"abcd\".slice(\"1\", \"3\");",
+        "bc",
+    );
+}

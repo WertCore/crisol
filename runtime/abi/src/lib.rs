@@ -916,11 +916,20 @@ extern "C" fn array_copy_within(
         return this_value;
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let target = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    let target = match relative_index(unsafe { argument(argc, argv, 0) }, length, 0) {
+        Ok(target) => target,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: as above.
-    let start = relative_index(unsafe { argument(argc, argv, 1) }, length, 0);
+    let start = match relative_index(unsafe { argument(argc, argv, 1) }, length, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: as above.
-    let end = relative_index(unsafe { argument(argc, argv, 2) }, length, length);
+    let end = match relative_index(unsafe { argument(argc, argv, 2) }, length, length) {
+        Ok(end) => end,
+        Err(thrown) => return thrown,
+    };
 
     let taken = end.saturating_sub(start).min(length - target);
     // Read before writing, because the source and destination runs may overlap — copying in
@@ -996,14 +1005,19 @@ extern "C" fn array_to_spliced(
         return Value::UNDEFINED.to_bits();
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    let start = match relative_index(unsafe { argument(argc, argv, 0) }, length, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
     let removing = if argc < 2 {
         length - start
     } else {
-        // SAFETY: as above.
-        let asked = Value::from_bits(unsafe { argument(argc, argv, 1) })
-            .as_number()
-            .unwrap_or(0.0);
+        // Coerced, and a throw from the coercion is the answer — the same rule as the start
+        // index beside it.
+        let asked = match integer_argument(argc, argv, 1) {
+            Ok(asked) => asked,
+            Err(thrown) => return thrown,
+        };
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -1210,17 +1224,22 @@ extern "C" fn array_splice(
         return Value::UNDEFINED.to_bits();
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    let start = match relative_index(unsafe { argument(argc, argv, 0) }, length, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
     // **No second argument removes everything from `start` on**; a second argument of
     // `undefined` removes nothing. The two are different, which is why `argc` is read rather
     // than the value.
     let removing = if argc < 2 {
         length - start
     } else {
-        // SAFETY: as above.
-        let asked = Value::from_bits(unsafe { argument(argc, argv, 1) })
-            .as_number()
-            .unwrap_or(0.0);
+        // Coerced, and a throw from the coercion is the answer — the same rule as the start
+        // index beside it.
+        let asked = match integer_argument(argc, argv, 1) {
+            Ok(asked) => asked,
+            Err(thrown) => return thrown,
+        };
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -5372,9 +5391,15 @@ extern "C" fn string_slice(
     };
     let units = code_units(&text);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let start = relative_index(unsafe { argument(argc, argv, 0) }, units.len(), 0);
+    let start = match relative_index(unsafe { argument(argc, argv, 0) }, units.len(), 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: as above.
-    let end = relative_index(unsafe { argument(argc, argv, 1) }, units.len(), units.len());
+    let end = match relative_index(unsafe { argument(argc, argv, 1) }, units.len(), units.len()) {
+        Ok(end) => end,
+        Err(thrown) => return thrown,
+    };
     units_between(&units, start, end)
 }
 
@@ -9964,12 +9989,18 @@ fn same_value(element: Value, wanted: Value) -> bool {
 /// **A negative index counts from the end** — `[1,2,3].slice(-1)` is `[3]` — and anything past
 /// either end clamps rather than erroring. `undefined` takes `fallback`, which is why `slice()`
 /// with no arguments is the whole array and `slice(1)` runs to the end.
-fn relative_index(value: u64, length: usize, fallback: usize) -> usize {
-    let Some(number) = Value::from_bits(value).as_number() else {
-        return fallback;
-    };
+fn relative_index(value: u64, length: usize, fallback: usize) -> Result<usize, u64> {
+    // **Only `undefined` takes the default.** That is what makes `slice(1)` and
+    // `slice(1, undefined)` the same call — and the reason the others cannot join it: reading
+    // `as_number` and falling back on `None` swallowed a string, an object and a symbol
+    // alike, so `[1, 2, 3].slice("1")` started at zero and a throwing `valueOf` never ran at
+    // all. A throw from a coercion is the answer, not a default.
+    if Value::from_bits(value).is_undefined() {
+        return Ok(fallback);
+    }
+    let number = coerce_number(value)?;
     if number.is_nan() {
-        return 0;
+        return Ok(0);
     }
     #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
     let span = length as f64;
@@ -9984,7 +10015,7 @@ fn relative_index(value: u64, length: usize, fallback: usize) -> usize {
         reason = "clamped into 0..=length just above"
     )]
     let index = resolved as usize;
-    index
+    Ok(index)
 }
 
 /// How many elements an **array-like** has.
@@ -10602,9 +10633,15 @@ extern "C" fn array_slice(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let start = relative_index(unsafe { argument(argc, argv, 0) }, length, 0);
+    let start = match relative_index(unsafe { argument(argc, argv, 0) }, length, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: as above.
-    let end = relative_index(unsafe { argument(argc, argv, 1) }, length, length);
+    let end = match relative_index(unsafe { argument(argc, argv, 1) }, length, length) {
+        Ok(end) => end,
+        Err(thrown) => return thrown,
+    };
     let taken = end.saturating_sub(start);
 
     // SAFETY: as above.
@@ -10903,9 +10940,15 @@ extern "C" fn array_fill(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
-    let start = relative_index(unsafe { argument(argc, argv, 1) }, length, 0);
+    let start = match relative_index(unsafe { argument(argc, argv, 1) }, length, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: as above.
-    let end = relative_index(unsafe { argument(argc, argv, 2) }, length, length);
+    let end = match relative_index(unsafe { argument(argc, argv, 2) }, length, length) {
+        Ok(end) => end,
+        Err(thrown) => return thrown,
+    };
     with_runtime(|runtime| {
         for index in start..end {
             runtime
