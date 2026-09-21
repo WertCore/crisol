@@ -7439,3 +7439,32 @@ fn a_proxy_traps_the_reflective_operations() {
         "a,b",
     );
 }
+
+/// **A proxy's enumerability comes from its descriptor, key by key** — its own shape holds
+/// nothing, so filtering by that dropped every name `ownKeys` reported.
+#[test]
+fn a_proxy_reports_which_of_its_keys_enumerate() {
+    check(
+        "proxy-keys-forwards",
+        "let p = new Proxy({a: 1, b: 2}, {}); return Object.keys(p).join(\",\");",
+        "a,b",
+    );
+    // A non-enumerable property on the target is left out, as it would be without the proxy.
+    check(
+        "proxy-keys-skips-non-enumerable",
+        "let t = {a: 1}; Object.defineProperty(t, \"h\", {value: 2}); \
+         let p = new Proxy(t, {}); return Object.keys(p).join(\",\");",
+        "a",
+    );
+    // And a trap can make a key enumerable that the target has no opinion about.
+    check(
+        "proxy-keys-through-a-descriptor-trap",
+        "let p = new Proxy({}, { \
+             ownKeys: function () { return [\"x\"]; }, \
+             getOwnPropertyDescriptor: function () { \
+                 return {value: 1, enumerable: true, configurable: true}; } \
+         }); \
+         return Object.keys(p).join(\",\");",
+        "x",
+    );
+}

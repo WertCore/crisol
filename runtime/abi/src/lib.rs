@@ -6979,6 +6979,24 @@ fn enumerable_keys(object: u64) -> Vec<String> {
     let Some(handle) = handle_of(object) else {
         return Vec::new();
     };
+    // **A proxy is asked, key by key.** Its own shape holds nothing, so filtering by that
+    // dropped every name `ownKeys` reported — `Object.keys` on a proxy answered empty however
+    // many properties the target had. The specification says to ask
+    // `getOwnPropertyDescriptor` for each key, which is also the only way a trap can make a
+    // property enumerable that the target does not.
+    if let Some((target, handler)) = proxy_parts(object) {
+        return own_keys(object)
+            .into_iter()
+            .filter(|name| {
+                let key = new_string(name);
+                let descriptor =
+                    with_rooted(&[object, key], || proxy_descriptor(target, handler, key));
+                handle_of(descriptor).is_some_and(|_| {
+                    is_truthy(Value::from_bits(property_of(descriptor, "enumerable")))
+                })
+            })
+            .collect();
+    }
     own_keys(object)
         .into_iter()
         .filter(|name| match own_property(object, name) {
