@@ -7019,3 +7019,36 @@ fn for_of_uses_the_iterator_protocol() {
         "TypeError",
     );
 }
+
+/// **`Array.prototype[Symbol.iterator]` *is* `Array.prototype.values`** — the same function
+/// object, not a copy of it, which is what the specification says and what a test comparing
+/// the two would catch.
+#[test]
+fn the_built_ins_answer_to_symbol_iterator() {
+    check(
+        "array-symbol-iterator-is-values",
+        "return Array.prototype[Symbol.iterator] === Array.prototype.values;",
+        "true",
+    );
+    // Not enumerable, so it does not show up in a list of an array's own names.
+    check(
+        "symbol-iterator-is-not-enumerable",
+        "return Object.keys(Array.prototype).length;",
+        "0",
+    );
+    // Reachable through the protocol, which is the point of defining it — the fast path in
+    // `crisol_iterate` would answer for an array either way, so this asks the symbol.
+    check(
+        "array-iterator-through-the-symbol",
+        "let it = [1, 2, 3][Symbol.iterator](); \
+         return it.next().value + \",\" + it.next().value;",
+        "1,2",
+    );
+    // `Map` and `Set` have no `values` or `entries` to alias yet, so they are not wired —
+    // asserted here so the gap is visible rather than assumed closed.
+    check(
+        "set-has-no-symbol-iterator-yet",
+        "return typeof Set.prototype[Symbol.iterator];",
+        "undefined",
+    );
+}

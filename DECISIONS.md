@@ -5471,3 +5471,26 @@ object to step, which is a change to the lowering and not to this.
 The errors are the ones the protocol specifies — a `next` that is not callable, a step that is
 not an object — and a throw from inside `next` reaches the program rather than quietly ending
 the loop, which is the failure that would look like an empty collection.
+
+## D-195
+
+**A well-known-symbol method is an alias, not a second function.**
+
+Status: Accepted
+
+`Array.prototype[Symbol.iterator]` **is** `Array.prototype.values` — the specification says
+the same function object, and a test comparing the two would catch a copy. So the wiring reads
+the method back off the prototype and defines it a second time under the symbol key, rather
+than making another native that does the same thing.
+
+It runs after `build_globals` because it needs both halves: the prototypes and the well-known
+symbols, and the symbols are made inside that.
+
+**Only `Array.prototype` is wired**, because an alias needs something to alias. `Map` and
+`Set` have no `values` or `entries` yet, and `String.prototype`'s iteration is the character
+walk `crisol_iterate` already performs — pointing the symbol at some other method would be
+worse than leaving the fast path to answer. The absence is asserted in the acceptance suite so
+it stays visible rather than being assumed closed.
+
+The symbol is added to the permanent key roots (D-192) even though it is also reachable from
+`Symbol.iterator`, because a program can delete that property and the shapes would outlive it.

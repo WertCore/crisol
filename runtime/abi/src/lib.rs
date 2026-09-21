@@ -7537,7 +7537,96 @@ impl Runtime {
         runtime.build_collection_prototypes();
         runtime.build_array_prototype();
         runtime.build_globals();
+        // **Last, because it needs both halves.** A symbol-keyed method needs the prototypes
+        // *and* the well-known symbols, and the symbols are made inside `build_globals`.
+        runtime.build_symbol_keyed_methods();
         runtime
+    }
+
+    /// Hangs the well-known-symbol methods on the prototypes that answer to them.
+    ///
+    /// **These are aliases, not new functions.** `Array.prototype[Symbol.iterator]` *is*
+    /// `Array.prototype.values` — the specification says the same function object, and a test
+    /// comparing the two would catch a copy. So each is read back off the prototype and
+    /// defined a second time under the symbol.
+    fn build_symbol_keyed_methods(&self) {
+        let Some(globals) = GLOBALS.with(std::cell::Cell::get) else {
+            return;
+        };
+        let Some(symbol) = self.global_object(globals, "Symbol") else {
+            return;
+        };
+        let iterator = {
+            let key = PropertyKey::new("iterator");
+            self.heap
+                .shape_of(symbol)
+                .and_then(|shape| self.shapes.borrow().lookup(shape, &key))
+                .and_then(|slot| self.heap.get(symbol, slot.index()))
+        };
+        let Some(iterator) = iterator.and_then(|value| value.as_address()) else {
+            return;
+        };
+        let key = PropertyKey::symbol(iterator, "Symbol.iterator");
+        // Rooted like any other symbol a shape names (D-192). It is also reachable from
+        // `Symbol.iterator`, but a program may delete that and the shapes would outlive it.
+        KEY_SYMBOLS.with(|symbols| {
+            if let Ok(mut entries) = symbols.try_borrow_mut() {
+                entries.insert(Value::symbol(iterator).to_bits());
+            }
+        });
+        // **Only `Array.prototype` for now**, because an alias needs something to alias.
+        // `Map` and `Set` have no `values` or `entries` yet, and `String.prototype`'s
+        // iteration is the character walk `crisol_iterate` already performs — pointing the
+        // symbol at some other method would be worse than leaving the fast path to answer.
+        // The loop is a loop because the list is the part that grows.
+        for (cell, name) in [(&ARRAY_PROTOTYPE, "values")] {
+            let Some(prototype) = cell.with(std::cell::Cell::get) else {
+                continue;
+            };
+            let existing = {
+                let named = PropertyKey::new(name);
+                self.heap
+                    .shape_of(prototype)
+                    .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                    .and_then(|slot| self.heap.get(prototype, slot.index()))
+            };
+            let Some(method) = existing else {
+                continue;
+            };
+            self.define_keyed(prototype, &key, method);
+        }
+    }
+
+    /// Writes `value` under a key that may name a symbol, with a method's attributes.
+    ///
+    /// The named `define` takes a `&str`, which a symbol has no identifying one of — see
+    /// D-193, where routing one through its description made two symbols the same property.
+    fn define_keyed(&self, object: GcRef, key: &PropertyKey, value: Value) {
+        let Some(current) = self.heap.shape_of(object) else {
+            return;
+        };
+        let (shape, slot, width) = {
+            let mut shapes = self.shapes.borrow_mut();
+            let shape = shapes.add(current, key);
+            let Some(slot) = shapes.lookup(shape, key) else {
+                return;
+            };
+            (shape, slot, shapes.len(shape) as usize)
+        };
+        if shape != current {
+            self.heap.transition(object, shape, width);
+        }
+        self.heap.set(object, slot.index(), value);
+        self.heap.set_attributes(
+            object,
+            slot.index(),
+            crisol_value::Attributes {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+            },
+        );
     }
 
     /// Writes `value` as a property of `object`, transitioning its shape.
