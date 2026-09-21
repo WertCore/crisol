@@ -138,7 +138,25 @@ struct Scope {
     /// Per scope, because slot numbers restart in every function — slot zero is a different
     /// variable in each one, so a single set would confuse them.
     cells: std::collections::HashSet<u32>,
+    /// Where an unlabelled `break` goes, innermost last.
+    breaks: Vec<BlockId>,
+    /// Where a raised exception goes, innermost last. Empty means out of the function.
+    handlers: Vec<BlockId>,
+    /// Where `continue` goes, innermost last. Separate from `breaks` because a `switch` is a
+    /// `break` target and not a `continue` one.
+    continues: Vec<BlockId>,
 }
+
+// **The three jump-target stacks live here and not on `Lowering`, because a `BlockId` names a
+// block *within one function* and nothing about the type says which.** Held module-wide, a
+// function defined inside a `try` inherited the enclosing function's catch block — and since
+// block numbering restarts per function, that id also existed in the nested one, so the
+// verifier's `NoSuchBlock` check saw nothing wrong and the jump silently went to a block of
+// the nested function's own. For `[1, 2].slice({valueOf: function () { throw … }})` the id
+// landed on the very block doing the jumping, which Cranelift emitted as `b .`: the program
+// did not throw, it spun for ever (D-206). Per-scope, the stacks start empty for every nested
+// function and an arrow, which is also what the language says — a `throw` inside a function
+// leaves that function, and an enclosing `try` catches it at the *call*, not at the throw.
 
 struct Lowering {
     functions: Vec<Function>,
@@ -152,13 +170,6 @@ struct Lowering {
     /// An arrow is absent from this, which is what makes it inherit the enclosing function's —
     /// the same rule `this` follows, and it falls out of the lookup rather than being a case.
     binds_arguments: Vec<usize>,
-    /// Where an unlabelled `break` goes, innermost last.
-    breaks: Vec<BlockId>,
-    /// Where a raised exception goes, innermost last. Empty means out of the function.
-    handlers: Vec<BlockId>,
-    /// Where `continue` goes, innermost last. Separate from `breaks` because a `switch` is a
-    /// `break` target and not a `continue` one.
-    continues: Vec<BlockId>,
 }
 
 /// The property a cell keeps its value in.
@@ -180,9 +191,6 @@ impl Lowering {
             functions: vec![function],
             shared: std::collections::HashSet::new(),
             binds_arguments: Vec::new(),
-            breaks: Vec::new(),
-            handlers: Vec::new(),
-            continues: Vec::new(),
             scopes: vec![Scope {
                 function: 0,
                 current: entry,
@@ -191,6 +199,9 @@ impl Lowering {
                 next_slot: 0,
                 captures: Vec::new(),
                 cells: std::collections::HashSet::new(),
+                breaks: Vec::new(),
+                handlers: Vec::new(),
+                continues: Vec::new(),
             }],
             unsupported: Vec::new(),
         };
@@ -448,11 +459,11 @@ impl Lowering {
         );
         self.bind_loop_variable(left, name);
 
-        self.breaks.push(exit);
-        self.continues.push(step);
+        self.scope_mut().breaks.push(exit);
+        self.scope_mut().continues.push(step);
         self.statement(body_statement);
-        self.breaks.pop();
-        self.continues.pop();
+        self.scope_mut().breaks.pop();
+        self.scope_mut().continues.pop();
         self.terminate(Terminator::Jump {
             target: step,
             args: Vec::new(),
@@ -562,11 +573,11 @@ impl Lowering {
         }
 
         self.switch_to(body);
-        self.breaks.push(exit);
-        self.continues.push(update);
+        self.scope_mut().breaks.push(exit);
+        self.scope_mut().continues.push(update);
         self.statement(&statement.body);
-        self.breaks.pop();
-        self.continues.pop();
+        self.scope_mut().breaks.pop();
+        self.scope_mut().continues.pop();
         self.terminate(Terminator::Jump {
             target: update,
             args: Vec::new(),
@@ -613,7 +624,7 @@ impl Lowering {
         });
 
         self.switch_to(unwind);
-        match self.handlers.last().copied() {
+        match self.scope().handlers.last().copied() {
             Some(handler) => self.terminate(Terminator::Jump {
                 target: handler,
                 args: Vec::new(),
@@ -643,11 +654,11 @@ impl Lowering {
         let handler = self.new_block();
         let end = self.new_block();
 
-        self.handlers.push(handler);
+        self.scope_mut().handlers.push(handler);
         for inner in &statement.block.body {
             self.statement(inner);
         }
-        self.handlers.pop();
+        self.scope_mut().handlers.pop();
         self.terminate(Terminator::Jump {
             target: end,
             args: Vec::new(),
@@ -736,7 +747,7 @@ impl Lowering {
             args: Vec::new(),
         });
 
-        self.breaks.push(end);
+        self.scope_mut().breaks.push(end);
         for (index, case) in statement.cases.iter().enumerate() {
             self.switch_to(bodies[index]);
             for inner in &case.consequent {
@@ -749,7 +760,7 @@ impl Lowering {
                 args: Vec::new(),
             });
         }
-        self.breaks.pop();
+        self.scope_mut().breaks.pop();
         self.switch_to(end);
     }
 
@@ -1128,11 +1139,11 @@ impl Lowering {
                 });
 
                 self.switch_to(body);
-                self.breaks.push(exit);
-                self.continues.push(header);
+                self.scope_mut().breaks.push(exit);
+                self.scope_mut().continues.push(header);
                 self.statement(&statement.body);
-                self.breaks.pop();
-                self.continues.pop();
+                self.scope_mut().breaks.pop();
+                self.scope_mut().continues.pop();
                 self.terminate(Terminator::Jump {
                     target: header,
                     args: Vec::new(),
@@ -1155,13 +1166,13 @@ impl Lowering {
                 });
 
                 self.switch_to(body);
-                self.breaks.push(exit);
+                self.scope_mut().breaks.push(exit);
                 // `continue` goes to the *test*, not back to the top — it ends this iteration
                 // rather than skipping the condition.
-                self.continues.push(header);
+                self.scope_mut().continues.push(header);
                 self.statement(&statement.body);
-                self.breaks.pop();
-                self.continues.pop();
+                self.scope_mut().breaks.pop();
+                self.scope_mut().continues.pop();
                 self.terminate(Terminator::Jump {
                     target: header,
                     args: Vec::new(),
@@ -1182,7 +1193,7 @@ impl Lowering {
             Statement::ContinueStatement(statement) => {
                 if statement.label.is_some() {
                     self.note("labelled continue", statement.span.start);
-                } else if let Some(target) = self.continues.last().copied() {
+                } else if let Some(target) = self.scope().continues.last().copied() {
                     self.terminate(Terminator::Jump {
                         target,
                         args: Vec::new(),
@@ -1223,7 +1234,7 @@ impl Lowering {
                     // a block. Refused rather than treated as an unlabelled one, which would
                     // leave the wrong construct.
                     self.note("labelled break", statement.span.start);
-                } else if let Some(target) = self.breaks.last().copied() {
+                } else if let Some(target) = self.scope().breaks.last().copied() {
                     self.terminate(Terminator::Jump {
                         target,
                         args: Vec::new(),
@@ -1818,6 +1829,9 @@ impl Lowering {
             next_slot: 0,
             captures: Vec::new(),
             cells: std::collections::HashSet::new(),
+            breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
         });
 
         if binds_this {
@@ -2008,6 +2022,9 @@ impl Lowering {
             next_slot: 0,
             captures: Vec::new(),
             cells: std::collections::HashSet::new(),
+            breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
         });
         self.declare("this");
         self.terminate(Terminator::Return(None));

@@ -932,6 +932,50 @@ fn a_throw_from_a_catch_reaches_the_outer_handler() {
     );
 }
 
+/// A function *written inside* a `try` does not throw into that `try`'s handler.
+///
+/// The enclosing `catch` is reached by the **call**, not by the `throw` — which is why a
+/// function body must be lowered with no handler in scope. Lowered with one, its unwind block
+/// jumped to a `BlockId` belonging to the enclosing function; block numbering restarts per
+/// function, so that id named a real block *here* and the verifier saw nothing wrong. When it
+/// named the jumping block itself the result was `b .` — a program that spun instead of
+/// throwing, for ever (D-206).
+///
+/// Three cases because three stacks leaked, and only the first was reachable through a
+/// throw: the second calls the function from outside the `try` entirely, where the handler
+/// must not apply either, and the third is the same leak through a loop rather than a `try`.
+#[test]
+fn a_function_written_inside_a_try_has_no_handler_of_its_own() {
+    check(
+        "throw-in-function-defined-in-try",
+        "try { (function () { throw new RangeError(\"x\"); })(); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // Defined inside the `try`, called after it: there is no handler at all by then, so a
+    // lowering that kept one would jump into a finished construct.
+    check(
+        "throw-in-function-escaping-its-try",
+        "let f; try { f = function () { throw new RangeError(\"y\"); }; } catch (e) {} \
+         try { f(); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "throw-in-function-defined-in-a-loop",
+        "let f; for (let i = 0; i < 1; i = i + 1) { \
+             f = function () { throw new RangeError(\"z\"); }; } \
+         try { f(); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // The ordinary case in the same position, which is what says the handler was removed
+    // rather than the propagation broken.
+    check(
+        "no-throw-in-function-defined-in-try",
+        "try { return (function () { return \"ok\"; })(); } catch (e) { return \"caught\"; }",
+        "ok",
+    );
+}
+
 // ---- loops ------------------------------------------------------------------------------
 
 #[test]

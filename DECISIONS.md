@@ -5785,3 +5785,44 @@ milliseconds of work and anything beyond that is stuck rather than slow.
 been handed an absurd value started receiving them. The lesson generalises past strings: a
 conversion that begins converting reaches code that was previously unreachable, and that code
 has never been tested with what the conversion now produces.
+
+## D-206
+
+**A function written inside a `try` is lowered with no handler in scope.**
+
+Status: Accepted
+
+`[1, 2].slice({valueOf: function () { throw new RangeError("x"); }})` did not throw. It spun,
+for ever, and took a CI job with it.
+
+The three jump-target stacks — `break`, `continue`, and the exception handler — were fields of
+the whole lowering rather than of the function being lowered. A nested function therefore
+began with whatever the enclosing one had pushed, so a `function` written between `try {` and
+`}` lowered its `throw` as a jump to the enclosing function's **catch block**.
+
+That is wrong twice over. It is wrong about the language: an enclosing `try` catches a throw
+from a function it contains at the **call**, not at the throw, and the two are different
+places — the second example in the regression test calls the function after the `try` has
+finished, where there is no handler at all.
+
+And it is wrong in a way nothing could see. A `BlockId` names a block *within one function*
+and carries nothing that says which, and block numbering restarts per function — so the
+enclosing function's catch block id also named a real block in the nested one. The verifier's
+`NoSuchBlock` check passed. The jump went somewhere valid and wrong. Where it landed on the
+very block doing the jumping, Cranelift emitted `b .`.
+
+**So the fix is where the state lives, not a matching pop.** The stacks moved onto `Scope`,
+which is pushed per function; a nested function and an arrow both start empty because that is
+the only thing an empty `Vec` can do. A save-and-restore pair at the top of `lower_function`
+would have fixed this exact bug and left the next one available.
+
+**What this says about the verifier**: it cannot catch a cross-function block reference,
+because the type it would have to check does not carry the function. Adding the check would
+mean giving `BlockId` a `FunctionId`, which is a real option and a larger change than this
+bug justifies on its own — recorded here so the next reference of this kind is not diagnosed
+from scratch.
+
+**And what it says about the corpus**: a hang is not a slow case. `a || b` where `a` throws
+inside a callback, `assert.throws(TypeError, function () { … })` — test262's most common
+shape is a function written inside something that catches, and the engine could not run it at
+all.
