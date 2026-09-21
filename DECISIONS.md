@@ -5425,3 +5425,26 @@ larger change than this one and buys only the memory back.
 `getOwnPropertySymbols` reports symbols and now actually has something to report. Mixing them
 would put a description where a property name was expected, which is the failure the type's
 documentation exists to prevent.
+
+## D-193
+
+**A symbol key never round-trips through its description.**
+
+Status: Accepted
+
+D-192 taught `key_of` to build a symbol key and stopped there, which was half the change. The
+computed paths take that key, call `as_str()` on it, and hand the text to
+`crisol_property_load` — so both halves of `Symbol("k")` and `Symbol("k")` arrived as the
+string `"k"` and were the same property. The acceptance test that caught it asserted exactly
+that two symbols described alike stay distinct; without it the feature would have looked
+finished, because every test using *one* symbol passes either way.
+
+`crisol_property_load` and `crisol_property_store` take `*const u8` and a length, so there is
+no way to pass a symbol through them — the fix is a key-based pair beside them, used by the
+computed paths when the key is a symbol. None of the named path's special cases apply on the
+way: a symbol is never an index, never `length`, and never a character of a string, so the
+symbol path is the chain walk and nothing else.
+
+`in` and `delete` had the same shape of bug in smaller form. `in` reached for `to_text`, which
+a symbol has none of, and answered `false`; `delete` asked the derived-property table by
+description, which would have answered about whatever string property shared the name.

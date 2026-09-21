@@ -9147,6 +9147,141 @@ fn indexed_length(value: u64) -> Result<usize, u64> {
     Ok(length)
 }
 
+/// Reads a property named by a symbol, walking the chain as the named path does.
+///
+/// **Separate from `crisol_property_load` because that one takes text**, and a symbol has
+/// none that identifies it. Routing a symbol through its description is what made two
+/// symbols described alike the same property — the key reached `key_of` correctly and was
+/// then flattened back to a string one line later.
+///
+/// None of the named path's special cases apply: a symbol is never an index, never `length`,
+/// and never a character of a string.
+fn symbol_property_load(object: u64, key: &PropertyKey) -> u64 {
+    /// A value to hand back, or an accessor still to be called. As in `crisol_property_load`,
+    /// the getter runs outside the runtime borrow.
+    enum Found {
+        Value(u64),
+        Get(u64),
+    }
+
+    let Some(handle) = handle_of(object) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let found = with_runtime(|runtime| {
+        let mut current = Some(handle);
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let Some(step) = current else { break };
+            let Some(shape) = runtime.heap.shape_of(step) else {
+                break;
+            };
+            let slot = runtime.shapes.borrow().lookup(shape, key);
+            if let Some(slot) = slot
+                && !runtime.heap.is_deleted(step, slot.index())
+                && let Some(value) = runtime.heap.get(step, slot.index())
+            {
+                if runtime.heap.attributes_of(step, slot.index()).accessor {
+                    return Found::Get(value.to_bits());
+                }
+                return Found::Value(value.to_bits());
+            }
+            current = runtime.heap.prototype_of(step);
+        }
+        Found::Value(Value::UNDEFINED.to_bits())
+    });
+    match found {
+        Found::Value(value) => value,
+        Found::Get(pair) => match elements_of(pair) {
+            Some((functions, _)) => {
+                let getter = element_at(functions, 0);
+                if is_callable(getter) {
+                    call_value(getter, object, &[])
+                } else {
+                    Value::UNDEFINED.to_bits()
+                }
+            }
+            None => Value::UNDEFINED.to_bits(),
+        },
+    }
+}
+
+/// Writes a property named by a symbol. See [`symbol_property_load`].
+fn symbol_property_store(object: u64, key: &PropertyKey, value: u64) -> u64 {
+    let Some(handle) = handle_of(object) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // A setter anywhere up the chain receives the write, as it does for a named property.
+    let accessor = with_runtime(|runtime| {
+        let mut current = Some(handle);
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let step = current?;
+            let shape = runtime.heap.shape_of(step)?;
+            let slot = runtime.shapes.borrow().lookup(shape, key);
+            if let Some(slot) = slot
+                && !runtime.heap.is_deleted(step, slot.index())
+            {
+                return runtime
+                    .heap
+                    .attributes_of(step, slot.index())
+                    .accessor
+                    .then(|| runtime.heap.get(step, slot.index()))
+                    .flatten()
+                    .map(|pair| pair.to_bits());
+            }
+            current = runtime.heap.prototype_of(step);
+        }
+        None
+    });
+    if let Some(pair) = accessor {
+        if let Some((functions, _)) = elements_of(pair) {
+            let setter = element_at(functions, 1);
+            if is_callable(setter) {
+                return call_value(setter, object, &[value]);
+            }
+        }
+        return Value::UNDEFINED.to_bits();
+    }
+    if symbol_own_slot(object, key).is_none() && !is_extensible(object) {
+        return Value::UNDEFINED.to_bits();
+    }
+    with_runtime(|runtime| {
+        let Some(current) = runtime.heap.shape_of(handle) else {
+            return;
+        };
+        let (shape, slot, width) = {
+            let mut shapes = runtime.shapes.borrow_mut();
+            let shape = shapes.add(current, key);
+            let Some(slot) = shapes.lookup(shape, key) else {
+                return;
+            };
+            (shape, slot, shapes.len(shape) as usize)
+        };
+        if shape != current {
+            runtime.heap.transition(handle, shape, width);
+        } else if runtime.heap.is_deleted(handle, slot.index()) {
+            runtime.heap.set_deleted(handle, slot.index(), false);
+            runtime
+                .heap
+                .set_attributes(handle, slot.index(), crisol_value::Attributes::DATA);
+        } else if !runtime.heap.attributes_of(handle, slot.index()).writable {
+            return;
+        }
+        runtime
+            .heap
+            .set(handle, slot.index(), Value::from_bits(value));
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+/// The slot a symbol-keyed own property occupies, if it has one.
+fn symbol_own_slot(object: u64, key: &PropertyKey) -> Option<u32> {
+    let handle = handle_of(object)?;
+    with_runtime(|runtime| {
+        let shape = runtime.heap.shape_of(handle)?;
+        let slot = runtime.shapes.borrow().lookup(shape, key)?;
+        (!runtime.heap.is_deleted(handle, slot.index())).then_some(slot.index())
+    })
+}
+
 /// `ToIntegerOrInfinity` on argument `position`, or the reason it has no number.
 ///
 /// **Absent is zero, and so is `NaN`** — the rule that makes `"abc".charAt()` the first
@@ -10173,6 +10308,10 @@ pub extern "C" fn crisol_computed_load(object: u64, key: u64) -> u64 {
     let Some(name) = key_of(key) else {
         return Value::UNDEFINED.to_bits();
     };
+    // **A symbol is not its description**, so it cannot go through the text path below.
+    if name.is_symbol() {
+        return symbol_property_load(object, &name);
+    }
     let text = name.as_str().to_owned();
     // SAFETY: `text` is a live Rust string, so its pointer and length describe readable UTF-8.
     unsafe { crisol_property_load(object, text.as_ptr(), text.len() as u64) }
@@ -10194,6 +10333,9 @@ pub extern "C" fn crisol_computed_store(object: u64, key: u64, value: u64) -> u6
     let Some(name) = key_of(key) else {
         return Value::UNDEFINED.to_bits();
     };
+    if name.is_symbol() {
+        return symbol_property_store(object, &name, value);
+    }
     let text = name.as_str().to_owned();
     // SAFETY: as above.
     unsafe { crisol_property_store(object, text.as_ptr(), text.len() as u64, value) }
@@ -10649,8 +10791,10 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
         return Value::TRUE.to_bits();
     };
     // A property nothing stores can still be non-configurable — a string's characters are —
-    // and there is no slot for the walk below to read that off.
-    if own_property(object, name.as_str()).is_none()
+    // and there is no slot for the walk below to read that off. A symbol never names one of
+    // those, and asking by its description would answer about a different property.
+    if !name.is_symbol()
+        && own_property(object, name.as_str()).is_none()
         && derived_own_property(object, name.as_str())
             .is_some_and(|(_, attributes)| !attributes.configurable)
     {
@@ -11175,6 +11319,25 @@ pub extern "C" fn crisol_in(key: u64, object: u64) -> u64 {
         && let Some((_, length)) = elements_of(object)
     {
         return boolean(index < length).to_bits();
+    }
+    if Value::from_bits(key).kind() == crisol_value::Kind::Symbol {
+        let Some(symbol) = key_of(Value::from_bits(key)) else {
+            return Value::FALSE.to_bits();
+        };
+        let mut current = object;
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            if symbol_own_slot(current, &symbol).is_some() {
+                return Value::TRUE.to_bits();
+            }
+            let Some(handle) = handle_of(current) else {
+                break;
+            };
+            match with_runtime(|runtime| runtime.heap.prototype_of(handle)) {
+                Some(parent) => current = parent.to_value().to_bits(),
+                None => break,
+            }
+        }
+        return Value::FALSE.to_bits();
     }
     let Some(name) = to_text(key) else {
         return Value::FALSE.to_bits();
