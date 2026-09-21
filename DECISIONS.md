@@ -5609,3 +5609,35 @@ invisible to every run that does not collect at the wrong moment.
 
 The body moved into a second function so the rooting is the whole of the entry point and
 cannot be stepped around by a later edit adding work above it.
+
+## D-200
+
+**Proxies, with the marker in an internal slot and the invariants in the builtin.**
+
+Status: Accepted
+
+Two halves, and the interesting decisions are in how each is paid for.
+
+**The test is an internal slot, not a hidden property.** Every property access has to ask "is
+this a proxy?", and a hidden property is a shape lookup — a real tax on every program, most of
+which contain no proxy at all. An internal slot is a `Vec` index inside a borrow the load path
+already takes, so the common answer costs one integer compare. The marker is `null` because no
+callable stores one: every function puts a number in slot zero, its index or its code pointer.
+
+That forced a change to `is_callable`, which tested for the *presence* of slot zero rather
+than its contents — so every proxy would have reported `typeof "function"`. It now requires a
+number, which is strictly more precise and true of every function the engine makes.
+
+**The invariants come from `crisol-builtins::proxy`**, which already had them: a `get` trap
+cannot report anything but the held value for a non-configurable, non-writable property,
+because that property is a promise the target made. Those checks are pure — they compare a
+trap's answer against the target's state and call nothing — so unlike the promise agent
+(D-197) they wire in as they stand. The ABI supplies a `Target` over the heap and calls the
+trap; the builtin decides whether the answer was allowed.
+
+**A proxy has no prototype of its own.** Every lookup goes to the trap or the target, so a
+chain on the proxy cell would be a second answer nothing consults.
+
+**`apply` and `construct` are not trapped**, so a proxy of a function is not callable. Doing
+it means `is_callable` following a proxy to its target, on the hot path, for a case the corpus
+barely exercises — recorded rather than smuggled in.

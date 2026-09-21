@@ -1591,6 +1591,7 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Set", make_set),
     ("Symbol", make_symbol),
     ("Promise", make_promise),
+    ("Proxy", make_proxy),
 ];
 
 /// Where a symbol keeps its description.
@@ -2403,6 +2404,8 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Promise.prototype", "finally", 1),
     ("Promise.prototype", "then", 2),
     ("global", "Promise", 1),
+    ("Proxy", "revocable", 2),
+    ("global", "Proxy", 2),
     ("Reflect", "apply", 3),
     ("Reflect", "defineProperty", 3),
     ("Reflect", "deleteProperty", 2),
@@ -2472,6 +2475,7 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     construct_array,
     error_to_text,
     promise_settle_call,
+    proxy_revoke_call,
 ];
 
 /// Where a promise object keeps its place in [`PROMISES`].
@@ -2560,6 +2564,9 @@ const ERROR_TO_TEXT: usize = 3;
 
 /// The index within [`ANONYMOUS_NATIVES`] of the body every `resolve`/`reject` pair runs.
 const PROMISE_SETTLE_CALL: usize = 4;
+
+/// The index within [`ANONYMOUS_NATIVES`] of the body a `revoke` function runs.
+const PROXY_REVOKE_CALL: usize = 5;
 
 /// Marks an array whose `length` has been made non-writable.
 ///
@@ -5392,6 +5399,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Math", "max", math_max),
     ("Math", "random", math_random),
     ("Array", "of", array_of),
+    ("Proxy", "revocable", proxy_revocable),
     ("Promise", "resolve", promise_resolve),
     ("Promise", "reject", promise_reject),
     ("Reflect", "get", reflect_get),
@@ -6403,6 +6411,9 @@ const INTERNAL_PROPERTIES: &[&str] = &[
     FIXED_LENGTH,
     ELEMENT_RULES,
     ERROR_DATA,
+    PROMISE_ID,
+    PROMISE_REJECTS,
+    PROXY_REVOKE_TARGET,
     COLLECTION_ENTRIES,
     BOUND_TARGET,
     BOUND_THIS,
@@ -8759,6 +8770,13 @@ pub unsafe extern "C" fn crisol_property_store(
     length: u64,
     value: u64,
 ) -> u64 {
+    if let Some((target, handler)) = proxy_parts(object) {
+        // SAFETY: the caller promises `length` readable UTF-8 bytes at `key`.
+        let Some(name) = (unsafe { key_text(key, length) }) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        return proxy_store(object, target, handler, &PropertyKey::new(&name), value);
+    }
     let Some(handle) = handle_of(object) else {
         return nullish_access(object);
     };
@@ -8950,6 +8968,15 @@ pub unsafe extern "C" fn crisol_property_store(
 #[unsafe(no_mangle)]
 #[must_use]
 pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, length: u64) -> u64 {
+    // **One integer compare for every program that uses no proxies** — see `PROXY_MARKER`.
+    // A trap is JavaScript, so it runs from here, before any borrow is taken.
+    if let Some((target, handler)) = proxy_parts(object) {
+        // SAFETY: the caller promises `length` readable UTF-8 bytes at `key`.
+        let Some(name) = (unsafe { key_text(key, length) }) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        return proxy_load(object, target, handler, &PropertyKey::new(&name));
+    }
     /// What the chain walk found: a value to hand back, or an accessor still to be called.
     ///
     /// The distinction has to survive the walk because a getter is JavaScript and will reach
@@ -9591,6 +9618,10 @@ fn symbol_property_load(object: u64, key: &PropertyKey) -> u64 {
         Get(u64),
     }
 
+    if let Some((target, handler)) = proxy_parts(object) {
+        return proxy_load(object, target, handler, key);
+    }
+
     let Some(handle) = handle_of(object) else {
         return Value::UNDEFINED.to_bits();
     };
@@ -9633,6 +9664,9 @@ fn symbol_property_load(object: u64, key: &PropertyKey) -> u64 {
 
 /// Writes a property named by a symbol. See [`symbol_property_load`].
 fn symbol_property_store(object: u64, key: &PropertyKey, value: u64) -> u64 {
+    if let Some((target, handler)) = proxy_parts(object) {
+        return proxy_store(object, target, handler, key, value);
+    }
     let Some(handle) = handle_of(object) else {
         return Value::UNDEFINED.to_bits();
     };
@@ -11198,6 +11232,12 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
     let Some(handle) = handle_of(object) else {
         return nullish_access(object);
     };
+    if let Some((target, handler)) = proxy_parts(object) {
+        let Some(name) = key_of(Value::from_bits(key)) else {
+            return Value::TRUE.to_bits();
+        };
+        return proxy_delete(target, handler, &name);
+    }
     let key_value = Value::from_bits(key);
 
     // An element is removed by shortening the array when it is the last one, and otherwise left
@@ -11355,6 +11395,390 @@ pub extern "C" fn crisol_iterate(value: u64) -> u64 {
         return items;
     }
     raise("value is not iterable", "TypeError")
+}
+
+/// What internal slot zero holds on a proxy.
+///
+/// **A marker rather than a hidden property**, because the test runs on every property
+/// access. A hidden property is a shape lookup; an internal slot is a `Vec` index inside a
+/// borrow the load path already holds, so a program with no proxies in it pays one integer
+/// compare. That is the difference between a feature nobody uses being free and being a tax.
+///
+/// `null` because no callable stores it: every function puts a number there (its index or its
+/// code pointer), which is what [`is_callable`] now checks rather than mere presence.
+const PROXY_MARKER: Value = Value::NULL;
+
+/// Internal slot holding a proxy's target.
+const PROXY_TARGET_SLOT: u32 = 1;
+
+/// Internal slot holding a proxy's handler, or `null` once revoked.
+const PROXY_HANDLER_SLOT: u32 = 2;
+
+/// A proxy's target and handler, or `None` if this is not a proxy.
+///
+/// The one integer compare every property access pays. Ordered so the common answer costs a
+/// single slot read.
+fn proxy_parts(object: u64) -> Option<(u64, u64)> {
+    let handle = handle_of(object)?;
+    with_runtime(|runtime| {
+        if runtime.heap.internal(handle, 0)? != PROXY_MARKER {
+            return None;
+        }
+        let target = runtime.heap.internal(handle, PROXY_TARGET_SLOT)?;
+        let handler = runtime.heap.internal(handle, PROXY_HANDLER_SLOT)?;
+        Some((target.to_bits(), handler.to_bits()))
+    })
+}
+
+/// A heap object seen through the invariant checks' eyes.
+struct HeapTarget(u64);
+
+impl crisol_builtins::Target for HeapTarget {
+    fn own_property(&self, key: &PropertyKey) -> Option<crisol_builtins::Property> {
+        // Symbol keys reach the shape directly; a string key can also name an element or a
+        // character, which `derived_own_property` answers for.
+        let (value, attributes) = if key.is_symbol() {
+            let slot = symbol_own_slot(self.0, key)?;
+            let handle = handle_of(self.0)?;
+            with_runtime(|runtime| {
+                Some((
+                    runtime.heap.get(handle, slot)?,
+                    runtime.heap.attributes_of(handle, slot),
+                ))
+            })?
+        } else {
+            let name = key.as_str();
+            match own_property(self.0, name) {
+                Some((slot, value)) => {
+                    let handle = handle_of(self.0)?;
+                    (
+                        value,
+                        with_runtime(|runtime| runtime.heap.attributes_of(handle, slot)),
+                    )
+                }
+                None => {
+                    let (bits, attributes) = derived_own_property(self.0, name)?;
+                    (Value::from_bits(bits), attributes)
+                }
+            }
+        };
+        if attributes.accessor {
+            let (get, set) = elements_of(value.to_bits()).map_or(
+                (Value::UNDEFINED, Value::UNDEFINED),
+                |(pair, _)| {
+                    (
+                        Value::from_bits(element_at(pair, 0)),
+                        Value::from_bits(element_at(pair, 1)),
+                    )
+                },
+            );
+            return Some(crisol_builtins::Property::Accessor {
+                get,
+                set,
+                enumerable: attributes.enumerable,
+                configurable: attributes.configurable,
+            });
+        }
+        Some(crisol_builtins::Property::Data {
+            value,
+            writable: attributes.writable,
+            enumerable: attributes.enumerable,
+            configurable: attributes.configurable,
+        })
+    }
+
+    fn is_extensible(&self) -> bool {
+        is_extensible(self.0)
+    }
+}
+
+/// The trap `name` on `handler`, or `None` when the handler does not define one.
+///
+/// **Absent means forward to the target**, which is what makes a handler with one trap a
+/// pass-through for everything else.
+fn proxy_trap(handler: u64, trap: crisol_builtins::Trap) -> Option<u64> {
+    let method = property_of(handler, trap.name());
+    is_callable(method).then_some(method)
+}
+
+/// Checks a trap's answer against the target, turning a violation into a thrown `TypeError`.
+fn proxy_checked<R>(
+    outcome: Result<R, crisol_builtins::ProxyError>,
+    ok: impl FnOnce(R) -> u64,
+) -> u64 {
+    match outcome {
+        Ok(value) => ok(value),
+        // **A violated invariant is the proxy's fault, not the program's**, and the message
+        // says which trap lied — without that a `TypeError` from deep inside a property read
+        // is unattributable.
+        Err(error) => raise(&error.to_string(), "TypeError"),
+    }
+}
+
+/// Builds the checker for `target`, honouring revocation.
+fn proxy_of(target: u64, handler: u64) -> crisol_builtins::Proxy<HeapTarget> {
+    let mut proxy = crisol_builtins::Proxy::new(HeapTarget(target));
+    if Value::from_bits(handler).is_null() {
+        proxy.revoke();
+    }
+    proxy
+}
+
+/// A key as the value a trap is handed.
+fn key_value(key: &PropertyKey) -> u64 {
+    key.symbol_address().map_or_else(
+        || new_string(key.as_str()),
+        |address| Value::symbol(address).to_bits(),
+    )
+}
+
+/// Reads `key` from `object` by whichever path its kind needs.
+fn load_with_key(object: u64, key: &PropertyKey) -> u64 {
+    if key.is_symbol() {
+        return symbol_property_load(object, key);
+    }
+    let text = key.as_str().to_owned();
+    // SAFETY: `text` is a live Rust string.
+    unsafe { crisol_property_load(object, text.as_ptr(), text.len() as u64) }
+}
+
+/// Writes `key` on `object` by whichever path its kind needs.
+fn store_with_key(object: u64, key: &PropertyKey, value: u64) -> u64 {
+    if key.is_symbol() {
+        return symbol_property_store(object, key, value);
+    }
+    let text = key.as_str().to_owned();
+    // SAFETY: `text` is a live Rust string.
+    unsafe { crisol_property_store(object, text.as_ptr(), text.len() as u64, value) }
+}
+
+/// `proxy[key]`, through the `get` trap or straight to the target.
+fn proxy_load(receiver: u64, target: u64, handler: u64, key: &PropertyKey) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::Get) else {
+        return load_with_key(target, key);
+    };
+    with_rooted(&[receiver, target, handler, trap], || {
+        let name = key_value(key);
+        let reported = with_rooted(&[name], || {
+            call_value(trap, handler, &[target, name, receiver])
+        });
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        proxy_checked(
+            proxy.checked_get(key, Value::from_bits(reported)),
+            |value| value.to_bits(),
+        )
+    })
+}
+
+/// `proxy[key] = value`, through the `set` trap or straight to the target.
+fn proxy_store(receiver: u64, target: u64, handler: u64, key: &PropertyKey, value: u64) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::Set) else {
+        return store_with_key(target, key, value);
+    };
+    with_rooted(&[receiver, target, handler, trap, value], || {
+        let name = key_value(key);
+        let reported = with_rooted(&[name], || {
+            call_value(trap, handler, &[target, name, value, receiver])
+        });
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        let accepted = is_truthy(Value::from_bits(reported));
+        proxy_checked(
+            proxy.checked_set(key, Value::from_bits(value), accepted),
+            |_| Value::UNDEFINED.to_bits(),
+        )
+    })
+}
+
+/// `key in proxy`, through the `has` trap or straight to the target.
+fn proxy_has(target: u64, handler: u64, key: &PropertyKey) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::Has) else {
+        let name = key_value(key);
+        return with_rooted(&[target, name], || crisol_in(name, target));
+    };
+    with_rooted(&[target, handler, trap], || {
+        let name = key_value(key);
+        let reported = with_rooted(&[name], || call_value(trap, handler, &[target, name]));
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        let present = is_truthy(Value::from_bits(reported));
+        proxy_checked(proxy.checked_has(key, present), |answer| {
+            boolean(answer).to_bits()
+        })
+    })
+}
+
+/// `delete proxy[key]`, through the `deleteProperty` trap or straight to the target.
+fn proxy_delete(target: u64, handler: u64, key: &PropertyKey) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::DeleteProperty) else {
+        let name = key_value(key);
+        return with_rooted(&[target, name], || crisol_delete(target, name));
+    };
+    with_rooted(&[target, handler, trap], || {
+        let name = key_value(key);
+        let reported = with_rooted(&[name], || call_value(trap, handler, &[target, name]));
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        let removed = is_truthy(Value::from_bits(reported));
+        proxy_checked(proxy.checked_delete(key, removed), |answer| {
+            boolean(answer).to_bits()
+        })
+    })
+}
+
+/// `new Proxy(target, handler)`.
+extern "C" fn make_proxy(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        // SAFETY: as above.
+        let handler = unsafe { argument(argc, argv, 1) };
+        if Value::from_bits(target).kind() != crisol_value::Kind::Object
+            || Value::from_bits(handler).kind() != crisol_value::Kind::Object
+        {
+            return raise("a proxy needs an object target and handler", "TypeError");
+        }
+        new_proxy_object(target, handler)
+    })
+}
+
+/// Allocates the proxy cell: the marker, the target and the handler, in internal slots.
+fn new_proxy_object(target: u64, handler: u64) -> u64 {
+    with_rooted(&[target, handler], || {
+        with_runtime(|runtime| {
+            let shape = runtime.shapes.borrow().root();
+            let scope = runtime.heap.scope();
+            let proxy = scope.alloc_with_internals(shape, 0, 3);
+            let handle = proxy.handle();
+            runtime.heap.set_internal(handle, 0, PROXY_MARKER);
+            runtime
+                .heap
+                .set_internal(handle, PROXY_TARGET_SLOT, Value::from_bits(target));
+            runtime
+                .heap
+                .set_internal(handle, PROXY_HANDLER_SLOT, Value::from_bits(handler));
+            // **No prototype of its own.** Every lookup goes to the trap or the target, so a
+            // chain here would be a second answer nothing consults.
+            runtime.heap.set_prototype(handle, None);
+            proxy.to_value().to_bits()
+        })
+    })
+}
+
+/// `Proxy.revocable(target, handler)`.
+extern "C" fn proxy_revocable(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let proxy = make_proxy(0, this_value, 0, argc, argv);
+        if Value::from_bits(proxy).is_exception() {
+            return proxy;
+        }
+        with_rooted(&[proxy], || {
+            let result = crisol_create_object();
+            with_rooted(&[result, proxy], || {
+                let revoke = with_runtime(|runtime| {
+                    runtime
+                        .native_function(
+                            NATIVES.len()
+                                + GLOBAL_NATIVES.len()
+                                + NAMESPACE_NATIVES.len()
+                                + PROXY_REVOKE_CALL,
+                        )
+                        .to_value()
+                        .to_bits()
+                });
+                with_rooted(&[revoke], || {
+                    if let Some(handle) = handle_of(revoke) {
+                        with_runtime(|runtime| {
+                            runtime.define_hidden(
+                                handle,
+                                PROXY_REVOKE_TARGET,
+                                Value::from_bits(proxy),
+                            );
+                        });
+                    }
+                });
+                if let Some(into) = handle_of(result) {
+                    with_runtime(|runtime| {
+                        runtime.define(into, "proxy", Value::from_bits(proxy));
+                        runtime.define(into, "revoke", Value::from_bits(revoke));
+                    });
+                }
+            });
+            result
+        })
+    })
+}
+
+/// Where a revoker keeps the proxy it revokes.
+const PROXY_REVOKE_TARGET: &str = "__revokes";
+
+/// The body a `revoke` function runs: clear the handler, which is what revocation *is*.
+extern "C" fn proxy_revoke_call(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some((_, proxy)) = own_property(closure, PROXY_REVOKE_TARGET)
+        && let Some(handle) = handle_of(proxy.to_bits())
+    {
+        with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_internal(handle, PROXY_HANDLER_SLOT, Value::NULL);
+        });
+    }
+    Value::UNDEFINED.to_bits()
 }
 
 /// Makes a pending promise and answers its place in [`PROMISES`].
@@ -11746,7 +12170,18 @@ fn is_callable(value: u64) -> bool {
     Value::from_bits(value)
         .as_address()
         .map(GcRef::from_address)
-        .is_some_and(|handle| with_runtime(|runtime| runtime.heap.internal(handle, 0).is_some()))
+        .is_some_and(|handle| {
+            // **A number, not merely a slot.** Every function puts one there — a native's
+            // index or a compiled function's code pointer — and a proxy puts `null` there to
+            // mark itself (see `PROXY_MARKER`). Testing for presence alone made every proxy
+            // report `typeof "function"`, which is the one thing the marker must not cost.
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .internal(handle, 0)
+                    .is_some_and(|slot| slot.as_number().is_some())
+            })
+        })
 }
 
 /// A heap value as JSON, or `None` for one JSON has no spelling for.
@@ -12075,6 +12510,12 @@ fn to_primitive(value: u64) -> u64 {
 pub extern "C" fn crisol_in(key: u64, object: u64) -> u64 {
     if handle_of(object).is_none() {
         return raise("the right side of `in` must be an object", "TypeError");
+    }
+    if let Some((target, handler)) = proxy_parts(object) {
+        let Some(name) = key_of(Value::from_bits(key)) else {
+            return Value::FALSE.to_bits();
+        };
+        return proxy_has(target, handler, &name);
     }
     if let Some(index) = as_index(Value::from_bits(key))
         && let Some((_, length)) = elements_of(object)

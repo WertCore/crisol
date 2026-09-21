@@ -7162,3 +7162,110 @@ fn a_promise_settles_through_the_microtask_queue() {
         "TypeError",
     );
 }
+
+/// **A proxy answers through its handler, or forwards to its target when there is no trap** —
+/// which is what makes a handler with one trap a pass-through for everything else.
+#[test]
+fn a_proxy_traps_what_its_handler_defines() {
+    check(
+        "proxy-get-trap",
+        "let p = new Proxy({a: 1}, {get: function () { return 9; }}); return p.a;",
+        "9",
+    );
+    check(
+        "proxy-get-forwards",
+        "let p = new Proxy({a: 1}, {}); return p.a;",
+        "1",
+    );
+    check(
+        "proxy-get-receives-target-and-key",
+        "let seen = \"\"; \
+         let p = new Proxy({a: 1}, {get: function (t, k) { seen = k; return t[k]; }}); \
+         let value = p.a; return seen + \":\" + value;",
+        "a:1",
+    );
+    check(
+        "proxy-set-trap",
+        "let seen = 0; \
+         let p = new Proxy({}, {set: function (t, k, v) { seen = v; return true; }}); \
+         p.x = 5; return seen;",
+        "5",
+    );
+    check(
+        "proxy-set-forwards",
+        "let t = {}; let p = new Proxy(t, {}); p.x = 5; return t.x;",
+        "5",
+    );
+    check(
+        "proxy-has-trap",
+        "let p = new Proxy({}, {has: function () { return true; }}); return \"nope\" in p;",
+        "true",
+    );
+    check(
+        "proxy-has-forwards",
+        "let p = new Proxy({a: 1}, {}); return (\"a\" in p) + \",\" + (\"b\" in p);",
+        "true,false",
+    );
+    check(
+        "proxy-delete-trap",
+        "let seen = \"\"; \
+         let p = new Proxy({a: 1}, {deleteProperty: function (t, k) { seen = k; return true; }}); \
+         delete p.a; return seen;",
+        "a",
+    );
+    // A proxy is not a function, whatever the marker in its internal slot might suggest.
+    check(
+        "proxy-is-not-a-function",
+        "return typeof new Proxy({}, {});",
+        "object",
+    );
+    check(
+        "proxy-needs-objects",
+        "try { new Proxy(1, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A symbol key reaches the trap like any other.
+    check(
+        "proxy-symbol-key",
+        "let s = Symbol(); \
+         let p = new Proxy({}, {get: function (t, k) { return k === s ? 7 : 0; }}); \
+         return p[s];",
+        "7",
+    );
+}
+
+/// **A revoked proxy refuses everything**, and the invariant checks refuse a trap that
+/// contradicts its target — both are `TypeError`s the proxy causes, not the program.
+#[test]
+fn a_proxy_is_held_to_its_target() {
+    check(
+        "proxy-revoked",
+        "let r = Proxy.revocable({a: 1}, {}); r.revoke(); \
+         try { return r.proxy.a; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-revocable-works-until-revoked",
+        "let r = Proxy.revocable({a: 1}, {}); return r.proxy.a;",
+        "1",
+    );
+    // A non-configurable, non-writable property is a promise the target made, and a `get`
+    // trap is not allowed to report anything else.
+    check(
+        "proxy-get-must-not-lie",
+        "let t = {}; \
+         Object.defineProperty(t, \"a\", {value: 1, writable: false, configurable: false}); \
+         let p = new Proxy(t, {get: function () { return 2; }}); \
+         try { return p.a; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Reporting the truth is fine.
+    check(
+        "proxy-get-may-agree",
+        "let t = {}; \
+         Object.defineProperty(t, \"a\", {value: 1, writable: false, configurable: false}); \
+         let p = new Proxy(t, {get: function () { return 1; }}); \
+         return p.a;",
+        "1",
+    );
+}
