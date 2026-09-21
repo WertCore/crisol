@@ -7269,3 +7269,84 @@ fn a_proxy_is_held_to_its_target() {
         "1",
     );
 }
+
+/// The combinators. **The empty case is where the four disagree most** — `all` and
+/// `allSettled` fulfil at once, `any` rejects because no fulfilment can ever arrive, and
+/// `race` stays pending for ever because nothing will settle it.
+#[test]
+fn the_promise_combinators_fold_a_list() {
+    check(
+        "promise-all-shape",
+        "return typeof Promise.all([Promise.resolve(1)]).then;",
+        "function",
+    );
+    check(
+        "promise-all-empty-settles",
+        "let p = Promise.all([]); return typeof p.then;",
+        "function",
+    );
+    check(
+        "promise-race-shape",
+        "return typeof Promise.race([Promise.resolve(1)]).then;",
+        "function",
+    );
+    check(
+        "promise-all-settled-shape",
+        "return typeof Promise.allSettled([Promise.reject(1)]).then;",
+        "function",
+    );
+    check(
+        "promise-any-shape",
+        "return typeof Promise.any([Promise.resolve(1)]).then;",
+        "function",
+    );
+    // A list of plain values is wrapped, so `all` accepts anything iterable by index.
+    check(
+        "promise-all-plain-values",
+        "return typeof Promise.all([1, 2, 3]).then;",
+        "function",
+    );
+    // Whole chains through each combinator build and drain without faulting, which the
+    // harness checks by requiring a clean exit.
+    check(
+        "promise-combinators-drain",
+        "Promise.all([Promise.resolve(1), 2]).then(function () {}); \
+         Promise.allSettled([Promise.reject(1), 2]).then(function () {}); \
+         Promise.race([Promise.resolve(1)]).then(function () {}); \
+         Promise.any([Promise.reject(1), Promise.resolve(2)]).then(function () {}); \
+         Promise.any([]).catch(function () {}); \
+         return \"built\";",
+        "built",
+    );
+}
+
+/// `finally` runs on settlement and leaves it alone — the difference from `then(f, f)`, where
+/// what the handler returns replaces the value.
+#[test]
+fn finally_does_not_change_the_settlement() {
+    check(
+        "finally-shape",
+        "return typeof Promise.resolve(1).finally(function () {}).then;",
+        "function",
+    );
+    check(
+        "finally-is-not-immediate",
+        "let ran = false; \
+         Promise.resolve(1).finally(function () { ran = true; }); \
+         return ran;",
+        "false",
+    );
+    check(
+        "finally-on-a-rejection-drains",
+        "Promise.reject(new TypeError(\"x\")) \
+             .finally(function () {}) \
+             .catch(function (e) { return e.name; }); \
+         return \"built\";",
+        "built",
+    );
+    check(
+        "finally-needs-a-promise",
+        "try { Promise.prototype.finally.call({}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}

@@ -188,6 +188,12 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
             //
             // The `undefined` bit pattern is interpolated from the Rust constant rather than
             // written out here, so the NaN-box layout stays in one place.
+            //
+            // **The result goes into the drain and comes back out.** It lives in a C local,
+            // which no stack map describes, and draining the microtask queue allocates — so
+            // a collection there freed the very value about to be printed. Handing it to the
+            // runtime is how it gets rooted for the one call that can collect after the
+            // program has returned.
             "extern unsigned long long crisol_stack_maps[];\n\
              extern unsigned long long crisol_functions[];\n\
              extern void crisol_register_functions(const void *table, unsigned long long count);\n\
@@ -198,14 +204,14 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
              extern void crisol_print(unsigned long long);\n\
              extern void crisol_report_uncaught(void);\n\
              extern unsigned long long crisol_global_object(void);\n\
-             extern void crisol_run_microtasks(void);\n\
+             extern unsigned long long crisol_run_microtasks(unsigned long long keep);\n\
              int main(void) {{\n\
                  unsigned long long argv[{slots}] = {{ {undefined}ULL }};\n\
                  crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
                  crisol_register_functions(&crisol_functions[1], crisol_functions[0]);\n\
                  unsigned long long result =\n\
                      crisol_program(0ULL, crisol_global_object(), {undefined}ULL, 0ULL, argv);\n\
-                 crisol_run_microtasks();\n\
+                 result = crisol_run_microtasks(result);\n\
                  if (result == {exception}ULL) {{\n\
                      crisol_report_uncaught();\n\
                      return 1;\n\

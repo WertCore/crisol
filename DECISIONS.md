@@ -5641,3 +5641,45 @@ chain on the proxy cell would be a second answer nothing consults.
 **`apply` and `construct` are not trapped**, so a proxy of a function is not callable. Doing
 it means `is_callable` following a proxy to its target, on the hot path, for a case the corpus
 barely exercises — recorded rather than smuggled in.
+
+## D-201
+
+**A promise's state lives on the promise, so a dead promise dies.**
+
+Status: Accepted, replacing the side table in D-197
+
+D-197 kept every promise in a `Vec` indexed by an id stored on the object. That table grew for
+the life of the program: a record could not be freed while its promise might still be reached,
+and nothing told the runtime when that stopped being true. It was recorded as a known leak,
+which is not the same as acceptable — a loop making promises leaks a record per iteration for
+ever.
+
+The fix was already in the heap: **`Heap::reachable` traces internal slots.** So a promise's
+state — settled-or-not, its value, and the list of reactions waiting on it — lives in its own
+internal slots, and the whole thing is freed with the promise by the collector that already
+runs. No table, no ids, no reclamation logic to get wrong, and one fewer root walk.
+
+The reaction list is a JavaScript array in a slot, holding groups of three. It is **made on
+first use**, because most promises settle before anything waits on them and those never
+allocate one, and it is **dropped as it is taken** on settling — a settled promise never needs
+its reactions again, and keeping them holds every handler and everything each closure captured
+alive for as long as the promise is.
+
+The microtask queue stays beside the heap, and that is fine for the reason the table was not:
+a queue empties.
+
+**`finally` was wrong, not merely incomplete.** It called the handler at the moment `finally`
+was called — before the promise settled, once rather than on whichever way it went — and the
+comment beside it claimed the drain did the work. It is a registered reaction now, with a
+pass-through flag: the handler runs for its effect, takes no argument, has its answer
+discarded, and the original settlement survives. A throw from it still replaces the outcome,
+which is the one way `finally` is allowed to change anything.
+
+**And the combinators exist**: `all`, `allSettled`, `race`, `any`, as one walk with four
+endings. The empty list is where they differ most and where a shared implementation earns its
+keep — `all` and `allSettled` fulfil at once, `any` rejects because no fulfilment can arrive,
+and `race` stays pending because nothing will settle it.
+
+Still missing, and named rather than implied: thenable assimilation (resolving with a
+non-promise object that has a `then`), subclassing through `Symbol.species`, and
+unhandled-rejection reporting.

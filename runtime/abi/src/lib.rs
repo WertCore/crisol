@@ -600,40 +600,16 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BOOLEAN_PROTOTYPE.with(std::cell::Cell::get));
-        // Everything the promise machinery holds. It is data rather than closures precisely
-        // so this walk is possible — a queue of `Box<dyn FnOnce>` hides its captures from the
-        // collector, and a settled value reachable only from one would be freed under it.
-        PROMISES.with(|promises| {
-            if let Ok(entries) = promises.try_borrow() {
-                for record in entries.iter() {
-                    roots.extend(
-                        Value::from_bits(record.value)
-                            .as_address()
-                            .map(GcRef::from_address),
-                    );
-                    for (handler, _, _) in &record.waiting {
-                        roots.extend(
-                            Value::from_bits(*handler)
-                                .as_address()
-                                .map(GcRef::from_address),
-                        );
-                    }
-                }
-            }
-        });
+        // The microtask queue. It is data rather than closures precisely so this walk is
+        // possible — a queue of `Box<dyn FnOnce>` hides its captures from the collector, and
+        // a settled value reachable only from one would be freed under it. Everything *else*
+        // a promise holds lives in its own internal slots, which the heap already traces.
         PROMISE_JOBS.with(|jobs| {
             if let Ok(entries) = jobs.try_borrow() {
                 for job in entries.iter() {
-                    roots.extend(
-                        Value::from_bits(job.handler)
-                            .as_address()
-                            .map(GcRef::from_address),
-                    );
-                    roots.extend(
-                        Value::from_bits(job.value)
-                            .as_address()
-                            .map(GcRef::from_address),
-                    );
+                    for held in [job.handler, job.value, job.derived] {
+                        roots.extend(Value::from_bits(held).as_address().map(GcRef::from_address));
+                    }
                 }
             }
         });
@@ -698,13 +674,12 @@ thread_local! {
     /// The prototype every boolean inherits from.
     static BOOLEAN_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
-    /// Every promise the program has made, and the jobs waiting to run.
-    ///
-    /// Thread-local rather than part of `Runtime`, because the drain has to reach them while
-    /// no borrow of either is held — see [`PromiseRecord`].
-    static PROMISES: RefCell<Vec<PromiseRecord>> = const { RefCell::new(Vec::new()) };
     /// The microtask queue. Drained to empty, and jobs queued by jobs run in the same drain,
     /// which is what "microtasks run to completion" means.
+    ///
+    /// **The only promise state that is not on a promise.** A queue empties by definition, so
+    /// it cannot grow the way a table of every promise ever made would. Thread-local because
+    /// the drain reaches it while no borrow of the runtime is held.
     static PROMISE_JOBS: RefCell<std::collections::VecDeque<PromiseJob>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
     /// Every symbol that has been used as a property key.
@@ -2398,6 +2373,10 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Object.prototype", "toLocaleString", 0),
     ("Object.prototype", "toString", 0),
     ("Object.prototype", "valueOf", 0),
+    ("Promise", "all", 1),
+    ("Promise", "allSettled", 1),
+    ("Promise", "any", 1),
+    ("Promise", "race", 1),
     ("Promise", "reject", 1),
     ("Promise", "resolve", 1),
     ("Promise.prototype", "catch", 1),
@@ -2476,13 +2455,41 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     error_to_text,
     promise_settle_call,
     proxy_revoke_call,
+    combine_call,
 ];
 
-/// Where a promise object keeps its place in [`PROMISES`].
-const PROMISE_ID: &str = "__promiseId";
+/// Where a `resolve`/`reject` function keeps the promise it settles.
+const PROMISE_SETTLES: &str = "__settles";
 
 /// Whether a settling function rejects rather than fulfils.
 const PROMISE_REJECTS: &str = "__promiseRejects";
+
+/// What internal slot zero holds on a promise.
+///
+/// A boolean rather than the `null` a proxy uses (see [`PROXY_MARKER`]): the two need telling
+/// apart by one compare, and neither is a number, so neither reads as callable.
+const PROMISE_MARKER: Value = Value::TRUE;
+
+/// Internal slot holding a promise's state: pending, fulfilled or rejected.
+const PROMISE_STATE_SLOT: u32 = 1;
+
+/// Internal slot holding what it settled to.
+const PROMISE_VALUE_SLOT: u32 = 2;
+
+/// Internal slot holding the reactions waiting on it.
+///
+/// A JavaScript array, in groups of three: the handler, the promise the reaction settles, and
+/// a flag word. **An array rather than a `Vec` beside the heap**, because internal slots are
+/// traced (`Heap::reachable` walks them) — so everything a pending promise holds is freed
+/// with the promise, and there is no side table to grow.
+const PROMISE_REACTIONS_SLOT: u32 = 3;
+
+/// A reaction's flag word: set when it runs on rejection.
+const REACTION_ON_REJECTION: u32 = 1;
+
+/// A reaction's flag word: set when the settlement passes through unchanged, as `finally`
+/// needs — the handler runs for its effect and the original value survives it.
+const REACTION_PASSTHROUGH: u32 = 2;
 
 /// What a promise has settled to, if anything.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2495,27 +2502,17 @@ enum Settled {
     Rejected,
 }
 
-/// One promise, as the runtime tracks it.
-///
-/// **Handlers and values are plain `u64`s in a `Vec`, not captured in closures.** That is the
-/// whole design: the drain pops a job, *drops the borrow*, calls the handler, and takes a
-/// fresh borrow to record the outcome. A queue of closures cannot do that — the handler needs
-/// the agent while the loop already holds it — and the workarounds all come down to two live
-/// `&mut` to the same thing. Keeping the queue as data also means the collector can walk it,
-/// which a `Box<dyn FnOnce>` hides.
-struct PromiseRecord {
-    state: Settled,
-    value: u64,
-    /// `(handler, derived, on_rejection)` for each waiting reaction.
-    waiting: Vec<(u64, u32, bool)>,
-}
-
 /// One queued reaction: which handler, on what, settling which promise.
+///
+/// Every field is a JavaScript value or a flag, never a closure — which is what lets the
+/// drain put the borrow down before calling the handler, and what lets the collector see
+/// what the queue is holding (D-197).
 struct PromiseJob {
     handler: u64,
     value: u64,
-    derived: u32,
+    derived: u64,
     rejected: bool,
+    passthrough: bool,
 }
 
 /// `Error.prototype.toString` — `"name: message"`, or whichever of the two is there.
@@ -2567,6 +2564,9 @@ const PROMISE_SETTLE_CALL: usize = 4;
 
 /// The index within [`ANONYMOUS_NATIVES`] of the body a `revoke` function runs.
 const PROXY_REVOKE_CALL: usize = 5;
+
+/// The index within [`ANONYMOUS_NATIVES`] of the body every combinator reaction runs.
+const COMBINE_CALL: usize = 6;
 
 /// Marks an array whose `length` has been made non-writable.
 ///
@@ -3167,9 +3167,9 @@ extern "C" fn promise_then_method(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(id) = promise_id_of(this_value) else {
+    if !is_promise(this_value) {
         return raise("`then` needs a promise", "TypeError");
-    };
+    }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let on_fulfilled = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
@@ -3186,10 +3186,9 @@ extern "C" fn promise_then_method(
     } else {
         Value::UNDEFINED.to_bits()
     };
-    let derived = with_rooted(&[this_value, on_fulfilled, on_rejected], || {
-        promise_then(id, on_fulfilled, on_rejected)
-    });
-    new_promise_object(derived)
+    with_rooted(&[this_value, on_fulfilled, on_rejected], || {
+        promise_then(this_value, on_fulfilled, on_rejected, false)
+    })
 }
 
 /// `Promise.prototype.catch` — `then(undefined, handler)` and nothing else.
@@ -3219,22 +3218,19 @@ extern "C" fn promise_finally(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(id) = promise_id_of(this_value) else {
+    if !is_promise(this_value) {
         return raise("`finally` needs a promise", "TypeError");
-    };
+    }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let handler = unsafe { argument(argc, argv, 0) };
-    // Attached as a pass-through pair so the settlement survives, and the handler is run for
-    // its effect by the drain before the derived promise is settled with the original value.
-    let derived = with_rooted(&[this_value, handler], || {
-        promise_then(id, Value::UNDEFINED.to_bits(), Value::UNDEFINED.to_bits())
-    });
-    if is_callable(handler) {
-        let _ = with_rooted(&[handler], || {
-            call_value(handler, Value::UNDEFINED.to_bits(), &[])
-        });
-    }
-    new_promise_object(derived)
+    // **Registered, not run.** The first version called the handler here, which is `finally`
+    // at the wrong time entirely: before the promise settles, and once rather than on
+    // whichever way it goes. The pass-through flag is what carries both halves — the handler
+    // runs for its effect and the original settlement survives it, which is the whole
+    // difference from `then(f, f)`, where what the handler returns replaces the value.
+    with_rooted(&[this_value, handler], || {
+        promise_then(this_value, handler, handler, true)
+    })
 }
 
 /// `new Promise(executor)`.
@@ -3261,11 +3257,10 @@ fn make_promise_rooted(argc: u64, argv: *const u64) -> u64 {
     if !is_callable(executor) {
         return raise("a promise needs an executor function", "TypeError");
     }
-    let id = new_promise_record();
-    let promise = new_promise_object(id);
+    let promise = new_promise_object();
     with_rooted(&[promise, executor], || {
-        let resolve = new_settling_function(id, false);
-        let reject = with_rooted(&[resolve], || new_settling_function(id, true));
+        let resolve = new_settling_function(promise, false);
+        let reject = with_rooted(&[resolve], || new_settling_function(promise, true));
         // **A throw from the executor rejects the promise**, which is what lets
         // `new Promise(() => { throw x; })` be caught rather than escaping the constructor.
         let outcome = with_rooted(&[resolve, reject], || {
@@ -3273,7 +3268,7 @@ fn make_promise_rooted(argc: u64, argv: *const u64) -> u64 {
         });
         if Value::from_bits(outcome).is_exception() {
             let reason = crisol_pending_exception();
-            settle_promise(id, reason, true);
+            settle_promise(promise, reason, true);
         }
     });
     promise
@@ -3291,12 +3286,12 @@ extern "C" fn promise_resolve(
     let value = unsafe { argument(argc, argv, 0) };
     // **A promise is handed back as it is**, which is what makes `Promise.resolve` the way to
     // normalise something that may or may not be one.
-    if promise_id_of(value).is_some() {
+    if is_promise(value) {
         return value;
     }
-    let id = new_promise_record();
-    settle_promise(id, value, false);
-    new_promise_object(id)
+    let promise = with_rooted(&[value], new_promise_object);
+    settle_promise(promise, value, false);
+    promise
 }
 
 /// `Promise.reject(reason)`.
@@ -3309,9 +3304,350 @@ extern "C" fn promise_reject(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let reason = unsafe { argument(argc, argv, 0) };
-    let id = new_promise_record();
-    settle_promise(id, reason, true);
-    new_promise_object(id)
+    let promise = with_rooted(&[reason], new_promise_object);
+    settle_promise(promise, reason, true);
+    promise
+}
+
+/// Which way a combinator folds a list of promises.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Combine {
+    /// `all` — every value, or the first rejection.
+    All,
+    /// `allSettled` — a report per entry, never rejecting.
+    AllSettled,
+    /// `race` — whichever settles first, either way.
+    Race,
+    /// `any` — the first fulfilment, or an error when none arrive.
+    Any,
+}
+
+/// The shared body of `Promise.all`, `allSettled`, `race` and `any`.
+///
+/// **One walk with four endings.** Each reads the same list, attaches the same pair of
+/// reactions to each entry, and differs only in what a settlement does to the shared counter
+/// — so writing them separately is the same bookkeeping four times with four chances to get
+/// the empty case wrong, which is exactly where they differ most.
+fn combine_promises(argc: u64, argv: *const u64, how: Combine) -> u64 {
+    // SAFETY: the caller guarantees `argc` readable values at `argv`.
+    let list = unsafe { argument(argc, argv, 0) };
+    let result = with_rooted(&[list], new_promise_object);
+    with_rooted(&[list, result], || {
+        let length = match indexed_length(list) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
+        // **The empty case is where they disagree.** `all` and `allSettled` are immediately
+        // fulfilled with nothing, `any` is immediately rejected because no fulfilment can
+        // ever arrive, and `race` stays pending for ever because nothing will settle it.
+        if length == 0 {
+            match how {
+                Combine::All | Combine::AllSettled => {
+                    let empty = crisol_create_array(0);
+                    with_rooted(&[empty], || settle_promise(result, empty, false));
+                }
+                Combine::Any => {
+                    let reason = raise_value("no promise was fulfilled", "TypeError");
+                    with_rooted(&[reason], || settle_promise(result, reason, true));
+                }
+                Combine::Race => {}
+            }
+            return result;
+        }
+
+        // The collected values, and how many entries are still outstanding. Both live in
+        // heap arrays so the collector sees them while the handlers run.
+        let values = with_rooted(&[result], || crisol_create_array(length));
+        with_rooted(&[result, values, list], || {
+            let pending = with_runtime(|runtime| {
+                let scope = runtime.heap.scope();
+                let shape = runtime.shapes.borrow().root();
+                let cell = scope.alloc(shape, 0);
+                runtime.heap.make_array(cell.handle(), 1);
+                #[expect(clippy::cast_precision_loss, reason = "a list length")]
+                let count = length as f64;
+                runtime
+                    .heap
+                    .set_element(cell.handle(), 0, Value::number(count));
+                cell.to_value().to_bits()
+            });
+            with_rooted(&[pending], || {
+                for index in 0..length {
+                    let entry = indexed_get(list, index);
+                    let settled =
+                        with_rooted(&[entry], || promise_resolve(0, 0, 0, 1, [entry].as_ptr()));
+                    if Value::from_bits(settled).is_exception() {
+                        return settled;
+                    }
+                    let state = CombineState {
+                        result,
+                        values,
+                        pending,
+                        index,
+                        how,
+                    };
+                    with_rooted(
+                        &[settled, state.result, state.values, state.pending],
+                        || {
+                            attach_combiner(settled, state);
+                        },
+                    );
+                }
+                result
+            })
+        })
+    })
+}
+
+/// What one entry of a combinator needs to know when it settles.
+#[derive(Clone, Copy)]
+struct CombineState {
+    result: u64,
+    values: u64,
+    pending: u64,
+    index: usize,
+    how: Combine,
+}
+
+/// Attaches the pair of reactions one entry of a combinator needs.
+fn attach_combiner(entry: u64, state: CombineState) {
+    let fulfil = new_combiner_function(state, false);
+    let reject = with_rooted(&[fulfil], || new_combiner_function(state, true));
+    with_rooted(&[entry, fulfil, reject], || {
+        promise_then(entry, fulfil, reject, false);
+    });
+}
+
+/// Where a combiner keeps the promise it is filling in.
+const COMBINE_RESULT: &str = "__combineResult";
+/// Where a combiner keeps the array of collected values.
+const COMBINE_VALUES: &str = "__combineValues";
+/// Where a combiner keeps the outstanding count.
+const COMBINE_PENDING: &str = "__combinePending";
+/// Where a combiner keeps its slot in the result, and which way it folds.
+const COMBINE_INDEX: &str = "__combineIndex";
+/// Where a combiner keeps whether it runs on rejection, and which combinator made it.
+const COMBINE_SHAPE: &str = "__combineShape";
+
+/// One reaction of a combinator, carrying everything it needs to fold a settlement in.
+fn new_combiner_function(state: CombineState, rejects: bool) -> u64 {
+    let function = with_runtime(|runtime| {
+        runtime
+            .native_function(
+                NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + COMBINE_CALL,
+            )
+            .to_value()
+            .to_bits()
+    });
+    with_rooted(
+        &[function, state.result, state.values, state.pending],
+        || {
+            let Some(handle) = handle_of(function) else {
+                return;
+            };
+            // Stored one at a time: each `define_hidden` can transition the shape, and a value
+            // held only in a Rust local while that happens is invisible (D-127).
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, COMBINE_RESULT, Value::from_bits(state.result));
+            });
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, COMBINE_VALUES, Value::from_bits(state.values));
+            });
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, COMBINE_PENDING, Value::from_bits(state.pending));
+            });
+            #[expect(clippy::cast_precision_loss, reason = "an index into a list")]
+            let index = state.index as f64;
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, COMBINE_INDEX, Value::number(index));
+            });
+            let shape = f64::from(u8::from(rejects)) + 2.0 * f64::from(state.how as u8);
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, COMBINE_SHAPE, Value::number(shape));
+            });
+        },
+    );
+    function
+}
+
+/// The body every combinator reaction runs.
+extern "C" fn combine_call(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let read = |name: &str| own_property(closure, name).map(|(_, value)| value.to_bits());
+    let (Some(result), Some(values), Some(pending)) = (
+        read(COMBINE_RESULT),
+        read(COMBINE_VALUES),
+        read(COMBINE_PENDING),
+    ) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "values this code wrote"
+    )]
+    let index = property_number(closure, COMBINE_INDEX).unwrap_or(0.0) as usize;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "as above"
+    )]
+    let shape = property_number(closure, COMBINE_SHAPE).unwrap_or(0.0) as u8;
+    let rejects = shape & 1 != 0;
+    let how = match shape >> 1 {
+        1 => Combine::AllSettled,
+        2 => Combine::Race,
+        3 => Combine::Any,
+        _ => Combine::All,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+
+    with_rooted(&[result, values, pending, value], || {
+        match (how, rejects) {
+            // The first settlement of either kind wins, and the rest are ignored because a
+            // settled promise never settles again.
+            (Combine::Race, _) => settle_promise(result, value, rejects),
+            (Combine::All, true) => settle_promise(result, value, true),
+            (Combine::Any, false) => settle_promise(result, value, false),
+            _ => {
+                let recorded = if how == Combine::AllSettled {
+                    combine_report(value, rejects)
+                } else {
+                    value
+                };
+                with_rooted(&[recorded], || {
+                    if let Some(array) = handle_of(values) {
+                        with_runtime(|runtime| {
+                            runtime
+                                .heap
+                                .set_element(array, index, Value::from_bits(recorded));
+                        });
+                    }
+                });
+                // The last one in settles the result — a counter rather than a scan, so a
+                // list of a thousand promises costs one decrement each rather than a thousand
+                // checks each.
+                let left = decrement_pending(pending);
+                if left == 0 {
+                    match how {
+                        Combine::Any => {
+                            let reason = raise_value("no promise was fulfilled", "TypeError");
+                            with_rooted(&[reason], || settle_promise(result, reason, true));
+                        }
+                        _ => settle_promise(result, values, false),
+                    }
+                }
+            }
+        }
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+/// One `allSettled` entry: `{status, value}` or `{status, reason}`.
+fn combine_report(value: u64, rejected: bool) -> u64 {
+    let report = with_rooted(&[value], crisol_create_object);
+    with_rooted(&[report, value], || {
+        let Some(into) = handle_of(report) else {
+            return;
+        };
+        let status = new_string(if rejected { "rejected" } else { "fulfilled" });
+        with_rooted(&[status], || {
+            with_runtime(|runtime| {
+                runtime.define(into, "status", Value::from_bits(status));
+            });
+        });
+        with_runtime(|runtime| {
+            runtime.define(
+                into,
+                if rejected { "reason" } else { "value" },
+                Value::from_bits(value),
+            );
+        });
+    });
+    report
+}
+
+/// Takes one off the outstanding count and answers what is left.
+fn decrement_pending(pending: u64) -> usize {
+    let Some(handle) = handle_of(pending) else {
+        return 0;
+    };
+    with_runtime(|runtime| {
+        let left = runtime
+            .heap
+            .element(handle, 0)
+            .and_then(|value| value.as_number())
+            .unwrap_or(0.0)
+            - 1.0;
+        runtime
+            .heap
+            .set_element(handle, 0, Value::number(left.max(0.0)));
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a count this code wrote, clamped at zero"
+        )]
+        let left = left.max(0.0) as usize;
+        left
+    })
+}
+
+/// `Promise.all`.
+extern "C" fn promise_all(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || combine_promises(argc, argv, Combine::All))
+}
+
+/// `Promise.allSettled`.
+extern "C" fn promise_all_settled(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || combine_promises(argc, argv, Combine::AllSettled))
+}
+
+/// `Promise.race`.
+extern "C" fn promise_race(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || combine_promises(argc, argv, Combine::Race))
+}
+
+/// `Promise.any`.
+extern "C" fn promise_any(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || combine_promises(argc, argv, Combine::Any))
 }
 
 /// Runs queued reactions until there are none.
@@ -3324,7 +3660,18 @@ extern "C" fn promise_reject(
 /// means — and why an endless `.then` chain starves rather than yielding. That is the
 /// specified behaviour; the bound below is only so a test runner stops rather than hangs.
 #[unsafe(no_mangle)]
-pub extern "C" fn crisol_run_microtasks() {
+#[must_use]
+pub extern "C" fn crisol_run_microtasks(keep: u64) -> u64 {
+    // **`keep` is rooted for the whole drain and handed back.** The entry point holds the
+    // program's result in a C local that no stack map describes, and every job here can
+    // allocate — so without this the value about to be printed is collected by the queue
+    // that runs after the program returned.
+    with_rooted(&[keep], drain_microtasks);
+    keep
+}
+
+/// The drain itself, with whatever the caller needs kept already rooted.
+fn drain_microtasks() {
     for _ in 0..MICROTASK_LIMIT {
         let Some(job) = PROMISE_JOBS.with(|jobs| jobs.borrow_mut().pop_front()) else {
             return;
@@ -3335,18 +3682,31 @@ pub extern "C" fn crisol_run_microtasks() {
             settle_promise(job.derived, job.value, job.rejected);
             continue;
         }
-        let outcome = with_rooted(&[job.handler, job.value], || {
-            call_value(job.handler, Value::UNDEFINED.to_bits(), &[job.value])
+        let outcome = with_rooted(&[job.handler, job.value, job.derived], || {
+            // **`finally`'s handler takes no argument and its answer is discarded**, which is
+            // the difference from `then(f, f)` — there, what the handler returns replaces the
+            // value, and `finally` must leave the settlement exactly as it found it.
+            if job.passthrough {
+                call_value(job.handler, Value::UNDEFINED.to_bits(), &[])
+            } else {
+                call_value(job.handler, Value::UNDEFINED.to_bits(), &[job.value])
+            }
         });
         if Value::from_bits(outcome).is_exception() {
+            // A throw from a `finally` handler *does* replace the settlement: that is the one
+            // way it can change the outcome, and the specification keeps it.
             let reason = crisol_pending_exception();
             settle_promise(job.derived, reason, true);
             continue;
         }
+        if job.passthrough {
+            settle_promise(job.derived, job.value, job.rejected);
+            continue;
+        }
         // Returning a promise from a handler makes the derived one follow it, which costs an
         // extra tick — the adoption is itself a job.
-        if let Some(inner) = promise_id_of(outcome) {
-            adopt_promise(job.derived, inner);
+        if is_promise(outcome) {
+            adopt_promise(job.derived, outcome);
             continue;
         }
         settle_promise(job.derived, outcome, false);
@@ -5400,6 +5760,10 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Math", "random", math_random),
     ("Array", "of", array_of),
     ("Proxy", "revocable", proxy_revocable),
+    ("Promise", "all", promise_all),
+    ("Promise", "allSettled", promise_all_settled),
+    ("Promise", "race", promise_race),
+    ("Promise", "any", promise_any),
     ("Promise", "resolve", promise_resolve),
     ("Promise", "reject", promise_reject),
     ("Reflect", "get", reflect_get),
@@ -6411,8 +6775,13 @@ const INTERNAL_PROPERTIES: &[&str] = &[
     FIXED_LENGTH,
     ELEMENT_RULES,
     ERROR_DATA,
-    PROMISE_ID,
+    PROMISE_SETTLES,
     PROMISE_REJECTS,
+    COMBINE_RESULT,
+    COMBINE_VALUES,
+    COMBINE_PENDING,
+    COMBINE_INDEX,
+    COMBINE_SHAPE,
     PROXY_REVOKE_TARGET,
     COLLECTION_ENTRIES,
     BOUND_TARGET,
@@ -11781,43 +12150,159 @@ extern "C" fn proxy_revoke_call(
     Value::UNDEFINED.to_bits()
 }
 
-/// Makes a pending promise and answers its place in [`PROMISES`].
-fn new_promise_record() -> u32 {
-    PROMISES.with(|promises| {
-        let mut entries = promises.borrow_mut();
-        entries.push(PromiseRecord {
-            state: Settled::Pending,
-            value: Value::UNDEFINED.to_bits(),
-            waiting: Vec::new(),
-        });
-        u32::try_from(entries.len() - 1).unwrap_or(u32::MAX)
+/// Whether `value` is a promise this engine made.
+fn is_promise(value: u64) -> bool {
+    handle_of(value).is_some_and(|handle| {
+        with_runtime(|runtime| runtime.heap.internal(handle, 0) == Some(PROMISE_MARKER))
     })
 }
 
-/// Settles promise `id`, queueing everything that was waiting on it.
-///
-/// **A settled promise never settles again.** The first call wins, which is what makes a
-/// `resolve` handed to an executor safe to call twice.
-fn settle_promise(id: u32, value: u64, rejected: bool) {
-    let waiting = PROMISES.with(|promises| {
-        let mut entries = promises.borrow_mut();
-        let Some(record) = entries.get_mut(id as usize) else {
-            return Vec::new();
-        };
-        if record.state != Settled::Pending {
-            return Vec::new();
+/// A promise's state and what it settled to.
+fn promise_state(promise: u64) -> Option<(Settled, u64)> {
+    let handle = handle_of(promise)?;
+    with_runtime(|runtime| {
+        if runtime.heap.internal(handle, 0)? != PROMISE_MARKER {
+            return None;
         }
-        record.state = if rejected {
-            Settled::Rejected
-        } else {
-            Settled::Fulfilled
+        let state = match runtime
+            .heap
+            .internal(handle, PROMISE_STATE_SLOT)?
+            .as_number()?
+        {
+            one if one == 1.0 => Settled::Fulfilled,
+            two if two == 2.0 => Settled::Rejected,
+            _ => Settled::Pending,
         };
-        record.value = value;
-        std::mem::take(&mut record.waiting)
+        let value = runtime.heap.internal(handle, PROMISE_VALUE_SLOT)?;
+        Some((state, value.to_bits()))
+    })
+}
+
+/// A fresh pending promise.
+///
+/// **Its whole state lives in its own internal slots**, which the collector already traces —
+/// so a promise nobody holds is freed with everything waiting on it, and there is no table of
+/// every promise ever made to grow for the life of the program.
+fn new_promise_object() -> u64 {
+    with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        let scope = runtime.heap.scope();
+        let promise = scope.alloc_with_internals(shape, 0, 4);
+        let handle = promise.handle();
+        runtime.heap.set_internal(handle, 0, PROMISE_MARKER);
+        runtime
+            .heap
+            .set_internal(handle, PROMISE_STATE_SLOT, Value::number(0.0));
+        runtime
+            .heap
+            .set_internal(handle, PROMISE_VALUE_SLOT, Value::UNDEFINED);
+        // The reaction list is left `undefined` and made on first use: most promises are
+        // settled before anything waits on them, and those never allocate one.
+        if let Some(prototype) = PROMISE_PROTOTYPE.with(std::cell::Cell::get) {
+            runtime.heap.set_prototype(handle, Some(prototype));
+        }
+        promise.to_value().to_bits()
+    })
+}
+
+/// Records a reaction on a pending promise.
+fn promise_add_reaction(promise: u64, handler: u64, derived: u64, flags: u32) {
+    let Some(handle) = handle_of(promise) else {
+        return;
+    };
+    let existing = with_runtime(|runtime| runtime.heap.internal(handle, PROMISE_REACTIONS_SLOT));
+    let list = match existing.map(|value| value.to_bits()) {
+        Some(list) if elements_of(list).is_some() => list,
+        _ => {
+            let made = with_rooted(&[promise, handler, derived], || crisol_create_array(0));
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_internal(handle, PROMISE_REACTIONS_SLOT, Value::from_bits(made));
+            });
+            made
+        }
+    };
+    let Some(target) = handle_of(list) else {
+        return;
+    };
+    // Three elements per reaction: the handler, the promise it settles, and the flags.
+    with_rooted(&[promise, list, handler, derived], || {
+        with_runtime(|runtime| {
+            let at = runtime.heap.element_count(target).unwrap_or(0);
+            runtime
+                .heap
+                .set_element(target, at, Value::from_bits(handler));
+            runtime
+                .heap
+                .set_element(target, at + 1, Value::from_bits(derived));
+            runtime
+                .heap
+                .set_element(target, at + 2, Value::number(f64::from(flags)));
+        });
     });
-    for (handler, derived, on_rejection) in waiting {
-        if on_rejection == rejected {
-            enqueue_reaction(handler, value, derived, rejected);
+}
+
+/// Settles `promise`, queueing everything that was waiting on it.
+///
+/// **A settled promise never settles again.** The first call wins, which is what makes the
+/// `resolve` handed to an executor safe to call twice.
+fn settle_promise(promise: u64, value: u64, rejected: bool) {
+    let Some(handle) = handle_of(promise) else {
+        return;
+    };
+    let waiting = with_runtime(|runtime| {
+        if runtime.heap.internal(handle, 0) != Some(PROMISE_MARKER) {
+            return None;
+        }
+        let state = runtime
+            .heap
+            .internal(handle, PROMISE_STATE_SLOT)
+            .and_then(|slot| slot.as_number())
+            .unwrap_or(0.0);
+        if state != 0.0 {
+            return None;
+        }
+        runtime.heap.set_internal(
+            handle,
+            PROMISE_STATE_SLOT,
+            Value::number(if rejected { 2.0 } else { 1.0 }),
+        );
+        runtime
+            .heap
+            .set_internal(handle, PROMISE_VALUE_SLOT, Value::from_bits(value));
+        let list = runtime.heap.internal(handle, PROMISE_REACTIONS_SLOT);
+        // **Dropped as it is taken.** A settled promise never needs its reactions again, and
+        // holding them keeps every handler — and everything each closure captured — alive for
+        // as long as the promise is reachable.
+        runtime
+            .heap
+            .set_internal(handle, PROMISE_REACTIONS_SLOT, Value::UNDEFINED);
+        list.map(|value| value.to_bits())
+    });
+    let Some(list) = waiting else {
+        return;
+    };
+    let Some((array, length)) = elements_of(list) else {
+        return;
+    };
+    for at in (0..length).step_by(3) {
+        let handler = element_at(array, at);
+        let derived = element_at(array, at + 1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a flag word this code wrote"
+        )]
+        let flags = Value::from_bits(element_at(array, at + 2))
+            .as_number()
+            .unwrap_or(0.0) as u32;
+        let on_rejection = flags & REACTION_ON_REJECTION != 0;
+        let passthrough = flags & REACTION_PASSTHROUGH != 0;
+        // A reaction runs on the settlement it was registered for. `finally`'s runs on both,
+        // which is what the pass-through flag says.
+        if on_rejection == rejected || passthrough {
+            enqueue_reaction(handler, value, derived, rejected, passthrough);
         }
     }
 }
@@ -11825,90 +12310,72 @@ fn settle_promise(id: u32, value: u64, rejected: bool) {
 /// Queues one reaction. A missing handler passes the settlement through **as it was**, which
 /// is what makes `.then(onFulfilled)` transparent to an error and `.catch` transparent when
 /// nothing threw.
-fn enqueue_reaction(handler: u64, value: u64, derived: u32, rejected: bool) {
+fn enqueue_reaction(handler: u64, value: u64, derived: u64, rejected: bool, passthrough: bool) {
     PROMISE_JOBS.with(|jobs| {
         jobs.borrow_mut().push_back(PromiseJob {
             handler,
             value,
             derived,
             rejected,
+            passthrough,
         });
     });
 }
 
-/// `promise.then(onFulfilled, onRejected)` on the record, answering the derived promise's id.
+/// `promise.then(onFulfilled, onRejected)`, answering the derived promise.
 ///
 /// **Always asynchronous.** Attaching to an already-settled promise queues a job rather than
 /// running it, so `Promise.resolve(1).then(f)` does not call `f` before `then` returns. Code
 /// relying on the synchronous case works until the promise happens to be pending, which is
-/// the intermittent failure that is worth never allowing.
-fn promise_then(id: u32, on_fulfilled: u64, on_rejected: u64) -> u32 {
-    let derived = new_promise_record();
-    let settled = PROMISES.with(|promises| {
-        let mut entries = promises.borrow_mut();
-        let record = entries.get_mut(id as usize)?;
-        match record.state {
-            Settled::Pending => {
-                record.waiting.push((on_fulfilled, derived, false));
-                record.waiting.push((on_rejected, derived, true));
-                None
+/// the intermittent failure worth never allowing.
+fn promise_then(promise: u64, on_fulfilled: u64, on_rejected: u64, passthrough: bool) -> u64 {
+    let derived = with_rooted(&[promise, on_fulfilled, on_rejected], new_promise_object);
+    let extra = if passthrough { REACTION_PASSTHROUGH } else { 0 };
+    with_rooted(
+        &[promise, derived, on_fulfilled, on_rejected],
+        || match promise_state(promise) {
+            Some((Settled::Pending, _)) => {
+                promise_add_reaction(promise, on_fulfilled, derived, extra);
+                if !passthrough {
+                    promise_add_reaction(promise, on_rejected, derived, REACTION_ON_REJECTION);
+                }
             }
-            Settled::Fulfilled => Some((record.value, false)),
-            Settled::Rejected => Some((record.value, true)),
-        }
-    });
-    if let Some((value, rejected)) = settled {
-        let handler = if rejected { on_rejected } else { on_fulfilled };
-        enqueue_reaction(handler, value, derived, rejected);
-    }
+            Some((Settled::Fulfilled, value)) => {
+                enqueue_reaction(on_fulfilled, value, derived, false, passthrough);
+            }
+            Some((Settled::Rejected, reason)) => {
+                let handler = if passthrough {
+                    on_fulfilled
+                } else {
+                    on_rejected
+                };
+                enqueue_reaction(handler, reason, derived, true, passthrough);
+            }
+            None => {}
+        },
+    );
     derived
 }
 
-/// The id a promise object carries, if it is one.
-fn promise_id_of(value: u64) -> Option<u32> {
-    let number = own_property(value, PROMISE_ID)?.1.as_number()?;
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "an id this code wrote"
-    )]
-    let id = number as u32;
-    Some(id)
-}
-
-/// Wraps promise `id` in the object a program holds.
-fn new_promise_object(id: u32) -> u64 {
-    let object = crisol_create_object();
-    with_rooted(&[object], || {
-        if let Some(handle) = handle_of(object) {
-            with_runtime(|runtime| {
-                runtime.define_hidden(handle, PROMISE_ID, Value::number(f64::from(id)));
-                if let Some(prototype) = PROMISE_PROTOTYPE.with(std::cell::Cell::get) {
-                    runtime.heap.set_prototype(handle, Some(prototype));
-                }
-            });
-        }
+/// One `resolve` or `reject` function, carrying the promise it settles.
+fn new_settling_function(promise: u64, rejects: bool) -> u64 {
+    let function = with_rooted(&[promise], || {
+        with_runtime(|runtime| {
+            runtime
+                .native_function(
+                    NATIVES.len()
+                        + GLOBAL_NATIVES.len()
+                        + NAMESPACE_NATIVES.len()
+                        + PROMISE_SETTLE_CALL,
+                )
+                .to_value()
+                .to_bits()
+        })
     });
-    object
-}
-
-/// One `resolve` or `reject` function, carrying which promise it settles.
-fn new_settling_function(id: u32, rejects: bool) -> u64 {
-    let function = with_runtime(|runtime| {
-        runtime
-            .native_function(
-                NATIVES.len()
-                    + GLOBAL_NATIVES.len()
-                    + NAMESPACE_NATIVES.len()
-                    + PROMISE_SETTLE_CALL,
-            )
-            .to_value()
-            .to_bits()
-    });
-    with_rooted(&[function], || {
+    with_rooted(&[function, promise], || {
         if let Some(handle) = handle_of(function) {
             with_runtime(|runtime| {
-                runtime.define_hidden(handle, PROMISE_ID, Value::number(f64::from(id)));
+                runtime.define_hidden(handle, PROMISE_SETTLES, Value::from_bits(promise));
                 runtime.define_hidden(handle, PROMISE_REJECTS, boolean(rejects));
             });
         }
@@ -11924,27 +12391,30 @@ extern "C" fn promise_settle_call(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(id) = promise_id_of(closure) else {
+    let Some((_, promise)) = own_property(closure, PROMISE_SETTLES) else {
         return Value::UNDEFINED.to_bits();
     };
+    let promise = promise.to_bits();
     let rejects = own_property(closure, PROMISE_REJECTS)
         .and_then(|(_, value)| value.as_boolean())
         .unwrap_or(false);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
     // **Resolving with a promise adopts it**, which is what makes a chain of `then`s flatten
-    // rather than nesting. Rejecting never adopts: a rejection reason is a value even when it
-    // is a promise.
-    if !rejects && let Some(inner) = promise_id_of(value) {
-        adopt_promise(id, inner);
+    // rather than nest. Rejecting never adopts: a reason is a value even when it is a
+    // promise.
+    if !rejects && is_promise(value) {
+        with_rooted(&[promise, value], || adopt_promise(promise, value));
         return Value::UNDEFINED.to_bits();
     }
-    settle_promise(id, value, rejects);
+    with_rooted(&[promise, value], || {
+        settle_promise(promise, value, rejects)
+    });
     Value::UNDEFINED.to_bits()
 }
 
 /// Makes `derived` follow `other`, which is what returning a promise from a handler does.
-fn adopt_promise(derived: u32, other: u32) {
+fn adopt_promise(derived: u64, other: u64) {
     if derived == other {
         // Resolving a promise with itself can never settle, which is worse than an error
         // because it is indistinguishable from a call that has not come back.
@@ -11952,15 +12422,16 @@ fn adopt_promise(derived: u32, other: u32) {
         settle_promise(derived, reason, true);
         return;
     }
-    // A pass-through reaction on both sides: no handler, so the settlement arrives unchanged.
+    // A pass-through pair: no handler, so the settlement arrives at `derived` unchanged.
     let pass = Value::UNDEFINED.to_bits();
-    let follower = promise_then(other, pass, pass);
-    PROMISES.with(|promises| {
-        let mut entries = promises.borrow_mut();
-        if let Some(record) = entries.get_mut(follower as usize) {
-            record.waiting.push((pass, derived, false));
-            record.waiting.push((pass, derived, true));
+    with_rooted(&[derived, other], || match promise_state(other) {
+        Some((Settled::Pending, _)) => {
+            promise_add_reaction(other, pass, derived, 0);
+            promise_add_reaction(other, pass, derived, REACTION_ON_REJECTION);
         }
+        Some((Settled::Fulfilled, value)) => enqueue_reaction(pass, value, derived, false, false),
+        Some((Settled::Rejected, reason)) => enqueue_reaction(pass, reason, derived, true, false),
+        None => {}
     });
 }
 
