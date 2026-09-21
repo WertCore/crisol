@@ -10884,6 +10884,13 @@ pub extern "C" fn crisol_enumerate(object: u64) -> u64 {
 #[unsafe(no_mangle)]
 #[must_use]
 pub extern "C" fn crisol_iterate(value: u64) -> u64 {
+    // **`Symbol.iterator` first**, because it is what makes a value iterable — the two fast
+    // paths below are shortcuts for the built-ins that would answer the same way. Asking the
+    // object first is also what lets a program override either of them, which is the point of
+    // the protocol being a property.
+    if let Some(items) = iterate_by_protocol(value) {
+        return items;
+    }
     if elements_of(value).is_some() {
         return value;
     }
@@ -10897,6 +10904,94 @@ pub extern "C" fn crisol_iterate(value: u64) -> u64 {
         });
     }
     raise("value is not iterable", "TypeError")
+}
+
+/// The value a well-known symbol names, read off the `Symbol` global.
+///
+/// Read rather than cached, so a program that replaces `Symbol.iterator` is obeyed. That is
+/// wrong for an internal operation and right against the alternative, which is a second copy
+/// of each symbol kept in step by hand.
+fn well_known_symbol(name: &str) -> Option<u64> {
+    with_runtime(|runtime| {
+        let globals = GLOBALS.with(std::cell::Cell::get)?;
+        let symbol = runtime.global_object(globals, "Symbol")?;
+        let key = PropertyKey::new(name);
+        let shape = runtime.heap.shape_of(symbol)?;
+        let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+        runtime
+            .heap
+            .get(symbol, slot.index())
+            .map(|value| value.to_bits())
+    })
+}
+
+/// Drains `value`'s own iterator into an array, or `None` if it has no `Symbol.iterator`.
+///
+/// **Eager, which the caller's contract already required.** `crisol_iterate` hands back
+/// something the loop walks by index, so the whole sequence is materialised before the first
+/// iteration of the body — a generator's side effects all happen up front, and an endless
+/// iterator is refused at the cap rather than filling memory. Making it lazy means giving
+/// `for-of` an iterator object to step, which is a change to the lowering.
+fn iterate_by_protocol(value: u64) -> Option<u64> {
+    let symbol = well_known_symbol("iterator")?;
+    let key = key_of(Value::from_bits(symbol))?;
+    let method = symbol_property_load(value, &key);
+    if !is_callable(method) {
+        return None;
+    }
+    Some(with_rooted(&[value, method], || {
+        let iterator = call_value(method, value, &[]);
+        if Value::from_bits(iterator).is_exception() {
+            return iterator;
+        }
+        with_rooted(&[iterator], || drain_iterator(iterator))
+    }))
+}
+
+/// Walks an iterator to exhaustion, collecting what it yields.
+fn drain_iterator(iterator: u64) -> u64 {
+    with_new_array(0, |array| {
+        let mut count = 0usize;
+        loop {
+            let advance = property_of(iterator, "next");
+            if !is_callable(advance) {
+                return raise("an iterator needs a `next` method", "TypeError");
+            }
+            let outcome = with_rooted(&[iterator, advance], || call_value(advance, iterator, &[]));
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
+            }
+            if handle_of(outcome).is_none() {
+                return raise("an iterator step must be an object", "TypeError");
+            }
+            if is_truthy(Value::from_bits(property_of(outcome, "done"))) {
+                break;
+            }
+            let item = with_rooted(&[iterator, outcome], || property_of(outcome, "value"));
+            if Value::from_bits(item).is_exception() {
+                return item;
+            }
+            if count > DENSE_ELEMENT_LIMIT {
+                return raise("this iterator does not end", "RangeError");
+            }
+            with_rooted(&[iterator, item], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(array, count, Value::from_bits(item));
+                });
+            });
+            count += 1;
+        }
+        array.to_value().to_bits()
+    })
+}
+
+/// A named property of `object`, read as a value.
+fn property_of(object: u64, name: &str) -> u64 {
+    let key = name.to_owned();
+    // SAFETY: `key` is a live Rust string.
+    unsafe { crisol_property_load(object, key.as_ptr(), key.len() as u64) }
 }
 
 /// `/source/flags` — a regular expression object.

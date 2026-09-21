@@ -6945,3 +6945,77 @@ fn a_symbol_can_be_a_property_key() {
         "5",
     );
 }
+
+/// **`Symbol.iterator` is what makes a value iterable**, so `for-of` asks the object before
+/// it falls back to the shapes it recognises — which is also what lets a program override
+/// either of them.
+#[test]
+fn for_of_uses_the_iterator_protocol() {
+    check(
+        "for-of-user-iterable",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             let n = 0; \
+             return {next: function () { n = n + 1; \
+                 return n <= 3 ? {value: n, done: false} : {value: undefined, done: true}; }}; \
+         }; \
+         let total = 0; for (let x of it) { total = total + x; } return total;",
+        "6",
+    );
+    check(
+        "for-of-empty-iterable",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             return {next: function () { return {done: true}; }}; \
+         }; \
+         let seen = 0; for (let x of it) { seen = seen + 1; } return seen;",
+        "0",
+    );
+    // The built-in shapes still work, and an override of one is obeyed.
+    check(
+        "for-of-array",
+        "let s = 0; for (let x of [1, 2, 3]) { s = s + x; } return s;",
+        "6",
+    );
+    check(
+        "for-of-string",
+        "let s = \"\"; for (let c of \"abc\") { s = s + c; } return s;",
+        "abc",
+    );
+    check(
+        "for-of-overridden-array",
+        "let a = [1, 2, 3]; \
+         a[Symbol.iterator] = function () { \
+             let done = false; \
+             return {next: function () { \
+                 if (done) { return {done: true}; } done = true; return {value: 9, done: false}; }}; \
+         }; \
+         let s = 0; for (let x of a) { s = s + x; } return s;",
+        "9",
+    );
+    // A `next` that is not a function, and a step that is not an object, are both errors.
+    check(
+        "for-of-bad-next",
+        "let it = {}; it[Symbol.iterator] = function () { return {next: 5}; }; \
+         try { for (let x of it) {} return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "for-of-bad-step",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             return {next: function () { return 5; }}; }; \
+         try { for (let x of it) {} return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A throw from the iterator reaches the program rather than ending the loop quietly.
+    check(
+        "for-of-throwing-next",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             return {next: function () { throw new RangeError(\"stop\"); }}; }; \
+         try { for (let x of it) {} return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "for-of-not-iterable",
+        "try { for (let x of {}) {} return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}

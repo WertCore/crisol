@@ -5448,3 +5448,26 @@ symbol path is the chain walk and nothing else.
 `in` and `delete` had the same shape of bug in smaller form. `in` reached for `to_text`, which
 a symbol has none of, and answered `false`; `delete` asked the derived-property table by
 description, which would have answered about whatever string property shared the name.
+
+## D-194
+
+**`for-of` asks for `Symbol.iterator` before it recognises a shape.**
+
+Status: Accepted
+
+`crisol_iterate` handled arrays and strings and refused everything else, so a user-defined
+iterable was a `TypeError` — the protocol existed in the language and not in the engine. Now
+that a symbol can be a property key (D-192), the object can be asked, and the two fast paths
+are what they always should have been: shortcuts for built-ins that would answer the same way.
+Asking first is also what lets a program override either, which is the point of the protocol
+being a property rather than a type.
+
+**It drains eagerly, which the caller's contract already required.** `crisol_iterate` hands
+back something the loop walks by index, so the whole sequence is materialised before the body
+runs once: a generator's side effects all happen up front, and an endless iterator is refused
+at the dense cap rather than filling memory. Making it lazy means giving `for-of` an iterator
+object to step, which is a change to the lowering and not to this.
+
+The errors are the ones the protocol specifies — a `next` that is not callable, a step that is
+not an object — and a throw from inside `next` reaches the program rather than quietly ending
+the loop, which is the failure that would look like an empty collection.
