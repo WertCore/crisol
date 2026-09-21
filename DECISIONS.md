@@ -5967,3 +5967,33 @@ the target builds its own from its own `prototype`, which a bound function does 
 **Both were found by the acceptance suite, not by reading.** Making a bound function report
 itself constructable is what made calling-instead-of-constructing observable, and the test for
 it is what found the missing prototype link one line earlier.
+
+## D-212
+
+**A replacement may be a function, and `$` in a string one means something.**
+
+Status: Accepted
+
+`"abc".replace(/b/, function (m) { return m.toUpperCase(); })` produced
+`afunction (m) { return m.toUpperCase(); }c`. The replacement was run through `ToString`
+whatever it was, so a function replacer substituted its own source text into the result.
+
+That is not a missing optimisation. A string replacement cannot see a group **as a value** —
+only as text — so `s.replace(/(\d+)/, n => n * 2)` has no other spelling, and the callback
+form is how every non-trivial replacement in the wild is written.
+
+The callback gets `(matched, …groups, position, whole)`, with `position` in **code units**,
+the space every other index in the language is in (D-115). A byte offset would read correctly
+for ASCII and wrongly for exactly the strings that make the difference visible.
+
+The `$` patterns were not expanded either: `"$&"` was two literal characters. All of `$$`,
+`$&`, `` $` ``, `$'` and `$1`–`$99` now are. **`$` is not an escape for the next character** —
+`$x` stays two characters — which matters because a replacement assembled from user text
+produces `$&` by accident, and smoothing that over would be a different language.
+
+Two digits are tried before one, so `$12` is group twelve where there are twelve and group one
+followed by `2` where there are not.
+
+The string-pattern path shares the same splice rather than keeping `str::replace`. One
+substitution rule, not two — and an empty needle advances by a character, without which
+`"ab".replaceAll("", "-")` did not terminate.

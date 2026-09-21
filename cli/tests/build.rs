@@ -2925,6 +2925,98 @@ fn replace_follows_the_patterns_own_flags() {
     );
 }
 
+/// **A replacement may be a function**, and calling it is not an optimisation: a string
+/// replacement cannot see a group as a value, so `s.replace(/(\d+)/, n => n * 2)` has no other
+/// spelling. Stringifying the function, which is what happened before, substituted its own
+/// source text into the result.
+#[test]
+fn a_replacement_can_be_a_function() {
+    check(
+        "replace-function",
+        "return \"abc\".replace(/b/, function (m) { return m.toUpperCase(); });",
+        "aBc",
+    );
+    check(
+        "replace-function-groups",
+        "return \"a1b2\".replace(/([a-z])([0-9])/g, \
+             function (m, one, two) { return two + one; });",
+        "1a2b",
+    );
+    // `(matched, …groups, position, whole)` — the last two are what a replacement uses to
+    // look at its surroundings.
+    check(
+        "replace-function-position",
+        "return \"abc\".replace(/b/, function (m, at, whole) { return at + whole.length; });",
+        "a4c",
+    );
+    check(
+        "replace-function-every-match",
+        "let n = 0; \"aaa\".replace(/a/g, function () { n = n + 1; return n; }); return n;",
+        "3",
+    );
+    // A string pattern takes one too.
+    check(
+        "replace-string-function",
+        "return \"abc\".replace(\"b\", function (m) { return \"[\" + m + \"]\"; });",
+        "a[b]c",
+    );
+    // A throw from the replacement reaches the program rather than becoming part of the text.
+    check(
+        "replace-function-throws",
+        "try { \"abc\".replace(/b/, function () { throw new RangeError(\"x\"); }); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
+/// The `$` patterns a string replacement may use.
+///
+/// **`$` is not an escape for the next character**: `$x` is two literal characters and `$&` is
+/// the match, so a replacement built by concatenating user text produces either by accident.
+/// That is the language's design rather than something to smooth over, which is why `$x` is
+/// tested as carefully as `$&`.
+#[test]
+fn a_string_replacement_expands_its_dollar_patterns() {
+    check(
+        "replace-dollar-match",
+        "return \"abc\".replace(/b/, \"[$&]\");",
+        "a[b]c",
+    );
+    check(
+        "replace-dollar-dollar",
+        "return \"abc\".replace(/b/, \"$$\");",
+        "a$c",
+    );
+    check(
+        "replace-dollar-group",
+        "return \"a1\".replace(/([a-z])([0-9])/, \"$2$1\");",
+        "1a",
+    );
+    check(
+        "replace-dollar-before-and-after",
+        "return \"abc\".replace(/b/, \"<$`|$'>\");",
+        "a<a|c>c",
+    );
+    // A group nobody has stays as it was written, and so does any other character.
+    check(
+        "replace-dollar-missing-group",
+        "return \"abc\".replace(/b/, \"$9\");",
+        "a$9c",
+    );
+    check(
+        "replace-dollar-literal",
+        "return \"abc\".replace(/b/, \"$x\");",
+        "a$xc",
+    );
+    // **Two digits are tried before one**, so this is group one followed by `2` where there
+    // is only one group.
+    check(
+        "replace-dollar-two-digits",
+        "return \"a\".replace(/(a)/, \"$12\");",
+        "a2",
+    );
+}
+
 /// `replaceAll` with a non-global pattern raises rather than quietly behaving like `replace`.
 #[test]
 fn replace_all_refuses_a_non_global_pattern() {

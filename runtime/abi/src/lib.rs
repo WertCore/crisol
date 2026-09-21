@@ -5171,40 +5171,209 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
         if all && !global {
             return raise("replaceAll needs a global regular expression", "TypeError");
         }
-        let Some(replacement) = to_text(replacement) else {
-            return new_string(&text);
-        };
         let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
             return new_string(&text);
         };
         let Ok(mut compiled) = crisol_builtins::JsRegExp::new(&source, parsed) else {
             return new_string(&text);
         };
-        let mut out = String::new();
-        let mut cursor = 0;
-        for found in compiled.all_matches(&text) {
-            out.push_str(text.get(cursor..found.start).unwrap_or_default());
-            out.push_str(&replacement);
-            cursor = found.end;
-            if !global {
-                break;
-            }
-        }
-        out.push_str(text.get(cursor..).unwrap_or_default());
-        return new_string(&out);
+        let found: Vec<crisol_builtins::Captured> = if global {
+            compiled.all_matches(&text)
+        } else {
+            compiled.exec(&text).into_iter().collect()
+        };
+        return with_rooted(&[this_value, pattern, replacement], || {
+            splice_matches(&text, &found, replacement)
+        });
     }
 
     let Some(needle) = to_text(pattern) else {
         return new_string(&text);
     };
-    let Some(replacement) = to_text(replacement) else {
-        return new_string(&text);
-    };
-    new_string(&if all {
-        text.replace(&needle, &replacement)
-    } else {
-        text.replacen(&needle, &replacement, 1)
+    // A plain string pattern has no groups, so the same splice serves it — found by
+    // searching rather than matching, and once unless this is `replaceAll`.
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text.get(from..).and_then(|rest| rest.find(&needle)) {
+        let start = from + offset;
+        found.push(crisol_builtins::Captured {
+            start,
+            end: start + needle.len(),
+            groups: Vec::new(),
+        });
+        if !all {
+            break;
+        }
+        // **An empty needle advances by a character, not by nothing.** Without this,
+        // `"ab".replaceAll("", "-")` never terminates.
+        from = if needle.is_empty() {
+            match text[start..].chars().next() {
+                Some(character) => start + character.len_utf8(),
+                None => break,
+            }
+        } else {
+            start + needle.len()
+        };
+    }
+    with_rooted(&[this_value, pattern, replacement], || {
+        splice_matches(&text, &found, replacement)
     })
+}
+
+/// Rebuilds `text` with each match replaced by what `replacement` says.
+///
+/// **`replacement` may be a function**, and calling it is not an optimisation — a string
+/// replacement cannot see the groups as values, so `s.replace(/(\d+)/, n => n * 2)` has no
+/// spelling without it. Stringifying the function instead, which is what happened before,
+/// substituted its own source text into the result.
+fn splice_matches(text: &str, found: &[crisol_builtins::Captured], replacement: u64) -> u64 {
+    let callable = is_callable(replacement);
+    let template = if callable {
+        String::new()
+    } else {
+        match to_text(replacement) {
+            Some(template) => template,
+            None => return new_string(text),
+        }
+    };
+    let mut out = String::new();
+    let mut cursor = 0;
+    for capture in found {
+        // Matches come back in order and cannot overlap, but a caller-supplied list could be
+        // anything; skipping a match that starts behind the cursor keeps this total.
+        if capture.start < cursor {
+            continue;
+        }
+        out.push_str(text.get(cursor..capture.start).unwrap_or_default());
+        if callable {
+            let produced = call_replacer(text, capture, replacement);
+            match produced {
+                Ok(piece) => out.push_str(&piece),
+                Err(thrown) => return thrown,
+            }
+        } else {
+            expand_replacement(text, capture, &template, &mut out);
+        }
+        cursor = capture.end;
+    }
+    out.push_str(text.get(cursor..).unwrap_or_default());
+    new_string(&out)
+}
+
+/// Calls a function replacement with `(matched, …groups, position, whole)`.
+///
+/// `position` is in **code units**, the space every other index in the language is in
+/// (D-115) — handing over a byte offset reads correctly for ASCII and wrongly for the strings
+/// that make the difference visible.
+fn call_replacer(
+    text: &str,
+    capture: &crisol_builtins::Captured,
+    replacement: u64,
+) -> Result<String, u64> {
+    let mut arguments = Vec::with_capacity(capture.groups.len() + 3);
+    arguments.push(new_string(
+        text.get(capture.start..capture.end).unwrap_or_default(),
+    ));
+    // Each argument is rooted as it is made: the one before it is held only by this `Vec`,
+    // which the collector does not read, and the next one allocates.
+    for group in &capture.groups {
+        let value = with_rooted(&arguments, || match group {
+            Some((start, end)) => new_string(text.get(*start..*end).unwrap_or_default()),
+            None => Value::UNDEFINED.to_bits(),
+        });
+        arguments.push(value);
+    }
+    #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+    let position = text
+        .get(..capture.start)
+        .unwrap_or_default()
+        .encode_utf16()
+        .count() as f64;
+    arguments.push(Value::number(position).to_bits());
+    let whole = with_rooted(&arguments, || new_string(text));
+    arguments.push(whole);
+
+    let produced = with_rooted(&arguments, || {
+        call_value(replacement, Value::UNDEFINED.to_bits(), &arguments)
+    });
+    if Value::from_bits(produced).is_exception() {
+        return Err(produced);
+    }
+    Ok(to_text(produced).unwrap_or_default())
+}
+
+/// `GetSubstitution` — the `$` patterns a string replacement may use.
+///
+/// **`$` is not an escape for the next character.** `$x` is two literal characters and `$&` is
+/// the match, so a replacement built by concatenating user text can produce either by
+/// accident; that is the language's design and not something to smooth over.
+fn expand_replacement(
+    text: &str,
+    capture: &crisol_builtins::Captured,
+    template: &str,
+    out: &mut String,
+) {
+    let bytes = template.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'$' || at + 1 >= bytes.len() {
+            // Pushed as a slice rather than a byte, so a multi-byte character survives.
+            let character = template[at..].chars().next().unwrap_or('$');
+            out.push(character);
+            at += character.len_utf8();
+            continue;
+        }
+        match bytes[at + 1] {
+            b'$' => {
+                out.push('$');
+                at += 2;
+            }
+            b'&' => {
+                out.push_str(text.get(capture.start..capture.end).unwrap_or_default());
+                at += 2;
+            }
+            b'`' => {
+                out.push_str(text.get(..capture.start).unwrap_or_default());
+                at += 2;
+            }
+            b'\'' => {
+                out.push_str(text.get(capture.end..).unwrap_or_default());
+                at += 2;
+            }
+            b'0'..=b'9' => {
+                // **Two digits are tried before one**, so `$12` is group twelve where there
+                // are twelve and group one followed by `2` where there are not.
+                let two = bytes
+                    .get(at + 2)
+                    .filter(|byte| byte.is_ascii_digit())
+                    .map(|byte| usize::from(bytes[at + 1] - b'0') * 10 + usize::from(*byte - b'0'))
+                    .filter(|index| *index >= 1 && *index <= capture.groups.len());
+                let one = usize::from(bytes[at + 1] - b'0');
+                if let Some(index) = two {
+                    push_group(text, capture, index, out);
+                    at += 3;
+                } else if one >= 1 && one <= capture.groups.len() {
+                    push_group(text, capture, one, out);
+                    at += 2;
+                } else {
+                    // Not a group anybody has, so it stays as it was written.
+                    out.push('$');
+                    at += 1;
+                }
+            }
+            _ => {
+                out.push('$');
+                at += 1;
+            }
+        }
+    }
+}
+
+/// Appends group `index` (1-based), which contributes nothing when it did not participate.
+fn push_group(text: &str, capture: &crisol_builtins::Captured, index: usize, out: &mut String) {
+    if let Some(Some((start, end))) = capture.groups.get(index - 1) {
+        out.push_str(text.get(*start..*end).unwrap_or_default());
+    }
 }
 
 /// `String.prototype.replace`.
@@ -10035,7 +10204,7 @@ extern "C" fn refused_construct(
 /// The body `new callee(...)` should run, given the receiver that was made for it.
 ///
 /// Never null, exactly as [`crisol_closure_code`] is never null: when the receiver is the
-/// exception signal the answer is [`refused_construct`], so the call site can jump through
+/// exception signal the answer is a body that runs nothing, so the call site can jump through
 /// whatever this returns without checking.
 #[unsafe(no_mangle)]
 #[must_use]
