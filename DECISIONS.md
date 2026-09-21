@@ -5352,3 +5352,25 @@ because closing it means giving the operators an exception path, which is its ow
 **The tests assert the order, not just the throw.** An engine that never called `valueOf` at
 all would pass a test that only checks for a `TypeError`, so the case that matters records
 `"vs"` and would catch a conversion that skipped straight to failing.
+
+## D-190
+
+**A namespace is an ordinary object, and `String()` with no argument is empty.**
+
+Status: Accepted
+
+Two bugs, both found by a check added for something else — `defineProperty` refusing a
+descriptor that is not an object (D-183) started throwing on a case that should have worked,
+and following it back found the second.
+
+**`ensure_global_object` never linked a prototype.** `Math`, `JSON`, `Reflect`, `Object` and
+`Array` all ended their chain immediately, so `Math.hasOwnProperty("x")` was not a function.
+One line, and it had been wrong since those objects existed — invisible because nothing
+reaches for `Object.prototype`'s methods on a namespace until a test does.
+
+**`String()` answered `"undefined"`.** An absent argument reads as `undefined`, and
+`String(undefined)` really is `"undefined"`, so the two cases have to be told apart by the
+argument count rather than by the value — and they were not. The consequence was worse than a
+wrong string: `new String()` wrapped nine characters, so it had nine own enumerable properties
+and behaved as an array-like of letters. That is what `Object.create({}, new String())` tripped
+over, and the reason it surfaced as a descriptor error three layers away.

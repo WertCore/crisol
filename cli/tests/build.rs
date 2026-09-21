@@ -6770,3 +6770,61 @@ fn a_length_that_cannot_convert_is_an_error() {
         "TypeError",
     );
 }
+
+/// **A namespace is an ordinary object**, and nothing linked it to one — so
+/// `Math.hasOwnProperty(…)` was not a function, on the objects a program is most likely to
+/// ask that of.
+#[test]
+fn a_namespace_inherits_from_object_prototype() {
+    check(
+        "math-has-own-property",
+        "Math.prop = 1; return Math.hasOwnProperty(\"prop\");",
+        "true",
+    );
+    check(
+        "json-inherits",
+        "return typeof JSON.hasOwnProperty;",
+        "function",
+    );
+    check(
+        "object-constructor-inherits",
+        "return Object.getPrototypeOf(Object) !== null;",
+        "true",
+    );
+    check(
+        "reflect-inherits",
+        "return Reflect.hasOwnProperty(\"get\");",
+        "true",
+    );
+}
+
+/// **`String()` with no argument is the empty string**, not `"undefined"`. An absent argument
+/// reads as `undefined` and `String(undefined)` really is `"undefined"`, so the two have to be
+/// told apart by the count — and they were not, which gave `new String()` nine own properties.
+#[test]
+fn string_with_no_argument_is_empty() {
+    check("string-no-argument", "return String().length;", "0");
+    check(
+        "string-undefined-argument",
+        "return String(undefined);",
+        "undefined",
+    );
+    check(
+        "string-wrapper-no-argument",
+        "return new String().length;",
+        "0",
+    );
+    check(
+        "string-wrapper-no-argument-keys",
+        "return Object.keys(new String()).length;",
+        "0",
+    );
+    // The case that found it: an empty wrapper used as a map of descriptors.
+    check(
+        "empty-wrapper-as-descriptors",
+        "let props = new String(); \
+         Object.defineProperty(props, \"p\", {value: {value: 7}, enumerable: true}); \
+         return Object.create({}, props).p;",
+        "7",
+    );
+}

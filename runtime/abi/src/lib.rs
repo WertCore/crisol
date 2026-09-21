@@ -2033,6 +2033,24 @@ extern "C" fn to_string_global(
     let value = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
+    // **No argument is the empty string, not `"undefined"`.** An absent argument reads as
+    // `undefined` and `String(undefined)` really is `"undefined"`, so the two cases have to
+    // be told apart by the count — and they were not. `new String()` wrapped nine characters,
+    // which gave it nine own properties and made it an array-like of letters.
+    if argc == 0 {
+        return with_rooted(&live, || {
+            if let Some(handle) = handle_of(this_value) {
+                let empty = new_string("");
+                with_rooted(&[empty], || {
+                    with_runtime(|runtime| {
+                        runtime.define_hidden(handle, STRING_PRIMITIVE, Value::from_bits(empty));
+                        runtime.define_hidden(handle, "length", Value::number(0.0));
+                    });
+                });
+            }
+            new_string("")
+        });
+    }
     with_rooted(&live, || match to_text(value) {
         Some(text) => {
             // Called with `new`, the receiver is a fresh object that will be the result, so
@@ -7554,6 +7572,11 @@ impl Runtime {
         // One internal slot, holding the index of the built-in it runs when called. `Object`
         // and `Array` are constructors as well as namespaces, so they need to be callable.
         let object = scope.alloc_with_internals(shape, 0, 1);
+        // **A namespace is an ordinary object**, and nothing linked it to one. `Math`, `JSON`,
+        // `Reflect`, `Object` and `Array` all reached the end of their chain immediately, so
+        // `Math.hasOwnProperty(…)` was not a function — on the objects a program is most
+        // likely to ask that of.
+        self.inherit_from_object(object.handle());
         #[expect(
             clippy::cast_precision_loss,
             reason = "there are a handful of built-ins"
