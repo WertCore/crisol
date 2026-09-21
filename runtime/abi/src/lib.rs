@@ -6302,6 +6302,9 @@ extern "C" fn object_define_property(
         let Some(name) = to_text(key) else {
             return raise("a property key must be a name", "TypeError");
         };
+        if let Some((behind, handler)) = proxy_parts(target) {
+            return proxy_define(behind, handler, key, descriptor);
+        }
         // **A descriptor has to be an object**, and a string is a cell without being one. A
         // primitive has no `value` and no `writable`, so reading fields off it found nothing
         // and the call quietly defined the property as `undefined` — a wrong answer where the
@@ -6529,6 +6532,9 @@ extern "C" fn object_own_descriptor(
         let key = unsafe { argument(argc, argv, 1) };
         if let Some(thrown) = reject_nullish(target, "cannot read a property descriptor") {
             return thrown;
+        }
+        if let Some((behind, handler)) = proxy_parts(target) {
+            return proxy_descriptor(behind, handler, key);
         }
         let Some(name) = to_text(key) else {
             return Value::UNDEFINED.to_bits();
@@ -6820,6 +6826,14 @@ fn own_keys(object: u64) -> Vec<String> {
     let Some(handle) = handle_of(object) else {
         return Vec::new();
     };
+    if let Some((target, handler)) = proxy_parts(object) {
+        // A proxy with no `ownKeys` trap reports its target's keys, which is what `None`
+        // from here means.
+        if let Some(names) = proxy_own_keys(target, handler) {
+            return names;
+        }
+        return own_keys(target);
+    }
     // Read before the borrow below: a hidden property is read by a property load, and a
     // property load enters the runtime itself.
     let wrapped = wrapped_text(object);
@@ -7076,6 +7090,9 @@ extern "C" fn object_get_prototype(
     let target = unsafe { argument(argc, argv, 0) };
     if let Some(thrown) = reject_nullish(target, "cannot read the prototype") {
         return thrown;
+    }
+    if let Some((behind, handler)) = proxy_parts(target) {
+        return proxy_prototype(behind, handler);
     }
     // **A primitive is coerced, not refused.** `Object.getPrototypeOf(1)` is
     // `Number.prototype`, because the specification wraps its argument first — and answering
@@ -7913,6 +7930,14 @@ extern "C" fn object_prevent_extensions(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let target = unsafe { argument(argc, argv, 0) };
+    if let Some((behind, handler)) = proxy_parts(target) {
+        let outcome = proxy_prevent_extensions(behind, handler);
+        return if Value::from_bits(outcome).is_exception() {
+            outcome
+        } else {
+            target
+        };
+    }
     prevent_extensions(target);
     target
 }
@@ -7927,6 +7952,9 @@ extern "C" fn object_is_extensible(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let target = unsafe { argument(argc, argv, 0) };
+    if let Some((behind, handler)) = proxy_parts(target) {
+        return proxy_is_extensible(behind, handler);
+    }
     // **A primitive is never extensible**, which is the opposite of it being vacuously frozen.
     boolean(handle_of(target).is_some() && is_extensible(target)).to_bits()
 }
@@ -12027,6 +12055,158 @@ fn proxy_delete(target: u64, handler: u64, key: &PropertyKey) -> u64 {
         proxy_checked(proxy.checked_delete(key, removed), |answer| {
             boolean(answer).to_bits()
         })
+    })
+}
+
+/// `Object.keys(proxy)` and friends: the `ownKeys` trap, or the target's own keys.
+///
+/// Answers the **string** keys, which is what `own_keys` reports; a symbol the trap lists is
+/// dropped here and picked up by `getOwnPropertySymbols`, exactly as for an ordinary object.
+fn proxy_own_keys(target: u64, handler: u64) -> Option<Vec<String>> {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return Some(Vec::new());
+    }
+    let trap = proxy_trap(handler, crisol_builtins::Trap::OwnKeys)?;
+    let reported = with_rooted(&[target, handler, trap], || {
+        call_value(trap, handler, &[target])
+    });
+    if Value::from_bits(reported).is_exception() {
+        return Some(Vec::new());
+    }
+    let length = indexed_length(reported).unwrap_or(0);
+    let mut names = Vec::with_capacity(length);
+    for index in 0..length {
+        let entry = indexed_get(reported, index);
+        if Value::from_bits(entry).kind() == crisol_value::Kind::String
+            && let Some(text) = text_of(entry)
+        {
+            names.push(text);
+        }
+    }
+    Some(names)
+}
+
+/// The `getOwnPropertyDescriptor` trap, or the target's descriptor.
+fn proxy_descriptor(target: u64, handler: u64, key: u64) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::GetOwnPropertyDescriptor) else {
+        let arguments = [target, key];
+        return with_rooted(&arguments, || {
+            object_own_descriptor(0, 0, 0, 2, arguments.as_ptr())
+        });
+    };
+    with_rooted(&[target, handler, trap, key], || {
+        call_value(trap, handler, &[target, key])
+    })
+}
+
+/// The `defineProperty` trap, or the target's definition.
+fn proxy_define(target: u64, handler: u64, key: u64, descriptor: u64) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::DefineProperty) else {
+        let arguments = [target, key, descriptor];
+        return with_rooted(&arguments, || {
+            object_define_property(0, 0, 0, 3, arguments.as_ptr())
+        });
+    };
+    with_rooted(&[target, handler, trap, key, descriptor], || {
+        let reported = call_value(trap, handler, &[target, key, descriptor]);
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        // **A refusal is an error here**, unlike `Reflect.defineProperty` where it is the
+        // answer: `Object.defineProperty` throws when the definition does not take, and a
+        // proxy saying `false` is a definition that did not take.
+        if is_truthy(Value::from_bits(reported)) {
+            return target;
+        }
+        raise(
+            "'defineProperty' on proxy: trap returned falsish",
+            "TypeError",
+        )
+    })
+}
+
+/// The `getPrototypeOf` trap, or the target's prototype.
+fn proxy_prototype(target: u64, handler: u64) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::GetPrototypeOf) else {
+        let arguments = [target];
+        return with_rooted(&arguments, || {
+            object_get_prototype(0, 0, 0, 1, arguments.as_ptr())
+        });
+    };
+    with_rooted(&[target, handler, trap], || {
+        call_value(trap, handler, &[target])
+    })
+}
+
+/// The `isExtensible` trap, checked against the target.
+///
+/// **This one cannot lie at all.** A proxy must report exactly what its target reports, so
+/// the invariant is not a corner case but the whole rule — which is why the trap exists only
+/// to observe.
+fn proxy_is_extensible(target: u64, handler: u64) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::IsExtensible) else {
+        return boolean(is_extensible(target)).to_bits();
+    };
+    with_rooted(&[target, handler, trap], || {
+        let reported = call_value(trap, handler, &[target]);
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        let claimed = is_truthy(Value::from_bits(reported));
+        proxy_checked(proxy.checked_is_extensible(claimed), |answer| {
+            boolean(answer).to_bits()
+        })
+    })
+}
+
+/// The `preventExtensions` trap, or the target's.
+fn proxy_prevent_extensions(target: u64, handler: u64) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::PreventExtensions) else {
+        prevent_extensions(target);
+        return Value::TRUE.to_bits();
+    };
+    with_rooted(&[target, handler, trap], || {
+        let reported = call_value(trap, handler, &[target]);
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        boolean(is_truthy(Value::from_bits(reported))).to_bits()
     })
 }
 

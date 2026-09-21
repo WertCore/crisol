@@ -7350,3 +7350,92 @@ fn finally_does_not_change_the_settlement() {
         "TypeError",
     );
 }
+
+/// The rest of the traps. Each forwards to the target when the handler defines nothing, which
+/// is what a handler with one trap depends on.
+#[test]
+fn a_proxy_traps_the_reflective_operations() {
+    check(
+        "proxy-own-keys-trap",
+        "let p = new Proxy({a: 1}, {ownKeys: function () { return [\"x\", \"y\"]; }}); \
+         return Object.getOwnPropertyNames(p).join(\",\");",
+        "x,y",
+    );
+    check(
+        "proxy-own-keys-forwards",
+        "let p = new Proxy({a: 1, b: 2}, {}); \
+         return Object.getOwnPropertyNames(p).join(\",\");",
+        "a,b",
+    );
+    check(
+        "proxy-descriptor-trap",
+        "let p = new Proxy({}, {getOwnPropertyDescriptor: function () { \
+             return {value: 9, configurable: true}; }}); \
+         return Object.getOwnPropertyDescriptor(p, \"a\").value;",
+        "9",
+    );
+    check(
+        "proxy-descriptor-forwards",
+        "let p = new Proxy({a: 3}, {}); \
+         return Object.getOwnPropertyDescriptor(p, \"a\").value;",
+        "3",
+    );
+    check(
+        "proxy-define-trap",
+        "let seen = \"\"; \
+         let p = new Proxy({}, {defineProperty: function (t, k) { seen = k; return true; }}); \
+         Object.defineProperty(p, \"z\", {value: 1}); return seen;",
+        "z",
+    );
+    // A definition that does not take is an error, unlike `Reflect.defineProperty`.
+    check(
+        "proxy-define-refused",
+        "let p = new Proxy({}, {defineProperty: function () { return false; }}); \
+         try { Object.defineProperty(p, \"z\", {value: 1}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-get-prototype-trap",
+        "let a = {}; \
+         let p = new Proxy({}, {getPrototypeOf: function () { return a; }}); \
+         return Object.getPrototypeOf(p) === a;",
+        "true",
+    );
+    check(
+        "proxy-get-prototype-forwards",
+        "let a = {}; let t = Object.create(a); let p = new Proxy(t, {}); \
+         return Object.getPrototypeOf(p) === a;",
+        "true",
+    );
+    check(
+        "proxy-is-extensible-forwards",
+        "let p = new Proxy({}, {}); return Object.isExtensible(p);",
+        "true",
+    );
+    // `isExtensible` is the one trap that cannot lie at all: it must match its target.
+    check(
+        "proxy-is-extensible-must-not-lie",
+        "let p = new Proxy({}, {isExtensible: function () { return false; }}); \
+         try { Object.isExtensible(p); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-is-extensible-may-agree",
+        "let p = new Proxy({}, {isExtensible: function () { return true; }}); \
+         return Object.isExtensible(p);",
+        "true",
+    );
+    check(
+        "proxy-prevent-extensions-forwards",
+        "let t = {}; let p = new Proxy(t, {}); Object.preventExtensions(p); \
+         return Object.isExtensible(t);",
+        "false",
+    );
+    // `Object.keys` sees only what the trap reports, filtered by the target's enumerability.
+    check(
+        "proxy-own-keys-through-keys",
+        "let p = new Proxy({a: 1, b: 2}, {}); return Object.keys(p).join(\",\");",
+        "a,b",
+    );
+}

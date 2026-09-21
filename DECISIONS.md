@@ -5683,3 +5683,32 @@ and `race` stays pending because nothing will settle it.
 Still missing, and named rather than implied: thenable assimilation (resolving with a
 non-promise object that has a `then`), subclassing through `Symbol.species`, and
 unhandled-rejection reporting.
+
+## D-202
+
+**The reflective traps, and where a proxy is allowed to disagree with its target.**
+
+Status: Accepted, completing D-200
+
+`ownKeys`, `getOwnPropertyDescriptor`, `defineProperty`, `getPrototypeOf`, `isExtensible` and
+`preventExtensions`. Each forwards to the target when the handler defines nothing, which is
+what a handler with one trap depends on.
+
+Two places where the shape of the answer is not obvious:
+
+- **`defineProperty` returning `false` is an error here.** `Object.defineProperty` throws when
+  a definition does not take, and a trap answering falsish is a definition that did not take —
+  where `Reflect.defineProperty` reports the same refusal as its answer. Same operation, two
+  conventions, and the proxy sits under both.
+- **`isExtensible` cannot lie at all.** Most invariants are corner cases about
+  non-configurable properties; this one is the whole rule, since a proxy must report exactly
+  what its target reports. The trap exists only to observe, and the test asserts both that
+  disagreeing throws and that agreeing does not.
+
+**`ownKeys` reports strings only**, which is what `own_keys` is for; a symbol the trap lists
+is dropped there and belongs to `getOwnPropertySymbols`, exactly as for an ordinary object.
+
+**The hot path stayed out of it.** The proxy checks went on the `Object.isExtensible` and
+`Object.preventExtensions` *natives*, not on the `is_extensible` and `prevent_extensions`
+helpers — those are on the element-write path, where the cost is one shape lookup and has to
+stay that way. A proxy never reaches them: `proxy_store` answers first.
