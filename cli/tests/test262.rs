@@ -28,6 +28,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use support::{Metadata, discover, parse, skip_or_root};
 
@@ -99,6 +100,42 @@ fn assemble(root: &Path, case: &Path, metadata: &Metadata) -> Option<String> {
     Some(source)
 }
 
+/// How long one case may run before it is killed.
+///
+/// A compiled case is milliseconds of work; anything past this is not slow but stuck.
+const CASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs `binary`, killing it if it will not stop.
+///
+/// **A harness must not hang.** `Command::output` waits for ever, so one case that loops
+/// takes the whole run with it — and a hung job reports nothing, holds a runner for its full
+/// hour, and looks like broken infrastructure rather than a bug in the engine. Forty-five
+/// minutes of a ninety-second step went into finding that out the other way.
+///
+/// A killed case reports as a *crash*, which is the honest category: it built, it ran, and it
+/// did not come back.
+fn run_with_timeout(binary: &Path) -> std::io::Result<std::process::Output> {
+    let mut child = Command::new(binary)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + CASE_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the case did not finish",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcome> {
     let metadata = parse(&std::fs::read_to_string(case).ok()?)?;
     // Module and async cases need machinery no part of this pipeline has; counting them as
@@ -121,7 +158,7 @@ fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcom
 
     let outcome = match crisol::build::build(&file, &binary, &runtime_archive()?) {
         Err(error) => Outcome::Refused(stage_of(&error)),
-        Ok(()) => match Command::new(&binary).output() {
+        Ok(()) => match run_with_timeout(&binary) {
             Ok(output) if output.status.success() => Outcome::Ran,
             // Exit 1 is the entry point reporting an uncaught throw, which is exactly how a
             // case signals a failed assertion. Anything else — a signal, a panic — is ours.

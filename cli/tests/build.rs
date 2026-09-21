@@ -54,13 +54,49 @@ fn build_and_run(name: &str, source: &str) -> Option<String> {
     Some(execute(name, &binary, false))
 }
 
+/// How long one acceptance program may run before it is killed.
+///
+/// Generous, because the second run of every case collects on **every** allocation and that
+/// is genuinely slow. Anything past it is not slow but stuck.
+const PROGRAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Runs a built program, optionally collecting on every allocation.
+///
+/// **Killed rather than waited for.** `Command::output` waits for ever, so one program that
+/// loops takes the whole suite with it — and a hung job reports nothing, holds a runner for
+/// its full hour, and reads as broken infrastructure rather than as the bug it is. A timeout
+/// turns the worst failure a test run can have into an ordinary one with a name attached.
 fn execute(name: &str, binary: &Path, stress: bool) -> String {
     let mut command = Command::new(binary);
     if stress {
         command.env("CRISOL_GC_STRESS", "1");
     }
-    let output = command.output().expect("run the binary");
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run the binary");
+    let deadline = std::time::Instant::now() + PROGRAM_TIMEOUT;
+    let output = loop {
+        match child.try_wait().expect("wait for the binary") {
+            Some(_) => break child.wait_with_output().expect("collect the output"),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    // **Killed before the panic**, not after: a panic alone leaves the
+                    // process running, which is the runner-holding half of the problem this
+                    // exists to stop.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "{name} did not finish within {}s{}",
+                        PROGRAM_TIMEOUT.as_secs(),
+                        if stress { " under GC stress" } else { "" }
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    };
     // **The program's own stderr, which is where it says why.** Without it a failure reads as
     // `exited with Some(1)` — true, and silent about the uncaught throw that caused it. The
     // entry point prints `uncaught: …` precisely so somebody can read it.

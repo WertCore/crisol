@@ -5754,3 +5754,34 @@ after. `repeat` and `padStart`/`padEnd` now check before allocating.
 nothing, holds a runner, and looks like infrastructure. The lesson is narrower than "add
 limits" — it is that a conversion which starts *working* makes previously unreachable code
 reachable, and the code on the other side had never been asked for anything absurd before.
+
+## D-205
+
+**Neither harness waits for ever.**
+
+Status: Accepted
+
+A case that loops took the whole run with it. `Command::output` has no timeout, so one hung
+program held a CI job for forty-five minutes of a ninety-second step — twice — and reported
+nothing at all. A hang is the worst failure a test run can have: no name, no output, and it
+reads as broken infrastructure rather than as the bug it is.
+
+Both harnesses now spawn, poll, and kill. In the corpus runner a killed case reports as a
+**crash**, which is the honest category — it built, it ran, and it did not come back — and
+crashes are already asserted empty, so the run fails with the case's path rather than
+stopping. In the acceptance suite it fails with the program's name and whether it was the
+GC-stress pass.
+
+The child is killed *before* the panic, not after. A panic alone leaves the process running,
+which is the runner-holding half of the problem.
+
+**Ten seconds for a corpus case and sixty for an acceptance program.** The second is generous
+because every acceptance program is run twice and the second pass collects on every
+allocation, which is genuinely slow; the first is not, because a compiled case is
+milliseconds of work and anything beyond that is stuck rather than slow.
+
+**What made this urgent was a fix working.** Coercing a count (D-203) made
+`"a".repeat("1e9")` a real request where it had been a silent zero — so code that had never
+been handed an absurd value started receiving them. The lesson generalises past strings: a
+conversion that begins converting reaches code that was previously unreachable, and that code
+has never been tested with what the conversion now produces.

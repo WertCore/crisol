@@ -1292,6 +1292,11 @@ extern "C" fn array_to_text(
     with_rooted(&[this_value], || {
         let mut out = String::new();
         for index in 0..length {
+            // As in `join`: the length is the program's, so the result is unbounded unless
+            // something bounds it.
+            if out.len() > MAX_STRING_UNITS {
+                return raise("joined string is too long", "RangeError");
+            }
             if index > 0 {
                 out.push(',');
             }
@@ -10633,6 +10638,13 @@ extern "C" fn array_join(
     with_rooted(&live, || {
         let mut out = String::new();
         for index in 0..length {
+            // **The length comes from the program**, so the result does too — and a walk
+            // that only checks the index would build until it ran out of memory. Checked as
+            // it grows rather than predicted, because each element's text is whatever its
+            // `toString` decides.
+            if out.len() > MAX_STRING_UNITS {
+                return raise("joined string is too long", "RangeError");
+            }
             if index > 0 {
                 out.push_str(&separator);
             }
