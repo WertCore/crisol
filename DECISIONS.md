@@ -5494,3 +5494,31 @@ it stays visible rather than being assumed closed.
 
 The symbol is added to the permanent key roots (D-192) even though it is also reachable from
 `Symbol.iterator`, because a program can delete that property and the shapes would outlive it.
+
+## D-196
+
+**`o[k]()` passes its receiver, and `for-of` over an array stays live.**
+
+Status: Accepted
+
+Two bugs found by one acceptance run, and the second was mine.
+
+**Only the dotted form passed a receiver.** The lowering matched
+`StaticMemberExpression` and sent every other callee shape down the plain-call path with
+`undefined` as `this` — so `a["push"](1)` pushed onto nothing. The comment directly above that
+match says losing a receiver is silent, which is exactly what happened: the call runs,
+something comes back, and only `this` is wrong. It surfaced because
+`[1, 2, 3][Symbol.iterator]()` built an iterator over `undefined` and answered
+`{done: true}` immediately.
+
+**And asking the protocol first broke live iteration.** D-194 put `Symbol.iterator` ahead of
+the array fast path, which is the right order in the abstract and wrong here, because this
+engine drains the protocol eagerly: the loop then walks a snapshot, and `for (x of a) a.pop()`
+visits three elements where the specification says two. The array iterator re-reads the length
+each step and the fast path preserves that; the drain cannot.
+
+So the order is **own symbol, then shape, then inherited protocol**. An override placed on the
+object is obeyed, a plain array stays live, and a user-defined iterable still works. The cost
+is that replacing `Array.prototype[Symbol.iterator]` wholesale is not obeyed for arrays —
+recorded rather than hidden, and it closes when `for-of` steps an iterator instead of walking
+an index.

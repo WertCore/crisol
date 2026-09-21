@@ -7052,3 +7052,33 @@ fn the_built_ins_answer_to_symbol_iterator() {
         "undefined",
     );
 }
+
+/// **`o[k]()` is a method call too**, and only the dotted form passed a receiver — so
+/// `a["push"](1)` ran with `this` as `undefined`. Losing a receiver is silent: the call
+/// happens, something comes back, and only `this` is wrong.
+#[test]
+fn a_computed_member_call_passes_its_receiver() {
+    check(
+        "computed-call-receiver",
+        "let a = [1]; a[\"push\"](2); return a.join(\",\");",
+        "1,2",
+    );
+    check(
+        "computed-call-this",
+        "let o = {n: 7, get: function () { return this.n; }}; return o[\"get\"]();",
+        "7",
+    );
+    // The dotted form keeps working, which is the thing this must not break.
+    check(
+        "dotted-call-receiver",
+        "let a = [1]; a.push(2); return a.join(\",\");",
+        "1,2",
+    );
+    // A computed call through a symbol key reaches the method with its receiver.
+    check(
+        "symbol-computed-call",
+        "let it = [1, 2, 3][Symbol.iterator](); \
+         return it.next().value + \",\" + it.next().value;",
+        "1,2",
+    );
+}

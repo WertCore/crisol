@@ -1356,6 +1356,16 @@ impl Lowering {
                         );
                         (method, object)
                     }
+                    // **`o[k]()` is a method call too.** Only the dotted form passed a
+                    // receiver, so `a["push"](1)` and `it[Symbol.iterator]()` ran with `this`
+                    // as `undefined` — and, as the note above says, losing it is silent: the
+                    // call happens, something comes back, and only `this` is wrong.
+                    Expression::ComputedMemberExpression(member) => {
+                        let object = self.expression(&member.object);
+                        let key = self.expression(&member.expression);
+                        let method = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+                        (method, object)
+                    }
                     other => {
                         let callee = self.expression(other);
                         // A plain call passes `undefined` explicitly rather than omitting a

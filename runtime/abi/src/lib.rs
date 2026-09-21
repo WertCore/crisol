@@ -10973,11 +10973,18 @@ pub extern "C" fn crisol_enumerate(object: u64) -> u64 {
 #[unsafe(no_mangle)]
 #[must_use]
 pub extern "C" fn crisol_iterate(value: u64) -> u64 {
-    // **`Symbol.iterator` first**, because it is what makes a value iterable — the two fast
-    // paths below are shortcuts for the built-ins that would answer the same way. Asking the
-    // object first is also what lets a program override either of them, which is the point of
-    // the protocol being a property.
-    if let Some(items) = iterate_by_protocol(value) {
+    // **An *own* `Symbol.iterator` wins**, and otherwise a shape the engine recognises takes
+    // the fast path below. The order matters and it is not the obvious one: draining the
+    // protocol eagerly would make `for-of` over an array walk a snapshot, and the loop is
+    // specified to re-read the length each step — `for (x of a) a.pop()` visits two of three
+    // elements, not three.
+    //
+    // The cost is that replacing `Array.prototype[Symbol.iterator]` wholesale is not obeyed
+    // for arrays; replacing it on the array itself is. Closing that means giving `for-of` an
+    // iterator object to step rather than something to walk by index (D-194).
+    if iterator_key().is_some_and(|key| symbol_own_slot(value, &key).is_some())
+        && let Some(items) = iterate_by_protocol(value)
+    {
         return items;
     }
     if elements_of(value).is_some() {
@@ -10992,7 +10999,15 @@ pub extern "C" fn crisol_iterate(value: u64) -> u64 {
             names_as_array(&points)
         });
     }
+    if let Some(items) = iterate_by_protocol(value) {
+        return items;
+    }
     raise("value is not iterable", "TypeError")
+}
+
+/// The key `Symbol.iterator` names, if the runtime has got that far.
+fn iterator_key() -> Option<PropertyKey> {
+    key_of(Value::from_bits(well_known_symbol("iterator")?))
 }
 
 /// The value a well-known symbol names, read off the `Symbol` global.
@@ -11022,8 +11037,7 @@ fn well_known_symbol(name: &str) -> Option<u64> {
 /// iterator is refused at the cap rather than filling memory. Making it lazy means giving
 /// `for-of` an iterator object to step, which is a change to the lowering.
 fn iterate_by_protocol(value: u64) -> Option<u64> {
-    let symbol = well_known_symbol("iterator")?;
-    let key = key_of(Value::from_bits(symbol))?;
+    let key = iterator_key()?;
     let method = symbol_property_load(value, &key);
     if !is_callable(method) {
         return None;
