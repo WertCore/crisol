@@ -2515,6 +2515,10 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     promise_settle_call,
     proxy_revoke_call,
     combine_call,
+    regexp_symbol_match,
+    regexp_symbol_search,
+    regexp_symbol_replace,
+    regexp_symbol_split,
 ];
 
 /// Where a `resolve`/`reject` function keeps the promise it settles.
@@ -2626,6 +2630,15 @@ const PROXY_REVOKE_CALL: usize = 5;
 
 /// The index within [`ANONYMOUS_NATIVES`] of the body every combinator reaction runs.
 const COMBINE_CALL: usize = 6;
+
+/// Where the symbol-keyed regular-expression methods begin in [`ANONYMOUS_NATIVES`].
+///
+/// A run rather than four constants, because they are installed by one loop over the names
+/// they answer to and the loop needs the order to be the table's order.
+const REGEXP_SYMBOL_METHODS: usize = 7;
+
+/// The symbols those four answer to, in the order the table holds them.
+const REGEXP_SYMBOL_NAMES: &[&str] = &["match", "search", "replace", "split"];
 
 /// Marks an array whose `length` has been made non-writable.
 ///
@@ -5284,25 +5297,21 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
     let replacement = unsafe { argument(argc, argv, 1) };
 
     // A regular expression pattern, recognised by its `source` rather than by a type tag.
-    if let Some(source) = property_text(pattern, "source") {
+    if property_text(pattern, "source").is_some() {
         let flags = property_text(pattern, "flags").unwrap_or_default();
-        let global = flags.contains('g');
-        if all && !global {
+        if all && !flags.contains('g') {
             return raise("replaceAll needs a global regular expression", "TypeError");
         }
-        let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
-            return new_string(&text);
-        };
-        let Ok(mut compiled) = crisol_builtins::JsRegExp::new(&source, parsed) else {
-            return new_string(&text);
-        };
-        let found: Vec<crisol_builtins::Captured> = if global {
-            compiled.all_matches(&text)
-        } else {
-            compiled.exec(&text).into_iter().collect()
-        };
+        // Asked of the pattern, which is what the specification says — see `symbol_method`.
+        let replacer = symbol_method(pattern, "replace");
+        if is_callable(replacer) {
+            let subject = with_rooted(&[pattern, replacer, replacement], || new_string(&text));
+            return with_rooted(&[pattern, replacer, replacement, subject], || {
+                call_value(replacer, pattern, &[subject, replacement])
+            });
+        }
         return with_rooted(&[this_value, pattern, replacement], || {
-            splice_matches(&text, &found, replacement)
+            replace_using_pattern(&text, pattern, replacement)
         });
     }
 
@@ -5337,6 +5346,29 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
     with_rooted(&[this_value, pattern, replacement], || {
         splice_matches(&text, &found, replacement)
     })
+}
+
+/// Every match of `rx` in `text`, replaced by what `replacement` says.
+///
+/// Shared by `String.prototype.replace` and `RegExp.prototype[Symbol.replace]`, which are the
+/// same operation reached two ways — the string method is *defined* as asking the pattern.
+fn replace_using_pattern(text: &str, rx: u64, replacement: u64) -> u64 {
+    let Some(source) = property_text(rx, "source") else {
+        return new_string(text);
+    };
+    let flags = property_text(rx, "flags").unwrap_or_default();
+    let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
+        return new_string(text);
+    };
+    let Ok(mut compiled) = crisol_builtins::JsRegExp::new(&source, parsed) else {
+        return new_string(text);
+    };
+    let found: Vec<crisol_builtins::Captured> = if flags.contains('g') {
+        compiled.all_matches(text)
+    } else {
+        compiled.exec(text).into_iter().collect()
+    };
+    splice_matches(text, &found, replacement)
 }
 
 /// Rebuilds `text` with each match replaced by what `replacement` says.
@@ -5534,6 +5566,240 @@ fn pattern_argument(value: u64) -> Option<(crisol_builtins::JsRegExp, String)> {
     Some((compiled, flags_text))
 }
 
+/// `GetMethod(value, @@name)` — the symbol-keyed method a pattern answers to, if it has one.
+///
+/// **This is what makes the string methods delegate.** `"a".match(p)` is defined as
+/// `p[Symbol.match]("a")` whenever `p` has one, which is how a `RegExp` subclass changes what
+/// every string method does; doing the work in the string method skips that entirely.
+///
+/// A plain string pattern has no such method, so it falls through to the built-in path — that
+/// is the same rule, not an exception to it.
+fn symbol_method(value: u64, name: &str) -> u64 {
+    if handle_of(value).is_none() {
+        return Value::UNDEFINED.to_bits();
+    }
+    let Some(symbol) = well_known_symbol(name) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    crisol_computed_load(value, symbol)
+}
+
+/// `RegExpExec(rx, S)` — the pattern's **own** `exec` when it has a callable one.
+///
+/// **A program may replace `exec`, and the specification says the replacement is used.** That
+/// is the whole point of the `Symbol.*` protocol: `String.prototype.match` is defined to ask
+/// the pattern, and the pattern is defined to ask `exec`, so a subclass that overrides one
+/// changes what every string method does. Calling the built-in directly skips both hooks and
+/// is indistinguishable from working until somebody overrides something.
+fn regexp_exec_value(rx: u64, subject: u64) -> u64 {
+    let exec = property_of(rx, "exec");
+    if is_callable(exec) {
+        let result = with_rooted(&[rx, exec, subject], || call_value(exec, rx, &[subject]));
+        if Value::from_bits(result).is_exception() {
+            return result;
+        }
+        let kind = Value::from_bits(result).kind();
+        if kind != crisol_value::Kind::Object && kind != crisol_value::Kind::Null {
+            return raise("exec must answer an object or null", "TypeError");
+        }
+        return result;
+    }
+    let arguments = [subject];
+    with_rooted(&[rx, subject], || {
+        regexp_exec(0, rx, 0, 1, arguments.as_ptr())
+    })
+}
+
+/// Reads a pattern's `lastIndex`, which a program may have assigned.
+fn last_index_of(rx: u64) -> f64 {
+    property_number(rx, "lastIndex").unwrap_or(0.0)
+}
+
+/// Writes a pattern's `lastIndex` through the ordinary path, so one made non-writable is
+/// honoured rather than bypassed.
+fn set_last_index(rx: u64, to: f64) {
+    if let Some(handle) = handle_of(rx) {
+        with_runtime(|runtime| runtime.define(handle, "lastIndex", Value::number(to)));
+    }
+}
+
+/// `RegExp.prototype[Symbol.match]`.
+///
+/// **Two shapes from one method.** A global pattern answers the matched text and nothing
+/// else; a non-global one answers what `exec` answers, groups and `index` included. A program
+/// written for one and handed the other reads `undefined` where it expected a group.
+extern "C" fn regexp_symbol_match(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise("this matcher needs a pattern", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    let subject = with_rooted(&[this_value, given], || {
+        new_string(&to_text(given).unwrap_or_default())
+    });
+    with_rooted(&[this_value, subject], || {
+        let global = is_truthy(Value::from_bits(property_of(this_value, "global")));
+        if !global {
+            return regexp_exec_value(this_value, subject);
+        }
+        set_last_index(this_value, 0.0);
+        let mut collected: Vec<u64> = Vec::new();
+        loop {
+            let result = with_rooted(&collected, || regexp_exec_value(this_value, subject));
+            if Value::from_bits(result).is_exception() {
+                return result;
+            }
+            if Value::from_bits(result).kind() == crisol_value::Kind::Null {
+                break;
+            }
+            let matched = with_rooted(&collected, || {
+                let first = indexed_get(result, 0);
+                to_text(first).unwrap_or_default()
+            });
+            let piece = with_rooted(&collected, || new_string(&matched));
+            collected.push(piece);
+            // **An empty match has to be stepped over by hand**, because it leaves
+            // `lastIndex` where it was and the next call would find it again, for ever.
+            if matched.is_empty() {
+                set_last_index(this_value, last_index_of(this_value) + 1.0);
+            }
+        }
+        // **No matches at all is `null`, not an empty array** — `if (s.match(/x/g))` is how a
+        // program asks, and an empty array is truthy.
+        if collected.is_empty() {
+            return Value::NULL.to_bits();
+        }
+        with_rooted(&collected, || {
+            with_new_array(collected.len(), |array| {
+                for (index, piece) in collected.iter().enumerate() {
+                    with_runtime(|runtime| {
+                        runtime
+                            .heap
+                            .set_element(array, index, Value::from_bits(*piece));
+                    });
+                }
+                array.to_value().to_bits()
+            })
+        })
+    })
+}
+
+/// `RegExp.prototype[Symbol.search]` — where the first match starts, or `-1`.
+///
+/// **`lastIndex` is put back.** A `search` that moved the cursor would make the same call
+/// answer differently the second time, which is the behaviour `exec` has by design and this
+/// deliberately does not.
+extern "C" fn regexp_symbol_search(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise("this searcher needs a pattern", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    let subject = with_rooted(&[this_value, given], || {
+        new_string(&to_text(given).unwrap_or_default())
+    });
+    with_rooted(&[this_value, subject], || {
+        let previous = last_index_of(this_value);
+        if previous != 0.0 {
+            set_last_index(this_value, 0.0);
+        }
+        let result = regexp_exec_value(this_value, subject);
+        if Value::from_bits(result).is_exception() {
+            return result;
+        }
+        if last_index_of(this_value) != previous {
+            set_last_index(this_value, previous);
+        }
+        if Value::from_bits(result).kind() == crisol_value::Kind::Null {
+            return Value::number(-1.0).to_bits();
+        }
+        property_of(result, "index")
+    })
+}
+
+/// `RegExp.prototype[Symbol.replace]`.
+extern "C" fn regexp_symbol_replace(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise("this replacer needs a pattern", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let replacement = unsafe { argument(argc, argv, 1) };
+    let Some(text) = with_rooted(&[this_value, given, replacement], || to_text(given)) else {
+        return new_string("");
+    };
+    with_rooted(&[this_value, replacement], || {
+        replace_using_pattern(&text, this_value, replacement)
+    })
+}
+
+/// `RegExp.prototype[Symbol.split]`.
+extern "C" fn regexp_symbol_split(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise("this splitter needs a pattern", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let limit = unsafe { argument(argc, argv, 1) };
+    let cap = match split_limit(limit) {
+        Ok(cap) => cap,
+        Err(thrown) => return thrown,
+    };
+    let Some(text) = with_rooted(&[this_value, given], || to_text(given)) else {
+        return one_piece_array("");
+    };
+    with_rooted(&[this_value], || {
+        if cap == 0 {
+            return with_new_array(0, |array| array.to_value().to_bits());
+        }
+        split_using_pattern(&text, this_value, cap)
+    })
+}
+
+/// How many pieces a `split` may answer — `ToUint32(limit)`, or everything.
+fn split_limit(limit: u64) -> Result<usize, u64> {
+    if Value::from_bits(limit).is_undefined() {
+        return Ok(usize::MAX);
+    }
+    let number = coerce_number(limit)?;
+    if !number.is_finite() || number <= 0.0 {
+        return Ok(0);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked finite and positive"
+    )]
+    let cap = number.min(f64::from(u32::MAX)) as usize;
+    Ok(cap)
+}
+
 /// `String.prototype.codePointAt` — the whole code point, not half of a surrogate pair.
 ///
 /// **This is what `charCodeAt` is not.** `"\u{1f4a9}".charCodeAt(0)` is the leading surrogate
@@ -5709,6 +5975,15 @@ extern "C" fn string_match(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let pattern = unsafe { argument(argc, argv, 0) };
+    // **Asked of the pattern first**, which is what the specification says and what lets a
+    // subclass or a plain object with a `Symbol.match` answer instead.
+    let matcher = symbol_method(pattern, "match");
+    if is_callable(matcher) {
+        let subject = with_rooted(&[pattern, matcher], || new_string(&text));
+        return with_rooted(&[pattern, matcher, subject], || {
+            call_value(matcher, pattern, &[subject])
+        });
+    }
     let Some((mut compiled, flags)) = pattern_argument(pattern) else {
         return Value::NULL.to_bits();
     };
@@ -5762,6 +6037,13 @@ extern "C" fn string_search(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let pattern = unsafe { argument(argc, argv, 0) };
+    let searcher = symbol_method(pattern, "search");
+    if is_callable(searcher) {
+        let subject = with_rooted(&[pattern, searcher], || new_string(&text));
+        return with_rooted(&[pattern, searcher, subject], || {
+            call_value(searcher, pattern, &[subject])
+        });
+    }
     let Some((mut compiled, _)) = pattern_argument(pattern) else {
         return Value::number(-1.0).to_bits();
     };
@@ -6185,22 +6467,9 @@ extern "C" fn string_split(
     let given = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let limit = unsafe { argument(argc, argv, 1) };
-    let cap = if Value::from_bits(limit).is_undefined() {
-        usize::MAX
-    } else {
-        match coerce_number(limit) {
-            Ok(number) if number.is_finite() && number > 0.0 => {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "checked finite and positive"
-                )]
-                let cap = number.min(f64::from(u32::MAX)) as usize;
-                cap
-            }
-            Ok(_) => 0,
-            Err(thrown) => return thrown,
-        }
+    let cap = match split_limit(limit) {
+        Ok(cap) => cap,
+        Err(thrown) => return thrown,
     };
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
@@ -6212,57 +6481,15 @@ extern "C" fn string_split(
         // pattern went through `ToString` and `"a1b".split(/[0-9]/)` looked for the literal
         // text `/[0-9]/` — which is never there, so it answered the whole string and looked
         // like a working call.
-        if let Some(source) = property_text(given, "source") {
-            let flags = property_text(given, "flags").unwrap_or_default();
-            let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
-                return one_piece_array(&text);
-            };
-            let Ok(mut compiled) = crisol_builtins::JsRegExp::new(&source, parsed) else {
-                return one_piece_array(&text);
-            };
-            // **An empty subject is decided by whether the pattern matches it**, not by the
-            // walk: `"".split(/x/)` is `[""]` and `"".split(/(?:)/)` is `[]`, and the loop
-            // below cannot tell those apart because it never runs.
-            if text.is_empty() {
-                if compiled.exec("").is_some() {
-                    return with_new_array(0, |array| array.to_value().to_bits());
-                }
-                return one_piece_array(&text);
+        if property_text(given, "source").is_some() {
+            let splitter = symbol_method(given, "split");
+            if is_callable(splitter) {
+                let subject = with_rooted(&[given, splitter], || new_string(&text));
+                return with_rooted(&[given, splitter, subject], || {
+                    call_value(splitter, given, &[subject, limit])
+                });
             }
-            let mut pieces: Vec<Option<String>> = Vec::new();
-            let mut cursor = 0;
-            for found in compiled.all_matches(&text) {
-                // A match starting at the end is past the last position the specification
-                // looks at, and a zero-width one where the cursor already is contributes
-                // nothing — without both, `"ab".split(/(?:)/)` gains a trailing `""`.
-                if found.start >= text.len() {
-                    break;
-                }
-                if found.end == cursor {
-                    continue;
-                }
-                pieces.push(Some(
-                    text.get(cursor..found.start).unwrap_or_default().to_owned(),
-                ));
-                // **The captures go into the result too**, which is what makes
-                // `"a1b".split(/([0-9])/)` three elements rather than two.
-                for group in &found.groups {
-                    pieces.push(
-                        group.map(|(start, end)| {
-                            text.get(start..end).unwrap_or_default().to_owned()
-                        }),
-                    );
-                }
-                cursor = found.end;
-                if pieces.len() >= cap {
-                    break;
-                }
-            }
-            if pieces.len() < cap {
-                pieces.push(Some(text.get(cursor..).unwrap_or_default().to_owned()));
-            }
-            pieces.truncate(cap);
-            return pieces_array(&pieces);
+            return split_using_pattern(&text, given, cap);
         }
 
         let pieces: Vec<Option<String>> = match to_text(given) {
@@ -6281,6 +6508,64 @@ extern "C" fn string_split(
         pieces.truncate(cap);
         pieces_array(&pieces)
     })
+}
+
+/// `text` split on every match of `rx`, at most `cap` pieces.
+///
+/// Shared by `String.prototype.split` and `RegExp.prototype[Symbol.split]`, which are the
+/// same operation reached two ways.
+fn split_using_pattern(text: &str, rx: u64, cap: usize) -> u64 {
+    let Some(source) = property_text(rx, "source") else {
+        return one_piece_array(text);
+    };
+    let flags = property_text(rx, "flags").unwrap_or_default();
+    let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
+        return one_piece_array(text);
+    };
+    let Ok(mut compiled) = crisol_builtins::JsRegExp::new(&source, parsed) else {
+        return one_piece_array(text);
+    };
+    // **An empty subject is decided by whether the pattern matches it**, not by the walk:
+    // `"".split(/x/)` is `[""]` and `"".split(/(?:)/)` is `[]`, and the loop below cannot
+    // tell those apart because it never runs.
+    if text.is_empty() {
+        if compiled.exec("").is_some() {
+            return with_new_array(0, |array| array.to_value().to_bits());
+        }
+        return one_piece_array(text);
+    }
+    let mut pieces: Vec<Option<String>> = Vec::new();
+    let mut cursor = 0;
+    for found in compiled.all_matches(text) {
+        // A match starting at the end is past the last position the specification looks at,
+        // and a zero-width one where the cursor already is contributes nothing — without
+        // both, `"ab".split(/(?:)/)` gains a trailing `""`.
+        if found.start >= text.len() {
+            break;
+        }
+        if found.end == cursor {
+            continue;
+        }
+        pieces.push(Some(
+            text.get(cursor..found.start).unwrap_or_default().to_owned(),
+        ));
+        // **The captures go into the result too**, which is what makes
+        // `"a1b".split(/([0-9])/)` three elements rather than two.
+        for group in &found.groups {
+            pieces.push(
+                group.map(|(start, end)| text.get(start..end).unwrap_or_default().to_owned()),
+            );
+        }
+        cursor = found.end;
+        if pieces.len() >= cap {
+            break;
+        }
+    }
+    if pieces.len() < cap {
+        pieces.push(Some(text.get(cursor..).unwrap_or_default().to_owned()));
+    }
+    pieces.truncate(cap);
+    pieces_array(&pieces)
 }
 
 /// A one-element array holding `text`, which is what a separator that never matches gives.
@@ -9293,6 +9578,52 @@ impl Runtime {
                 continue;
             };
             self.define_keyed(prototype, &key, method);
+        }
+
+        // **The regular-expression protocol.** `String.prototype.match` is *defined* as
+        // asking the pattern, and the pattern is defined as asking `exec` — so a subclass
+        // that overrides either changes what every string method does. Without these the
+        // string methods did the work themselves and both hooks were unreachable.
+        //
+        // New functions rather than aliases, unlike `Symbol.iterator` above: there is no
+        // named method on `RegExp.prototype` that does any of these, so there is nothing to
+        // alias.
+        let Some(prototype) = REGEXP_PROTOTYPE.with(std::cell::Cell::get) else {
+            return;
+        };
+        for (offset, name) in REGEXP_SYMBOL_NAMES.iter().enumerate() {
+            let named = PropertyKey::new(name);
+            let held = self
+                .heap
+                .shape_of(symbol)
+                .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                .and_then(|slot| self.heap.get(symbol, slot.index()));
+            let Some(address) = held.and_then(|value| value.as_address()) else {
+                continue;
+            };
+            // Rooted for the same reason `Symbol.iterator` is: a shape names it, and a
+            // program may delete the property it was read from (D-192).
+            KEY_SYMBOLS.with(|symbols| {
+                if let Ok(mut entries) = symbols.try_borrow_mut() {
+                    entries.insert(Value::symbol(address).to_bits());
+                }
+            });
+            let index = NATIVES.len()
+                + GLOBAL_NATIVES.len()
+                + NAMESPACE_NATIVES.len()
+                + REGEXP_SYMBOL_METHODS
+                + offset;
+            let function = self.native_function(index);
+            // **On the prototype before anything else is allocated.** `native_function` hands
+            // back an unrooted handle, so the function is reachable only once it is stored —
+            // and building its `name` allocates, which under stress freed it between the two
+            // lines. `typeof` then answered `"object"`, because what came back was a
+            // different cell.
+            let key = PropertyKey::symbol(address, &format!("Symbol.{name}"));
+            self.define_keyed(prototype, &key, function.to_value());
+            let text = self.string(&format!("[Symbol.{name}]"));
+            self.define_named(function, "name", text);
+            self.define_named(function, "length", Value::number(1.0));
         }
     }
 

@@ -2577,6 +2577,90 @@ fn exec_distinguishes_a_missing_group_from_an_empty_one() {
     );
 }
 
+/// **A string method asks the pattern, and the pattern asks `exec`.**
+///
+/// That is what the `Symbol.*` protocol is for: a subclass or a plain object that overrides
+/// either changes what every string method does. Doing the work in the string method skips
+/// both hooks and is indistinguishable from working until somebody overrides something.
+#[test]
+fn a_string_method_asks_the_pattern() {
+    check(
+        "symbol-match-exists",
+        "return typeof RegExp.prototype[Symbol.match];",
+        "function",
+    );
+    check(
+        "symbol-match-direct",
+        "return /b./[Symbol.match](\"abcd\")[0];",
+        "bc",
+    );
+    check(
+        "symbol-search-direct",
+        "return /c/[Symbol.search](\"abcd\");",
+        "2",
+    );
+    check(
+        "symbol-replace-direct",
+        "return /b/[Symbol.replace](\"abc\", \"X\");",
+        "aXc",
+    );
+    check(
+        "symbol-split-direct",
+        "return /,/[Symbol.split](\"a,b\").join(\"|\");",
+        "a|b",
+    );
+    // **The string method delegates**, so an object that is not a pattern at all answers for
+    // it.
+    check(
+        "match-delegates",
+        "let p = {}; p[Symbol.match] = function (s) { return \"saw \" + s; };          return \"abc\".match(p);",
+        "saw abc",
+    );
+    check(
+        "search-delegates",
+        "let p = {}; p[Symbol.search] = function () { return 42; };          return \"abc\".search(p);",
+        "42",
+    );
+    check(
+        "replace-delegates",
+        "let p = {source: \"x\", flags: \"\"};          p[Symbol.replace] = function (s, r) { return s + r; };          return \"abc\".replace(p, \"!\");",
+        "abc!",
+    );
+    check(
+        "split-delegates",
+        "let p = {source: \"x\", flags: \"\"};          p[Symbol.split] = function (s) { return [s, \"z\"]; };          return \"abc\".split(p).join(\"|\");",
+        "abc|z",
+    );
+    // **And the pattern asks `exec`**, which is the second hook and the one a subclass uses.
+    check(
+        "symbol-match-uses-exec",
+        "let r = /a/; r.exec = function () { return [\"replaced\"]; };          return r[Symbol.match](\"aaa\")[0];",
+        "replaced",
+    );
+    check(
+        "symbol-search-uses-exec",
+        "let r = /a/; r.exec = function () { return {index: 9}; };          return r[Symbol.search](\"aaa\");",
+        "9",
+    );
+    // A global match collects the text of every one, and `null` rather than an empty array.
+    check(
+        "symbol-match-global",
+        "return /[0-9]/g[Symbol.match](\"a1b2\").join(\",\");",
+        "1,2",
+    );
+    check(
+        "symbol-match-global-none",
+        "return /z/g[Symbol.match](\"ab\");",
+        "null",
+    );
+    // `search` puts `lastIndex` back, so asking twice answers twice the same.
+    check(
+        "symbol-search-restores-last-index",
+        "let r = /c/g; r.lastIndex = 3; let a = r[Symbol.search](\"abc\");          return a + \",\" + r.lastIndex;",
+        "2,3",
+    );
+}
+
 /// `String.prototype.match` and `String.prototype.search`.
 ///
 /// **`match` answers two different shapes**: a global pattern gives the matched text and

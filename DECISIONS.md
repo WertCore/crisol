@@ -6148,3 +6148,38 @@ So the bound on these loops is no longer arithmetic — a length of 2^53 that ne
 not finish. That is what the specification says to do, and what every engine does; the case
 timeout (D-205) is the backstop, and it is the thing that turned this from a held runner into
 a named failure.
+
+## D-218
+
+**A string method asks the pattern, and the pattern asks `exec`.**
+
+Status: Accepted
+
+`String.prototype.match` is not defined as "match a regular expression". It is defined as
+calling `pattern[Symbol.match](this)`, and `RegExp.prototype[Symbol.match]` is defined as
+calling `this.exec(…)`. Two hooks, and neither existed: the string methods did the matching
+themselves, so a `RegExp` subclass that overrode either was ignored and an object that is not
+a pattern at all could not stand in for one.
+
+That is invisible until somebody overrides something, which is what makes it worth fixing
+rather than noting. It is also a large share of what was left in the corpus: `RegExp.prototype`
+is forty cases and most of them are the protocol.
+
+`RegExp.prototype[Symbol.match]`, `[Symbol.search]`, `[Symbol.replace]` and `[Symbol.split]`
+are new functions rather than aliases — unlike `Symbol.iterator`, which *is*
+`Array.prototype.values` and must be the same object — because there is no named method on
+`RegExp.prototype` that does any of these.
+
+The string methods ask through `GetMethod` and fall through to the built-in path when there
+is no such method, which is how a plain string separator still works: the same rule, not an
+exception to it.
+
+**Two details the tests pin because another engine and this one could quietly differ.** An
+empty match has to be stepped over by hand, or the next `exec` finds it again for ever. And
+`[Symbol.search]` puts `lastIndex` back, so asking twice answers the same — `exec` moves the
+cursor by design and `search` must not.
+
+**And a rooting bug this found**: `native_function` hands back an unrooted handle, so the
+function has to reach the prototype before anything else allocates. Building its `name` first
+freed it under stress, and `typeof` then answered `"object"` because what came back was a
+different cell. `define_method` had the same note; the new installer did not.
