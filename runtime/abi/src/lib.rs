@@ -2930,18 +2930,42 @@ const DATE_YEAR: usize = 0;
 /// `valueOf` it was handed. The first argument is coerced even when absent, which is why
 /// `d.setHours()` yields an invalid date rather than leaving the date alone.
 fn date_set(this_value: u64, argc: u64, argv: *const u64, first: usize, count: usize) -> u64 {
-    let Some(handle) = handle_of(this_value) else {
-        return raise("not a date", "TypeError");
-    };
+    // **The receiver is checked before a single argument is converted**, which is the
+    // specification's order and is observable: `Date.prototype.setDate.call({}, o)` must
+    // throw without ever reaching `o.valueOf`.
     if own_property(this_value, DATE_TIME).is_none() {
         return raise("not a date", "TypeError");
     }
     let supplied = (argc as usize).min(count).max(1);
     let mut given = [f64::NAN; 7];
-    for (index, slot) in given.iter_mut().enumerate().take(supplied) {
-        // SAFETY: the convention guarantees `argc` readable values at `argv`.
-        *slot = to_number(unsafe { argument(argc, argv, index) });
+    // **Rooted before the first conversion, not during it.** A conversion runs user code
+    // that allocates, and the arguments live in the caller's frame slot, which nothing
+    // scans (D-208) — so converting the first freed the second and third, and
+    // `d.setHours(a, b, c)` reported that it could not convert an object to a primitive.
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    let converted = with_rooted(&live, || {
+        for (index, slot) in given.iter_mut().enumerate().take(supplied) {
+            // SAFETY: as above.
+            let value = unsafe { argument(argc, argv, index) };
+            // **`ToNumber`, which calls user code and may throw.** `to_number` answers `NaN`
+            // for an object without asking it anything, so `d.setDate({valueOf: () => 3})`
+            // set the date to `NaN` — and a `valueOf` that threw was swallowed. Every
+            // argument is converted, in order, before any of them is used: the specification
+            // says so, and it is observable whenever two of them have effects.
+            if let Err(thrown) = coerce_number(value).map(|number| *slot = number) {
+                return Err(thrown);
+            }
+        }
+        Ok(())
+    });
+    if let Err(thrown) = converted {
+        return thrown;
     }
+    // Re-read after the coercions, which run user code that can collect.
+    let Some(handle) = handle_of(this_value) else {
+        return raise("not a date", "TypeError");
+    };
 
     let time = time_of(this_value);
     // **`setFullYear` starts from the epoch when the date is invalid**, and every other setter
@@ -2988,14 +3012,19 @@ extern "C" fn date_set_time(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(handle) = handle_of(this_value) else {
-        return raise("not a date", "TypeError");
-    };
     if own_property(this_value, DATE_TIME).is_none() {
         return raise("not a date", "TypeError");
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let given = to_number(unsafe { argument(argc, argv, 0) });
+    let value = unsafe { argument(argc, argv, 0) };
+    let given = match coerce_number(value) {
+        Ok(number) => number,
+        Err(thrown) => return thrown,
+    };
+    // Re-read after the coercion, which runs user code that can collect.
+    let Some(handle) = handle_of(this_value) else {
+        return raise("not a date", "TypeError");
+    };
     store_time(handle, crisol_builtins::time_clip(given))
 }
 
@@ -7210,19 +7239,16 @@ extern "C" fn reflect_construct(
 /// `defineProperty` redefines rather than assigns, so the check an assignment makes must not
 /// apply — otherwise a property defined non-writable could never be redefined.
 ///
-/// # Safety
-///
-/// `name` must be a live string.
-unsafe fn define_ignoring_writability(handle: GcRef, name: &str, value: u64) -> u64 {
-    let key = PropertyKey::new(name);
+/// Takes a [`PropertyKey`] rather than a name, because a symbol has no identifying one.
+fn define_keyed_ignoring_writability(handle: GcRef, key: &PropertyKey, value: u64) -> u64 {
     with_runtime(|runtime| {
         let Some(current) = runtime.heap.shape_of(handle) else {
             return Value::UNDEFINED.to_bits();
         };
         let (shape, slot, width) = {
             let mut shapes = runtime.shapes.borrow_mut();
-            let shape = shapes.add(current, &key);
-            let Some(slot) = shapes.lookup(shape, &key) else {
+            let shape = shapes.add(current, key);
+            let Some(slot) = shapes.lookup(shape, key) else {
                 return Value::UNDEFINED.to_bits();
             };
             (shape, slot, shapes.len(shape) as usize)
@@ -7245,11 +7271,18 @@ unsafe fn define_ignoring_writability(handle: GcRef, name: &str, value: u64) -> 
 
 /// Reads a property of `object` by name, without walking the prototype chain.
 fn own_property(object: u64, name: &str) -> Option<(u32, Value)> {
+    own_property_keyed(object, &PropertyKey::new(name))
+}
+
+/// [`own_property`] for a key that may name a symbol.
+///
+/// Separate because the named form takes a `&str`, and a symbol has no identifying one —
+/// routing one through its description made two symbols the same property (D-193).
+fn own_property_keyed(object: u64, key: &PropertyKey) -> Option<(u32, Value)> {
     let handle = handle_of(object)?;
     with_runtime(|runtime| {
         let shape = runtime.heap.shape_of(handle)?;
-        let key = PropertyKey::new(name);
-        let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+        let slot = runtime.shapes.borrow().lookup(shape, key)?;
         // **A deleted property is absent**, and the shape still names its slot — that is what
         // the tombstone is for. Answering from the slot anyway handed back the attributes the
         // property had before it was deleted, so a redefinition validated against a property
@@ -7439,9 +7472,20 @@ extern "C" fn object_define_property(
             Some(handle) if Value::from_bits(target).kind() == crisol_value::Kind::Object => handle,
             _ => return raise("cannot define a property on a non-object", "TypeError"),
         };
-        let Some(name) = to_text(key) else {
+        // **A symbol is a key too, and `to_text` refuses one.** `Object.defineProperty(o,
+        // Symbol.iterator, …)` was a `TypeError` — on the one property a program is most
+        // likely to define that way. The key goes through `key_of`, which knows both
+        // spellings, and the string is kept alongside only for the two questions that are
+        // genuinely about names: whether this is `length`, and whether it is an index.
+        let Some(property) = key_of(Value::from_bits(key)) else {
             return raise("a property key must be a name", "TypeError");
         };
+        let name = if property.is_symbol() {
+            String::new()
+        } else {
+            property.as_str().to_owned()
+        };
+        let named = !property.is_symbol();
         if let Some((behind, handler)) = proxy_parts(target) {
             return proxy_define(behind, handler, key, descriptor);
         }
@@ -7457,7 +7501,8 @@ extern "C" fn object_define_property(
         // resize rather than store. Storing left the array reporting two lengths at once — the
         // descriptor said one and the elements said two — and every question after that got
         // whichever answer its asker happened to consult.
-        if name == "length"
+        if named
+            && name == "length"
             && let Some(count) = with_runtime(|runtime| runtime.heap.element_count(handle))
         {
             let read_value = "value".to_owned();
@@ -7509,10 +7554,11 @@ extern "C" fn object_define_property(
         // Past `DENSE_ELEMENT_LIMIT` an index is not an element (see `store_element`), so it
         // takes the slot path — readable by the same key, but not counted by `length`.
         let element = with_runtime(|runtime| runtime.heap.element_count(handle))
+            .filter(|_| named)
             .and(canonical_index(&name))
             .filter(|index| *index <= DENSE_ELEMENT_LIMIT);
 
-        let existing = own_property(target, &name);
+        let existing = own_property_keyed(target, &property);
         let read_field = |field: &str| -> u64 { read_descriptor_field(descriptor, field) };
         let given = read_field("value");
         let has_value = Value::from_bits(given).kind() != crisol_value::Kind::Undefined
@@ -7573,8 +7619,9 @@ extern "C" fn object_define_property(
                 with_runtime(|runtime| runtime.heap.attributes_of(handle, slot)),
                 value,
             )),
-            None => derived_own_property(target, &name)
+            None if named => derived_own_property(target, &name)
                 .map(|(bits, attributes)| (attributes, Value::from_bits(bits))),
+            None => None,
         };
         // **A non-extensible object refuses a property it does not have**, which is the one
         // refusal `defineProperty` never made — so `Object.preventExtensions(o)` stopped
@@ -7664,13 +7711,12 @@ extern "C" fn object_define_property(
             return target;
         }
 
-        // SAFETY: `name` is a live Rust string.
-        let outcome = unsafe { define_ignoring_writability(handle, &name, stored) };
+        let outcome = define_keyed_ignoring_writability(handle, &property, stored);
         if Value::from_bits(outcome).is_exception() {
             return outcome;
         }
 
-        let Some((slot, _)) = own_property(target, &name) else {
+        let Some((slot, _)) = own_property_keyed(target, &property) else {
             return target;
         };
         with_runtime(|runtime| runtime.heap.set_attributes(handle, slot, wanted));
@@ -7699,8 +7745,16 @@ extern "C" fn object_own_descriptor(
         if let Some((behind, handler)) = proxy_parts(target) {
             return proxy_descriptor(behind, handler, key);
         }
-        let Some(name) = to_text(key) else {
+        // A symbol is a key here too — see `object_define_property`, which refused one for
+        // the same reason until it stopped asking `to_text`.
+        let Some(property) = key_of(Value::from_bits(key)) else {
             return Value::UNDEFINED.to_bits();
+        };
+        let named = !property.is_symbol();
+        let name = if named {
+            property.as_str().to_owned()
+        } else {
+            String::new()
         };
         let Some(handle) = handle_of(target) else {
             return Value::UNDEFINED.to_bits();
@@ -7714,13 +7768,16 @@ extern "C" fn object_own_descriptor(
         let descriptor = crisol_create_object();
         // **`undefined` for an absent property**, which is how a caller tells "not there" from
         // "there and not writable".
-        let found = with_rooted(&[descriptor], || match own_property(target, &name) {
-            Some((slot, value)) => Some((
-                value,
-                with_runtime(|runtime| runtime.heap.attributes_of(handle, slot)),
-            )),
-            None => derived_own_property(target, &name)
-                .map(|(bits, attributes)| (Value::from_bits(bits), attributes)),
+        let found = with_rooted(&[descriptor], || {
+            match own_property_keyed(target, &property) {
+                Some((slot, value)) => Some((
+                    value,
+                    with_runtime(|runtime| runtime.heap.attributes_of(handle, slot)),
+                )),
+                None if named => derived_own_property(target, &name)
+                    .map(|(bits, attributes)| (Value::from_bits(bits), attributes)),
+                None => None,
+            }
         });
         let Some((value, attributes)) = found else {
             return Value::UNDEFINED.to_bits();

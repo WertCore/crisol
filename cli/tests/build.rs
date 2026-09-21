@@ -2577,6 +2577,106 @@ fn exec_distinguishes_a_missing_group_from_an_empty_one() {
     );
 }
 
+/// **A date setter converts its arguments, and the conversion can throw.**
+///
+/// `to_number` answers `NaN` for an object without asking it anything, so
+/// `d.setDate({valueOf: () => 3})` set the date to `Invalid Date` — and a `valueOf` that
+/// threw was swallowed entirely.
+#[test]
+fn a_date_setter_converts_what_it_is_given() {
+    check(
+        "set-date-coerced",
+        "let d = new Date(0); d.setDate({valueOf: function () { return 3; }}); \
+         return d.getDate();",
+        "3",
+    );
+    check(
+        "set-time-coerced",
+        "let d = new Date(0); d.setTime(\"1000\"); return d.getTime();",
+        "1000",
+    );
+    check(
+        "set-full-year-coerced",
+        "let d = new Date(0); d.setFullYear(\"2020\"); return d.getFullYear();",
+        "2020",
+    );
+    check(
+        "set-date-throwing",
+        "let d = new Date(0); \
+         try { d.setDate({valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "set-date-symbol",
+        "let d = new Date(0); \
+         try { d.setDate(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // **The receiver is checked before a single argument is converted**, which is the
+    // specification's order and is observable.
+    check(
+        "set-date-checks-receiver-first",
+        "let touched = false; \
+         let o = {valueOf: function () { touched = true; return 1; }}; \
+         try { Date.prototype.setDate.call({}, o); } catch (e) {} \
+         return touched;",
+        "false",
+    );
+    // Every argument is converted, in order, before any is used.
+    check(
+        "set-hours-converts-all",
+        "let seen = \"\"; \
+         let mark = function (n) { return {valueOf: function () { seen = seen + n; return 1; }}; }; \
+         let d = new Date(0); d.setHours(mark(\"a\"), mark(\"b\"), mark(\"c\")); return seen;",
+        "abc",
+    );
+}
+
+/// **A symbol is a property key, including where a descriptor is involved.**
+///
+/// `Object.defineProperty(o, Symbol.iterator, …)` was a `TypeError` — on the one property a
+/// program is most likely to define that way — because the key went through `ToString`, which
+/// refuses a symbol. So did `getOwnPropertyDescriptor`, which meant a symbol-keyed property
+/// could be created by assignment and then not described.
+#[test]
+fn a_symbol_can_be_defined_and_described() {
+    check(
+        "define-symbol-key",
+        "let s = Symbol(\"k\"); let o = {};          Object.defineProperty(o, s, {value: 7, enumerable: true}); return o[s];",
+        "7",
+    );
+    check(
+        "describe-symbol-key",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 3;          let d = Object.getOwnPropertyDescriptor(o, s); return d.value + \",\" + d.writable;",
+        "3,true",
+    );
+    check(
+        "describe-absent-symbol-key",
+        "return Object.getOwnPropertyDescriptor({}, Symbol(\"k\"));",
+        "undefined",
+    );
+    // A well-known symbol is the case that actually comes up.
+    check(
+        "define-well-known-symbol-key",
+        "let o = {};          Object.defineProperty(o, Symbol.iterator, {value: function () { return 1; }});          return o[Symbol.iterator]();",
+        "1",
+    );
+    // **Two symbols with the same description are two properties**, which is the whole
+    // reason a key cannot be its text.
+    check(
+        "define-two-alike-symbols",
+        "let a = Symbol(\"k\"); let b = Symbol(\"k\"); let o = {};          Object.defineProperty(o, a, {value: 1});          Object.defineProperty(o, b, {value: 2});          return o[a] + \",\" + o[b];",
+        "1,2",
+    );
+    // A non-enumerable symbol property stays out of the string keys, as any other does.
+    check(
+        "symbol-key-not-in-keys",
+        "let s = Symbol(\"k\"); let o = {a: 1}; Object.defineProperty(o, s, {value: 2});          return Object.keys(o).join(\",\");",
+        "a",
+    );
+}
+
 /// **A string method asks the pattern, and the pattern asks `exec`.**
 ///
 /// That is what the `Symbol.*` protocol is for: a subclass or a plain object that overrides

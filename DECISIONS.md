@@ -6183,3 +6183,45 @@ cursor by design and `search` must not.
 function has to reach the prototype before anything else allocates. Building its `name` first
 freed it under stress, and `typeof` then answered `"object"` because what came back was a
 different cell. `define_method` had the same note; the new installer did not.
+
+## D-219
+
+**A symbol is a property key where a descriptor is involved too.**
+
+Status: Accepted
+
+`Object.defineProperty(o, Symbol.iterator, …)` was a `TypeError` — on the one property a
+program is most likely to define that way. Both it and `getOwnPropertyDescriptor` turned the
+key into text with `to_text`, which refuses a symbol by design, so a symbol-keyed property
+could be created by assignment and then neither redefined nor described.
+
+The key goes through `key_of` now, which knows both spellings. The *string* is kept alongside
+it, but only for the two questions that are genuinely about names: whether this is `length`,
+and whether it is an array index. A symbol is neither, so both are skipped rather than
+answered wrongly.
+
+`own_property` and `define_ignoring_writability` grew keyed twins for the same reason
+`define_keyed` exists (D-193): the named forms take a `&str`, and routing a symbol through its
+description made two symbols the same property.
+
+## D-220
+
+**A date setter converts its arguments, in order, before using any of them.**
+
+Status: Accepted
+
+`d.setDate({valueOf: () => 3})` produced `Invalid Date`. The setters used `to_number`, which
+answers `NaN` for an object without asking it anything — so a `valueOf` was never called and
+one that threw was swallowed.
+
+Three things the order gets right, and each is a test. The **receiver** is checked before a
+single argument is converted, so `Date.prototype.setDate.call({}, o)` throws without reaching
+`o.valueOf`. Every argument is converted before any is used, which is observable whenever two
+of them have effects. And the receiver's handle is re-read afterwards, because a conversion
+runs user code that can collect.
+
+**And the arguments are rooted before the first conversion, not during it.** They live in the
+caller's frame slot, which nothing scans (D-208) — so converting the first freed the second
+and third, and `d.setHours(a, b, c)` reported that it could not convert an object to a
+primitive. That is the third time this exact hazard has appeared; the rule is in D-208 and it
+is worth reading before writing any built-in that converts more than one argument.
