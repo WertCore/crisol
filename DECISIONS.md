@@ -2930,6 +2930,10 @@ is the one that matters: there is no allocation per call, and arguments are alre
 because the collector reads frame slots through the stack maps (D-93). A heap list would need
 its own rooting and would allocate on the hottest path in the language.
 
+*(Corrected by D-208: that second reason is about the argument **values**, which are live at
+the call and so are in its stack map. The slot itself is not scanned, and the difference shows
+the moment anything allocates between filling it and entering the callee.)*
+
 `new.target` is in the signature although nothing reads it until classes. Adding a parameter
 later rewrites every call site, and the slot costs a register that is free anyway.
 
@@ -5826,3 +5830,140 @@ from scratch.
 inside a callback, `assert.throws(TypeError, function () { … })` — test262's most common
 shape is a function written inside something that catches, and the engine could not run it at
 all.
+
+## D-207
+
+**Not everything callable can be constructed.**
+
+Status: Accepted
+
+`new Array.prototype.find()` is a `TypeError`, and the engine answered an object. test262 says
+so in a case of its own for very nearly every built-in method it covers — `not-a-constructor.js`
+is one of the largest single families in the corpus — and it asks twice: once with `new`, and
+once through `isConstructor`, which is `Reflect.construct(function () {}, [], f)` and reads the
+answer from whether that threw. `Reflect.construct` did not exist, so the second question was a
+missing function rather than a wrong answer.
+
+**The answer is read off the function index already in internal zero.** The native tables share
+one negative index space in a fixed order, so the index says which table a function came from,
+and a prototype method's table never holds a constructor. Nothing is stored per function. A flag
+beside the index would have been clearer to read and would cost eight bytes on every closure a
+program allocates, which for a language where closures are how everything is expressed is the
+wrong eight bytes to spend.
+
+`Math`, `JSON` and `Reflect` stopped being callable at all. They were given the plain-object
+constructor by the helper that makes a namespace exist, which is right for `Object` and `Array`
+— both are namespaces *and* constructors — and wrong for the three that are only namespaces:
+`typeof Math` answered `"function"` and `new JSON()` answered an object.
+
+**A compiled function is a constructor here and an arrow is not one in the language.** Telling
+them apart needs the frontend to record which it lowered, because by the time a closure exists
+the two are the same object. That is a change to the closure ABI rather than to this rule, and
+is not made here.
+
+## D-208
+
+**`argv` is traced because its values are still live, not because it is a frame slot.**
+
+Status: Accepted
+
+D-94 says arguments need no rooting of their own, "because the collector reads frame slots
+through the stack maps". That is true of the *values*, which are live SSA values across the
+call and therefore in the map. It is not true of the **slot**: nothing scans those words.
+
+The distinction had never mattered, because nothing allocates between laying the arguments out
+and the callee taking them — a compiled callee's prologue reads them into locals, and a native
+calls `live_values` before its first allocation. Reordering `new` to do its allocation after
+`build_arguments` broke that, and `new P({y: 1}, {z: 2})` read `NaN` under stress: both
+arguments were collected while the receiver was being made.
+
+So the order in `Op::Construct` is load-bearing and is written down as such. Allocate the
+receiver first, resolve the body second, lay the arguments out last — which keeps every
+argument a live value over the one call that can collect.
+
+**The general rule, which D-94 should have said**: a value is traced while something the stack
+map knows about holds it. A frame slot is not that. Anything that allocates between filling
+`argv` and entering the callee has to root what it wrote there.
+
+## D-209
+
+**The rest of the well-known symbols, and the two string methods that need a pattern.**
+
+Status: Accepted
+
+Five well-known symbols existed and eight did not. A `PropertyKey` carries a symbol's address
+now, so the note saying they were "present but not yet usable as property keys" had stopped
+being true and the list had not grown with it.
+
+**A program branches on whether `Symbol.species` exists far more often than it uses it.** That
+is what a feature test is, and one that reads `undefined` sends the program down a path
+written for an engine from before the symbol existed — so the missing eight were not eight
+missing features but a wrong answer to thirteen questions. Defining the symbol and acting on
+it are separate; this does the first and does not pretend to have done the second.
+
+They are defined frozen, which is what `Object.getOwnPropertyDescriptor(Symbol, "iterator")`
+reads and what the specification says.
+
+`String.prototype.match` and `String.prototype.search` were missing outright, which is a
+`TypeError` rather than a wrong answer — the largest single bucket in the corpus report is
+"is not a function". `match` answers **two shapes**: a global pattern gives the matched text
+and nothing else, a non-global one gives what `exec` gives, and a program written for one and
+handed the other reads `undefined` where it expected a group. `search` does not touch
+`lastIndex`, so asking twice answers the same — which `exec` deliberately does not.
+
+Both take a string argument as a *pattern* rather than a literal, which is the one thing about
+them a reader coming from `indexOf` gets wrong, so it is a test rather than a comment.
+
+`exec` and `match` build the same array through the same function now. They are compared
+against each other in the corpus, so two builders would have been two chances to disagree
+about `index`.
+
+## D-210
+
+**`Date.prototype.toString` is not the ISO form.**
+
+Status: Accepted
+
+It answered `1970-01-01T00:00:00.000Z`, which is `toISOString`'s spelling. The specification
+gives `toString` a different one — `Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal
+Time)` — and the difference is not cosmetic: `String(date)` is what a date turns into in every
+concatenation, and `Date.parse(String(d))` is how a program round-trips one. An engine that
+prints a form no other engine prints breaks both quietly.
+
+`toUTCString`, `toDateString`, `toTimeString` and the two `toLocale*` partners did not exist
+at all, which is a `TypeError` rather than a wrong answer.
+
+**The zone is UTC and everything agrees on that.** `getTimezoneOffset` answers zero, so the
+printed offset is `+0000` rather than the host's — printing a local offset beside an accessor
+that says there is none would put a program that reconstructs a date from its own output an
+hour out.
+
+The day and month names are tables, which is exactly the shape of thing that is right for one
+entry and wrong for the next, so the tests walk all seven and all twelve rather than sampling.
+
+## D-211
+
+**A global that is a function inherits from `Function.prototype`, and `new` through a bound
+function constructs.**
+
+Status: Accepted
+
+Two gaps that only showed once `new` started checking what it was given.
+
+`Date.bind` was `undefined`. A global is built before `Function.prototype` exists, so nothing
+linked the two — which also made `Object instanceof Function` false. The *prototype methods*
+had the link, and that is what made it hard to see: `Math.max.bind` worked and `Date.bind` did
+not, so a program testing one concluded the other. Linked in a late pass rather than at each
+creation, because this is the first point where the object exists and one pass in the right
+place beats three that have to be kept in the right order.
+
+`new (Date.bind(null, 0))()` called `Date(0)` instead of constructing it. That is not a near
+miss: `Date` called as a function answers a *string*, so the `new` fell back to the bare
+receiver and `.getTime` was not a function. A bound function's body now reads the `new.target`
+the convention already passes it — which is what that parameter was reserved for (D-94) — and
+constructs the target when it is set. The receiver the caller made is discarded on that path:
+the target builds its own from its own `prototype`, which a bound function does not have.
+
+**Both were found by the acceptance suite, not by reading.** Making a bound function report
+itself constructable is what made calling-instead-of-constructing observable, and the test for
+it is what found the missing prototype link one line earlier.

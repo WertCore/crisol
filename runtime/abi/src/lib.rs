@@ -55,6 +55,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_closure_code",
     "crisol_not_a_function",
     "crisol_construct_this",
+    "crisol_construct_code",
     "crisol_construct_result",
     "crisol_create_array",
     "crisol_computed_load",
@@ -2318,6 +2319,11 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Date.prototype", "toISOString", 0),
     ("Date.prototype", "toJSON", 1),
     ("Date.prototype", "toString", 0),
+    ("Date.prototype", "toUTCString", 0),
+    ("Date.prototype", "toDateString", 0),
+    ("Date.prototype", "toTimeString", 0),
+    ("Date.prototype", "toLocaleDateString", 0),
+    ("Date.prototype", "toLocaleTimeString", 0),
     ("Date.prototype", "valueOf", 0),
     ("Function.prototype", "apply", 2),
     ("Function.prototype", "bind", 1),
@@ -2410,6 +2416,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Proxy", "revocable", 2),
     ("global", "Proxy", 2),
     ("Reflect", "apply", 3),
+    ("Reflect", "construct", 2),
     ("Reflect", "defineProperty", 3),
     ("Reflect", "deleteProperty", 2),
     ("Reflect", "get", 2),
@@ -2444,6 +2451,8 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("String.prototype", "repeat", 1),
     ("String.prototype", "replace", 2),
     ("String.prototype", "replaceAll", 2),
+    ("String.prototype", "match", 1),
+    ("String.prototype", "search", 1),
     ("String.prototype", "slice", 2),
     ("String.prototype", "split", 2),
     ("String.prototype", "startsWith", 1),
@@ -2804,6 +2813,12 @@ const DATE_NATIVES: &[(&str, Native)] = &[
     ("toJSON", date_to_iso),
     ("toString", date_to_text),
     ("toLocaleString", date_to_text),
+    ("toUTCString", date_to_utc_text),
+    ("toGMTString", date_to_utc_text),
+    ("toDateString", date_to_date_text),
+    ("toTimeString", date_to_time_text),
+    ("toLocaleDateString", date_to_date_text),
+    ("toLocaleTimeString", date_to_time_text),
     ("setTime", date_set_time),
     ("setFullYear", date_set_full_year),
     ("setUTCFullYear", date_set_full_year),
@@ -3169,7 +3184,12 @@ extern "C" fn date_to_iso(
     )
 }
 
-/// `Date.prototype.toString`.
+/// `Date.prototype.toString` — `"Thu Jan 01 1970 00:00:00 GMT+0000 (…)"`.
+///
+/// **Not the ISO form**, which is what it used to answer. The two are different methods with
+/// different spellings and different failure modes, and a `toString` that printed
+/// `1970-01-01T00:00:00.000Z` made `String(date)` disagree with every engine a program was
+/// written against — including `Date.parse(String(d))`, which is how a program round-trips.
 extern "C" fn date_to_text(
     _closure: u64,
     this_value: u64,
@@ -3177,7 +3197,49 @@ extern "C" fn date_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    crisol_builtins::to_iso_string(time_of(this_value)).map_or_else(
+    crisol_builtins::to_date_time_string(time_of(this_value)).map_or_else(
+        || new_string(crisol_builtins::INVALID_DATE),
+        |text| new_string(&text),
+    )
+}
+
+/// `Date.prototype.toUTCString` — `"Thu, 01 Jan 1970 00:00:00 GMT"`.
+extern "C" fn date_to_utc_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    crisol_builtins::to_utc_string(time_of(this_value)).map_or_else(
+        || new_string(crisol_builtins::INVALID_DATE),
+        |text| new_string(&text),
+    )
+}
+
+/// `Date.prototype.toDateString` — the date half of `toString`.
+extern "C" fn date_to_date_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    crisol_builtins::to_date_string(time_of(this_value)).map_or_else(
+        || new_string(crisol_builtins::INVALID_DATE),
+        |text| new_string(&text),
+    )
+}
+
+/// `Date.prototype.toTimeString` — the time half of `toString`.
+extern "C" fn date_to_time_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    crisol_builtins::to_time_string(time_of(this_value)).map_or_else(
         || new_string(crisol_builtins::INVALID_DATE),
         |text| new_string(&text),
     )
@@ -4906,40 +4968,9 @@ extern "C" fn regexp_exec(
         return Value::NULL.to_bits();
     };
 
-    with_rooted(&[this_value], || {
-        let whole = text
-            .get(found.start..found.end)
-            .unwrap_or_default()
-            .to_owned();
-        with_new_array(found.groups.len() + 1, |array| {
-            let first = new_string(&whole);
-            with_runtime(|runtime| {
-                runtime.heap.set_element(array, 0, Value::from_bits(first));
-            });
-            for (position, group) in found.groups.iter().enumerate() {
-                let value = match group {
-                    Some((start, end)) => new_string(text.get(*start..*end).unwrap_or_default()),
-                    None => Value::UNDEFINED.to_bits(),
-                };
-                with_runtime(|runtime| {
-                    runtime
-                        .heap
-                        .set_element(array, position + 1, Value::from_bits(value));
-                });
-            }
-            // Byte offsets become code-unit offsets, so `index` is in the same space
-            // `length` and `charAt` use (D-115).
-            let prefix = text.get(..found.start).unwrap_or_default();
-            #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
-            let index = Value::number(prefix.encode_utf16().count() as f64);
-            let input = new_string(&text);
-            with_runtime(|runtime| {
-                runtime.define(array, "index", index);
-                runtime.define(array, "input", Value::from_bits(input));
-            });
-            array.to_value().to_bits()
-        })
-    })
+    // Rooted across the array's allocation: `this_value` reached here in a register and the
+    // text came out of it.
+    with_rooted(&[this_value], || match_result(&text, &found))
 }
 
 /// `RegExp.prototype.toString`.
@@ -4981,6 +5012,8 @@ const STRING_NATIVES: &[(&str, Native)] = &[
     ("padEnd", string_pad_end),
     ("replace", string_replace),
     ("replaceAll", string_replace_all),
+    ("match", string_match),
+    ("search", string_search),
 ];
 
 /// `String.prototype.at`.
@@ -5194,6 +5227,140 @@ extern "C" fn string_replace_all(
     argv: *const u64,
 ) -> u64 {
     replace_with(this_value, argc, argv, true)
+}
+
+/// A pattern argument compiled, whether it arrived as a regular expression or as text.
+///
+/// **A string is a pattern, not a literal.** `"a.c".match(".")` matches `"a"`, because the
+/// argument is given to the `RegExp` constructor rather than searched for — which is the one
+/// thing about `match` and `search` that a reader coming from `indexOf` gets wrong.
+fn pattern_argument(value: u64) -> Option<(crisol_builtins::JsRegExp, String)> {
+    let (source, flags_text) = match property_text(value, "source") {
+        Some(source) => (source, property_text(value, "flags").unwrap_or_default()),
+        // `"".match()` with nothing is the empty pattern, which matches at zero.
+        None if Value::from_bits(value).is_undefined() => (String::new(), String::new()),
+        None => (to_text(value)?, String::new()),
+    };
+    let flags = crisol_builtins::Flags::parse(&flags_text).ok()?;
+    let compiled = crisol_builtins::JsRegExp::new(&source, flags).ok()?;
+    Some((compiled, flags_text))
+}
+
+/// `String.prototype.match`.
+///
+/// **A global pattern answers differently**: a list of the matched text and nothing else,
+/// where a non-global one answers what `exec` would — an array with the groups on it and an
+/// `index`. Two shapes from one method, which is why this cannot simply loop.
+extern "C" fn string_match(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return Value::NULL.to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let pattern = unsafe { argument(argc, argv, 0) };
+    let Some((mut compiled, flags)) = pattern_argument(pattern) else {
+        return Value::NULL.to_bits();
+    };
+    if !flags.contains('g') {
+        let Some(found) = compiled.exec(&text) else {
+            return Value::NULL.to_bits();
+        };
+        return match_result(&text, &found);
+    }
+    let matched: Vec<String> = compiled
+        .all_matches(&text)
+        .into_iter()
+        .map(|found| {
+            text.get(found.start..found.end)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    // **No matches at all is `null`, not an empty array** — `if (s.match(/x/g))` is how a
+    // program asks, and an empty array is truthy.
+    if matched.is_empty() {
+        return Value::NULL.to_bits();
+    }
+    with_new_array(matched.len(), |array| {
+        for (index, text) in matched.iter().enumerate() {
+            let value = new_string(text);
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(array, index, Value::from_bits(value));
+            });
+        }
+        array.to_value().to_bits()
+    })
+}
+
+/// `String.prototype.search` — where the first match starts, or `-1`.
+///
+/// Does not read or write `lastIndex`: a `search` that moved the cursor would make the same
+/// call answer differently the second time, which is the bug `exec` has by design and this
+/// deliberately does not.
+extern "C" fn string_search(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(text) = this_text(this_value) else {
+        return Value::number(-1.0).to_bits();
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let pattern = unsafe { argument(argc, argv, 0) };
+    let Some((mut compiled, _)) = pattern_argument(pattern) else {
+        return Value::number(-1.0).to_bits();
+    };
+    let Some(found) = compiled.exec(&text) else {
+        return Value::number(-1.0).to_bits();
+    };
+    // Byte offsets become code-unit offsets, which is the space every other index is in
+    // (D-115).
+    let prefix = text.get(..found.start).unwrap_or_default();
+    #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+    let index = prefix.encode_utf16().count() as f64;
+    Value::number(index).to_bits()
+}
+
+/// One match as the array `exec` answers: the whole match, then the groups, then `index`.
+///
+/// Shared by `exec` and `match`, because a caller that compares the two — and test262 does,
+/// repeatedly — is comparing objects rather than the text in them.
+fn match_result(text: &str, found: &crisol_builtins::Captured) -> u64 {
+    with_new_array(found.groups.len() + 1, |array| {
+        let whole = new_string(text.get(found.start..found.end).unwrap_or_default());
+        with_runtime(|runtime| {
+            runtime.heap.set_element(array, 0, Value::from_bits(whole));
+        });
+        for (position, group) in found.groups.iter().enumerate() {
+            let value = match group {
+                Some((start, end)) => new_string(text.get(*start..*end).unwrap_or_default()),
+                None => Value::UNDEFINED.to_bits(),
+            };
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(array, position + 1, Value::from_bits(value));
+            });
+        }
+        let prefix = text.get(..found.start).unwrap_or_default();
+        #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+        let index = Value::number(prefix.encode_utf16().count() as f64);
+        let input = new_string(text);
+        with_runtime(|runtime| {
+            runtime.define(array, "index", index);
+            runtime.define(array, "input", Value::from_bits(input));
+        });
+        array.to_value().to_bits()
+    })
 }
 
 /// A string as the code units JavaScript counts.
@@ -5671,7 +5838,7 @@ extern "C" fn function_bind(
 extern "C" fn bound_call(
     closure: u64,
     _this_value: u64,
-    _new_target: u64,
+    new_target: u64,
     argc: u64,
     argv: *const u64,
 ) -> u64 {
@@ -5696,6 +5863,22 @@ extern "C" fn bound_call(
         for position in 0..argc as usize {
             // SAFETY: as above.
             all.push(unsafe { argument(argc, argv, position) });
+        }
+        // **`new` through a bound function constructs the target**, and calling it instead is
+        // not a near miss: `new (Date.bind(null, 0))()` ran `Date(0)`, which answers a string,
+        // so the `new` fell back to the bare receiver and `.getTime` was not a function. The
+        // receiver the caller made is discarded on this path — the target makes its own, from
+        // its own `prototype`, which a bound function does not have.
+        if !Value::from_bits(new_target).is_undefined() {
+            // The convention requires at least one readable slot even for no arguments.
+            let count = all.len() as u64;
+            if all.is_empty() {
+                all.push(Value::UNDEFINED.to_bits());
+            }
+            return with_rooted(&all, || {
+                // SAFETY: `all` holds `count` values and at least one slot.
+                unsafe { construct_with(target, target, count, all.as_ptr()) }
+            });
         }
         call_value(target, receiver, &all)
     })
@@ -5844,6 +6027,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Reflect", "isExtensible", reflect_is_extensible),
     ("Reflect", "preventExtensions", reflect_prevent_extensions),
     ("Reflect", "apply", reflect_apply),
+    ("Reflect", "construct", reflect_construct),
 ];
 
 /// Whether `value` is the exception signal, **clearing the pending throw if it is**.
@@ -6122,6 +6306,62 @@ extern "C" fn reflect_apply(
         };
         let arguments: Vec<u64> = (0..length).map(|index| indexed_get(list, index)).collect();
         with_rooted(&arguments, || call_value(target, receiver, &arguments))
+    })
+}
+
+/// `Reflect.construct(target, argumentsList, newTarget)`.
+///
+/// **test262 asks every built-in whether it can be constructed through this**, with
+/// `isConstructor`, which is `Reflect.construct(function () {}, [], f)` and reads the answer
+/// from whether it threw. So the third argument is not an exotic corner here: it is the only
+/// argument those cases vary, and refusing a `newTarget` that is not a constructor is the
+/// whole of what they check.
+extern "C" fn reflect_construct(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // SAFETY: as above.
+        let target = unsafe { argument(argc, argv, 0) };
+        // **Absent is not `undefined` here.** `Reflect.construct(f, [])` constructs `f`, and
+        // `Reflect.construct(f, [], undefined)` is a `TypeError` — so the default is taken
+        // from how many arguments arrived rather than from what the third one holds.
+        let new_target = if argc > 2 {
+            // SAFETY: as above.
+            unsafe { argument(argc, argv, 2) }
+        } else {
+            target
+        };
+        if !is_constructor(target) {
+            return raise("Reflect.construct needs a constructor", "TypeError");
+        }
+        if !is_constructor(new_target) {
+            return raise("a new target must be a constructor", "TypeError");
+        }
+        // SAFETY: as above.
+        let list = unsafe { argument(argc, argv, 1) };
+        if handle_of(list).is_none() {
+            return raise("an argument list must be an object", "TypeError");
+        }
+        let length = match indexed_length(list) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
+        // The convention requires at least one readable slot even for no arguments.
+        let mut arguments: Vec<u64> = (0..length).map(|index| indexed_get(list, index)).collect();
+        let count = arguments.len() as u64;
+        if arguments.is_empty() {
+            arguments.push(Value::UNDEFINED.to_bits());
+        }
+        with_rooted(&arguments, || {
+            // SAFETY: `arguments` holds `count` values and at least one slot.
+            unsafe { construct_with(target, new_target, count, arguments.as_ptr()) }
+        })
     })
 }
 
@@ -8516,36 +8756,48 @@ impl Runtime {
             .map(GcRef::from_address)
     }
 
-    /// The global named `name`, creating it as a callable object if it is not there.
+    /// The global named `name`, creating it if it is not there.
+    ///
+    /// Callable only when it should be. `Object` and `Array` are constructors as well as
+    /// namespaces; `Math`, `JSON` and `Reflect` are **not functions at all** — `Math()` is a
+    /// `TypeError` — and giving them a body made `typeof Math` answer `"function"` and
+    /// `new Reflect()` answer an object.
     fn ensure_global_object(&self, globals: GcRef, name: &str) -> GcRef {
         if let Some(existing) = self.global_object(globals, name) {
             return existing;
         }
         let shape = self.shapes.borrow().root();
         let scope = self.heap.scope();
-        // One internal slot, holding the index of the built-in it runs when called. `Object`
-        // and `Array` are constructors as well as namespaces, so they need to be callable.
-        let object = scope.alloc_with_internals(shape, 0, 1);
+        let callable = !NAMESPACES_ONLY.contains(&name);
+        // One internal slot for a callable, holding the index of the built-in it runs; none
+        // at all for a namespace, because internal zero is exactly what makes an object a
+        // function (see `is_callable`).
+        let object = scope.alloc_with_internals(shape, 0, usize::from(callable));
         // **A namespace is an ordinary object**, and nothing linked it to one. `Math`, `JSON`,
         // `Reflect`, `Object` and `Array` all reached the end of their chain immediately, so
         // `Math.hasOwnProperty(…)` was not a function — on the objects a program is most
         // likely to ask that of.
         self.inherit_from_object(object.handle());
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "there are a handful of built-ins"
-        )]
-        let encoded = -((NATIVES.len()
-            + GLOBAL_NATIVES.len()
-            + NAMESPACE_NATIVES.len()
-            + CONSTRUCT_PLAIN_OBJECT) as f64
-            + 1.0);
-        self.heap
-            .set_internal(object.handle(), 0, Value::number(encoded));
-        let text = self.string(name);
-        self.define_named(object.handle(), "name", text);
-        if let Some(arity) = arity_of("global", name) {
-            self.define_named(object.handle(), "length", Value::number(f64::from(arity)));
+        if callable {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "there are a handful of built-ins"
+            )]
+            let encoded = -((NATIVES.len()
+                + GLOBAL_NATIVES.len()
+                + NAMESPACE_NATIVES.len()
+                + CONSTRUCT_PLAIN_OBJECT) as f64
+                + 1.0);
+            self.heap
+                .set_internal(object.handle(), 0, Value::number(encoded));
+            // A function's own name and arity. A namespace has neither: `Math.name` is
+            // `undefined`, and a `length` on it would be a property the specification does
+            // not give it.
+            let text = self.string(name);
+            self.define_named(object.handle(), "name", text);
+            if let Some(arity) = arity_of("global", name) {
+                self.define_named(object.handle(), "length", Value::number(f64::from(arity)));
+            }
         }
         self.define(globals, name, object.to_value());
         object.handle()
@@ -8687,11 +8939,38 @@ impl Runtime {
                 self.define_linking(prototype, "constructor", constructor.to_value());
             }
         }
-        // The well-known symbols, as values on `Symbol`. **Present but not yet usable as
-        // property keys**: a `PropertyKey` is a string, so `obj[Symbol.iterator]` cannot name
-        // one. They exist so a program that reads `Symbol.iterator` gets a symbol rather than
-        // `undefined`, which is what most feature tests check — and so that when keys learn
-        // about symbols, the values are already the right ones.
+
+        // **Every global that is a function inherits from `Function.prototype`.** They did
+        // not: a global was built before that object existed, so `Date.bind` was `undefined`
+        // and `Object instanceof Function` was false — on the objects a program is most
+        // likely to ask either of. The prototype methods already had it, which is what made
+        // the gap hard to see: `Math.max.bind` worked and `Date.bind` did not.
+        //
+        // Done here rather than at each creation because this is the first point where
+        // `Function.prototype` exists, and one late pass is better than three early ones that
+        // have to be kept in the right order.
+        if let Some(functions) = FUNCTION_PROTOTYPE.with(std::cell::Cell::get) {
+            for (name, _) in GLOBAL_NATIVES {
+                if let Some(global) = self.global_object(globals.handle(), name) {
+                    self.heap.set_prototype(global, Some(functions));
+                }
+            }
+            for name in ["Object", "Array"] {
+                if let Some(global) = self.global_object(globals.handle(), name) {
+                    self.heap.set_prototype(global, Some(functions));
+                }
+            }
+        }
+
+        // The well-known symbols, as values on `Symbol`. A `PropertyKey` carries a symbol's
+        // address now, so these are usable as property keys and not merely readable.
+        //
+        // **All of them, including the ones nothing consults yet.** A program branches on
+        // whether `Symbol.species` exists far more often than it uses it — that is what a
+        // feature test is — and one that is `undefined` sends the program down a path written
+        // for an engine from before it existed. Defining the symbol is a value; acting on it
+        // is a separate question per symbol, and answering the first does not pretend to
+        // answer the second.
         if let Some(symbol) = self.global_object(globals.handle(), "Symbol") {
             for name in [
                 "iterator",
@@ -8699,9 +8978,19 @@ impl Runtime {
                 "hasInstance",
                 "toPrimitive",
                 "toStringTag",
+                "species",
+                "match",
+                "matchAll",
+                "replace",
+                "search",
+                "split",
+                "isConcatSpreadable",
+                "unscopables",
             ] {
                 let value = self.symbol(Some(&format!("Symbol.{name}")));
-                self.define_named(symbol, name, value);
+                // **Neither writable nor configurable**, which is what the specification says
+                // and what `Object.getOwnPropertyDescriptor(Symbol, "iterator")` checks.
+                self.define_frozen(symbol, name, value);
             }
         }
 
@@ -9650,6 +9939,25 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
 /// reaching it means the heap holds a chain the specification says cannot exist.
 const PROTOTYPE_CHAIN_LIMIT: usize = 1000;
 
+/// The `this` for `new callee(...)`, or the signal that `callee` cannot be constructed.
+///
+/// **This is where `new` asks the question**, because it is the only step that happens before
+/// the body runs. Asking later is asking after the side effects.
+///
+/// It answers the exception signal rather than taking a branch of its own: the call site then
+/// resolves the body through [`crisol_construct_code`], which hands back one that runs
+/// nothing, and [`crisol_construct_result`] passes the signal out. So a refusal costs the same
+/// straight line as an ordinary `new` — the same arrangement, and for the same reason, as
+/// [`crisol_not_a_function`].
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_construct_this(callee: u64) -> u64 {
+    if !is_constructor(callee) {
+        return raise("is not a constructor", "TypeError");
+    }
+    allocate_receiver(callee)
+}
+
 /// Allocates the `this` for `new callee(...)`, inheriting from `callee.prototype`.
 ///
 /// This is `OrdinaryCreateFromConstructor`: the prototype link is established here rather than
@@ -9659,9 +9967,7 @@ const PROTOTYPE_CHAIN_LIMIT: usize = 1000;
 /// A callee with no `prototype` property still yields an object, just one with no prototype.
 /// That is wrong for a real constructor and right for the only way to reach it here — a
 /// `new` on something that is not a class — and it beats returning nothing at all.
-#[unsafe(no_mangle)]
-#[must_use]
-pub extern "C" fn crisol_construct_this(callee: u64) -> u64 {
+fn allocate_receiver(callee: u64) -> u64 {
     let prototype = {
         let key = PropertyKey::new("prototype");
         handle_of(callee).and_then(|handle| {
@@ -9708,6 +10014,73 @@ pub extern "C" fn crisol_construct_result(this_value: u64, returned: u64) -> u64
     } else {
         this_value
     }
+}
+
+/// A body for a `new` that was refused.
+///
+/// Runs nothing and hands the signal back, so the call site's straight line — allocate,
+/// resolve, call, decide — needs no branch for the case where the first step said no. The
+/// value it throws was recorded by [`crisol_construct_this`]; this must not raise one of its
+/// own, which would replace "is not a constructor" with something less true.
+extern "C" fn refused_construct(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    Value::EXCEPTION.to_bits()
+}
+
+/// The body `new callee(...)` should run, given the receiver that was made for it.
+///
+/// Never null, exactly as [`crisol_closure_code`] is never null: when the receiver is the
+/// exception signal the answer is [`refused_construct`], so the call site can jump through
+/// whatever this returns without checking.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_construct_code(callee: u64, this_value: u64) -> *const u8 {
+    if Value::from_bits(this_value).is_exception() {
+        let refused: Native = refused_construct;
+        return refused as *const u8;
+    }
+    crisol_closure_code(callee)
+}
+
+/// `Construct(callee, args, new_target)`, for the runtime's own callers.
+///
+/// `new_target` is what the receiver's prototype comes from and what the body sees as
+/// `new.target`; for `new f()` the two are the same function, and `Reflect.construct` is the
+/// only way to make them differ — which is why the generated code does not come through here
+/// and `Reflect.construct` does.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values, and to at least one.
+unsafe fn construct_with(callee: u64, new_target: u64, argc: u64, argv: *const u64) -> u64 {
+    if !is_constructor(callee) {
+        return raise("is not a constructor", "TypeError");
+    }
+    if !is_constructor(new_target) {
+        return raise("a new target must be a constructor", "TypeError");
+    }
+    with_runtime(|runtime| {
+        let scope = runtime.heap.scope();
+        // Everything here is held by a Rust local across an allocation and by nothing else:
+        // the caller's frame is not scanned for values it has finished with. Rooted one at a
+        // time rather than through `with_rooted`, which collects a `Vec` of its own.
+        let _callee = handle_of(callee).map(|handle| scope.root(handle));
+        let _target = handle_of(new_target).map(|handle| scope.root(handle));
+        let this_value = allocate_receiver(new_target);
+        let code = crisol_closure_code(callee);
+        // SAFETY: `crisol_closure_code` answers either a compiled function or
+        // `crisol_not_a_function`, and both have exactly this signature.
+        let function: Native = unsafe { std::mem::transmute::<*const u8, Native>(code) };
+        let _receiver = handle_of(this_value).map(|handle| scope.root(handle));
+        // SAFETY: the caller promises `argc` readable values at `argv`.
+        let returned = function(callee, this_value, new_target, argc, argv);
+        crisol_construct_result(this_value, returned)
+    })
 }
 
 /// Reads a key passed as a pointer and a length.
@@ -12943,6 +13316,83 @@ fn is_callable(value: u64) -> bool {
                     .is_some_and(|slot| slot.as_number().is_some())
             })
         })
+}
+
+/// The globals that are functions and **not** constructors.
+///
+/// Small enough to name, which is the point: everything else reachable through
+/// [`GLOBAL_NATIVES`] is a constructor, so the list that has to stay correct is the short one.
+/// `Symbol` is here because `new Symbol()` is a `TypeError` — a symbol exists to be unequal to
+/// everything, and a wrapper for one would have an identity of its own.
+const NOT_CONSTRUCTORS: &[&str] = &["parseInt", "parseFloat", "isNaN", "isFinite", "Symbol"];
+
+/// The globals that own methods but are not functions themselves.
+///
+/// Every other name [`NAMESPACE_NATIVES`] hangs a method on is either already a global function
+/// — `String`, `Number`, `Date` — or one of the two that is both a namespace and a constructor.
+const NAMESPACES_ONLY: &[&str] = &["Math", "JSON", "Reflect"];
+
+/// Whether `new value` is allowed — the specification's [[Construct]].
+///
+/// **Being callable is not enough.** `Array.prototype.find` is a function and
+/// `new Array.prototype.find()` is a `TypeError`; test262 says so in a case of its own for
+/// very nearly every built-in method it covers, and asks through `Reflect.construct`'s third
+/// argument as well as through `new`.
+///
+/// Answered from the function index that is already in internal zero, rather than from a flag
+/// stored beside it. The native tables share one index space laid out in a fixed order, so the
+/// index says which table a function came from — and a method's table never holds a
+/// constructor. Nothing is stored per function, which matters because the alternative costs
+/// eight bytes on every closure a program allocates.
+///
+/// **A compiled function is a constructor here, and an arrow is not one in the language.**
+/// Telling them apart needs the frontend to record which it lowered, because by the time a
+/// closure exists the two are the same object; that is a change to the closure ABI rather than
+/// to this, and is not made here.
+fn is_constructor(value: u64) -> bool {
+    let Some(handle) = handle_of(value) else {
+        return false;
+    };
+    let index = with_runtime(|runtime| {
+        runtime
+            .heap
+            .internal(handle, 0)
+            .and_then(|slot| slot.as_number())
+    });
+    let Some(index) = index else {
+        return false;
+    };
+    if index >= 0.0 {
+        return true;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked negative, and the count of built-ins is tiny"
+    )]
+    let native = (-index - 1.0) as usize;
+    // Before the globals is [`NATIVES`], which is every prototype method.
+    let Some(global) = native.checked_sub(NATIVES.len()) else {
+        return false;
+    };
+    if let Some((name, _)) = GLOBAL_NATIVES.get(global) {
+        return !NOT_CONSTRUCTORS.contains(name);
+    }
+    // `Object` and `Array` run bodies from the anonymous table. The namespaces used to share
+    // the first of them and no longer do — see `ensure_global_object` — so reaching it here
+    // means one of those two rather than `Math`.
+    let anonymous = global.wrapping_sub(GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len());
+    if anonymous == CONSTRUCT_PLAIN_OBJECT || anonymous == CONSTRUCT_ARRAY {
+        return true;
+    }
+    // **A bound function is constructable exactly when what it was bound to is.**
+    // `new (Date.bind(null))()` is a date and `new (Math.max.bind(null))()` is a `TypeError`,
+    // so the question has to be passed along rather than answered from the wrapper — which
+    // looks the same in both cases.
+    if anonymous == BOUND_CALL {
+        return is_constructor(property_of(value, BOUND_TARGET));
+    }
+    false
 }
 
 /// A heap value as JSON, or `None` for one JSON has no spelling for.

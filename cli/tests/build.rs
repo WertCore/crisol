@@ -2267,6 +2267,65 @@ fn exec_distinguishes_a_missing_group_from_an_empty_one() {
     );
 }
 
+/// `String.prototype.match` and `String.prototype.search`.
+///
+/// **`match` answers two different shapes**: a global pattern gives the matched text and
+/// nothing else, a non-global one gives what `exec` gives. That is not a quirk to work around
+/// — a program written for one shape and handed the other reads `undefined` where it expected
+/// a group.
+#[test]
+fn a_string_can_be_matched_and_searched() {
+    check(
+        "string-match-whole",
+        "return \"abcd\".match(/b./)[0];",
+        "bc",
+    );
+    check(
+        "string-match-index",
+        "return \"abcd\".match(/b./).index;",
+        "1",
+    );
+    check(
+        "string-match-group",
+        "return \"ab\".match(/(a)(b)/)[2];",
+        "b",
+    );
+    check("string-match-none", "return \"abc\".match(/z/);", "null");
+    // Global: the text of every match, and `null` rather than an empty array when there is
+    // none — `if (s.match(/x/g))` is how a program asks, and `[]` is truthy.
+    check(
+        "string-match-global",
+        "return \"a1b2\".match(/[0-9]/g).join(\",\");",
+        "1,2",
+    );
+    check(
+        "string-match-global-none",
+        "return \"ab\".match(/[0-9]/g);",
+        "null",
+    );
+    // **A string argument is a pattern, not a literal**, which is the one thing about this
+    // that a reader coming from `indexOf` gets wrong.
+    check(
+        "string-match-a-string",
+        "return \"abc\".match(\".\")[0];",
+        "a",
+    );
+    check("string-search", "return \"abcd\".search(/c/);", "2");
+    check("string-search-none", "return \"abcd\".search(/z/);", "-1");
+    check(
+        "string-search-a-string",
+        "return \"a.c\".search(\"\\\\.\");",
+        "1",
+    );
+    // `search` does not move the cursor, so asking twice answers twice the same.
+    check(
+        "string-search-is-inert",
+        "let r = /c/g; let a = \"abc\".search(r); let b = \"abc\".search(r); \
+         return a + \",\" + b + \",\" + r.lastIndex;",
+        "2,2,0",
+    );
+}
+
 /// `lastIndex` is a property because a program may assign to it, and the compiled pattern is
 /// set from it rather than owning it.
 #[test]
@@ -2579,6 +2638,59 @@ fn a_date_prints_as_iso_text() {
         "date-iso-value",
         "return new Date(2020, 0, 2, 3, 4, 5).toISOString();",
         "2020-01-02T03:04:05.000Z",
+    );
+}
+
+/// **`toString` is not the ISO form**, which is what it used to answer.
+///
+/// They are different methods with different spellings and different failure modes, and a
+/// `toString` printing `1970-01-01T00:00:00.000Z` made `String(date)` disagree with every
+/// engine a program was written against — `Date.parse(String(d))` included.
+#[test]
+fn a_date_prints_the_forms_the_specification_names() {
+    check(
+        "date-to-string",
+        "return new Date(0).toString();",
+        "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)",
+    );
+    check(
+        "date-to-utc-string",
+        "return new Date(0).toUTCString();",
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+    );
+    check(
+        "date-to-date-string",
+        "return new Date(2020, 0, 2, 3, 4, 5).toDateString();",
+        "Thu Jan 02 2020",
+    );
+    check(
+        "date-to-time-string",
+        "return new Date(2020, 0, 2, 3, 4, 5).toTimeString();",
+        "03:04:05 GMT+0000 (Coordinated Universal Time)",
+    );
+    // The day names are a table, and a table is exactly the kind of thing that is right for
+    // one entry and wrong for the next.
+    check(
+        "date-day-names",
+        "let out = []; \
+         for (let i = 0; i < 7; i = i + 1) { \
+             out.push(new Date(i * 86400000).toUTCString().slice(0, 3)); } \
+         return out.join(\",\");",
+        "Thu,Fri,Sat,Sun,Mon,Tue,Wed",
+    );
+    check(
+        "date-month-names",
+        "let out = []; \
+         for (let i = 0; i < 12; i = i + 1) { \
+             out.push(new Date(Date.UTC(2020, i, 1)).toUTCString().slice(8, 11)); } \
+         return out.join(\",\");",
+        "Jan,Feb,Mar,Apr,May,Jun,Jul,Aug,Sep,Oct,Nov,Dec",
+    );
+    // An invalid date prints rather than raising, from every one of them.
+    check(
+        "date-invalid-utc-string",
+        "return new Date(0 / 0).toUTCString();",
+        "Invalid Date",
     );
 }
 
@@ -4030,6 +4142,32 @@ fn the_well_known_symbols_are_symbols() {
         "symbol-iterator-stable",
         "return Symbol.iterator === Symbol.iterator;",
         "true",
+    );
+    // The rest of them. **A program branches on whether these exist far more often than it
+    // uses them** — that is what a feature test is — and one that reads `undefined` takes the
+    // path written for an engine from before the symbol existed.
+    check(
+        "the-rest-of-the-well-known-symbols",
+        "let names = [\"species\", \"match\", \"matchAll\", \"replace\", \"search\", \"split\", \
+                      \"isConcatSpreadable\", \"unscopables\"]; \
+         let count = 0; \
+         for (let i = 0; i < names.length; i = i + 1) { \
+             if (typeof Symbol[names[i]] === \"symbol\") { count = count + 1; } } \
+         return count;",
+        "8",
+    );
+    // Each is its own symbol, which is the whole of what makes them usable as distinct keys.
+    check(
+        "well-known-symbols-are-distinct",
+        "return Symbol.match === Symbol.replace;",
+        "false",
+    );
+    // Neither writable nor configurable, which is what the specification says.
+    check(
+        "symbol-iterator-is-frozen",
+        "let d = Object.getOwnPropertyDescriptor(Symbol, \"iterator\"); \
+         return d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "false,false,false",
     );
 }
 
@@ -6693,6 +6831,187 @@ fn reflect_exposes_the_object_operations() {
          return ok + \",\" + o.x;",
         "true,1",
     );
+}
+
+/// **Being callable is not being constructable**, and test262 asks nearly every built-in
+/// method which it is.
+///
+/// It asks through `isConstructor`, which is `Reflect.construct(function () {}, [], f)` —
+/// so the third argument is not a corner here but the whole question, and a `Reflect.construct`
+/// that ignored it would answer "yes, a constructor" for every function in the engine.
+#[test]
+fn only_a_constructor_can_be_constructed() {
+    check(
+        "new-a-built-in-method",
+        "try { new Array.prototype.find(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "new-a-namespace",
+        "try { new Math(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "new-a-plain-global-function",
+        "try { new parseInt(\"1\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `new Symbol()` is a `TypeError` even though `Symbol()` is a symbol.
+    check(
+        "new-a-symbol",
+        "try { new Symbol(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // And the ones that are constructors still are, which is what says the rule discriminates
+    // rather than refuses.
+    check(
+        "new-a-declared-function",
+        "function P() { this.x = 1; } return new P().x;",
+        "1",
+    );
+    // **Under stress this is about rooting, not about `new`.** `new` lays its arguments out
+    // in the caller's frame and *then* allocates the receiver, so both the constructor and
+    // every argument are live across a collection with nothing but the frame holding them.
+    check(
+        "new-with-object-arguments",
+        "function P(a, b) { this.v = a.y + b.z; } return new P({y: 1}, {z: 2}).v;",
+        "3",
+    );
+    check(
+        "new-a-built-in-constructor",
+        "return new Date(0).getTime();",
+        "0",
+    );
+    // **A bound function passes the question along.** The wrapper looks identical either
+    // way, so answering from it would make `new (Date.bind(null, 0))()` and
+    // `new (Math.max.bind(null))()` agree, and they must not.
+    check(
+        "new-a-bound-constructor",
+        "let D = Date.bind(null, 0); return new D().getTime();",
+        "0",
+    );
+    check(
+        "new-a-bound-method",
+        "let f = Math.max.bind(null); \
+         try { new f(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "new-an-error",
+        "return new RangeError(\"x\").name;",
+        "RangeError",
+    );
+}
+
+/// **Every global that is a function inherits from `Function.prototype`.**
+///
+/// They did not. A global is built before that object exists, so `Date.bind` was `undefined`
+/// and `Object instanceof Function` was false — on the objects a program is most likely to ask
+/// either of. The prototype methods already had it, which is what made the gap hard to see:
+/// `Math.max.bind` worked and `Date.bind` did not.
+#[test]
+fn a_global_constructor_is_a_function() {
+    check(
+        "global-constructor-has-bind",
+        "return typeof Date.bind + \",\" + typeof Object.call + \",\" + typeof Array.apply;",
+        "function,function,function",
+    );
+    check(
+        "global-constructor-instanceof-function",
+        "return (Date instanceof Function) + \",\" + (Object instanceof Function);",
+        "true,true",
+    );
+    // A namespace is not one, which is the other half of the same rule.
+    check(
+        "namespace-is-not-a-function",
+        "return Math instanceof Function;",
+        "false",
+    );
+    // And the methods, which already worked and are here so a fix to one cannot silently
+    // break the other.
+    check(
+        "method-has-bind",
+        "return typeof Math.max.bind;",
+        "function",
+    );
+}
+
+/// `Reflect.construct(target, args, newTarget)`.
+#[test]
+fn reflect_constructs_and_says_what_cannot_be() {
+    check(
+        "reflect-construct",
+        "function P(a) { this.x = a; } return Reflect.construct(P, [4]).x;",
+        "4",
+    );
+    check(
+        "reflect-construct-a-built-in",
+        "return Reflect.construct(Array, [1, 2, 3]).length;",
+        "3",
+    );
+    // What `isConstructor` in test262's harness is, spelled out.
+    check(
+        "is-constructor-of-a-method",
+        "function isConstructor(f) { \
+             try { Reflect.construct(function () {}, [], f); } catch (e) { return false; } \
+             return true; } \
+         return isConstructor(Array.prototype.find);",
+        "false",
+    );
+    check(
+        "is-constructor-of-a-function",
+        "function isConstructor(f) { \
+             try { Reflect.construct(function () {}, [], f); } catch (e) { return false; } \
+             return true; } \
+         return isConstructor(function () {});",
+        "true",
+    );
+    // **Absent is not `undefined`.** The default new target comes from how many arguments
+    // arrived, so passing one explicitly is a refusal rather than the same call.
+    check(
+        "reflect-construct-undefined-new-target",
+        "try { Reflect.construct(function () {}, [], undefined); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "reflect-construct-a-method",
+        "try { Reflect.construct(Array.prototype.find, []); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "reflect-construct-a-bad-argument-list",
+        "try { Reflect.construct(function () {}, 5); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The new target is where the prototype comes from, which is the only thing the third
+    // argument is *for* beyond saying no.
+    check(
+        "reflect-construct-new-target-prototype",
+        "function A() {} function B() {} \
+         return Reflect.construct(A, [], B) instanceof B;",
+        "true",
+    );
+}
+
+/// A namespace is an object, not a function.
+///
+/// `typeof Math` was `"function"` because every global the namespaces are built by was given a
+/// body to call. Nothing asked for one — `Math()` is a `TypeError` — and the body it got was
+/// the plain-object constructor, so `new JSON()` answered an object.
+#[test]
+fn a_namespace_is_not_a_function() {
+    check("typeof-math", "return typeof Math;", "object");
+    check("typeof-json", "return typeof JSON;", "object");
+    check("typeof-reflect", "return typeof Reflect;", "object");
+    // The two that are both, which is why this cannot simply be "a namespace is not callable".
+    check("typeof-object", "return typeof Object;", "function");
+    check("typeof-array", "return typeof Array;", "function");
+    // Their methods are still reachable, which is what the namespaces exist for.
+    check("math-still-works", "return Math.max(1, 2);", "2");
+    check("json-still-works", "return JSON.stringify([1]);", "[1]");
 }
 
 /// **The failures are reported, not thrown** — which is the whole reason to reach for

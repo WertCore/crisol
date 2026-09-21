@@ -1893,9 +1893,12 @@ Both mutation-tested.
 ## Where the corpus stands
 
 The number that matters is `cargo test -p crisol --test test262` on CI, at the default sample
-of 1500. **490 passed at the start of the `Object` work and 677 after it**, with crashes at
-zero throughout; the sample is identical between runs, so the two are comparable. D-168 to
-D-187 are that work.
+of 1500. **490 passed at the start of the `Object` work and 767 by the end of the run that
+followed it**, with crashes at zero throughout; the sample is identical between runs, so they
+are comparable. D-168 to D-205 are that work.
+
+**The matrix jobs use a sample of 400 and the dispatch uses 1500, and they are different
+subsets.** Comparing one against the other reads as a regression that is not there.
 
 **Read the failure histogram before picking anything up.** The runner prints examples per
 failure reason *and* per area, and the two cuts disagree usefully: the `Object` area barely
@@ -1903,19 +1906,32 @@ moved across the first half of that work while twenty-one more cases passed, bec
 element-descriptor machinery is shared and the wins landed in `Array.prototype`. Picking by
 area alone would have looked like no progress.
 
-What remains is no longer shaped like missing methods:
+The list that used to be here — `Proxy`, `Promise`, `Reflect`, symbols as property keys —
+is done (D-187 to D-201). What the report says now is different in kind: almost nothing is
+refused any more (43 of 1500), and the failures are behaviour.
 
-- **110 cases are globals that do not exist** — `Proxy` (42), `Promise` (33), `$262` (11),
-  `Uint8Array` (7). `Reflect` was the fourth and is now in (D-187); it was cheap precisely
-  because every one of its operations already existed behind a property access. The other two
-  are not: `Proxy` wants traps threaded through every property operation, and `Promise` wants a
-  microtask queue.
-- **Symbols cannot be property keys** (D-149), which is the ceiling on `Object` and on every
-  iterator protocol. It is the single change that unblocks the most.
-- **A compiled function has no `name` and no `length`**, and a class's methods are enumerable.
-  Both want the same thing — a way to define a non-enumerable property from the IR — so they
-  are one piece of work in the compiler rather than two in the runtime. Built-ins got theirs in
-  D-184.
+**The histogram below is from `e8fea2d` and is already partly stale**, which is the thing to
+check first rather than to discover halfway through a fix: the `return-abrupt-from-*` family
+it lists was the relative-index coercion (D-203), landed a commit later. A measurement is a
+dispatch away and is worth taking before picking from a list.
+
+The two largest reasons, and they overlap:
+
+- **"Expected a TypeError to be thrown but no" (65).** Mostly one family: `not-a-constructor`,
+  which test262 writes once per built-in method. D-207 is that.
+- **"TypeError: is not a function" (63).** Methods that do not exist —
+  `Reflect.construct`, `String.prototype.match`, `Date.prototype.toUTCString`, `Error.isError`,
+  `Map.groupBy`, `RegExp.escape`, `RegExp.prototype[Symbol.match]`. Each is small and there are
+  many; the report names them and is the list to work from.
+
+By area the weight is `Array.prototype` (148), `RegExp` and `RegExp.prototype` (96 together),
+`Object` (71), `String.prototype` (57), `Promise` (28). The `RegExp` half is the least
+explored and the most concentrated: the `Symbol.match`/`replace`/`search`/`split` protocol and
+the flag accessors account for most of it.
+
+Two things are deliberately not done. The regular-expression `v` flag is refused rather than
+accepted as `u`, because accepting it turns a correct `SyntaxError` into wrong match results
+(15 cases). `$262` (11 cases) wants `createRealm`, which is a second global object.
 
 ---
 

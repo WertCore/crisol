@@ -31,7 +31,8 @@ pub use convert::{
 pub use date::{
     Fields, INVALID_DATE, MAX_TIME, MS_PER_DAY, civil_from_days, day_from_time, days_from_civil,
     days_in_month, fields, is_leap_year, make_date, make_time, time_clip, time_from_civil,
-    time_within_day, to_iso_string, week_day,
+    time_within_day, to_date_string, to_date_time_string, to_iso_string, to_time_string,
+    to_utc_string, week_day,
 };
 pub use descriptor::{Entry, PartialDescriptor, Property, Rejected, validate_and_apply};
 pub use error::{ErrorKind, JsError};

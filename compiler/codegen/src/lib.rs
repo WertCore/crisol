@@ -175,6 +175,7 @@ const CREATE_CLOSURE_SYMBOL: &str = "crisol_create_closure";
 const SET_CAPTURE_SYMBOL: &str = "crisol_closure_set_capture";
 const CLOSURE_CODE_SYMBOL: &str = "crisol_closure_code";
 const CONSTRUCT_THIS_SYMBOL: &str = "crisol_construct_this";
+const CONSTRUCT_CODE_SYMBOL: &str = "crisol_construct_code";
 const CONSTRUCT_RESULT_SYMBOL: &str = "crisol_construct_result";
 const CREATE_ARRAY_SYMBOL: &str = "crisol_create_array";
 const COMPUTED_LOAD_SYMBOL: &str = "crisol_computed_load";
@@ -225,8 +226,10 @@ struct ObjectHelpers<T> {
     set_capture: T,
     /// `crisol_closure_code(closure) -> address`
     code: T,
-    /// `crisol_construct_this(callee) -> object`
+    /// `crisol_construct_this(callee) -> object or the exception signal`
     construct_this: T,
+    /// `crisol_construct_code(callee, this) -> address`
+    construct_code: T,
     /// `crisol_construct_result(this, returned) -> value`
     construct_result: T,
     /// `crisol_create_array(length) -> array`
@@ -315,6 +318,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     let mut construct_this = module.make_signature();
     construct_this.params.push(AbiParam::new(types::I64));
     construct_this.returns.push(AbiParam::new(types::I64));
+
+    let mut construct_code = module.make_signature();
+    construct_code.params.push(AbiParam::new(types::I64));
+    construct_code.params.push(AbiParam::new(types::I64));
+    construct_code.returns.push(AbiParam::new(pointer));
 
     let mut construct_result = module.make_signature();
     construct_result.params.push(AbiParam::new(types::I64));
@@ -435,6 +443,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         set_capture: declare(SET_CAPTURE_SYMBOL, &set_capture)?,
         code: declare(CLOSURE_CODE_SYMBOL, &code)?,
         construct_this: declare(CONSTRUCT_THIS_SYMBOL, &construct_this)?,
+        construct_code: declare(CONSTRUCT_CODE_SYMBOL, &construct_code)?,
         construct_result: declare(CONSTRUCT_RESULT_SYMBOL, &construct_result)?,
         create_array: declare(CREATE_ARRAY_SYMBOL, &create_array)?,
         computed_load: declare(COMPUTED_LOAD_SYMBOL, &computed_load)?,
@@ -946,6 +955,9 @@ impl Backend for Cranelift {
             construct_this: self
                 .module
                 .declare_func_in_func(self.objects.construct_this, &mut context.func),
+            construct_code: self
+                .module
+                .declare_func_in_func(self.objects.construct_code, &mut context.func),
             construct_result: self
                 .module
                 .declare_func_in_func(self.objects.construct_result, &mut context.func),
@@ -1610,17 +1622,40 @@ impl Lowering<'_> {
                 let callee = self.value(*callee);
                 // The receiver is allocated from `callee.prototype` before the constructor
                 // runs, which is `OrdinaryCreateFromConstructor` — establishing the prototype
-                // link here rather than in a separate step that could be omitted.
+                // link here rather than in a separate step that could be omitted. It is also
+                // where **not everything callable can be constructed** is decided, because
+                // this is the last moment before the body could have side effects.
                 let created = self
                     .builder
                     .ins()
                     .call(self.objects.construct_this, &[callee]);
                 let this_value = self.builder.inst_results(created)[0];
 
+                // **Resolved before the arguments are laid out, and the order matters.**
+                // `argv` points into this frame, and the collector reaches those words only
+                // while the callee holds them — a value written there and then left across
+                // an allocation is invisible. Allocating the receiver first keeps every
+                // argument a live SSA value over the one call that collects, which is what
+                // the stack map does cover. Reversing these two made
+                // `new P({y: 1}, {z: 2})` read `NaN` under stress.
+                //
+                // A refused `new` resolves to a body that runs nothing and hands the signal
+                // back, so there is no branch here for it.
+                let code = self
+                    .builder
+                    .ins()
+                    .call(self.objects.construct_code, &[callee, this_value]);
+                let code = self.builder.inst_results(code)[0];
+
                 let (argv, argc) = self.build_arguments(args);
                 // `new.target` is the constructor being invoked, which is what makes `new f()`
                 // distinguishable from `f()` inside the body.
-                let returned = self.call_through(callee, this_value, callee, argc, argv);
+                let call = self.builder.ins().call_indirect(
+                    self.uniform,
+                    code,
+                    &[callee, this_value, callee, argc, argv],
+                );
+                let returned = self.builder.inst_results(call)[0];
 
                 // **A constructor returning an object replaces `this`; one returning a
                 // primitive does not.** The runtime decides, so the rule lives in one place
@@ -1807,8 +1842,13 @@ impl Lowering<'_> {
     /// Lays out `args` for a call, returning where they are and how many there are.
     ///
     /// They go in a slot of this function's own frame. Not a heap list: that would allocate on
-    /// the hottest path in the language, and the collector already reaches frame slots through
-    /// the stack maps (D-94).
+    /// the hottest path in the language, and the arguments need no rooting of their own
+    /// because they are still live values at the call and so are in its stack map (D-94).
+    ///
+    /// **That is about the values, not about the slot.** Nothing scans these words. It holds
+    /// only because nothing allocates between filling them and the callee taking them — so
+    /// anything that wants to allocate in that gap has to root what it wrote here first, and
+    /// `Op::Construct` orders itself to avoid the gap entirely (D-208).
     ///
     /// Shared by `Op::Call` and `Op::Construct` rather than written twice. The two must agree
     /// with the *callee's* prologue about the layout, and three copies of one contract is two
@@ -2108,6 +2148,9 @@ impl Jit {
             construct_this: self
                 .module
                 .declare_func_in_func(self.objects.construct_this, &mut context.func),
+            construct_code: self
+                .module
+                .declare_func_in_func(self.objects.construct_code, &mut context.func),
             construct_result: self
                 .module
                 .declare_func_in_func(self.objects.construct_result, &mut context.func),
