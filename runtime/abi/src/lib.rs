@@ -12166,14 +12166,19 @@ fn promise_state(promise: u64) -> Option<(Settled, u64)> {
         if runtime.heap.internal(handle, 0)? != PROMISE_MARKER {
             return None;
         }
-        let state = match runtime
+        // Compared rather than matched: a float *pattern* is a future-compatibility warning
+        // in its own right, so the guard clippy objects to cannot simply become a literal
+        // arm — the shape it wants is the one this cannot have.
+        let marker = runtime
             .heap
             .internal(handle, PROMISE_STATE_SLOT)?
-            .as_number()?
-        {
-            one if one == 1.0 => Settled::Fulfilled,
-            two if two == 2.0 => Settled::Rejected,
-            _ => Settled::Pending,
+            .as_number()?;
+        let state = if marker == 1.0 {
+            Settled::Fulfilled
+        } else if marker == 2.0 {
+            Settled::Rejected
+        } else {
+            Settled::Pending
         };
         let value = runtime.heap.internal(handle, PROMISE_VALUE_SLOT)?;
         Some((state, value.to_bits()))
