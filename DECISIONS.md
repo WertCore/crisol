@@ -5997,3 +5997,63 @@ followed by `2` where there are not.
 The string-pattern path shares the same splice rather than keeping `str::replace`. One
 substitution rule, not two — and an empty needle advances by a character, without which
 `"ab".replaceAll("", "-")` did not terminate.
+
+## D-213
+
+**A getter is called on read, so it cannot be lowered as a property holding a function.**
+
+Status: Accepted
+
+`({get x() { return 1; }}).x` answered the function. The object-literal lowering read the
+property's *name* and *value* and ignored its **kind**, so `get x() {…}`, `set x(v) {…}` and
+`x: …` were the same thing — and a class body did the same with `get x() {…}`.
+
+This is the failure D-59 exists to prevent, and it slipped past because the rule it states is
+about constructs the compiler does not *understand*. The parser understood this one perfectly.
+What went missing was a field on a node the lowering was already reading, which no refusal
+could have caught: the compiler had no reason to think anything was absent.
+
+`Op::DefineAccessor` carries both halves, because `{get x() {…}, set x(v) {…}}` is one
+property with two functions on it. It routes through `defineProperty` like
+`__defineGetter__` does, so the three ways of making an accessor cannot disagree about what
+one is.
+
+**And `defineProperty` was rebuilding the pair from the descriptor alone**, so defining the
+setter erased the getter. A partial accessor descriptor merges with the one already there —
+which is what `validate_and_apply` in `crisol-builtins` has always said and what the caller
+in `crisol-abi` was not doing. Distinguishing "absent" from "present and `undefined`" is part
+of that: `{get: undefined}` clears the getter and omitting `get` keeps it.
+
+**Still missing, and recorded rather than half-done**: a computed accessor name
+(`{get [k]() {…}}`) is refused, because the operation carries a `PropertyKey` and not a value;
+and a class body's accessors come out enumerable, where the specification says a class member
+is not.
+
+## D-214
+
+**The array methods are generic over anything with a `length`.**
+
+Status: Accepted
+
+`Array.prototype.reverse.call({0: 1, 1: 2, length: 2})` did nothing. Eighteen methods opened
+with `let Some((array, length)) = elements_of(this_value) else { return … }`, which is the
+fast path written as though it were the only path — so every one of them was a silent no-op on
+the receivers test262 spends a whole family of cases on.
+
+Two consequences, and the second is the worse one. Reading `length` from an object **can
+throw**, from a getter or from a symbol that refuses to be a number, and a method that bailed
+before reading it swallowed that. `indexed_length` already propagates; the methods now use it.
+
+`indexed_get` existed and `indexed_set` did not, which is why the reads were already generic
+and the writes were not. Both now branch on `elements_of` internally, so a real array keeps
+the element path and pays one test per element — which is what generality over a plain object
+costs when the fast case has to stay fast.
+
+**`length` is written back even when nothing moved.** `push()` with no arguments and `pop()`
+on an empty receiver both assign it, and on a receiver that refuses the write that assignment
+is where they throw. Returning early skipped it.
+
+`reduce` on an empty array with no initial value is now a `TypeError` rather than `undefined`:
+there is no value to answer with, and inventing one makes the mistake quiet where the
+specification is loud. `reduceRight` already did this, which is how the disagreement was
+spotted.

@@ -724,6 +724,159 @@ fn reduce_seeds_from_the_first_element_when_given_no_initial_value() {
         "return [1, 2, 3].reduce(function (a, b) { return a + b; }, 10);",
         "16",
     );
+    // **Empty with no seed is a `TypeError`**, not `undefined`: there is no value to answer
+    // with, and inventing one makes the mistake quiet where the specification is loud.
+    check(
+        "array-reduce-empty-no-seed",
+        "try { [].reduce(function (a, b) { return a + b; }); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "array-reduce-empty-with-seed",
+        "return [].reduce(function (a, b) { return a + b; }, 7);",
+        "7",
+    );
+}
+
+/// **A getter is called on read; a data property holding a function is not.**
+///
+/// `{get x() { return 1; }}` was lowered as a property named `x` holding the function, so
+/// `o.x` answered the function and `o.x()` answered `1`. Nothing said so — which is the shape
+/// of failure D-59 exists to prevent, and it slipped through because the *parser* understood
+/// the syntax and the lowering quietly dropped what made it different.
+#[test]
+fn an_object_literal_can_define_an_accessor() {
+    check("literal-getter", "return ({get x() { return 1; }}).x;", "1");
+    check(
+        "literal-setter",
+        "let seen = 0; let o = {set x(v) { seen = v; }}; o.x = 7; return seen;",
+        "7",
+    );
+    // **One property with two functions on it**, not two properties — defining them
+    // separately would make the second replace the first.
+    check(
+        "literal-getter-and-setter",
+        "let held = 1;          let o = {get x() { return held; }, set x(v) { held = v * 2; }};          o.x = 5; return o.x;",
+        "10",
+    );
+    // A throw from a getter reaches the program, which is the whole reason a getter is not a
+    // stored value.
+    check(
+        "literal-getter-throws",
+        "let o = {get x() { throw new RangeError(\"x\"); }};          try { let n = o.x; return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // It reports as an accessor, which is what `getOwnPropertyDescriptor` is for.
+    check(
+        "literal-getter-descriptor",
+        "let d = Object.getOwnPropertyDescriptor({get x() { return 1; }}, \"x\");          return (typeof d.get) + \",\" + d.enumerable + \",\" + d.configurable;",
+        "function,true,true",
+    );
+    // A data property in the same literal is still a data property.
+    check(
+        "literal-mixed",
+        "let o = {a: 1, get b() { return 2; }}; return o.a + o.b;",
+        "3",
+    );
+}
+
+/// A class body's accessors are accessors too, and for the same reason.
+#[test]
+fn a_class_can_define_an_accessor() {
+    check(
+        "class-getter",
+        "class C { get x() { return 3; } } return new C().x;",
+        "3",
+    );
+    check(
+        "class-setter",
+        "class C { set x(v) { this.held = v; } }          let c = new C(); c.x = 4; return c.held;",
+        "4",
+    );
+    check(
+        "class-accessor-pair",
+        "class C { get x() { return this.h; } set x(v) { this.h = v + 1; } }          let c = new C(); c.x = 1; return c.x;",
+        "2",
+    );
+}
+
+/// **The array methods are generic over anything with a `length`.**
+///
+/// `Array.prototype.reverse.call({0: 1, 1: 2, length: 2})` reverses that object's properties.
+/// Reading `length` from a receiver that is not an array may also *throw*, and that has to
+/// reach the caller — a method that bailed out on the first line did neither, which is a
+/// silent no-op where the corpus expects work or an exception.
+#[test]
+fn the_array_methods_work_on_anything_with_a_length() {
+    check(
+        "generic-reverse",
+        "let o = {0: 1, 1: 2, 2: 3, length: 3}; Array.prototype.reverse.call(o); \
+         return o[0] + \",\" + o[1] + \",\" + o[2];",
+        "3,2,1",
+    );
+    check(
+        "generic-pop",
+        "let o = {0: 1, 1: 2, length: 2}; \
+         let taken = Array.prototype.pop.call(o); return taken + \",\" + o.length;",
+        "2,1",
+    );
+    check(
+        "generic-shift",
+        "let o = {0: 1, 1: 2, length: 2}; \
+         let taken = Array.prototype.shift.call(o); \
+         return taken + \",\" + o[0] + \",\" + o.length;",
+        "1,2,1",
+    );
+    check(
+        "generic-push",
+        "let o = {length: 0}; Array.prototype.push.call(o, \"a\"); \
+         return o[0] + \",\" + o.length;",
+        "a,1",
+    );
+    check(
+        "generic-unshift",
+        "let o = {0: \"b\", length: 1}; Array.prototype.unshift.call(o, \"a\"); \
+         return o[0] + o[1] + \",\" + o.length;",
+        "ab,2",
+    );
+    check(
+        "generic-fill",
+        "let o = {0: 1, 1: 2, length: 2}; Array.prototype.fill.call(o, 9); \
+         return o[0] + \",\" + o[1];",
+        "9,9",
+    );
+    check(
+        "generic-at",
+        "return Array.prototype.at.call({0: \"a\", 1: \"b\", length: 2}, -1);",
+        "b",
+    );
+    check(
+        "generic-reduce",
+        "return Array.prototype.reduce.call({0: 1, 1: 2, length: 2}, \
+             function (a, b) { return a + b; });",
+        "3",
+    );
+    check(
+        "generic-copy-within",
+        "let o = {0: 1, 1: 2, 2: 3, length: 3}; \
+         Array.prototype.copyWithin.call(o, 0, 1); \
+         return o[0] + \",\" + o[1] + \",\" + o[2];",
+        "2,3,3",
+    );
+    // **A `length` that throws reaches the caller** rather than becoming a quiet no-op.
+    check(
+        "generic-throwing-length",
+        "let o = {get length() { throw new RangeError(\"x\"); }}; \
+         try { Array.prototype.reverse.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "generic-symbol-length",
+        "let o = {length: Symbol()}; \
+         try { Array.prototype.fill.call(o, 1); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
 }
 
 #[test]

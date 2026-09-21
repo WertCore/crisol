@@ -1982,11 +1982,36 @@ impl Lowering {
                 constructor = Some(closure);
                 continue;
             }
-            self.emit_effect(Op::PropertyStore {
-                object: prototype,
-                key: PropertyKey::new(&method_name),
-                value: closure,
-            });
+            // A class body's accessors are accessors, exactly as a literal's are — and a
+            // class method is **not** enumerable, which `crisol_define_accessor` does not
+            // arrange, so that difference is recorded rather than quietly wrong (D-213).
+            match method.kind {
+                oxc_ast::ast::MethodDefinitionKind::Get => {
+                    let absent = self.placeholder();
+                    self.emit_effect(Op::DefineAccessor {
+                        object: prototype,
+                        key: PropertyKey::new(&method_name),
+                        getter: closure,
+                        setter: absent,
+                    });
+                }
+                oxc_ast::ast::MethodDefinitionKind::Set => {
+                    let absent = self.placeholder();
+                    self.emit_effect(Op::DefineAccessor {
+                        object: prototype,
+                        key: PropertyKey::new(&method_name),
+                        getter: absent,
+                        setter: closure,
+                    });
+                }
+                _ => {
+                    self.emit_effect(Op::PropertyStore {
+                        object: prototype,
+                        key: PropertyKey::new(&method_name),
+                        value: closure,
+                    });
+                }
+            }
         }
 
         let constructor = match constructor {
@@ -2137,11 +2162,37 @@ impl Lowering {
                     match name {
                         Some(name) => {
                             let value = self.expression(&property.value);
-                            self.emit_effect(Op::PropertyStore {
-                                object: result,
-                                key: PropertyKey::new(&name),
-                                value,
-                            });
+                            // **A getter is called on read and a data property is not**, so
+                            // storing the function would be a wrong answer rather than a
+                            // missing feature — `({get x() { return 1; }}).x` was the
+                            // function, and nothing said so (D-213).
+                            match property.kind {
+                                oxc_ast::ast::PropertyKind::Init => {
+                                    self.emit_effect(Op::PropertyStore {
+                                        object: result,
+                                        key: PropertyKey::new(&name),
+                                        value,
+                                    });
+                                }
+                                oxc_ast::ast::PropertyKind::Get => {
+                                    let absent = self.placeholder();
+                                    self.emit_effect(Op::DefineAccessor {
+                                        object: result,
+                                        key: PropertyKey::new(&name),
+                                        getter: value,
+                                        setter: absent,
+                                    });
+                                }
+                                oxc_ast::ast::PropertyKind::Set => {
+                                    let absent = self.placeholder();
+                                    self.emit_effect(Op::DefineAccessor {
+                                        object: result,
+                                        key: PropertyKey::new(&name),
+                                        getter: absent,
+                                        setter: value,
+                                    });
+                                }
+                            }
                         }
                         None => {
                             let Some(key) = self.property_key_value(&property.key) else {
@@ -2152,6 +2203,14 @@ impl Lowering {
                             // specification gives and is observable whenever either has an
                             // effect.
                             let value = self.expression(&property.value);
+                            if property.kind != oxc_ast::ast::PropertyKind::Init {
+                                // A computed accessor name needs a key the accessor operation
+                                // cannot take — it carries a `PropertyKey`, not a value.
+                                // Refused rather than stored as data, which is the wrong
+                                // answer this whole arm exists to stop.
+                                self.note("computed accessor name", property.span.start);
+                                continue;
+                            }
                             self.emit_effect(Op::ComputedStore {
                                 object: result,
                                 key,

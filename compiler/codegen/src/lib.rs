@@ -169,6 +169,7 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
 /// binary operator: allocation takes nothing, a store takes four words and returns nothing.
 const CREATE_OBJECT_SYMBOL: &str = "crisol_create_object";
 const PROPERTY_STORE_SYMBOL: &str = "crisol_property_store";
+const DEFINE_ACCESSOR_SYMBOL: &str = "crisol_define_accessor";
 const PROPERTY_LOAD_SYMBOL: &str = "crisol_property_load";
 const CLOSURE_CAPTURE_SYMBOL: &str = "crisol_closure_capture";
 const CREATE_CLOSURE_SYMBOL: &str = "crisol_create_closure";
@@ -218,6 +219,8 @@ struct ObjectHelpers<T> {
     store: T,
     /// `crisol_property_load(object, key, length) -> value`
     load: T,
+    /// `crisol_define_accessor(object, key, length, getter, setter) -> undefined or the signal`
+    define_accessor: T,
     /// `crisol_closure_capture(closure, index) -> value`
     capture: T,
     /// `crisol_create_closure(function, captures) -> closure`
@@ -289,6 +292,14 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     store.params.push(AbiParam::new(types::I64));
     store.params.push(AbiParam::new(types::I64));
     store.returns.push(AbiParam::new(types::I64));
+
+    let mut define_accessor = module.make_signature();
+    define_accessor.params.push(AbiParam::new(types::I64));
+    define_accessor.params.push(AbiParam::new(pointer));
+    define_accessor.params.push(AbiParam::new(types::I64));
+    define_accessor.params.push(AbiParam::new(types::I64));
+    define_accessor.params.push(AbiParam::new(types::I64));
+    define_accessor.returns.push(AbiParam::new(types::I64));
 
     let mut load = module.make_signature();
     load.params.push(AbiParam::new(types::I64));
@@ -437,6 +448,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     Ok(ObjectHelpers {
         create: declare(CREATE_OBJECT_SYMBOL, &create)?,
         store: declare(PROPERTY_STORE_SYMBOL, &store)?,
+        define_accessor: declare(DEFINE_ACCESSOR_SYMBOL, &define_accessor)?,
         load: declare(PROPERTY_LOAD_SYMBOL, &load)?,
         capture: declare(CLOSURE_CAPTURE_SYMBOL, &capture)?,
         create_closure: declare(CREATE_CLOSURE_SYMBOL, &create_closure)?,
@@ -514,6 +526,7 @@ fn keys_of(function: &Function) -> Vec<String> {
             let key = match &instruction.op {
                 Op::PropertyLoad { key, .. }
                 | Op::PropertyStore { key, .. }
+                | Op::DefineAccessor { key, .. }
                 | Op::GlobalLoad { name: key }
                 | Op::GlobalLoadOptional { name: key } => key.as_str(),
                 Op::Const(Constant::String(text)) => text.as_str(),
@@ -937,6 +950,9 @@ impl Backend for Cranelift {
             store: self
                 .module
                 .declare_func_in_func(self.objects.store, &mut context.func),
+            define_accessor: self
+                .module
+                .declare_func_in_func(self.objects.define_accessor, &mut context.func),
             load: self
                 .module
                 .declare_func_in_func(self.objects.load, &mut context.func),
@@ -1797,6 +1813,22 @@ impl Lowering<'_> {
                 // property of `null` throws. The frontend checks it like any call.
                 Some(self.builder.inst_results(call)[0])
             }
+            Op::DefineAccessor {
+                object,
+                key,
+                getter,
+                setter,
+            } => {
+                let object = self.value(*object);
+                let getter = self.value(*getter);
+                let setter = self.value(*setter);
+                let (pointer, length) = self.key_operands(key)?;
+                let call = self.builder.ins().call(
+                    self.objects.define_accessor,
+                    &[object, pointer, length, getter, setter],
+                );
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::PropertyLoad { object, key } => {
                 let object = self.value(*object);
                 let (pointer, length) = self.key_operands(key)?;
@@ -2130,6 +2162,9 @@ impl Jit {
             store: self
                 .module
                 .declare_func_in_func(self.objects.store, &mut context.func),
+            define_accessor: self
+                .module
+                .declare_func_in_func(self.objects.define_accessor, &mut context.func),
             load: self
                 .module
                 .declare_func_in_func(self.objects.load, &mut context.func),

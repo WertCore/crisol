@@ -447,6 +447,25 @@ pub enum Op {
         /// What to write.
         value: ValueId,
     },
+    /// Defines an accessor property — `{get x() {…}}` and `{set x(v) {…}}`.
+    ///
+    /// **Not a `PropertyStore` of a function.** A getter is *called* on read and a data
+    /// property holding a function is not, so lowering one as the other is a wrong answer
+    /// rather than a missing feature: `({get x() { return 1; }}).x` was the function.
+    ///
+    /// One operation for both halves, because `{get x() {…}, set x(v) {…}}` is a single
+    /// property with two functions on it — defining them separately would make the second
+    /// replace the first.
+    DefineAccessor {
+        /// The receiver.
+        object: ValueId,
+        /// The name.
+        key: PropertyKey,
+        /// The getter, or `undefined` when there is none.
+        getter: ValueId,
+        /// The setter, or `undefined` when there is none.
+        setter: ValueId,
+    },
     /// Allocates an object.
     CreateObject {
         /// Its initial shape.
@@ -533,6 +552,7 @@ impl Op {
                 | Self::Binary { op: BinaryOp::Add, .. }
                 | Self::PropertyLoad { .. }
                 | Self::PropertyStore { .. }
+                | Self::DefineAccessor { .. }
                 | Self::ComputedLoad { .. }
                 | Self::ComputedStore { .. }
                 | Self::Delete { .. }
@@ -573,6 +593,12 @@ impl Op {
             | Self::Enumerate { object }
             | Self::Iterate { object } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
+            Self::DefineAccessor {
+                object,
+                getter,
+                setter,
+                ..
+            } => vec![*object, *getter, *setter],
             Self::ComputedLoad { object, key } | Self::Delete { object, key } => {
                 vec![*object, *key]
             }

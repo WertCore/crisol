@@ -48,6 +48,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_instanceof",
     "crisol_create_object",
     "crisol_property_store",
+    "crisol_define_accessor",
     "crisol_property_load",
     "crisol_closure_capture",
     "crisol_create_closure",
@@ -913,8 +914,9 @@ extern "C" fn array_copy_within(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return this_value;
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let target = match relative_index(unsafe { argument(argc, argv, 0) }, length, 0) {
@@ -935,12 +937,12 @@ extern "C" fn array_copy_within(
     let taken = end.saturating_sub(start).min(length - target);
     // Read before writing, because the source and destination runs may overlap — copying in
     // place forwards would read values it had already overwritten.
-    let moved: Vec<u64> = (0..taken).map(|at| element_at(array, start + at)).collect();
-    with_runtime(|runtime| {
+    let moved: Vec<u64> = (0..taken)
+        .map(|at| indexed_get(this_value, start + at))
+        .collect();
+    with_rooted(&moved, || {
         for (at, value) in moved.iter().enumerate() {
-            runtime
-                .heap
-                .set_element(array, target + at, Value::from_bits(*value));
+            indexed_set(this_value, target + at, *value);
         }
     });
     this_value
@@ -1326,8 +1328,9 @@ extern "C" fn array_reduce_right(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let callback = unsafe { argument(argc, argv, 0) };
@@ -1354,16 +1357,18 @@ extern "C" fn array_reduce_right(
             );
         } else {
             position -= 1;
-            element_at(array, position)
+            indexed_get(this_value, position)
         };
         while position > 0 {
             position -= 1;
-            let element = element_at(array, position);
-            total = call_value(
-                callback,
-                Value::UNDEFINED.to_bits(),
-                &[total, element, index_value(position), this_value],
-            );
+            let element = with_rooted(&[total], || indexed_get(this_value, position));
+            total = with_rooted(&[total, element], || {
+                call_value(
+                    callback,
+                    Value::UNDEFINED.to_bits(),
+                    &[total, element, index_value(position), this_value],
+                )
+            });
             if Value::from_bits(total).is_exception() {
                 return total;
             }
@@ -1482,8 +1487,9 @@ extern "C" fn array_at(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     let wanted = match integer_argument(argc, argv, 0) {
         Ok(wanted) => wanted,
@@ -1501,7 +1507,7 @@ extern "C" fn array_at(
         reason = "checked against both ends just above"
     )]
     let index = resolved as usize;
-    element_at(array, index)
+    indexed_get(this_value, index)
 }
 
 /// `findLast` and `findLastIndex`, which walk backwards.
@@ -4199,6 +4205,61 @@ fn define_accessor(this_value: u64, argc: u64, argv: *const u64, as_getter: bool
     })
 }
 
+/// `{get x() {…}}` and `{set x(v) {…}}` — an accessor from a literal or a class body.
+///
+/// **Not a property holding a function.** A getter is *called* on read and a data property is
+/// not, so lowering one as the other is a wrong answer rather than a missing feature:
+/// `({get x() { return 1; }}).x` was the function itself, and the compiler said nothing.
+///
+/// Routed through `defineProperty` like `__defineGetter__` is, so the three ways of making an
+/// accessor cannot disagree about what one is. A literal's accessor is **enumerable and
+/// configurable**, which is what a literal makes and what `defineProperty`'s own defaults are
+/// the opposite of.
+///
+/// # Safety
+///
+/// `key` must point to `length` readable UTF-8 bytes.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_define_accessor(
+    object: u64,
+    key: *const u8,
+    length: u64,
+    getter: u64,
+    setter: u64,
+) -> u64 {
+    // SAFETY: the caller promises `length` readable UTF-8 bytes at `key`.
+    let Some(name) = (unsafe { key_text(key, length) }) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    with_rooted(&[object, getter, setter], || {
+        let descriptor = crisol_create_object();
+        let named = with_rooted(&[descriptor, getter, setter], || new_string(&name));
+        with_rooted(&[descriptor, getter, setter, named], || {
+            let Some(into) = handle_of(descriptor) else {
+                return Value::UNDEFINED.to_bits();
+            };
+            with_runtime(|runtime| {
+                // **Only the half that was written.** `{get x() {…}}` has no setter, and a
+                // descriptor carrying `set: undefined` says something different from one
+                // carrying no `set` at all when the property is being redefined.
+                if !Value::from_bits(getter).is_undefined() {
+                    runtime.define(into, "get", Value::from_bits(getter));
+                }
+                if !Value::from_bits(setter).is_undefined() {
+                    runtime.define(into, "set", Value::from_bits(setter));
+                }
+                runtime.define(into, "enumerable", Value::TRUE);
+                runtime.define(into, "configurable", Value::TRUE);
+            });
+            let arguments = [object, named, descriptor];
+            with_rooted(&arguments, || {
+                object_define_property(0, 0, 0, 3, arguments.as_ptr())
+            })
+        })
+    })
+}
+
 /// `Object.prototype.__lookupGetter__` and `__lookupSetter__`.
 ///
 /// **Inherited, unlike `getOwnPropertyDescriptor`.** These walk the chain, which is the whole
@@ -6870,7 +6931,14 @@ extern "C" fn object_define_property(
                 );
             }
         }
-        let is_accessor = is_callable(getter) || is_callable(setter);
+        // **Present and `undefined` is not absent.** `{get: undefined}` on an existing
+        // accessor clears the getter and keeps the property an accessor; omitting `get`
+        // leaves the one that is there. The two read the same through a plain field read, so
+        // the descriptor is asked whether it has the key at all — the same question `value`
+        // is already asked.
+        let has_getter = is_callable(getter) || own_property(descriptor, "get").is_some();
+        let has_setter = is_callable(setter) || own_property(descriptor, "set").is_some();
+        let is_accessor = has_getter || has_setter;
         if is_accessor && has_value {
             return raise(
                 "a descriptor cannot have both a value and an accessor",
@@ -6931,10 +6999,26 @@ extern "C" fn object_define_property(
 
         // The write goes through the ordinary path so the shape transition happens there once.
         let stored = if is_accessor {
+            // **A partial accessor descriptor merges with the one already there.**
+            // `{get x() {…}, set x(v) {…}}` is two definitions of *one* property, and
+            // rebuilding the pair from the descriptor alone made the second erase the first —
+            // so the literal's getter disappeared the moment its setter was defined.
+            let mut pair = [getter, setter];
+            if let Some((current, current_value)) = current_state
+                && current.accessor
+            {
+                let existing = current_value.to_bits();
+                if !has_getter {
+                    pair[0] = indexed_get(existing, 0);
+                }
+                if !has_setter {
+                    pair[1] = indexed_get(existing, 1);
+                }
+            }
             // The pair, in the slot the property already occupies — so the collector traces
             // them exactly as it traces any other property value, with nothing added to the
             // heap's idea of what an object holds.
-            with_rooted(&[getter, setter], || array_of_values(&[getter, setter]))
+            with_rooted(&pair, || array_of_values(&pair))
         } else if has_value {
             given
         } else {
@@ -10883,6 +10967,69 @@ fn indexed_get(value: u64, index: usize) -> u64 {
     unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) }
 }
 
+/// Writes the element at `index` of an array-like.
+///
+/// The counterpart of [`indexed_get`], and it exists for the same reason: **test262 applies
+/// the array methods to anything with a `length`**, and a method that wrote only to real
+/// elements silently did nothing on `Array.prototype.reverse.call({0: 1, 1: 2, length: 2})`.
+///
+/// A real array still takes the element path; the branch costs one test per element, which is
+/// what generality over a plain object costs when the fast case has to stay fast.
+fn indexed_set(value: u64, index: usize, item: u64) {
+    if let Some((array, length)) = elements_of(value)
+        && index < length
+    {
+        with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(array, index, Value::from_bits(item));
+        });
+        return;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an index below the clamp in `indexed_length`"
+    )]
+    let key = number_text(index as f64);
+    // SAFETY: `key` is a live Rust string, and `item` is rooted by the caller.
+    unsafe {
+        crisol_property_store(value, key.as_ptr(), key.len() as u64, item);
+    }
+}
+
+/// Removes the element at `index` of an array-like.
+///
+/// **A hole is not `undefined`**, which is the whole reason this is separate from writing one:
+/// `delete` leaves the position absent, and `"0" in a` is how the corpus tells the two apart.
+fn indexed_delete(value: u64, index: usize) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an index below the clamp in `indexed_length`"
+    )]
+    let key = Value::number(index as f64);
+    // The answer is whether the delete was allowed; a method that is removing an element it
+    // has already read has nothing to do with a refusal, and the specification does not look
+    // at it either.
+    let _allowed = crisol_delete(value, key.to_bits());
+}
+
+/// Writes an array-like's `length`.
+///
+/// A real array's is derived from its elements and cannot be assigned here, so this only has
+/// work to do for everything else — which is exactly where the corpus looks.
+fn indexed_set_length(value: u64, length: usize) {
+    if elements_of(value).is_some() {
+        return;
+    }
+    let key = "length";
+    #[expect(clippy::cast_precision_loss, reason = "lengths are far below 2^53")]
+    let count = Value::number(length as f64).to_bits();
+    // SAFETY: `key` is a live Rust string.
+    unsafe {
+        crisol_property_store(value, key.as_ptr(), key.len() as u64, count);
+    }
+}
+
 /// `Array.prototype.map` — a new array of the results.
 ///
 /// The callback gets `(element, index, array)`, which is the specification's signature and not
@@ -11042,8 +11189,9 @@ extern "C" fn array_reduce(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let Some((array, length)) = elements_of(this_value) else {
-            return Value::UNDEFINED.to_bits();
+        let length = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
         };
         // SAFETY: as above.
         let callback = unsafe { argument(argc, argv, 0) };
@@ -11059,18 +11207,29 @@ extern "C" fn array_reduce(
             // SAFETY: as above.
             (unsafe { argument(argc, argv, 1) }, 0)
         } else if length == 0 {
-            return Value::UNDEFINED.to_bits();
+            // **Empty with no seed is a `TypeError`**, not `undefined`: there is no value to
+            // answer with, and inventing one makes `[].reduce(add)` quietly wrong where the
+            // specification is loud.
+            return raise(
+                "reduce of an empty array with no initial value",
+                "TypeError",
+            );
         } else {
-            (element_at(array, 0), 1)
+            (indexed_get(this_value, 0), 1)
         };
 
         for index in start..length {
-            let element = element_at(array, index);
-            accumulator = call_value(
-                callback,
-                Value::UNDEFINED.to_bits(),
-                &[accumulator, element, index_value(index), this_value],
-            );
+            let element = with_rooted(&[accumulator], || indexed_get(this_value, index));
+            accumulator = with_rooted(&[accumulator, element], || {
+                call_value(
+                    callback,
+                    Value::UNDEFINED.to_bits(),
+                    &[accumulator, element, index_value(index), this_value],
+                )
+            });
+            if Value::from_bits(accumulator).is_exception() {
+                return accumulator;
+            }
         }
         accumulator
     })
@@ -11087,16 +11246,19 @@ extern "C" fn array_push(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let Some((array, length)) = elements_of(this_value) else {
-            return Value::UNDEFINED.to_bits();
+        let mut at = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
         };
-        let mut at = length;
         for position in 0..argc as usize {
             // SAFETY: as above.
             let value = unsafe { argument(argc, argv, position) };
-            with_runtime(|runtime| runtime.heap.set_element(array, at, Value::from_bits(value)));
+            indexed_set(this_value, at, value);
             at += 1;
         }
+        // **Written back even when nothing was pushed**, which is what `push()` on a frozen
+        // array-like throws on and what the specification's step order requires.
+        indexed_set_length(this_value, at);
         index_value(at)
     })
 }
@@ -11278,6 +11440,10 @@ extern "C" fn array_concat(
 }
 
 /// `Array.prototype.reverse`, in place.
+///
+/// **Not just an array.** `Array.prototype.reverse.call({0: 1, 1: 2, length: 2})` reverses
+/// that object's properties, and reading its `length` may throw — which has to reach the
+/// caller rather than be a quiet no-op.
 extern "C" fn array_reverse(
     _closure: u64,
     this_value: u64,
@@ -11285,26 +11451,27 @@ extern "C" fn array_reverse(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     for index in 0..length / 2 {
         let mirror = length - 1 - index;
-        let left = element_at(array, index);
-        let right = element_at(array, mirror);
-        with_runtime(|runtime| {
-            runtime
-                .heap
-                .set_element(array, index, Value::from_bits(right));
-            runtime
-                .heap
-                .set_element(array, mirror, Value::from_bits(left));
+        let left = indexed_get(this_value, index);
+        let right = with_rooted(&[this_value, left], || indexed_get(this_value, mirror));
+        with_rooted(&[this_value, left, right], || {
+            indexed_set(this_value, index, right);
+            indexed_set(this_value, mirror, left);
         });
     }
     this_value
 }
 
 /// `Array.prototype.pop`.
+///
+/// **An empty array-like still has its `length` written back**, and that write is what
+/// `Array.prototype.pop.call("")` throws on — a string's `length` is not writable. Returning
+/// early on an empty receiver skipped it and answered `undefined` quietly.
 extern "C" fn array_pop(
     _closure: u64,
     this_value: u64,
@@ -11312,14 +11479,24 @@ extern "C" fn array_pop(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     if length == 0 {
+        indexed_set_length(this_value, 0);
         return Value::UNDEFINED.to_bits();
     }
-    let last = element_at(array, length - 1);
-    with_runtime(|runtime| runtime.heap.truncate_elements(array, length - 1));
+    if let Some((array, count)) = elements_of(this_value) {
+        let last = element_at(array, count - 1);
+        with_runtime(|runtime| runtime.heap.truncate_elements(array, count - 1));
+        return last;
+    }
+    let last = indexed_get(this_value, length - 1);
+    with_rooted(&[this_value, last], || {
+        indexed_delete(this_value, length - 1);
+        indexed_set_length(this_value, length - 1);
+    });
     last
 }
 
@@ -11331,22 +11508,36 @@ extern "C" fn array_shift(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     if length == 0 {
+        indexed_set_length(this_value, 0);
         return Value::UNDEFINED.to_bits();
     }
-    let first = element_at(array, 0);
-    with_runtime(|runtime| {
+    if let Some((array, count)) = elements_of(this_value) {
+        let first = element_at(array, 0);
+        with_runtime(|runtime| {
+            for index in 1..count {
+                let moved = runtime
+                    .heap
+                    .element(array, index)
+                    .unwrap_or(Value::UNDEFINED);
+                runtime.heap.set_element(array, index - 1, moved);
+            }
+            runtime.heap.truncate_elements(array, count - 1);
+        });
+        return first;
+    }
+    let first = indexed_get(this_value, 0);
+    with_rooted(&[this_value, first], || {
         for index in 1..length {
-            let moved = runtime
-                .heap
-                .element(array, index)
-                .unwrap_or(Value::UNDEFINED);
-            runtime.heap.set_element(array, index - 1, moved);
+            let moved = indexed_get(this_value, index);
+            with_rooted(&[moved], || indexed_set(this_value, index - 1, moved));
         }
-        runtime.heap.truncate_elements(array, length - 1);
+        indexed_delete(this_value, length - 1);
+        indexed_set_length(this_value, length - 1);
     });
     first
 }
@@ -11359,32 +11550,54 @@ extern "C" fn array_unshift(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     let added = argc as usize;
     if added == 0 {
+        // **Still written back.** `unshift()` with nothing sets `length` to what it already
+        // was, and on a receiver that refuses the write that is where it throws.
+        indexed_set_length(this_value, length);
         return index_value(length);
     }
-    with_runtime(|runtime| {
-        // Grown first, then moved from the back, so nothing is overwritten before it has moved.
-        runtime
-            .heap
-            .set_element(array, length + added - 1, Value::UNDEFINED);
-        for index in (0..length).rev() {
-            let moved = runtime
-                .heap
-                .element(array, index)
-                .unwrap_or(Value::UNDEFINED);
-            runtime.heap.set_element(array, index + added, moved);
-        }
-        for position in 0..added {
-            // SAFETY: the convention guarantees `argc` readable values at `argv`.
-            let value = unsafe { argument(argc, argv, position) };
+    if let Some((array, count)) = elements_of(this_value) {
+        with_runtime(|runtime| {
+            // Grown first, then moved from the back, so nothing is overwritten before it has
+            // moved.
             runtime
                 .heap
-                .set_element(array, position, Value::from_bits(value));
+                .set_element(array, count + added - 1, Value::UNDEFINED);
+            for index in (0..count).rev() {
+                let moved = runtime
+                    .heap
+                    .element(array, index)
+                    .unwrap_or(Value::UNDEFINED);
+                runtime.heap.set_element(array, index + added, moved);
+            }
+            for position in 0..added {
+                // SAFETY: the convention guarantees `argc` readable values at `argv`.
+                let value = unsafe { argument(argc, argv, position) };
+                runtime
+                    .heap
+                    .set_element(array, position, Value::from_bits(value));
+            }
+        });
+        return index_value(count + added);
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        for index in (0..length).rev() {
+            let moved = indexed_get(this_value, index);
+            with_rooted(&[moved], || indexed_set(this_value, index + added, moved));
         }
+        for position in 0..added {
+            // SAFETY: as above.
+            let value = unsafe { argument(argc, argv, position) };
+            indexed_set(this_value, position, value);
+        }
+        indexed_set_length(this_value, length + added);
     });
     index_value(length + added)
 }
@@ -11518,8 +11731,9 @@ extern "C" fn array_fill(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some((array, length)) = elements_of(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let length = match indexed_length(this_value) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
@@ -11533,11 +11747,9 @@ extern "C" fn array_fill(
         Ok(end) => end,
         Err(thrown) => return thrown,
     };
-    with_runtime(|runtime| {
+    with_rooted(&[this_value, value], || {
         for index in start..end {
-            runtime
-                .heap
-                .set_element(array, index, Value::from_bits(value));
+            indexed_set(this_value, index, value);
         }
     });
     this_value
