@@ -3357,7 +3357,8 @@ fn combine_promises(argc: u64, argv: *const u64, how: Combine) -> u64 {
 
         // The collected values, and how many entries are still outstanding. Both live in
         // heap arrays so the collector sees them while the handlers run.
-        let values = with_rooted(&[result], || crisol_create_array(length));
+        let wanted = u64::try_from(length).unwrap_or(0);
+        let values = with_rooted(&[result], || crisol_create_array(wanted));
         with_rooted(&[result, values, list], || {
             let pending = with_runtime(|runtime| {
                 let scope = runtime.heap.scope();
@@ -3551,7 +3552,8 @@ extern "C" fn combine_call(
 
 /// One `allSettled` entry: `{status, value}` or `{status, reason}`.
 fn combine_report(value: u64, rejected: bool) -> u64 {
-    let report = with_rooted(&[value], crisol_create_object);
+    // A closure, not the function item: an `extern "C"` fn does not implement `FnOnce`.
+    let report = with_rooted(&[value], || crisol_create_object());
     with_rooted(&[report, value], || {
         let Some(into) = handle_of(report) else {
             return;
