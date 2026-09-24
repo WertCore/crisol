@@ -870,42 +870,59 @@ extern "C" fn array_iterator_next(
     let at = position as usize;
 
     with_rooted(&[this_value, target], || {
-        let length = elements_of(target).map_or(0, |(_, len)| len);
+        // **Walked by `indexed_length`/`indexed_get`, not `element_at`.** The iterator's
+        // receiver may be an array-like — `Array.prototype.values.call({0:…, length:…})` is a
+        // whole family of test262 cases — and reading its elements as though it were a dense
+        // array answered `undefined` for every one.
+        let length = match indexed_length(target) {
+            Ok(len) => len,
+            Err(thrown) => return thrown,
+        };
+        if at >= length {
+            let result = crisol_create_object();
+            with_rooted(&[result], || {
+                if let Some(into) = handle_of(result) {
+                    with_runtime(|runtime| {
+                        runtime.define(into, "value", Value::UNDEFINED);
+                        runtime.define(into, "done", Value::TRUE);
+                    });
+                }
+            });
+            return result;
+        }
+        // A `keys` walk reads no element, so a throwing getter cannot reach it; the other two
+        // read one, and a throw there propagates rather than ending the walk quietly.
+        let element = if kind == 0.0 {
+            index_value(at)
+        } else {
+            match indexed_get_checked(target, at) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            }
+        };
         let result = crisol_create_object();
-        with_rooted(&[result], || {
+        with_rooted(&[result, element], || {
             let Some(into) = handle_of(result) else {
                 return;
             };
-            if at >= length {
-                with_runtime(|runtime| {
-                    runtime.define(into, "value", Value::UNDEFINED);
-                    runtime.define(into, "done", Value::TRUE);
-                });
-                return;
-            }
-            let Some((array, _)) = elements_of(target) else {
-                return;
-            };
             // Built and stored one at a time, because each allocates (D-127).
-            let value = if kind == 0.0 {
-                index_value(at)
-            } else if kind == 2.0 {
-                array_of_values(&[index_value(at), element_at(array, at)])
+            let value = if kind == 2.0 {
+                array_of_values(&[index_value(at), element])
             } else {
-                element_at(array, at)
+                element
             };
             with_runtime(|runtime| {
                 runtime.define(into, "value", Value::from_bits(value));
                 runtime.define(into, "done", Value::FALSE);
             });
-            #[expect(clippy::cast_precision_loss, reason = "an index into an array")]
-            let next = (at + 1) as f64;
-            if let Some(handle) = handle_of(this_value) {
-                with_runtime(|runtime| {
-                    runtime.define_hidden(handle, ITERATOR_POSITION, Value::number(next));
-                });
-            }
         });
+        #[expect(clippy::cast_precision_loss, reason = "an index into an array")]
+        let next = (at + 1) as f64;
+        if let Some(handle) = handle_of(this_value) {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, ITERATOR_POSITION, Value::number(next));
+            });
+        }
         result
     })
 }
