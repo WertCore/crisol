@@ -1282,16 +1282,16 @@ extern "C" fn array_splice(
         count.min(length - start)
     };
 
-    // Species is consulted with the delete count, which `splice(0, -0)` makes a `+0` passed as
-    // the one argument — `create-species-neg-zero` checks exactly that.
-    let probe = array_species_create(this_value, removing);
-    if Value::from_bits(probe).is_exception() {
-        return probe;
-    }
-
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
+        // Species is consulted with the delete count, which `splice(0, -0)` makes a `+0`
+        // passed as the one argument — `create-species-neg-zero` checks exactly that. Inside
+        // `with_rooted` so the discarded probe allocation cannot collect the receiver.
+        let probe = array_species_create(this_value, removing);
+        if Value::from_bits(probe).is_exception() {
+            return probe;
+        }
         let removed: Vec<u64> = (0..removing)
             .map(|offset| element_at(array, start + offset))
             .collect();
@@ -12358,17 +12358,17 @@ extern "C" fn array_slice(
     };
     let taken = end.saturating_sub(start);
 
-    // **The species lookup happens before any element is read**, and it can throw — a
-    // constructor or `@@species` getter that does is the whole of `create-species-abrupt` and
-    // its neighbours. The result is discarded (see `array_species_create`).
-    let probe = array_species_create(this_value, taken);
-    if Value::from_bits(probe).is_exception() {
-        return probe;
-    }
-
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
+        // **The species lookup happens before any element is read**, and it can throw — a
+        // constructor or `@@species` getter that does is the whole of `create-species-abrupt`
+        // and its neighbours. Inside `with_rooted` so the discarded probe array's allocation
+        // cannot collect the receiver that is not yet held anywhere else (D-208 territory).
+        let probe = array_species_create(this_value, taken);
+        if Value::from_bits(probe).is_exception() {
+            return probe;
+        }
         with_new_array(taken, |result| {
             for offset in 0..taken {
                 let element = indexed_get(this_value, start + offset);
