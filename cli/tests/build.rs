@@ -939,6 +939,55 @@ fn a_boolean_method_rejects_a_non_boolean_receiver() {
     );
 }
 
+/// **A Map or Set method on the wrong receiver is a `TypeError`.**
+///
+/// `thisMapData`/`thisSetData`: a non-object, a non-collection, and — because Map and Set share
+/// one backing store — a Map method on a Set (and the reverse) all throw before doing any work.
+#[test]
+fn a_map_or_set_method_rejects_a_wrong_receiver() {
+    for method in ["get", "set", "has", "delete", "forEach", "clear"] {
+        check(
+            &format!("map-{method}-on-non-object"),
+            &format!(
+                "try {{ Map.prototype.{method}.call(5); return 1; }} catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    for method in ["add", "has", "delete", "forEach", "clear"] {
+        check(
+            &format!("set-{method}-on-non-object"),
+            &format!(
+                "try {{ Set.prototype.{method}.call(undefined); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // Map and Set share a backing store, so the brand is what tells them apart.
+    check(
+        "map-get-on-set",
+        "try { Map.prototype.get.call(new Set(), 1); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "set-add-on-map",
+        "try { Set.prototype.add.call(new Map(), 1); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A real Map and Set still work through the checked path.
+    check(
+        "map-still-works-after-check",
+        "let m = new Map(); m.set(1, 2); return m.get(1) + \",\" + m.has(1) + \",\" + m.size;",
+        "2,true,1",
+    );
+    check(
+        "set-still-works-after-check",
+        "let s = new Set(); s.add(7); s.add(7); return s.has(7) + \",\" + s.size;",
+        "true,1",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

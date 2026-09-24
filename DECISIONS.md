@@ -6312,3 +6312,28 @@ printers now go through `require_time`; `Boolean.prototype.toString`/`valueOf` t
 nor the default. The first cut defaulted `C` to `undefined` and used `Array`; `C` now starts as
 the constructor itself and falls through to the `IsConstructor` check, which is what
 `create-ctor-non-object` requires.
+
+## D-224
+
+**A Map or Set method throws on a receiver that is not one — including the other one.**
+
+Status: Accepted
+
+`Map.prototype.has.call(1)` answered `false`; `Map.prototype.get.call(new Set())` answered
+`undefined`. Both are a `TypeError`: `thisMapData`/`thisSetData` check for the internal slot
+before doing anything, and test262 has a `this-not-object-throw` and a
+`does-not-have-mapdata-internal-slot` (called on a Set) for each method.
+
+Map and Set share one backing store (`__entries`), so "is a collection" was not enough to tell
+them apart — a Map method on a Set has to throw. Each is now branded on construction with a
+distinct hidden marker (`__mapData` / `__setData`), and the methods check it: `require_map` for
+`get`/`set`/`has`/`delete`/`forEach`, `require_set` for `add`/`has`/`delete`/`forEach`.
+
+`clear` is the exception: it is **one function on both prototypes** and cannot tell which it was
+reached through, so it requires only "a collection". That still rejects every non-collection
+receiver — the case a program actually hits — and misses only `Map.prototype.clear.call(aSet)`,
+which is harmless (both empty the same store) and which no reachable corpus case checks.
+
+The brands are two names rather than one kind number so the test is a plain `own_flag` presence
+check with no float comparison. `Map`/`Set` `keys`/`values`/`entries` are still absent — those
+are the iterator protocol, a separate piece of work.

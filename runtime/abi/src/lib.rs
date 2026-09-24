@@ -1984,6 +1984,46 @@ fn entries_of(collection: u64) -> Option<(GcRef, usize)> {
     elements_of(held)
 }
 
+/// The mark a Map carries and a Set does not, and vice versa — the brand each method checks.
+///
+/// **Two names rather than one kind number** so the check is a plain presence test (`own_flag`)
+/// with no float comparison, and so `Map.prototype.get.call(new Set())` — a real collection of
+/// the wrong kind — is a `TypeError` as the specification's `thisMapData`/`thisSetData` require.
+const MAP_BRAND: &str = "__mapData";
+/// The mark a Set carries; see [`MAP_BRAND`].
+const SET_BRAND: &str = "__setData";
+
+/// A `TypeError` unless `this` is a Map, returned as the signal to propagate.
+fn require_map(this_value: u64) -> Option<u64> {
+    if own_flag(this_value, MAP_BRAND) {
+        None
+    } else {
+        Some(raise("this is not a Map", "TypeError"))
+    }
+}
+
+/// A `TypeError` unless `this` is a Set.
+fn require_set(this_value: u64) -> Option<u64> {
+    if own_flag(this_value, SET_BRAND) {
+        None
+    } else {
+        Some(raise("this is not a Set", "TypeError"))
+    }
+}
+
+/// A `TypeError` unless `this` is a Map or a Set.
+///
+/// `clear` is one function on both prototypes and cannot tell which it was reached through, so
+/// it can require only "a collection" — which still rejects every non-collection receiver, the
+/// case a program actually hits.
+fn require_collection(this_value: u64) -> Option<u64> {
+    if own_flag(this_value, MAP_BRAND) || own_flag(this_value, SET_BRAND) {
+        None
+    } else {
+        Some(raise("this is not a Map or Set", "TypeError"))
+    }
+}
+
 /// Records how many entries a collection now holds.
 fn set_collection_size(collection: u64, entries: usize, stride: usize) {
     if let Some(handle) = handle_of(collection) {
@@ -1994,7 +2034,7 @@ fn set_collection_size(collection: u64, entries: usize, stride: usize) {
 }
 
 /// Builds a `Map` or a `Set`: an object with a backing array and a size.
-fn new_collection(prototype: Option<GcRef>) -> u64 {
+fn new_collection(prototype: Option<GcRef>, is_set: bool) -> u64 {
     let object = crisol_create_object();
     with_rooted(&[object], || {
         let Some(handle) = handle_of(object) else {
@@ -2005,6 +2045,9 @@ fn new_collection(prototype: Option<GcRef>) -> u64 {
         with_runtime(|runtime| {
             runtime.define_hidden(handle, COLLECTION_ENTRIES, Value::from_bits(entries));
             runtime.define_hidden(handle, COLLECTION_SIZE, Value::number(0.0));
+            // The brand, so a method can tell a Map from a Set from anything else.
+            let brand = if is_set { SET_BRAND } else { MAP_BRAND };
+            runtime.define_hidden(handle, brand, Value::TRUE);
             if let Some(prototype) = prototype {
                 runtime.heap.set_prototype(handle, Some(prototype));
             }
@@ -2021,7 +2064,7 @@ extern "C" fn make_map(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get))
+    new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get), false)
 }
 
 /// `new Set()`.
@@ -2032,7 +2075,7 @@ extern "C" fn make_set(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    new_collection(SET_PROTOTYPE.with(std::cell::Cell::get))
+    new_collection(SET_PROTOTYPE.with(std::cell::Cell::get), true)
 }
 
 /// A global that exists so its `prototype` can be reached, but cannot be called.
@@ -4014,6 +4057,9 @@ extern "C" fn map_get(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
     let Some((array, length)) = entries_of(this_value) else {
         return Value::UNDEFINED.to_bits();
     };
@@ -4035,6 +4081,9 @@ extern "C" fn map_set(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
     let Some((array, length)) = entries_of(this_value) else {
         return this_value;
     };
@@ -4076,6 +4125,9 @@ extern "C" fn map_has(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
     let Some((array, length)) = entries_of(this_value) else {
         return Value::FALSE.to_bits();
     };
@@ -4107,6 +4159,9 @@ extern "C" fn map_delete(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
     let Some((array, length)) = entries_of(this_value) else {
         return Value::FALSE.to_bits();
     };
@@ -4129,6 +4184,9 @@ extern "C" fn collection_clear(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_collection(this_value) {
+        return thrown;
+    }
     if let Some((array, _)) = entries_of(this_value) {
         with_runtime(|runtime| runtime.heap.truncate_elements(array, 0));
         set_collection_size(this_value, 0, 1);
@@ -4147,6 +4205,9 @@ extern "C" fn map_for_each(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
     let Some((array, _length)) = entries_of(this_value) else {
         return Value::UNDEFINED.to_bits();
     };
@@ -4190,6 +4251,9 @@ extern "C" fn set_add(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
     let Some((array, length)) = entries_of(this_value) else {
         return this_value;
     };
@@ -4214,6 +4278,9 @@ extern "C" fn set_has(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
     let Some((array, length)) = entries_of(this_value) else {
         return Value::FALSE.to_bits();
     };
@@ -4230,6 +4297,9 @@ extern "C" fn set_delete(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
     let Some((array, length)) = entries_of(this_value) else {
         return Value::FALSE.to_bits();
     };
@@ -4253,6 +4323,9 @@ extern "C" fn set_for_each(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
     let Some((array, _)) = entries_of(this_value) else {
         return Value::UNDEFINED.to_bits();
     };
@@ -7934,7 +8007,7 @@ extern "C" fn map_group_by(
         if !is_callable(classify) {
             return raise("a grouping needs a function", "TypeError");
         }
-        let groups = new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get));
+        let groups = new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get), false);
         with_rooted(&[groups, items, classify], || {
             let length = match indexed_length(items) {
                 Ok(length) => length,
