@@ -900,6 +900,11 @@ fn a_date_accessor_rejects_a_non_date_receiver() {
         "Invalid Date",
     );
     // And a real Date still works through the checked path.
+    check(
+        "invalid-date-timezone-offset",
+        "return new Date(0 / 0).getTimezoneOffset();",
+        "NaN",
+    );
     check("real-date-get-time", "return new Date(0).getTime();", "0");
     check(
         "real-date-utc-string",

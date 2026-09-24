@@ -3297,12 +3297,19 @@ extern "C" fn date_milliseconds(
 /// `Date.prototype.getTimezoneOffset`, which is always zero here.
 extern "C" fn date_timezone_offset(
     _closure: u64,
-    _this_value: u64,
+    this_value: u64,
     _new_target: u64,
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    from_number(0.0)
+    // **Zero for a real date, `NaN` for an invalid one, and a throw for a non-date.** The
+    // engine keeps one zone, UTC, so the offset is always zero — but it still has to answer
+    // `NaN` when the time is `NaN` and reject a receiver that is not a date at all.
+    match require_time(this_value) {
+        Ok(time) if time.is_nan() => from_number(f64::NAN),
+        Ok(_) => from_number(0.0),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `Date.prototype.toISOString` and `toJSON`.
