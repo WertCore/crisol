@@ -11534,7 +11534,9 @@ fn array_species_create(original: u64, length: usize) -> u64 {
     #[expect(clippy::cast_precision_loss, reason = "a length below 2^32")]
     let arg = [Value::number(length as f64).to_bits()];
     // SAFETY: `arg` holds exactly one readable value and outlives the call.
-    with_rooted(&[original, c], || unsafe { construct_with(c, c, 1, arg.as_ptr()) })
+    with_rooted(&[original, c], || unsafe {
+        construct_with(c, c, 1, arg.as_ptr())
+    })
 }
 
 /// Reads one element, or `undefined` past the end.

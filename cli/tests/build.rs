@@ -889,7 +889,11 @@ fn a_date_accessor_rejects_a_non_date_receiver() {
     );
     // **An invalid but real Date still answers rather than throwing** — the distinction the
     // receiver check preserves.
-    check("invalid-date-get-time", "return new Date(0 / 0).getTime();", "NaN");
+    check(
+        "invalid-date-get-time",
+        "return new Date(0 / 0).getTime();",
+        "NaN",
+    );
     check(
         "invalid-date-to-string",
         "return new Date(0 / 0).toString();",
@@ -897,7 +901,11 @@ fn a_date_accessor_rejects_a_non_date_receiver() {
     );
     // And a real Date still works through the checked path.
     check("real-date-get-time", "return new Date(0).getTime();", "0");
-    check("real-date-utc-string", "return new Date(0).toUTCString();", "Thu, 01 Jan 1970 00:00:00 GMT");
+    check(
+        "real-date-utc-string",
+        "return new Date(0).toUTCString();",
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+    );
 }
 
 /// `Boolean.prototype.toString`/`valueOf` on a non-Boolean receiver is a `TypeError`.
@@ -914,7 +922,11 @@ fn a_boolean_method_rejects_a_non_boolean_receiver() {
         "TypeError",
     );
     // A real boolean, and a Boolean wrapper, both still work.
-    check("boolean-tostring-primitive", "return true.toString();", "true");
+    check(
+        "boolean-tostring-primitive",
+        "return true.toString();",
+        "true",
+    );
     check(
         "boolean-valueof-wrapper",
         "return Boolean.prototype.valueOf.call(new Boolean(false));",
