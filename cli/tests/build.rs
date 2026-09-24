@@ -687,6 +687,111 @@ fn a_callback_receives_the_index() {
     );
 }
 
+/// **The callback's `this` is the second argument, not the array.**
+///
+/// `[11].map(fn, o)` runs `fn` with `this === o`. Every iterating method passed the array as
+/// the receiver instead, so a callback that read `this` got the wrong object — silently, since
+/// the call still happened and still returned something.
+#[test]
+fn an_iterating_method_binds_this_to_its_second_argument() {
+    check(
+        "map-this-arg",
+        "return [1].map(function () { return this.tag; }, {tag: 7})[0];",
+        "7",
+    );
+    check(
+        "every-this-arg",
+        "return [1].every(function () { return this.ok; }, {ok: true});",
+        "true",
+    );
+    check(
+        "some-this-arg",
+        "return [1].some(function () { return this.ok; }, {ok: true});",
+        "true",
+    );
+    check(
+        "find-this-arg",
+        "return [5].find(function () { return this.ok; }, {ok: true});",
+        "5",
+    );
+    check(
+        "foreach-this-arg",
+        "let seen = 0; [1].forEach(function () { seen = this.tag; }, {tag: 9}); return seen;",
+        "9",
+    );
+    // Absent thisArg means the callback's `this` is not the array — whatever sloppy-mode
+    // substitution then applies, it is not the receiver the method was called on.
+    check(
+        "map-no-this-arg-is-not-the-array",
+        "let a = [1]; return a.map(function () { return this === a; })[0];",
+        "false",
+    );
+}
+
+/// A throw from the callback stops the walk and reaches the caller, rather than being stored
+/// as a result and the loop carrying on.
+#[test]
+fn a_throwing_callback_stops_an_iterating_method() {
+    for (name, call) in [
+        ("map", "[1, 2].map"),
+        ("filter", "[1, 2].filter"),
+        ("forEach", "[1, 2].forEach"),
+        ("find", "[1, 2].find"),
+        ("some", "[1, 2].some"),
+        ("every", "[1, 2].every"),
+    ] {
+        check(
+            &format!("{name}-throwing-callback"),
+            &format!(
+                "try {{ {call}(function () {{ throw new RangeError(\"x\"); }}); return \"no\"; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "RangeError",
+        );
+    }
+    // The walk stops at the throw — a later element is never visited.
+    check(
+        "foreach-stops-at-throw",
+        "let seen = 0; \
+         try { [1, 2, 3].forEach(function (x) { seen = x; if (x === 2) throw new Error(\"x\"); }); } \
+         catch (e) {} \
+         return seen;",
+        "2",
+    );
+}
+
+/// **A nullish receiver is a `TypeError`** — `RequireObjectCoercible` at the top of each
+/// iterator method. An iterator over `undefined` was made instead and answered `{done: true}`,
+/// which reads as a working empty walk.
+#[test]
+fn an_array_iterator_rejects_a_nullish_receiver() {
+    for method in ["keys", "values", "entries"] {
+        check(
+            &format!("{method}-on-undefined"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(undefined); return \"no\"; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("{method}-on-null"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(null); return \"no\"; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A real array-like still iterates.
+    check(
+        "values-on-array-like",
+        "let it = Array.prototype.values.call({0: \"a\", 1: \"b\", length: 2}); \
+         return it.next().value + it.next().value;",
+        "ab",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

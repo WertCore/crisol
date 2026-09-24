@@ -774,6 +774,13 @@ const ITERATOR_POSITION: &str = "__position";
 /// `const it = a.values(); it.next()` does and what most of test262's coverage of these
 /// methods checks.
 fn new_array_iterator(target: u64, kind: f64) -> u64 {
+    // **A nullish receiver is a `TypeError`.** `Array.prototype.values.call(undefined)` throws
+    // before making anything, which is `RequireObjectCoercible` at the top of each of these —
+    // and a program feature-tests exactly this. An iterator over `undefined` was made instead
+    // and answered `{done: true}` on the first `next`, which reads as a working empty walk.
+    if let Some(thrown) = reject_nullish(target, "cannot iterate") {
+        return thrown;
+    }
     // **`target` is rooted before anything is allocated.** Every other native roots its
     // receiver through `live_values` before doing work; these three did not, so the array in
     // `[7, 8].values()` — a temporary, held by nothing else — could be freed by the very
@@ -1540,14 +1547,22 @@ fn find_last_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool
     }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
+    // SAFETY: as above.
+    let this_arg = unsafe { argument(argc, argv, 1) };
     with_rooted(&live, || {
         for index in (0..length).rev() {
-            let element = indexed_get(this_value, index);
+            let element = match indexed_get_checked(this_value, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
             let verdict = call_value(
                 callback,
-                this_value,
+                this_arg,
                 &[element, index_value(index), this_value],
             );
+            if Value::from_bits(verdict).is_exception() {
+                return verdict;
+            }
             if is_truthy(Value::from_bits(verdict)) {
                 return if want_index {
                     index_value(index)
@@ -11893,14 +11908,27 @@ extern "C" fn array_map(
             return raise("a callback must be a function", "TypeError");
         }
 
+        // SAFETY: as above.
+        let this_arg = unsafe { argument(argc, argv, 1) };
         with_new_array(length, |result| {
             for index in 0..length {
-                let element = indexed_get(this_value, index);
+                let element = match indexed_get_checked(this_value, index) {
+                    Ok(element) => element,
+                    Err(thrown) => return thrown,
+                };
+                // **The callback's `this` is the second argument, not the array.**
+                // `[11].map(fn, o)` runs `fn` with `this === o`; passing the array made every
+                // `this` inside a mapped callback wrong, silently.
                 let mapped = call_value(
                     callback,
-                    this_value,
+                    this_arg,
                     &[element, index_value(index), this_value],
                 );
+                // A throw from the callback stops the walk and reaches the caller, rather than
+                // being stored as an element and the loop carrying on.
+                if Value::from_bits(mapped).is_exception() {
+                    return mapped;
+                }
                 with_runtime(|runtime| {
                     runtime
                         .heap
@@ -11939,15 +11967,23 @@ extern "C" fn array_filter(
 
         // Allocated at full length and shortened after, because the result is rooted through the
         // whole loop and the count is not known until the end.
+        // SAFETY: as above.
+        let this_arg = unsafe { argument(argc, argv, 1) };
         with_new_array(length, |result| {
             let mut kept = 0;
             for index in 0..length {
-                let element = indexed_get(this_value, index);
+                let element = match indexed_get_checked(this_value, index) {
+                    Ok(element) => element,
+                    Err(thrown) => return thrown,
+                };
                 let verdict = call_value(
                     callback,
-                    this_value,
+                    this_arg,
                     &[element, index_value(index), this_value],
                 );
+                if Value::from_bits(verdict).is_exception() {
+                    return verdict;
+                }
                 if is_truthy(Value::from_bits(verdict)) {
                     with_runtime(|runtime| {
                         runtime
@@ -11989,13 +12025,21 @@ extern "C" fn array_for_each(
         if !is_callable(callback) {
             return raise("a callback must be a function", "TypeError");
         }
+        // SAFETY: as above.
+        let this_arg = unsafe { argument(argc, argv, 1) };
         for index in 0..length {
-            let element = indexed_get(this_value, index);
-            call_value(
+            let element = match indexed_get_checked(this_value, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
+            let outcome = call_value(
                 callback,
-                this_value,
+                this_arg,
                 &[element, index_value(index), this_value],
             );
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
+            }
         }
         Value::UNDEFINED.to_bits()
     })
@@ -12470,14 +12514,24 @@ fn find_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> 
     }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
+    // SAFETY: as above.
+    let this_arg = unsafe { argument(argc, argv, 1) };
     with_rooted(&live, || {
         for index in 0..length {
-            let element = indexed_get(this_value, index);
+            // **`find` reads a hole**, unlike `forEach` which skips one — it visits every
+            // index, so a throwing getter has to propagate rather than be skipped.
+            let element = match indexed_get_checked(this_value, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
             let verdict = call_value(
                 callback,
-                this_value,
+                this_arg,
                 &[element, index_value(index), this_value],
             );
+            if Value::from_bits(verdict).is_exception() {
+                return verdict;
+            }
             if is_truthy(Value::from_bits(verdict)) {
                 return if want_index {
                     index_value(index)
@@ -12534,14 +12588,22 @@ fn quantify(this_value: u64, argc: u64, argv: *const u64, want_all: bool) -> u64
     }
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
+    // SAFETY: as above.
+    let this_arg = unsafe { argument(argc, argv, 1) };
     with_rooted(&live, || {
         for index in 0..length {
-            let element = indexed_get(this_value, index);
+            let element = match indexed_get_checked(this_value, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
             let verdict = call_value(
                 callback,
-                this_value,
+                this_arg,
                 &[element, index_value(index), this_value],
             );
+            if Value::from_bits(verdict).is_exception() {
+                return verdict;
+            }
             if is_truthy(Value::from_bits(verdict)) != want_all {
                 return if want_all { Value::FALSE } else { Value::TRUE }.to_bits();
             }

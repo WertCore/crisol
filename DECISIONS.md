@@ -6225,3 +6225,31 @@ caller's frame slot, which nothing scans (D-208) — so converting the first fre
 and third, and `d.setHours(a, b, c)` reported that it could not convert an object to a
 primitive. That is the third time this exact hazard has appeared; the rule is in D-208 and it
 is worth reading before writing any built-in that converts more than one argument.
+
+## D-221
+
+**An iterating method binds `this` to its second argument, and a throw from the callback stops it.**
+
+Status: Accepted
+
+`[11].map(fn, o)` runs `fn` with `this === o`. All seven iterating methods — `map`, `filter`,
+`forEach`, `find`/`findIndex`, `findLast`/`findLastIndex`, `every`, `some` — passed the *array*
+as the callback's receiver and ignored the `thisArg` argument entirely. A callback that read
+`this` got the wrong object, silently, because the call still happened and still returned
+something.
+
+They also did not propagate a throw. `call_value` answers the exception signal like any other
+value, so a callback that threw had its signal stored as a mapped element (or read as a truthy
+verdict) and the loop carried on. A throw now stops the walk and reaches the caller — and the
+element reads go through `indexed_get_checked`, so a throwing getter on an array-like does too.
+
+And `Array.prototype.values.call(undefined)` made an iterator over `undefined` that answered
+`{done: true}` on the first `next` — a working empty walk where the specification's
+`RequireObjectCoercible` demands a `TypeError`. `keys`, `values` and `entries` reject a nullish
+receiver before allocating anything.
+
+**Not done here, and it is why some `filter`/`slice` cases still fail**: the species protocol.
+`filter` and `map` build their result with the plain array constructor rather than
+`this.constructor[Symbol.species]`, so a subclass gets a plain `Array` back and the
+`create-species-*` cases — which poison that lookup to observe it happening — see nothing to
+throw. That is a larger change than this batch and is left for one of its own.
