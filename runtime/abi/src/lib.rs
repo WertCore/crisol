@@ -6010,8 +6010,9 @@ extern "C" fn string_code_point_at(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     let position = match integer_argument(argc, argv, 0) {
@@ -6299,6 +6300,33 @@ fn code_units(text: &str) -> Vec<u16> {
 }
 
 /// The receiver of a string method, as text.
+/// `ToString(RequireObjectCoercible(this))` — a string method's receiver as text, or the throw.
+///
+/// **Two receivers are errors, not values.** `null` and `undefined` fail
+/// `RequireObjectCoercible`, and a symbol fails `ToString`; both are a `TypeError`, where
+/// [`this_text`] answered `"undefined"` for the first and empty for the second. Everything else
+/// coerces, which is why `String.prototype.indexOf.call(5, …)` still works.
+fn coercible_text(this_value: u64) -> Result<String, u64> {
+    let held = Value::from_bits(this_value);
+    if held.is_nullish() {
+        return Err(raise(
+            "a string method needs a receiver that is not null or undefined",
+            "TypeError",
+        ));
+    }
+    if held.kind() == crisol_value::Kind::Symbol {
+        return Err(raise("a symbol is not a string", "TypeError"));
+    }
+    Ok(this_text(this_value).unwrap_or_default())
+}
+
+/// Whether `needle` sits at `haystack[at..]`, both in UTF-16 code units.
+fn units_match_at(haystack: &[u16], needle: &[u16], at: usize) -> bool {
+    haystack
+        .get(at..at + needle.len())
+        .is_some_and(|window| window == needle)
+}
+
 fn this_text(this_value: u64) -> Option<String> {
     // **An object receiver is read, not asked.** Asking would call `to_text`, which calls the
     // object's `toString`, which for a string wrapper is this function again — unbounded
@@ -6389,10 +6417,12 @@ extern "C" fn string_index_of(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let (Some(text), Some(needle)) = (this_text(this_value), {
-        // SAFETY: the convention guarantees `argc` readable values at `argv`.
-        to_text(unsafe { argument(argc, argv, 0) })
-    }) else {
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return Value::number(-1.0).to_bits();
     };
     // Reported in code units, so the answer is an index into the same space `charAt` uses.
@@ -6410,10 +6440,12 @@ extern "C" fn string_last_index_of(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let (Some(text), Some(needle)) = (this_text(this_value), {
-        // SAFETY: the convention guarantees `argc` readable values at `argv`.
-        to_text(unsafe { argument(argc, argv, 0) })
-    }) else {
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return Value::number(-1.0).to_bits();
     };
     match text.rfind(&needle) {
@@ -6430,18 +6462,32 @@ extern "C" fn string_includes(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let (Some(text), Some(needle)) = (this_text(this_value), {
-        // SAFETY: the convention guarantees `argc` readable values at `argv`.
-        to_text(unsafe { argument(argc, argv, 0) })
-    }) else {
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return Value::FALSE.to_bits();
     };
-    if text.contains(&needle) {
-        Value::TRUE
-    } else {
-        Value::FALSE
-    }
-    .to_bits()
+    // **The position is coerced, and a symbol there throws** — the same rule as any index.
+    let from = match integer_argument(argc, argv, 1) {
+        Ok(from) => from,
+        Err(thrown) => return thrown,
+    };
+    let units = code_units(&text);
+    let needle = code_units(&needle);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped into 0..=len below"
+    )]
+    let start = (from.max(0.0) as usize).min(units.len());
+    // Empty needle is found at any in-range position; otherwise scan from `start`.
+    let found = needle.is_empty()
+        || (start..=units.len().saturating_sub(needle.len()))
+            .any(|at| units_match_at(&units, &needle, at));
+    boolean(found).to_bits()
 }
 
 /// `String.prototype.startsWith`.
@@ -6452,18 +6498,27 @@ extern "C" fn string_starts_with(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let (Some(text), Some(needle)) = (this_text(this_value), {
-        // SAFETY: the convention guarantees `argc` readable values at `argv`.
-        to_text(unsafe { argument(argc, argv, 0) })
-    }) else {
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return Value::FALSE.to_bits();
     };
-    if text.starts_with(&needle) {
-        Value::TRUE
-    } else {
-        Value::FALSE
-    }
-    .to_bits()
+    let from = match integer_argument(argc, argv, 1) {
+        Ok(from) => from,
+        Err(thrown) => return thrown,
+    };
+    let units = code_units(&text);
+    let needle = code_units(&needle);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped into 0..=len below"
+    )]
+    let start = (from.max(0.0) as usize).min(units.len());
+    boolean(units_match_at(&units, &needle, start)).to_bits()
 }
 
 /// `String.prototype.endsWith`.
@@ -6474,18 +6529,37 @@ extern "C" fn string_ends_with(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let (Some(text), Some(needle)) = (this_text(this_value), {
-        // SAFETY: the convention guarantees `argc` readable values at `argv`.
-        to_text(unsafe { argument(argc, argv, 0) })
-    }) else {
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return Value::FALSE.to_bits();
     };
-    if text.ends_with(&needle) {
-        Value::TRUE
+    let units = code_units(&text);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let end_arg = unsafe { argument(argc, argv, 1) };
+    // **The end position defaults to the length, and is where the match must finish** — which
+    // is what `"the future".endsWith("future", 10)` needs and a plain `ends_with` ignores.
+    let end = if Value::from_bits(end_arg).is_undefined() {
+        units.len()
     } else {
-        Value::FALSE
-    }
-    .to_bits()
+        let asked = match integer_argument(argc, argv, 1) {
+            Ok(asked) => asked,
+            Err(thrown) => return thrown,
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped into 0..=len below"
+        )]
+        let end = (asked.max(0.0) as usize).min(units.len());
+        end
+    };
+    let needle = code_units(&needle);
+    let found = needle.len() <= end && units_match_at(&units, &needle, end - needle.len());
+    boolean(found).to_bits()
 }
 
 /// The text between two code-unit positions.

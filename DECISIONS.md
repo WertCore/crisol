@@ -6337,3 +6337,30 @@ which is harmless (both empty the same store) and which no reachable corpus case
 The brands are two names rather than one kind number so the test is a plain `own_flag` presence
 check with no float comparison. `Map`/`Set` `keys`/`values`/`entries` are still absent — those
 are the iterator protocol, a separate piece of work.
+
+## D-225
+
+**A string method coerces its receiver, and the search methods honour their position.**
+
+Status: Accepted
+
+`String.prototype.codePointAt.call(undefined)` answered a value and
+`String.prototype.includes.call(Symbol())` answered `false`. Both are a `TypeError`:
+`ToString(RequireObjectCoercible(this))` rejects `null`/`undefined` at the first step and a
+symbol at the second. `this_text` answered `"undefined"` for the first and empty for the
+second — a working call where there should be a throw. `coercible_text` returns the throw, and
+the failing methods (`codePointAt`, `indexOf`, `lastIndexOf`, `includes`, `startsWith`,
+`endsWith`) go through it; a number receiver still coerces, so `"".indexOf.call(1234, "3")`
+keeps working.
+
+`includes`, `startsWith` and `endsWith` also ignored their **position** argument entirely.
+`"the future".endsWith("future", 10)` was `false`. The position is coerced like any index — a
+symbol there throws — and the match is measured in code units: `endsWith` against the slice
+ending at its argument, the other two starting at theirs. The comparison moved from byte-based
+`str::contains`/`starts_with`/`ends_with` to a code-unit `units_match_at`, so a position that
+splits a surrogate pair is counted the way `length` and `charAt` count (D-115).
+
+Not done: the `IsRegExp` guard that makes `"x".includes(/re/)` a `TypeError` before coercing,
+and the full `this_text`→`coercible_text` conversion for the ~20 other string methods that
+should also `RequireObjectCoercible`. Both are mechanical extensions of this and left for a
+sweep of their own rather than mixed in blind.

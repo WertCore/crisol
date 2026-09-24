@@ -988,6 +988,106 @@ fn a_map_or_set_method_rejects_a_wrong_receiver() {
     );
 }
 
+/// **A string method on `null`/`undefined` or a symbol is a `TypeError`.**
+///
+/// `ToString(RequireObjectCoercible(this))`: nullish fails the first step, a symbol the second.
+/// Answering `"undefined"` or empty instead read as a working call.
+#[test]
+fn a_string_method_requires_a_coercible_receiver() {
+    for method in [
+        "codePointAt",
+        "indexOf",
+        "includes",
+        "startsWith",
+        "endsWith",
+    ] {
+        check(
+            &format!("string-{method}-on-undefined"),
+            &format!(
+                "try {{ String.prototype.{method}.call(undefined); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("string-{method}-on-symbol"),
+            &format!(
+                "try {{ String.prototype.{method}.call(Symbol()); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A number receiver still coerces, which is the case the coercibility check must not break.
+    check(
+        "indexof-on-number",
+        "return String.prototype.indexOf.call(1234, \"3\");",
+        "2",
+    );
+}
+
+/// **`includes`/`startsWith`/`endsWith` take a position, and coerce it.**
+///
+/// `endsWith` measures a slice ending at its second argument; `includes`/`startsWith` start at
+/// theirs. A symbol there throws, like any index.
+#[test]
+fn the_search_methods_honour_their_position() {
+    check(
+        "endswith-at-position",
+        "return \"the future\".endsWith(\"future\", 10);",
+        "true",
+    );
+    check(
+        "endswith-short-of-position",
+        "return \"the future\".endsWith(\"the\", 3);",
+        "true",
+    );
+    check(
+        "endswith-wrong-position",
+        "return \"the future\".endsWith(\"future\", 3);",
+        "false",
+    );
+    check(
+        "startswith-at-position",
+        "return \"the future\".startsWith(\"future\", 4);",
+        "true",
+    );
+    check(
+        "includes-from-position",
+        "return \"abcabc\".includes(\"a\", 1);",
+        "true",
+    );
+    check(
+        "includes-past-position",
+        "return \"abc\".includes(\"a\", 1);",
+        "false",
+    );
+    check(
+        "includes-empty-needle",
+        "return \"abc\".includes(\"\");",
+        "true",
+    );
+    // A symbol position throws.
+    for method in ["includes", "startsWith", "endsWith"] {
+        check(
+            &format!("string-{method}-symbol-position"),
+            &format!(
+                "try {{ \"abc\".{method}(\"a\", Symbol()); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // The no-position cases still work.
+    check(
+        "startswith-plain",
+        "return \"abc\".startsWith(\"ab\");",
+        "true",
+    );
+    check("endswith-plain", "return \"abc\".endsWith(\"bc\");", "true");
+    check("includes-plain", "return \"abc\".includes(\"b\");", "true");
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(
