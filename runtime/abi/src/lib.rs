@@ -1282,6 +1282,13 @@ extern "C" fn array_splice(
         count.min(length - start)
     };
 
+    // Species is consulted with the delete count, which `splice(0, -0)` makes a `+0` passed as
+    // the one argument — `create-species-neg-zero` checks exactly that.
+    let probe = array_species_create(this_value, removing);
+    if Value::from_bits(probe).is_exception() {
+        return probe;
+    }
+
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -11426,6 +11433,56 @@ fn with_new_array<R>(length: usize, body: impl FnOnce(GcRef) -> R) -> R {
     })
 }
 
+/// `ArraySpeciesCreate(originalArray, length)` — the array a species-aware method builds into.
+///
+/// **crisol has no `Array` subclassing** (`class X extends Array` is refused), so a species
+/// that resolves to a real `Array` — which is every non-throwing case — produces an array
+/// indistinguishable from `ArrayCreate(length)`. What this call is *for*, then, is its
+/// observable lookups: reading `originalArray.constructor` and `constructor[@@species]`, either
+/// of which may be a getter that throws, and calling a custom species constructor, which may
+/// throw or may not be a constructor. test262 checks each of those directly, and checks that
+/// they happen *before* the method touches an element.
+///
+/// The result is used only to propagate a throw; the caller builds the array it returns with
+/// [`with_new_array`]. A custom species that returns without throwing has its result discarded
+/// — a deviation with no observable consequence while `Array` cannot be subclassed, and
+/// recorded rather than pretended away (D-222).
+fn array_species_create(original: u64, length: usize) -> u64 {
+    // `IsArray(O)` is false → `ArrayCreate`, with no constructor lookup at all.
+    if elements_of(original).is_none() {
+        return with_new_array(length, |array| array.to_value().to_bits());
+    }
+    let ctor = property_of(original, "constructor");
+    if Value::from_bits(ctor).is_exception() {
+        return ctor;
+    }
+    let mut species = Value::UNDEFINED.to_bits();
+    if Value::from_bits(ctor).kind() == crisol_value::Kind::Object {
+        let Some(symbol) = well_known_symbol("species") else {
+            return with_new_array(length, |array| array.to_value().to_bits());
+        };
+        species = crisol_computed_load(ctor, symbol);
+        if Value::from_bits(species).is_exception() {
+            return species;
+        }
+    }
+    let held = Value::from_bits(species);
+    // **`null` and `undefined` both mean the default**, which is `Array` — the one place the
+    // two nullish values are treated alike here.
+    if held.is_undefined() || held.kind() == crisol_value::Kind::Null {
+        return with_new_array(length, |array| array.to_value().to_bits());
+    }
+    if !is_constructor(species) {
+        return raise("the array species is not a constructor", "TypeError");
+    }
+    #[expect(clippy::cast_precision_loss, reason = "a length below 2^32")]
+    let arg = [Value::number(length as f64).to_bits()];
+    // SAFETY: `arg` holds exactly one readable value and outlives the call.
+    with_rooted(&[original, species], || unsafe {
+        construct_with(species, species, 1, arg.as_ptr())
+    })
+}
+
 /// Reads one element, or `undefined` past the end.
 fn element_at(array: GcRef, index: usize) -> u64 {
     with_runtime(|runtime| runtime.heap.element(array, index))
@@ -11925,6 +11982,13 @@ extern "C" fn array_map(
             return raise("a callback must be a function", "TypeError");
         }
 
+        // Before a single element is read, so a throwing species lookup leaves the callback
+        // uncalled — `create-species-poisoned` asserts a call count of zero.
+        let probe = array_species_create(this_value, length);
+        if Value::from_bits(probe).is_exception() {
+            return probe;
+        }
+
         // SAFETY: as above.
         let this_arg = unsafe { argument(argc, argv, 1) };
         with_new_array(length, |result| {
@@ -11980,6 +12044,14 @@ extern "C" fn array_filter(
         // element produced, and it looked like a working call every time.
         if !is_callable(callback) {
             return raise("a callback must be a function", "TypeError");
+        }
+
+        // Like `map`, before the callback so a throwing species lookup leaves the count at
+        // zero. `filter` species-creates with length zero in the specification; the result is
+        // discarded either way (see `array_species_create`).
+        let probe = array_species_create(this_value, 0);
+        if Value::from_bits(probe).is_exception() {
+            return probe;
         }
 
         // Allocated at full length and shortened after, because the result is rooted through the
@@ -12285,6 +12357,14 @@ extern "C" fn array_slice(
         Err(thrown) => return thrown,
     };
     let taken = end.saturating_sub(start);
+
+    // **The species lookup happens before any element is read**, and it can throw — a
+    // constructor or `@@species` getter that does is the whole of `create-species-abrupt` and
+    // its neighbours. The result is discarded (see `array_species_create`).
+    let probe = array_species_create(this_value, taken);
+    if Value::from_bits(probe).is_exception() {
+        return probe;
+    }
 
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };

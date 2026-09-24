@@ -792,6 +792,59 @@ fn an_array_iterator_rejects_a_nullish_receiver() {
     );
 }
 
+/// **The species protocol: `filter`/`map`/`slice`/`splice` consult `constructor[@@species]`
+/// before they touch an element.**
+///
+/// crisol cannot subclass `Array`, so the *result* is always a plain array — but the lookups
+/// are observable, and test262 checks each: a throwing `.constructor`, a throwing `@@species`,
+/// a species that is not a constructor, and a species constructor that is actually invoked
+/// (with `+0` for an empty `splice`). See D-222.
+#[test]
+fn a_species_aware_method_consults_the_constructor_first() {
+    // `.constructor` getter throws — and the callback never runs.
+    check(
+        "filter-ctor-getter-throws",
+        "let a = []; let n = 0;          Object.defineProperty(a, \"constructor\",              {get: function () { throw new RangeError(\"c\"); }});          try { a.filter(function () { n = n + 1; }); return \"no\"; }          catch (e) { return e.name + \":\" + n; }",
+        "RangeError:0",
+    );
+    // `@@species` getter throws — likewise before the callback.
+    check(
+        "filter-species-getter-throws",
+        "let a = []; let n = 0; a.constructor = {};          Object.defineProperty(a.constructor, Symbol.species,              {get: function () { throw new RangeError(\"s\"); }});          try { a.filter(function () { n = n + 1; }); return \"no\"; }          catch (e) { return e.name + \":\" + n; }",
+        "RangeError:0",
+    );
+    // A species constructor that throws, reached through `slice`.
+    check(
+        "slice-species-throws",
+        "let a = [1, 2]; a.constructor = {};          a.constructor[Symbol.species] = function () { throw new RangeError(\"x\"); };          try { a.slice(); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A species that is not a constructor is a `TypeError`.
+    check(
+        "map-species-not-constructor",
+        "let a = [1]; a.constructor = {}; a.constructor[Symbol.species] = 5;          try { a.map(function (x) { return x; }); return \"no\"; }          catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `splice(0, -0)` calls the species constructor with a single `+0` argument.
+    check(
+        "splice-species-neg-zero",
+        "let a = []; a.constructor = {}; let seen = \"none\";          a.constructor[Symbol.species] =              function () { seen = arguments.length + \":\" + arguments[0]; };          a.splice(0, -0); return seen;",
+        "1:0",
+    );
+    // A non-throwing species is genuinely invoked, and the method still answers a real array.
+    check(
+        "slice-species-invoked-result-still-works",
+        "let a = [1, 2, 3]; a.constructor = {}; let called = 0;          a.constructor[Symbol.species] = function () { called = called + 1; };          let r = a.slice(1); return called + \":\" + r.length + \":\" + r[0];",
+        "1:2:2",
+    );
+    // The ordinary case — no custom constructor — still builds the right array.
+    check(
+        "map-default-species-still-works",
+        "return [1, 2, 3].map(function (x) { return x * 2; }).join(\",\");",
+        "2,4,6",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

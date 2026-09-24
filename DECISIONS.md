@@ -6253,3 +6253,36 @@ receiver before allocating anything.
 `this.constructor[Symbol.species]`, so a subclass gets a plain `Array` back and the
 `create-species-*` cases — which poison that lookup to observe it happening — see nothing to
 throw. That is a larger change than this batch and is left for one of its own.
+
+## D-222
+
+**The species protocol is consulted, even though its result is discarded.**
+
+Status: Accepted
+
+`filter`, `map`, `slice` and `splice` build their result through `ArraySpeciesCreate`, which
+reads `originalArray.constructor`, then `constructor[@@species]`, then constructs from whatever
+that resolves to. test262 has a family of cases — `create-ctor-poisoned`,
+`create-species-poisoned`, `create-species-abrupt`, `create-species-neg-zero` — that make each
+of those steps observable and assert it happens *before* the method touches an element (a
+poisoned lookup asserts the callback's call count is still zero).
+
+None of that was happening: the four methods went straight to building a plain array.
+
+**crisol cannot subclass `Array`** — `class X extends Array` is refused — so a species that
+resolves to a real `Array`, which is every non-throwing realistic case, produces an array
+indistinguishable from `ArrayCreate(length)`. So `array_species_create` is called for its
+*observable lookups* — the two property reads, either of which may be a throwing getter, and
+the constructor call, which may throw or may not be a constructor — and its result is
+**discarded**; the method builds the array it returns as before.
+
+That is a real deviation: a non-throwing custom species constructor has its return value
+ignored where the specification would use it. It has no observable consequence while `Array`
+cannot be subclassed, and it is written down here rather than hidden. When subclassing lands,
+this becomes "thread the species result through as the output array", which is a larger change
+to how each method stores — the reason it is not done now.
+
+The lookup order is the specification's and is load-bearing: `.constructor` before `@@species`
+before the construct, and all of it before the first element read — which is what the
+call-count-zero assertions check. `splice(0, -0)` constructs with a single `+0` argument, which
+`create-species-neg-zero` checks exactly.
