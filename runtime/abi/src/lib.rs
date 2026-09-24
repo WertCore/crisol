@@ -1894,13 +1894,22 @@ extern "C" fn number_to_fixed(
 }
 
 /// The boolean a receiver stands for.
-fn this_boolean(this_value: u64) -> bool {
-    if handle_of(this_value).is_some() {
-        return own_property(this_value, STRING_PRIMITIVE)
-            .and_then(|(_, held)| held.as_boolean())
-            .unwrap_or_default();
+fn require_boolean(this_value: u64) -> Result<bool, u64> {
+    let held = Value::from_bits(this_value);
+    if held.kind() == crisol_value::Kind::Boolean {
+        return Ok(held.as_boolean().unwrap_or(false));
     }
-    is_truthy(Value::from_bits(this_value))
+    // **A Boolean wrapper, and not a Number or String one.** All three keep their primitive in
+    // the same slot; `as_boolean` answering `Some` is what says this one holds a boolean, so
+    // `Boolean.prototype.toString.call(new Number(1))` reaches the throw rather than reading a
+    // number as `false`.
+    if handle_of(this_value).is_some()
+        && let Some((_, wrapped)) = own_property(this_value, STRING_PRIMITIVE)
+        && let Some(value) = wrapped.as_boolean()
+    {
+        return Ok(value);
+    }
+    Err(raise("this is not a Boolean", "TypeError"))
 }
 
 /// `Boolean.prototype.toString`.
@@ -1911,11 +1920,11 @@ extern "C" fn boolean_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    new_string(if this_boolean(this_value) {
-        "true"
-    } else {
-        "false"
-    })
+    match require_boolean(this_value) {
+        Ok(true) => new_string("true"),
+        Ok(false) => new_string("false"),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `Boolean.prototype.valueOf`.
@@ -1926,7 +1935,10 @@ extern "C" fn boolean_value_of(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    boolean(this_boolean(this_value)).to_bits()
+    match require_boolean(this_value) {
+        Ok(value) => boolean(value).to_bits(),
+        Err(thrown) => thrown,
+    }
 }
 
 /// Methods on `Symbol.prototype`.
@@ -3150,9 +3162,26 @@ fn time_of(this_value: u64) -> f64 {
     property_number(this_value, DATE_TIME).unwrap_or(f64::NAN)
 }
 
-/// One of the field readers, all of which answer `NaN` for an invalid date.
+/// The time value of `this`, or a `TypeError` when `this` is not a Date.
+///
+/// **`thisTimeValue` throws before it reads.** A Date getter on a non-Date receiver —
+/// `Date.prototype.getFullYear.call({})`, or `.call(Date.prototype)` itself — is a `TypeError`,
+/// not `NaN`: the two are different answers, and `NaN` is reserved for a real Date that holds
+/// an invalid time. The mark is the hidden `__time` slot, which only a real Date carries.
+fn require_time(this_value: u64) -> Result<f64, u64> {
+    if own_property(this_value, DATE_TIME).is_none() {
+        return Err(raise("this is not a Date", "TypeError"));
+    }
+    Ok(time_of(this_value))
+}
+
+/// One of the field readers, all of which answer `NaN` for an invalid date and throw for a
+/// non-date receiver.
 fn date_field(this_value: u64, read: impl FnOnce(&crisol_builtins::Fields) -> i64) -> u64 {
-    let time = time_of(this_value);
+    let time = match require_time(this_value) {
+        Ok(time) => time,
+        Err(thrown) => return thrown,
+    };
     crisol_builtins::fields(time).map_or_else(
         || from_number(f64::NAN),
         |fields| {
@@ -3171,7 +3200,10 @@ extern "C" fn date_get_time(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    from_number(time_of(this_value))
+    match require_time(this_value) {
+        Ok(time) => from_number(time),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `Date.prototype.getFullYear`.
@@ -3281,9 +3313,13 @@ extern "C" fn date_to_iso(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    // **An invalid date raises here and prints as text elsewhere.** `toISOString` has no
-    // spelling for one, where `toString` does.
-    crisol_builtins::to_iso_string(time_of(this_value)).map_or_else(
+    // **A non-date is a `TypeError`; an invalid date is a `RangeError`.** Two receivers, two
+    // failures: `toISOString` has no spelling for an invalid date, where `toString` does.
+    let time = match require_time(this_value) {
+        Ok(time) => time,
+        Err(thrown) => return thrown,
+    };
+    crisol_builtins::to_iso_string(time).map_or_else(
         || raise("this date cannot be represented as ISO text", "RangeError"),
         |text| new_string(&text),
     )
@@ -3302,7 +3338,11 @@ extern "C" fn date_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    crisol_builtins::to_date_time_string(time_of(this_value)).map_or_else(
+    let time = match require_time(this_value) {
+        Ok(time) => time,
+        Err(thrown) => return thrown,
+    };
+    crisol_builtins::to_date_time_string(time).map_or_else(
         || new_string(crisol_builtins::INVALID_DATE),
         |text| new_string(&text),
     )
@@ -3316,7 +3356,11 @@ extern "C" fn date_to_utc_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    crisol_builtins::to_utc_string(time_of(this_value)).map_or_else(
+    let time = match require_time(this_value) {
+        Ok(time) => time,
+        Err(thrown) => return thrown,
+    };
+    crisol_builtins::to_utc_string(time).map_or_else(
         || new_string(crisol_builtins::INVALID_DATE),
         |text| new_string(&text),
     )
@@ -3330,7 +3374,11 @@ extern "C" fn date_to_date_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    crisol_builtins::to_date_string(time_of(this_value)).map_or_else(
+    let time = match require_time(this_value) {
+        Ok(time) => time,
+        Err(thrown) => return thrown,
+    };
+    crisol_builtins::to_date_string(time).map_or_else(
         || new_string(crisol_builtins::INVALID_DATE),
         |text| new_string(&text),
     )
@@ -3344,7 +3392,11 @@ extern "C" fn date_to_time_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    crisol_builtins::to_time_string(time_of(this_value)).map_or_else(
+    let time = match require_time(this_value) {
+        Ok(time) => time,
+        Err(thrown) => return thrown,
+    };
+    crisol_builtins::to_time_string(time).map_or_else(
         || new_string(crisol_builtins::INVALID_DATE),
         |text| new_string(&text),
     )
@@ -11452,35 +11504,37 @@ fn array_species_create(original: u64, length: usize) -> u64 {
     if elements_of(original).is_none() {
         return with_new_array(length, |array| array.to_value().to_bits());
     }
-    let ctor = property_of(original, "constructor");
-    if Value::from_bits(ctor).is_exception() {
-        return ctor;
+    // **`C` starts as the constructor itself**, not as `undefined`. A non-object, non-nullish
+    // constructor — `a.constructor = 1` — is neither replaced by a species (it has none) nor
+    // taken as the default; it falls through to the `IsConstructor` check and throws, which is
+    // what `create-ctor-non-object` requires. Defaulting `C` to `undefined` here quietly used
+    // `Array` instead.
+    let mut c = property_of(original, "constructor");
+    if Value::from_bits(c).is_exception() {
+        return c;
     }
-    let mut species = Value::UNDEFINED.to_bits();
-    if Value::from_bits(ctor).kind() == crisol_value::Kind::Object {
+    if Value::from_bits(c).kind() == crisol_value::Kind::Object {
         let Some(symbol) = well_known_symbol("species") else {
             return with_new_array(length, |array| array.to_value().to_bits());
         };
-        species = crisol_computed_load(ctor, symbol);
-        if Value::from_bits(species).is_exception() {
-            return species;
+        c = crisol_computed_load(c, symbol);
+        if Value::from_bits(c).is_exception() {
+            return c;
         }
     }
-    let held = Value::from_bits(species);
+    let held = Value::from_bits(c);
     // **`null` and `undefined` both mean the default**, which is `Array` — the one place the
     // two nullish values are treated alike here.
     if held.is_undefined() || held.kind() == crisol_value::Kind::Null {
         return with_new_array(length, |array| array.to_value().to_bits());
     }
-    if !is_constructor(species) {
+    if !is_constructor(c) {
         return raise("the array species is not a constructor", "TypeError");
     }
     #[expect(clippy::cast_precision_loss, reason = "a length below 2^32")]
     let arg = [Value::number(length as f64).to_bits()];
     // SAFETY: `arg` holds exactly one readable value and outlives the call.
-    with_rooted(&[original, species], || unsafe {
-        construct_with(species, species, 1, arg.as_ptr())
-    })
+    with_rooted(&[original, c], || unsafe { construct_with(c, c, 1, arg.as_ptr()) })
 }
 
 /// Reads one element, or `undefined` past the end.

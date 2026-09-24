@@ -6286,3 +6286,29 @@ The lookup order is the specification's and is load-bearing: `.constructor` befo
 before the construct, and all of it before the first element read — which is what the
 call-count-zero assertions check. `splice(0, -0)` constructs with a single `+0` argument, which
 `create-species-neg-zero` checks exactly.
+
+## D-223
+
+**A method that reads a receiver's internal slot throws when the slot is absent.**
+
+Status: Accepted
+
+`Date.prototype.getFullYear.call({})` answered `NaN`; `Boolean.prototype.toString.call(1)`
+answered `"true"`. Both should be a `TypeError`. The pattern is `thisTimeValue` /
+`thisBooleanValue`: a method that reads `[[DateValue]]` or `[[BooleanData]]` throws before
+reading when the receiver does not have that slot — and test262 has a `this-value-non-*` case
+for nearly every one.
+
+The distinction the check preserves is the point: `NaN` is a *real* Date holding an invalid
+time (`new Date(0/0).getTime()` is `NaN`, not a throw), and `false` is a real Boolean. Only the
+absence of the slot — the hidden `__time` property, or a wrapper whose stored primitive reads
+back as a boolean — is a type error. Every Date getter, `getTime`/`valueOf`, `toISOString`
+(a `TypeError` for a non-date, still a `RangeError` for an invalid one) and the four `toString`
+printers now go through `require_time`; `Boolean.prototype.toString`/`valueOf` through
+`require_boolean`.
+
+**And a correction to D-222**: `ArraySpeciesCreate` with a non-object, non-nullish constructor
+— `a.constructor = 1` — must throw, because `1` is neither replaced by a species (it has none)
+nor the default. The first cut defaulted `C` to `undefined` and used `Array`; `C` now starts as
+the constructor itself and falls through to the `IsConstructor` check, which is what
+`create-ctor-non-object` requires.

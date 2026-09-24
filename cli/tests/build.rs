@@ -843,6 +843,83 @@ fn a_species_aware_method_consults_the_constructor_first() {
         "return [1, 2, 3].map(function (x) { return x * 2; }).join(\",\");",
         "2,4,6",
     );
+    // **A non-object, non-nullish constructor throws** — it is neither replaced by a species
+    // nor taken as the default.
+    check(
+        "slice-ctor-non-object",
+        "let a = [1, 2]; a.constructor = 1;          try { a.slice(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **A Date accessor on a non-Date receiver is a `TypeError`, not `NaN`.**
+///
+/// `thisTimeValue` throws before it reads; `NaN` is reserved for a real Date holding an invalid
+/// time. The mark is the hidden time slot, which only a real Date carries.
+#[test]
+fn a_date_accessor_rejects_a_non_date_receiver() {
+    for method in [
+        "getFullYear",
+        "getMonth",
+        "getDate",
+        "getDay",
+        "getHours",
+        "getTime",
+        "getTimezoneOffset",
+        "valueOf",
+        "toISOString",
+        "toString",
+        "toUTCString",
+        "toDateString",
+    ] {
+        check(
+            &format!("date-{method}-on-non-date"),
+            &format!(
+                "try {{ Date.prototype.{method}.call({{}}); return "no"; }}                  catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // `Date.prototype` itself is not a Date, which is the receiver a program reaches by
+    // accident most often.
+    check(
+        "date-getfullyear-on-prototype",
+        "try { Date.prototype.getFullYear(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // **An invalid but real Date still answers rather than throwing** — the distinction the
+    // receiver check preserves.
+    check("invalid-date-get-time", "return new Date(0 / 0).getTime();", "NaN");
+    check(
+        "invalid-date-to-string",
+        "return new Date(0 / 0).toString();",
+        "Invalid Date",
+    );
+    // And a real Date still works through the checked path.
+    check("real-date-get-time", "return new Date(0).getTime();", "0");
+    check("real-date-utc-string", "return new Date(0).toUTCString();", "Thu, 01 Jan 1970 00:00:00 GMT");
+}
+
+/// `Boolean.prototype.toString`/`valueOf` on a non-Boolean receiver is a `TypeError`.
+#[test]
+fn a_boolean_method_rejects_a_non_boolean_receiver() {
+    check(
+        "boolean-tostring-on-object",
+        "try { Boolean.prototype.toString.call({}); return \"no\"; }          catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "boolean-valueof-on-number",
+        "try { Boolean.prototype.valueOf.call(5); return \"no\"; }          catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A real boolean, and a Boolean wrapper, both still work.
+    check("boolean-tostring-primitive", "return true.toString();", "true");
+    check(
+        "boolean-valueof-wrapper",
+        "return Boolean.prototype.valueOf.call(new Boolean(false));",
+        "false",
+    );
 }
 
 #[test]
