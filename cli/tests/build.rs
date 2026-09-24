@@ -875,7 +875,7 @@ fn a_date_accessor_rejects_a_non_date_receiver() {
         check(
             &format!("date-{method}-on-non-date"),
             &format!(
-                "try {{ Date.prototype.{method}.call({{}}); return "no"; }}                  catch (e) {{ return e.name; }}"
+                "try {{ Date.prototype.{method}.call({{}}); return 1; }} catch (e) {{ return e.name; }}"
             ),
             "TypeError",
         );
