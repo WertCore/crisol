@@ -5357,8 +5357,9 @@ extern "C" fn string_at(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     let wanted = match integer_argument(argc, argv, 0) {
@@ -5388,7 +5389,10 @@ extern "C" fn string_trim_start(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(text.trim_start()))
+    match coercible_text(this_value) {
+        Ok(text) => new_string(text.trim_start()),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `String.prototype.trimEnd`.
@@ -5399,13 +5403,17 @@ extern "C" fn string_trim_end(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(text.trim_end()))
+    match coercible_text(this_value) {
+        Ok(text) => new_string(text.trim_end()),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `padStart` and `padEnd`, which differ only in which side the filling goes.
 fn pad_with(this_value: u64, argc: u64, argv: *const u64, at_start: bool) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return new_string("");
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     let target = match integer_argument(argc, argv, 0) {
@@ -5486,8 +5494,9 @@ extern "C" fn string_pad_end(
 /// why `replaceAll` with a non-global regular expression is a `TypeError` rather than quietly
 /// behaving like `replace`.
 fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return new_string("");
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let pattern = unsafe { argument(argc, argv, 0) };
@@ -6061,8 +6070,9 @@ extern "C" fn string_locale_compare(
     if let Some(thrown) = reject_nullish(this_value, "cannot compare") {
         return thrown;
     }
-    let Some(text) = this_text(this_value) else {
-        return Value::number(0.0).to_bits();
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let other = unsafe { argument(argc, argv, 0) };
@@ -6089,8 +6099,9 @@ extern "C" fn string_substr(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return new_string("");
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     let start = match integer_argument(argc, argv, 0) {
@@ -6169,8 +6180,9 @@ extern "C" fn string_match(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return Value::NULL.to_bits();
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let pattern = unsafe { argument(argc, argv, 0) };
@@ -6231,8 +6243,9 @@ extern "C" fn string_search(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return Value::number(-1.0).to_bits();
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let pattern = unsafe { argument(argc, argv, 0) };
@@ -6351,8 +6364,9 @@ extern "C" fn string_char_at(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return new_string("");
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     let index = match integer_argument(argc, argv, 0) {
@@ -6384,8 +6398,9 @@ extern "C" fn string_char_code_at(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return from_number(f64::NAN);
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     let index = match integer_argument(argc, argv, 0) {
@@ -6576,8 +6591,9 @@ extern "C" fn string_slice(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return new_string("");
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
@@ -6605,8 +6621,9 @@ extern "C" fn string_substring(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return new_string("");
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     let clamp = |bits: u64, fallback: usize| -> usize {
@@ -6641,7 +6658,10 @@ extern "C" fn string_to_upper(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(&text.to_uppercase()))
+    match coercible_text(this_value) {
+        Ok(text) => new_string(&text.to_uppercase()),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `String.prototype.toLowerCase`.
@@ -6652,7 +6672,10 @@ extern "C" fn string_to_lower(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(&text.to_lowercase()))
+    match coercible_text(this_value) {
+        Ok(text) => new_string(&text.to_lowercase()),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `String.prototype.trim`.
@@ -6663,7 +6686,10 @@ extern "C" fn string_trim(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    this_text(this_value).map_or_else(|| new_string(""), |text| new_string(text.trim()))
+    match coercible_text(this_value) {
+        Ok(text) => new_string(text.trim()),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `String.prototype.concat`.
@@ -6674,7 +6700,10 @@ extern "C" fn string_concat(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let mut out = this_text(this_value).unwrap_or_default();
+    let mut out = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
     for position in 0..argc as usize {
         // SAFETY: the convention guarantees `argc` readable values at `argv`.
         let piece = unsafe { argument(argc, argv, position) };
@@ -6691,8 +6720,9 @@ extern "C" fn string_repeat(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return new_string("");
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     let count = match integer_argument(argc, argv, 0) {
         Ok(count) => count,
@@ -6732,8 +6762,9 @@ extern "C" fn string_split(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let Some(text) = this_text(this_value) else {
-        return Value::UNDEFINED.to_bits();
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let given = unsafe { argument(argc, argv, 0) };

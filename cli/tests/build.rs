@@ -1088,6 +1088,56 @@ fn the_search_methods_honour_their_position() {
     check("includes-plain", "return \"abc\".includes(\"b\");", "true");
 }
 
+/// The rest of the string methods `RequireObjectCoercible` too — a sweep of the same fix as the
+/// six search methods, so a nullish or symbol receiver throws rather than reading as empty.
+#[test]
+fn every_string_method_requires_a_coercible_receiver() {
+    let methods = [
+        "charAt",
+        "at",
+        "slice",
+        "substring",
+        "substr",
+        "toUpperCase",
+        "toLowerCase",
+        "trim",
+        "trimStart",
+        "trimEnd",
+        "repeat",
+        "concat",
+        "split",
+    ];
+    for method in methods {
+        check(
+            &format!("string-sweep-{method}-on-undefined"),
+            &format!(
+                "try {{ String.prototype.{method}.call(undefined); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("string-sweep-{method}-on-symbol"),
+            &format!(
+                "try {{ String.prototype.{method}.call(Symbol()); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A number receiver still coerces through every one of them.
+    check(
+        "sweep-slice-on-number",
+        "return String.prototype.slice.call(12345, 1, 3);",
+        "23",
+    );
+    check(
+        "sweep-upper-on-boolean",
+        "return String.prototype.toUpperCase.call(true);",
+        "TRUE",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

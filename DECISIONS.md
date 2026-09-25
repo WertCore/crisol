@@ -6364,3 +6364,24 @@ Not done: the `IsRegExp` guard that makes `"x".includes(/re/)` a `TypeError` bef
 and the full `this_text`→`coercible_text` conversion for the ~20 other string methods that
 should also `RequireObjectCoercible`. Both are mechanical extensions of this and left for a
 sweep of their own rather than mixed in blind.
+
+## D-226
+
+**The rest of the string methods `RequireObjectCoercible`, completing D-225's sweep.**
+
+Status: Accepted
+
+D-225 fixed the six search methods and left the note that ~20 others still answered `"undefined"`
+or empty for a nullish or symbol receiver. This is that sweep: every remaining
+`String.prototype` method that read its receiver through `this_text` now reads it through
+`coercible_text`, so `charAt`, `at`, `slice`, `substring`, `substr`, the two `toLocale*Case`
+and case methods, `trim`/`trimStart`/`trimEnd`, `repeat`, `concat` and `split` all throw a
+`TypeError` on `null`/`undefined`/symbol and coerce everything else.
+
+**`toString` and `valueOf` are deliberately not converted.** They use `thisStringValue`, which
+is stricter than `RequireObjectCoercible`: a *number* receiver is a `TypeError` there, not
+coerced to `"5"`. `coercible_text` would coerce it, so those two keep their own reading.
+`toWellFormed`/`isWellFormed` already reject nullish through `reject_nullish` and are left as
+they are.
+
+Mechanical, one pattern applied 19 times, which is why it is one commit rather than nineteen.
