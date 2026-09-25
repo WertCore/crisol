@@ -4357,8 +4357,7 @@ fn every_object_reaches_object_prototype() {
     );
 }
 
-/// **The array tag is the only one distinguished**: a real engine reads `Symbol.toStringTag`,
-/// and without symbols the honest choice is the one distinction that can be made.
+/// **`Symbol.toStringTag` overrides the builtin tag**, now that a symbol can be a key (D-233).
 #[test]
 fn object_to_string_reports_a_tag() {
     check(
@@ -4375,6 +4374,49 @@ fn object_to_string_reports_a_tag() {
         "tag-null",
         "return Object.prototype.toString.call(null);",
         "[object Null]",
+    );
+    check(
+        "tag-undefined",
+        "return Object.prototype.toString.call(undefined);",
+        "[object Undefined]",
+    );
+    check(
+        "tag-number-primitive",
+        "return Object.prototype.toString.call(5);",
+        "[object Number]",
+    );
+    // The namespaces carry a `Symbol.toStringTag`.
+    check(
+        "tag-math",
+        "return Object.prototype.toString.call(Math);",
+        "[object Math]",
+    );
+    check(
+        "tag-json",
+        "return Object.prototype.toString.call(JSON);",
+        "[object JSON]",
+    );
+    // A program's own tag wins over the builtin one.
+    check(
+        "tag-custom",
+        "let o = {}; o[Symbol.toStringTag] = \"Cool\"; \
+         return Object.prototype.toString.call(o);",
+        "[object Cool]",
+    );
+    // A non-string tag falls back to the builtin.
+    check(
+        "tag-non-string-ignored",
+        "let o = {}; o[Symbol.toStringTag] = 42; \
+         return Object.prototype.toString.call(o);",
+        "[object Object]",
+    );
+    // A throwing tag getter propagates.
+    check(
+        "tag-getter-throws",
+        "let o = {}; Object.defineProperty(o, Symbol.toStringTag, \
+             {get: function () { throw new RangeError(\"x\"); }}); \
+         try { Object.prototype.toString.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
     );
 }
 

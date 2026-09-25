@@ -6509,3 +6509,24 @@ the live iterator object that D-194 also wants for arrays.
 `values` — the same-object aliasing the array already used. And `%IteratorPrototype%` gained
 `[Symbol.iterator]` returning `this` (`iterator_self`), so an iterator is its own iterable and
 `Array.from`/spread drain it directly, not only the collection behind it.
+
+## D-233
+
+**`Object.prototype.toString` consults `Symbol.toStringTag`.**
+
+Status: Accepted
+
+It answered `"[object Object]"` for `Math`, `JSON` and `Reflect`, and ignored a program's own
+`Symbol.toStringTag` — the code even said so, with a note that symbols could not be keys yet.
+D-149 closed that; the note was stale.
+
+`object_to_text` now computes the builtin tag (from the internal slot the receiver carries) as
+the *fallback*, then reads `this[Symbol.toStringTag]` and uses it when it is a string — the
+specification's order. A non-string tag is ignored; a getter that throws propagates. `Math`,
+`JSON` and `Reflect` are given the tag (`"Math"` etc.), which is what
+`Object.prototype.toString.call(Math)` reads.
+
+`undefined` and `null` still answer before any lookup — they have no object to read the tag
+from. The builtin `RegExp` and `Arguments` tags are still not distinguished (they need a brand
+this does not carry), so `Object.prototype.toString.call(/x/)` remains `"[object Object]"` —
+recorded rather than pretended.

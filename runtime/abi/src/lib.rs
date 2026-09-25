@@ -4873,41 +4873,59 @@ extern "C" fn object_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    // **`Symbol.toStringTag` is not consulted**, because symbols cannot be property keys yet
-    // (D-149). Everything below is the fallback the specification gives when that lookup finds
-    // nothing, which is what every object in the corpus actually reaches.
-    if elements_of(this_value).is_some() {
-        return new_string("[object Array]");
-    }
+    // **`undefined` and `null` answer without a lookup**, and before `ToObject` — they have no
+    // object to read `Symbol.toStringTag` from.
     let held = Value::from_bits(this_value);
-    let tag = match held.kind() {
-        crisol_value::Kind::Undefined => "Undefined",
-        crisol_value::Kind::Null => "Null",
-        // A primitive receiver is wrapped first, and the wrapper's class is what is reported.
-        crisol_value::Kind::Number => "Number",
-        crisol_value::Kind::Boolean => "Boolean",
-        crisol_value::Kind::String => "String",
-        crisol_value::Kind::Symbol => "Symbol",
-        crisol_value::Kind::Object => {
-            if is_callable(this_value) {
-                "Function"
-            } else if own_flag(this_value, DATE_TIME) {
-                "Date"
-            } else if own_flag(this_value, ERROR_DATA) {
-                "Error"
-            } else {
-                // A wrapper carries the primitive it wraps, and its class follows from what
-                // that primitive is — the one thing distinguishing `new String("")` from `{}`.
-                match own_property(this_value, STRING_PRIMITIVE).map(|(_, value)| value.kind()) {
-                    Some(crisol_value::Kind::String) => "String",
-                    Some(crisol_value::Kind::Number) => "Number",
-                    Some(crisol_value::Kind::Boolean) => "Boolean",
-                    _ => "Object",
+    if held.kind() == crisol_value::Kind::Undefined {
+        return new_string("[object Undefined]");
+    }
+    if held.kind() == crisol_value::Kind::Null {
+        return new_string("[object Null]");
+    }
+    // The builtin tag, from the internal slot the receiver carries — the fallback when there is
+    // no `Symbol.toStringTag`.
+    let builtin = if elements_of(this_value).is_some() {
+        "Array"
+    } else {
+        match held.kind() {
+            // A primitive receiver is wrapped first, and the wrapper's class is what is
+            // reported.
+            crisol_value::Kind::Number => "Number",
+            crisol_value::Kind::Boolean => "Boolean",
+            crisol_value::Kind::String => "String",
+            crisol_value::Kind::Symbol => "Object",
+            _ => {
+                if is_callable(this_value) {
+                    "Function"
+                } else if own_flag(this_value, DATE_TIME) {
+                    "Date"
+                } else if own_flag(this_value, ERROR_DATA) {
+                    "Error"
+                } else {
+                    match own_property(this_value, STRING_PRIMITIVE).map(|(_, value)| value.kind())
+                    {
+                        Some(crisol_value::Kind::String) => "String",
+                        Some(crisol_value::Kind::Number) => "Number",
+                        Some(crisol_value::Kind::Boolean) => "Boolean",
+                        _ => "Object",
+                    }
                 }
             }
         }
     };
-    new_string(&format!("[object {tag}]"))
+    // **`Symbol.toStringTag` overrides the builtin tag when it is a string.** `Math`, `JSON` and
+    // `Reflect` carry one, and a class may define one; a getter there may throw, which
+    // propagates (D-233). D-149 is closed, so this lookup is now possible.
+    if let Some(symbol) = well_known_symbol("toStringTag") {
+        let tag = with_rooted(&[this_value], || crisol_computed_load(this_value, symbol));
+        if Value::from_bits(tag).is_exception() {
+            return tag;
+        }
+        if let Some(text) = text_of(tag) {
+            return new_string(&format!("[object {text}]"));
+        }
+    }
+    new_string(&format!("[object {builtin}]"))
 }
 
 /// `Object.prototype.valueOf`.
@@ -10165,6 +10183,33 @@ impl Runtime {
             let text = self.string(&format!("[Symbol.{name}]"));
             self.define_named(function, "name", text);
             self.define_named(function, "length", Value::number(1.0));
+        }
+
+        // **`Symbol.toStringTag` on the namespaces that carry one**, so
+        // `Object.prototype.toString.call(Math)` is `"[object Math]"` rather than `"[object
+        // Object]"`. The tag is read by `object_to_text`; defining it here is what gives it
+        // something to read.
+        let tag = {
+            let named = PropertyKey::new("toStringTag");
+            self.heap
+                .shape_of(symbol)
+                .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                .and_then(|slot| self.heap.get(symbol, slot.index()))
+                .and_then(|value| value.as_address())
+        };
+        if let Some(tag) = tag {
+            KEY_SYMBOLS.with(|symbols| {
+                if let Ok(mut entries) = symbols.try_borrow_mut() {
+                    entries.insert(Value::symbol(tag).to_bits());
+                }
+            });
+            let key = PropertyKey::symbol(tag, "Symbol.toStringTag");
+            for name in ["Math", "JSON", "Reflect"] {
+                if let Some(namespace) = self.global_object(globals, name) {
+                    let text = self.string(name);
+                    self.define_keyed(namespace, &key, text);
+                }
+            }
         }
     }
 
