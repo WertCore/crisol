@@ -3186,6 +3186,27 @@ fn detaching_a_buffer_empties_its_views() {
     );
 }
 
+/// The `v` (unicodeSets) flag: it parses, reports itself, does set operations in a character class,
+/// and is mutually exclusive with `u`.
+#[test]
+fn regexp_v_flag_does_set_operations() {
+    check("v-flag-reported", "return /a/v.flags;", "v");
+    check("v-unicode-sets", "return /a/v.unicodeSets;", "true");
+    check("v-basic-match", "return /[\\d]/v.test(\"5\");", "true");
+    // `[[a-z]&&[aeiou]]` is the intersection — the vowels — so a consonant does not match.
+    check(
+        "v-set-intersection",
+        "let re = /[[a-z]&&[aeiou]]/v; return re.test(\"e\") && !re.test(\"z\");",
+        "true",
+    );
+    check(
+        "v-and-u-exclusive",
+        "try { new RegExp(\"a\", \"uv\"); return \"no\"; } \
+         catch (e) { return e instanceof SyntaxError; }",
+        "true",
+    );
+}
+
 /// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults
 /// (taken only when the value is `undefined`), holes, nesting, a computed key, a string source,
 /// and the `TypeError` a nullish source raises.

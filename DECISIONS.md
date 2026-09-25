@@ -6794,3 +6794,19 @@ construction — so the `length`/`byteLength` getters consult the flag and repor
 Deferred: the exact `TypeError`-on-detached that many operations owe (a `DataView` read on a
 detached buffer answers `RangeError` from the short store rather than `TypeError`), and the rest of
 the `$262` surface (`createRealm`, `evalScript`, `agent`, `global`, `gc`, `IsHTMLDDA`).
+
+## D-245
+
+**The RegExp `v` flag (unicodeSets).**
+
+Status: Accepted
+
+`regress` — the JavaScript-regex crate crisol already builds on — supports unicodeSets in full
+(`Flags.unicode_sets`, set operations in character classes, properties of strings). So `v` is not
+an engine feature to write but a flag to wire: crisol's `Flags` gains a `unicode_sets` field, `parse`
+accepts `v` and rejects `u`+`v` together (the `SyntaxError` the specification names — `v` is a
+different dialect of the same mode, not an addition), `flags` reports it in the `dgimsuvy` order, and
+`JsRegExp::new` passes it through to `regress`. The instance also gains `unicodeSets` (and the
+previously-absent `hasIndices`) as a data property. That clears the "invalid regular expression
+flags" cases that were only failing because the flag was refused, and set operations like
+`/[[a-z]&&[aeiou]]/v` now match through `regress`.

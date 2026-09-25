@@ -17023,7 +17023,9 @@ pub unsafe extern "C" fn crisol_create_regexp(
             runtime.define(handle, "multiline", boolean(parsed.multiline));
             runtime.define(handle, "sticky", boolean(parsed.sticky));
             runtime.define(handle, "unicode", boolean(parsed.unicode));
+            runtime.define(handle, "unicodeSets", boolean(parsed.unicode_sets));
             runtime.define(handle, "dotAll", boolean(parsed.dot_all));
+            runtime.define(handle, "hasIndices", boolean(parsed.has_indices));
             if let Some(prototype) = REGEXP_PROTOTYPE.with(std::cell::Cell::get) {
                 runtime.heap.set_prototype(handle, Some(prototype));
             }
