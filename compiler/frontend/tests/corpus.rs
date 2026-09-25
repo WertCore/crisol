@@ -333,10 +333,11 @@ fn unfaithful_programs_are_reported_not_guessed() {
     // dump. A compiler that silently emits `undefined` for syntax it did not read produces a
     // program that runs and is wrong, which is worse than one that refuses.
     let cases = [
-        // The function itself lowers now; what does not is **hoisting**. The binding appears
-        // where the declaration does, so calling it earlier in the source reads an unset slot
-        // rather than working. Recorded rather than left silently half-right.
-        ("let [a] = [1];", "destructuring declaration"),
+        // Destructuring itself lowers now (D-242); what does not is the **rest** element, which
+        // gathers the remaining values into a fresh array or object this has no runtime copy for.
+        // Recorded rather than left silently half-right.
+        ("let [...a] = [1];", "array rest pattern"),
+        ("let { ...r } = {};", "object rest pattern"),
         ("let o = { ...{} };", "object spread"),
         // A hole is not `undefined` (D-64) and the IR cannot yet say so, so it is recorded
         // rather than filled in with a value that reads the same and answers `in` differently.
