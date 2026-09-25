@@ -1365,59 +1365,61 @@ extern "C" fn array_reduce_right(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let length = match indexed_length(this_value) {
-        Ok(length) => length,
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let callback = unsafe { argument(argc, argv, 0) };
-    // **Checked before a single element is read.** `[1, 2].map(5)` throws
-    // rather than calling nothing twice and answering `[undefined,
-    // undefined]` — which is what reaching `crisol_not_a_function` per
-    // element produced, and it looked like a working call every time.
-    if !is_callable(callback) {
-        return raise("a callback must be a function", "TypeError");
-    }
-    // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let mut position = length;
-        let mut total = if argc > 1 {
-            // SAFETY: the count was just checked.
-            unsafe { argument(argc, argv, 1) }
-        } else if position == 0 {
-            // **An empty array with no initial value is a `TypeError`**, not `undefined` —
-            // there is no answer to give, and inventing one hides the mistake.
-            return raise(
-                "reduceRight of an empty array with no initial value",
-                "TypeError",
-            );
-        } else {
-            position -= 1;
-            match indexed_get_checked(this_value, position) {
-                Ok(last) => last,
-                Err(thrown) => return thrown,
-            }
-        };
-        while position > 0 {
-            position -= 1;
-            let element = match with_rooted(&[total], || indexed_get_checked(this_value, position))
-            {
-                Ok(element) => element,
+        with_rooted(&[receiver], || {
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
                 Err(thrown) => return thrown,
             };
-            total = with_rooted(&[total, element], || {
-                call_value(
-                    callback,
-                    Value::UNDEFINED.to_bits(),
-                    &[total, element, index_value(position), this_value],
-                )
-            });
-            if Value::from_bits(total).is_exception() {
-                return total;
+            // SAFETY: the convention guarantees `argc` readable values at `argv`.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
             }
-        }
-        total
+            let mut position = length;
+            let mut total = if argc > 1 {
+                // SAFETY: the count was just checked.
+                unsafe { argument(argc, argv, 1) }
+            } else if position == 0 {
+                // **An empty array with no initial value is a `TypeError`**, not `undefined` —
+                // there is no answer to give, and inventing one hides the mistake.
+                return raise(
+                    "reduceRight of an empty array with no initial value",
+                    "TypeError",
+                );
+            } else {
+                position -= 1;
+                match indexed_get_checked(receiver, position) {
+                    Ok(last) => last,
+                    Err(thrown) => return thrown,
+                }
+            };
+            while position > 0 {
+                position -= 1;
+                let element =
+                    match with_rooted(&[total], || indexed_get_checked(receiver, position)) {
+                        Ok(element) => element,
+                        Err(thrown) => return thrown,
+                    };
+                total = with_rooted(&[total, element], || {
+                    call_value(
+                        callback,
+                        Value::UNDEFINED.to_bits(),
+                        &[total, element, index_value(position), receiver],
+                    )
+                });
+                if Value::from_bits(total).is_exception() {
+                    return total;
+                }
+            }
+            total
+        })
     })
 }
 
@@ -12222,64 +12224,59 @@ extern "C" fn array_map(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        // **A length of 2^32 or more is a `RangeError`**, because the result cannot exist.
-        // Walking such a thing is merely slow; building one is four billion allocations, and
-        // that arrived as a killed process rather than an error a program could catch.
-        if !indexed_length_is_valid(this_value) {
-            return raise("invalid array length", "RangeError");
-        }
-        let length = match indexed_length(this_value) {
-            Ok(length) => length,
-            Err(thrown) => return thrown,
-        };
-        // SAFETY: the convention guarantees `argc` readable values at `argv`.
-        let callback = unsafe { argument(argc, argv, 0) };
-        // **Checked before a single element is read.** `[1, 2].map(5)` throws
-        // rather than calling nothing twice and answering `[undefined,
-        // undefined]` — which is what reaching `crisol_not_a_function` per
-        // element produced, and it looked like a working call every time.
-        if !is_callable(callback) {
-            return raise("a callback must be a function", "TypeError");
-        }
-
-        // Before a single element is read, so a throwing species lookup leaves the callback
-        // uncalled — `create-species-poisoned` asserts a call count of zero.
-        let probe = array_species_create(this_value, length);
-        if Value::from_bits(probe).is_exception() {
-            return probe;
-        }
-
-        // SAFETY: as above.
-        let this_arg = unsafe { argument(argc, argv, 1) };
-        with_new_array(length, |result| {
-            for index in 0..length {
-                let element = match indexed_get_checked(this_value, index) {
-                    Ok(element) => element,
-                    Err(thrown) => return thrown,
-                };
-                // **The callback's `this` is the second argument, not the array.**
-                // `[11].map(fn, o)` runs `fn` with `this === o`; passing the array made every
-                // `this` inside a mapped callback wrong, silently.
-                let mapped = call_value(
-                    callback,
-                    this_arg,
-                    &[element, index_value(index), this_value],
-                );
-                // A throw from the callback stops the walk and reaches the caller, rather than
-                // being stored as an element and the loop carrying on.
-                if Value::from_bits(mapped).is_exception() {
-                    return mapped;
-                }
-                with_runtime(|runtime| {
-                    runtime
-                        .heap
-                        .set_element(result, index, Value::from_bits(mapped))
-                });
+        with_rooted(&[receiver], || {
+            // **A length of 2^32 or more is a `RangeError`**, because the result cannot exist.
+            // Walking such a thing is merely slow; building one is four billion allocations,
+            // and that arrived as a killed process rather than an error a program could catch.
+            if !indexed_length_is_valid(receiver) {
+                return raise("invalid array length", "RangeError");
             }
-            result.to_value().to_bits()
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
+                Err(thrown) => return thrown,
+            };
+            // SAFETY: the convention guarantees `argc` readable values at `argv`.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
+            }
+            // Before a single element is read, so a throwing species lookup leaves the callback
+            // uncalled — `create-species-poisoned` asserts a call count of zero.
+            let probe = array_species_create(receiver, length);
+            if Value::from_bits(probe).is_exception() {
+                return probe;
+            }
+            // SAFETY: as above.
+            let this_arg = unsafe { argument(argc, argv, 1) };
+            with_new_array(length, |result| {
+                for index in 0..length {
+                    let element = match indexed_get_checked(receiver, index) {
+                        Ok(element) => element,
+                        Err(thrown) => return thrown,
+                    };
+                    // **The callback's `this` is the second argument, not the array.**
+                    // `[11].map(fn, o)` runs `fn` with `this === o`.
+                    let mapped =
+                        call_value(callback, this_arg, &[element, index_value(index), receiver]);
+                    // A throw from the callback stops the walk and reaches the caller.
+                    if Value::from_bits(mapped).is_exception() {
+                        return mapped;
+                    }
+                    with_runtime(|runtime| {
+                        runtime
+                            .heap
+                            .set_element(result, index, Value::from_bits(mapped))
+                    });
+                }
+                result.to_value().to_bits()
+            })
         })
     })
 }
@@ -12292,63 +12289,60 @@ extern "C" fn array_filter(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let length = match indexed_length(this_value) {
-            Ok(length) => length,
-            Err(thrown) => return thrown,
-        };
-        // SAFETY: as above.
-        let callback = unsafe { argument(argc, argv, 0) };
-        // **Checked before a single element is read.** `[1, 2].map(5)` throws
-        // rather than calling nothing twice and answering `[undefined,
-        // undefined]` — which is what reaching `crisol_not_a_function` per
-        // element produced, and it looked like a working call every time.
-        if !is_callable(callback) {
-            return raise("a callback must be a function", "TypeError");
-        }
-
-        // Like `map`, before the callback so a throwing species lookup leaves the count at
-        // zero. `filter` species-creates with length zero in the specification; the result is
-        // discarded either way (see `array_species_create`).
-        let probe = array_species_create(this_value, 0);
-        if Value::from_bits(probe).is_exception() {
-            return probe;
-        }
-
-        // Allocated at full length and shortened after, because the result is rooted through the
-        // whole loop and the count is not known until the end.
-        // SAFETY: as above.
-        let this_arg = unsafe { argument(argc, argv, 1) };
-        with_new_array(length, |result| {
-            let mut kept = 0;
-            for index in 0..length {
-                let element = match indexed_get_checked(this_value, index) {
-                    Ok(element) => element,
-                    Err(thrown) => return thrown,
-                };
-                let verdict = call_value(
-                    callback,
-                    this_arg,
-                    &[element, index_value(index), this_value],
-                );
-                if Value::from_bits(verdict).is_exception() {
-                    return verdict;
-                }
-                if is_truthy(Value::from_bits(verdict)) {
-                    with_runtime(|runtime| {
-                        runtime
-                            .heap
-                            .set_element(result, kept, Value::from_bits(element))
-                    });
-                    kept += 1;
-                }
+        with_rooted(&[receiver], || {
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
+                Err(thrown) => return thrown,
+            };
+            // SAFETY: as above.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
             }
-            // `truncate_elements`, not `make_array`: the latter replaces the elements, so
-            // sizing the result this way discarded everything `filter` had just kept.
-            with_runtime(|runtime| runtime.heap.truncate_elements(result, kept));
-            result.to_value().to_bits()
+            // Like `map`, before the callback so a throwing species lookup leaves the count at
+            // zero. `filter` species-creates with length zero in the specification; the result
+            // is discarded either way (see `array_species_create`).
+            let probe = array_species_create(receiver, 0);
+            if Value::from_bits(probe).is_exception() {
+                return probe;
+            }
+            // Allocated at full length and shortened after, because the result is rooted
+            // through the whole loop and the count is not known until the end.
+            // SAFETY: as above.
+            let this_arg = unsafe { argument(argc, argv, 1) };
+            with_new_array(length, |result| {
+                let mut kept = 0;
+                for index in 0..length {
+                    let element = match indexed_get_checked(receiver, index) {
+                        Ok(element) => element,
+                        Err(thrown) => return thrown,
+                    };
+                    let verdict =
+                        call_value(callback, this_arg, &[element, index_value(index), receiver]);
+                    if Value::from_bits(verdict).is_exception() {
+                        return verdict;
+                    }
+                    if is_truthy(Value::from_bits(verdict)) {
+                        with_runtime(|runtime| {
+                            runtime
+                                .heap
+                                .set_element(result, kept, Value::from_bits(element))
+                        });
+                        kept += 1;
+                    }
+                }
+                // `truncate_elements`, not `make_array`: the latter replaces the elements, so
+                // sizing the result this way discarded everything `filter` had just kept.
+                with_runtime(|runtime| runtime.heap.truncate_elements(result, kept));
+                result.to_value().to_bits()
+            })
         })
     })
 }
@@ -12361,39 +12355,38 @@ extern "C" fn array_for_each(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let length = match indexed_length(this_value) {
-            Ok(length) => length,
-            Err(thrown) => return thrown,
-        };
-        // SAFETY: as above.
-        let callback = unsafe { argument(argc, argv, 0) };
-        // **Checked before a single element is read.** `[1, 2].map(5)` throws
-        // rather than calling nothing twice and answering `[undefined,
-        // undefined]` — which is what reaching `crisol_not_a_function` per
-        // element produced, and it looked like a working call every time.
-        if !is_callable(callback) {
-            return raise("a callback must be a function", "TypeError");
-        }
-        // SAFETY: as above.
-        let this_arg = unsafe { argument(argc, argv, 1) };
-        for index in 0..length {
-            let element = match indexed_get_checked(this_value, index) {
-                Ok(element) => element,
+        with_rooted(&[receiver], || {
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
                 Err(thrown) => return thrown,
             };
-            let outcome = call_value(
-                callback,
-                this_arg,
-                &[element, index_value(index), this_value],
-            );
-            if Value::from_bits(outcome).is_exception() {
-                return outcome;
+            // SAFETY: as above.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
             }
-        }
-        Value::UNDEFINED.to_bits()
+            // SAFETY: as above.
+            let this_arg = unsafe { argument(argc, argv, 1) };
+            for index in 0..length {
+                let element = match indexed_get_checked(receiver, index) {
+                    Ok(element) => element,
+                    Err(thrown) => return thrown,
+                };
+                let outcome =
+                    call_value(callback, this_arg, &[element, index_value(index), receiver]);
+                if Value::from_bits(outcome).is_exception() {
+                    return outcome;
+                }
+            }
+            Value::UNDEFINED.to_bits()
+        })
     })
 }
 
@@ -12410,59 +12403,59 @@ extern "C" fn array_reduce(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
-        let length = match indexed_length(this_value) {
-            Ok(length) => length,
-            Err(thrown) => return thrown,
-        };
-        // SAFETY: as above.
-        let callback = unsafe { argument(argc, argv, 0) };
-        // **Checked before a single element is read.** `[1, 2].map(5)` throws
-        // rather than calling nothing twice and answering `[undefined,
-        // undefined]` — which is what reaching `crisol_not_a_function` per
-        // element produced, and it looked like a working call every time.
-        if !is_callable(callback) {
-            return raise("a callback must be a function", "TypeError");
-        }
-
-        let (mut accumulator, start) = if argc >= 2 {
-            // SAFETY: as above.
-            (unsafe { argument(argc, argv, 1) }, 0)
-        } else if length == 0 {
-            // **Empty with no seed is a `TypeError`**, not `undefined`: there is no value to
-            // answer with, and inventing one makes `[].reduce(add)` quietly wrong where the
-            // specification is loud.
-            return raise(
-                "reduce of an empty array with no initial value",
-                "TypeError",
-            );
-        } else {
-            match indexed_get_checked(this_value, 0) {
-                Ok(first) => (first, 1),
+        with_rooted(&[receiver], || {
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
                 Err(thrown) => return thrown,
+            };
+            // SAFETY: as above.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
             }
-        };
-
-        for index in start..length {
-            let element =
-                match with_rooted(&[accumulator], || indexed_get_checked(this_value, index)) {
-                    Ok(element) => element,
+            let (mut accumulator, start) = if argc >= 2 {
+                // SAFETY: as above.
+                (unsafe { argument(argc, argv, 1) }, 0)
+            } else if length == 0 {
+                // **Empty with no seed is a `TypeError`**, not `undefined`: there is no value to
+                // answer with, and inventing one makes `[].reduce(add)` quietly wrong where the
+                // specification is loud.
+                return raise(
+                    "reduce of an empty array with no initial value",
+                    "TypeError",
+                );
+            } else {
+                match indexed_get_checked(receiver, 0) {
+                    Ok(first) => (first, 1),
                     Err(thrown) => return thrown,
-                };
-            accumulator = with_rooted(&[accumulator, element], || {
-                call_value(
-                    callback,
-                    Value::UNDEFINED.to_bits(),
-                    &[accumulator, element, index_value(index), this_value],
-                )
-            });
-            if Value::from_bits(accumulator).is_exception() {
-                return accumulator;
+                }
+            };
+            for index in start..length {
+                let element =
+                    match with_rooted(&[accumulator], || indexed_get_checked(receiver, index)) {
+                        Ok(element) => element,
+                        Err(thrown) => return thrown,
+                    };
+                accumulator = with_rooted(&[accumulator, element], || {
+                    call_value(
+                        callback,
+                        Value::UNDEFINED.to_bits(),
+                        &[accumulator, element, index_value(index), receiver],
+                    )
+                });
+                if Value::from_bits(accumulator).is_exception() {
+                    return accumulator;
+                }
             }
-        }
-        accumulator
+            accumulator
+        })
     })
 }
 

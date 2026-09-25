@@ -1225,6 +1225,53 @@ fn a_quantifier_boxes_a_primitive_receiver() {
     );
 }
 
+/// `map`, `filter`, `forEach`, `reduce` and `reduceRight` `ToObject` their receiver too — the
+/// follow-up to D-228, completing the family.
+#[test]
+fn the_result_building_methods_box_their_receiver() {
+    // forEach over a boxed string runs once per code unit.
+    check(
+        "foreach-boxes-string",
+        "let n = 0; Array.prototype.forEach.call(\"ab\", function () { n = n + 1; }); return n;",
+        "2",
+    );
+    // map answers an array of the receiver's length; indices are real even where elements are not.
+    check(
+        "map-boxes-string",
+        "return Array.prototype.map.call(\"ab\", function (v, i) { return i; }).join(\",\");",
+        "0,1",
+    );
+    // reduce walks the boxed length.
+    check(
+        "reduce-boxes-string",
+        "return Array.prototype.reduce.call(\"abc\", function (acc) { return acc + 1; }, 0);",
+        "3",
+    );
+    // A nullish receiver throws for each of them, before the callback.
+    for method in ["map", "filter", "forEach", "reduce", "reduceRight"] {
+        check(
+            &format!("{method}-on-null-throws"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(null, function () {{}}); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // Real arrays are unchanged, callback still sees the array itself.
+    check(
+        "map-real-array-unchanged",
+        "return [1, 2, 3].map(function (x) { return x * 2; }).join(\",\");",
+        "2,4,6",
+    );
+    check(
+        "foreach-real-array-sees-array",
+        "let a = [1]; let same = false; \
+         a.forEach(function (v, i, obj) { same = obj === a; }); return same;",
+        "true",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

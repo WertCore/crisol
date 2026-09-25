@@ -6423,3 +6423,19 @@ structure is a plain scan. `map`, `filter`, `forEach`, `reduce` and `reduceRight
 `ToObject` and are the follow-up; they were left out because their result-array and seed logic
 makes the change bigger, and one localizable batch at a time is worth more than one broad one
 that is hard to bisect when it fails.
+
+## D-229
+
+**The result-building array methods `ToObject` their receiver too, completing D-228.**
+
+Status: Accepted
+
+`map`, `filter`, `forEach`, `reduce` and `reduceRight` now box a primitive receiver through
+`object_receiver`, the same as `every`/`some`/`find` in D-228. Held back there because each has
+extra structure — `map`/`filter` a result array and a species probe, `reduce` a seed — but the
+change is uniform: box once, root the box across the loop, and read length, elements and the
+callback's array argument from it while the result array (for `map`/`filter`) stays separate.
+The species probe reads the boxed receiver, matching `ToObject` then `ArraySpeciesCreate`.
+
+With this, every callback-taking `Array.prototype` method treats its receiver the way the
+specification's first step does, and a nullish one throws before the callback rather than after.
