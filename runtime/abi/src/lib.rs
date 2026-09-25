@@ -73,6 +73,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_truthy",
     "crisol_global_load",
     "crisol_delete",
+    "crisol_set_prototype",
     "crisol_enumerate",
     "crisol_iterate",
     "crisol_create_regexp",
@@ -10266,6 +10267,19 @@ fn set_prototype_of(handle: GcRef, proto: u64) -> Result<bool, &'static str> {
         runtime.heap.set_prototype(handle, parent);
         Ok(true)
     })
+}
+
+/// `object.[[Prototype]] = prototype`, the primitive behind `Op::SetPrototype` — `class B extends
+/// A` links `B.prototype` to `A.prototype` and `B` to `A`. Returns `object`. A non-object (a
+/// primitive receiver cannot happen for a class binding) is left alone, and the cyclic / non-
+/// extensible refusals `set_prototype_of` reports cannot arise for a freshly built class.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_set_prototype(object: u64, prototype: u64) -> u64 {
+    if let Some(handle) = handle_of(object) {
+        let _ = set_prototype_of(handle, prototype);
+    }
+    object
 }
 
 /// `Object.setPrototypeOf(o, proto)`.

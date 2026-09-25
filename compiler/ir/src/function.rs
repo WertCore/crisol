@@ -466,6 +466,15 @@ pub enum Op {
         /// The setter, or `undefined` when there is none.
         setter: ValueId,
     },
+    /// Sets `object`'s `[[Prototype]]`. `class B extends A` links `B.prototype` to `A.prototype`
+    /// and `B` to `A`, which is what makes an instance inherit the parent's methods and a static
+    /// call reach the parent's statics.
+    SetPrototype {
+        /// The object whose prototype changes.
+        object: ValueId,
+        /// The new prototype.
+        prototype: ValueId,
+    },
     /// Allocates an object.
     CreateObject {
         /// Its initial shape.
@@ -593,6 +602,7 @@ impl Op {
             | Self::Enumerate { object }
             | Self::Iterate { object } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
+            Self::SetPrototype { object, prototype } => vec![*object, *prototype],
             Self::DefineAccessor {
                 object,
                 getter,

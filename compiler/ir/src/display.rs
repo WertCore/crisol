@@ -126,6 +126,9 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         }
         Op::CreateRegExp { source, flags } => write!(f, "regexp /{source}/{flags}"),
         Op::ComputedStore { object, key, value } => write!(f, "set {object}[{key}] = {value}"),
+        Op::SetPrototype { object, prototype } => {
+            write!(f, "set-prototype {object} <- {prototype}")
+        }
         Op::CreateObject { shape } => write!(f, "object #{}", shape.index()),
         Op::CaughtValue => write!(f, "caught"),
         Op::GlobalLoad { name } => write!(f, "global {name:?}"),

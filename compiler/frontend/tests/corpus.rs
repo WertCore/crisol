@@ -347,10 +347,9 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // `==` is not `===`: it coerces, and the coercion table needs machinery that is not
         // here yet. Lowering it as a strict comparison would be wrong for every mixed-type
         // operand, which is the only case anyone writes `==` for.
-        // `extends` needs the prototype chain wired through the parent *and* `super` resolved
-        // inside methods. Half of that produces a class that constructs and then fails its
-        // first inherited call.
-        ("class A { } class B extends A { }", "class extends"),
+        // `extends`/`super` lower now (D-243); a class **field** does not — it initialises per
+        // instance inside the constructor, which the class lowering does not synthesise yet.
+        ("class C { x = 1; }", "class member that is not a method"),
         ("class C { static m() { } }", "static class member"),
     ];
 

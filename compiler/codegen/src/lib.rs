@@ -188,6 +188,7 @@ const CREATE_STRING_SYMBOL: &str = "crisol_create_string";
 const TRUTHY_SYMBOL: &str = "crisol_truthy";
 const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
 const DELETE_SYMBOL: &str = "crisol_delete";
+const SET_PROTOTYPE_SYMBOL: &str = "crisol_set_prototype";
 const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
 const ITERATE_SYMBOL: &str = "crisol_iterate";
 const CREATE_REGEXP_SYMBOL: &str = "crisol_create_regexp";
@@ -257,6 +258,8 @@ struct ObjectHelpers<T> {
     global_load: T,
     /// `crisol_delete(object, key) -> boolean`
     delete: T,
+    /// `crisol_set_prototype(object, prototype) -> object`
+    set_prototype: T,
     /// `crisol_enumerate(object) -> array of names`
     enumerate: T,
     /// `crisol_iterate(value) -> something indexable`
@@ -386,6 +389,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     delete.params.push(AbiParam::new(types::I64));
     delete.returns.push(AbiParam::new(types::I64));
 
+    let mut set_prototype = module.make_signature();
+    set_prototype.params.push(AbiParam::new(types::I64));
+    set_prototype.params.push(AbiParam::new(types::I64));
+    set_prototype.returns.push(AbiParam::new(types::I64));
+
     let mut enumerate = module.make_signature();
     enumerate.params.push(AbiParam::new(types::I64));
     enumerate.returns.push(AbiParam::new(types::I64));
@@ -467,6 +475,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         truthy: declare(TRUTHY_SYMBOL, &truthy)?,
         global_load: declare(GLOBAL_LOAD_SYMBOL, &global_load)?,
         delete: declare(DELETE_SYMBOL, &delete)?,
+        set_prototype: declare(SET_PROTOTYPE_SYMBOL, &set_prototype)?,
         enumerate: declare(ENUMERATE_SYMBOL, &enumerate)?,
         iterate: declare(ITERATE_SYMBOL, &iterate)?,
         create_regexp: declare(CREATE_REGEXP_SYMBOL, &create_regexp)?,
@@ -1007,6 +1016,9 @@ impl Backend for Cranelift {
             delete: self
                 .module
                 .declare_func_in_func(self.objects.delete, &mut context.func),
+            set_prototype: self
+                .module
+                .declare_func_in_func(self.objects.set_prototype, &mut context.func),
             enumerate: self
                 .module
                 .declare_func_in_func(self.objects.enumerate, &mut context.func),
@@ -1754,6 +1766,15 @@ impl Lowering<'_> {
                 let call = self.builder.ins().call(self.objects.delete, &[object, key]);
                 Some(self.builder.inst_results(call)[0])
             }
+            Op::SetPrototype { object, prototype } => {
+                let object = self.value(*object);
+                let prototype = self.value(*prototype);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.set_prototype, &[object, prototype]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::ComputedLoad { object, key } => {
                 let object = self.value(*object);
                 let key = self.value(*key);
@@ -2219,6 +2240,9 @@ impl Jit {
             delete: self
                 .module
                 .declare_func_in_func(self.objects.delete, &mut context.func),
+            set_prototype: self
+                .module
+                .declare_func_in_func(self.objects.set_prototype, &mut context.func),
             enumerate: self
                 .module
                 .declare_func_in_func(self.objects.enumerate, &mut context.func),

@@ -1502,7 +1502,13 @@ impl Lowering {
                 value
             }
             Expression::StaticMemberExpression(member) => {
-                let object = self.expression(&member.object);
+                // `super.x` reads from the parent prototype; every other object reads from itself.
+                let object = if matches!(member.object, Expression::Super(_)) {
+                    let proto_slot = self.slot(" superproto");
+                    self.read(proto_slot)
+                } else {
+                    self.expression(&member.object)
+                };
                 let value = self.emit(
                     Type::Unknown,
                     Op::PropertyLoad {
@@ -1523,6 +1529,45 @@ impl Lowering {
                 // The object is evaluated once and reused, because `f().m()` must not call
                 // `f` twice.
                 let (callee, this_value) = match &call.callee {
+                    // `super(...)`: call the captured parent constructor with the current `this`,
+                    // which its body then initialises (crisol allocates `this` up front, so
+                    // `super` initialises rather than allocates — the this-before-super TDZ is not
+                    // enforced, D-243).
+                    Expression::Super(_) => {
+                        let super_slot = self.slot(" super");
+                        let super_ctor = self.read(super_slot);
+                        let this_slot = self.slot("this");
+                        let this_value = self.read(this_slot);
+                        (super_ctor, this_value)
+                    }
+                    // `super.m(...)`: the method comes from the parent prototype, but the receiver
+                    // is the current `this`, not the prototype.
+                    Expression::StaticMemberExpression(member)
+                        if matches!(member.object, Expression::Super(_)) =>
+                    {
+                        let proto_slot = self.slot(" superproto");
+                        let proto = self.read(proto_slot);
+                        let method = self.emit(
+                            Type::Unknown,
+                            Op::PropertyLoad {
+                                object: proto,
+                                key: PropertyKey::new(member.property.name.as_str()),
+                            },
+                        );
+                        let this_slot = self.slot("this");
+                        (method, self.read(this_slot))
+                    }
+                    Expression::ComputedMemberExpression(member)
+                        if matches!(member.object, Expression::Super(_)) =>
+                    {
+                        let proto_slot = self.slot(" superproto");
+                        let proto = self.read(proto_slot);
+                        let key = self.expression(&member.expression);
+                        let method =
+                            self.emit(Type::Unknown, Op::ComputedLoad { object: proto, key });
+                        let this_slot = self.slot("this");
+                        (method, self.read(this_slot))
+                    }
                     Expression::StaticMemberExpression(member) => {
                         let object = self.expression(&member.object);
                         let method = self.emit(
@@ -1718,7 +1763,12 @@ impl Lowering {
                     .unwrap_or_else(|| self.emit(Type::Object(None), Op::CreateArray { elements }))
             }
             Expression::ComputedMemberExpression(member) => {
-                let object = self.expression(&member.object);
+                let object = if matches!(member.object, Expression::Super(_)) {
+                    let proto_slot = self.slot(" superproto");
+                    self.read(proto_slot)
+                } else {
+                    self.expression(&member.object)
+                };
                 let key = self.expression(&member.expression);
                 let value = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
                 self.propagate(value)
@@ -2109,15 +2159,39 @@ impl Lowering {
     /// implementation that stored them on the instance would work until someone compared two
     /// objects' methods for identity, or counted `Object.keys`.
     fn class(&mut self, class: &oxc_ast::ast::Class<'_>, name: &str) -> ValueId {
-        if class.heritage.is_some() {
-            // `extends` needs the prototype chain wired through the parent *and* `super`
-            // resolved inside methods. Half of that would produce a class that constructs and
-            // then fails its first inherited call.
-            self.note("class extends", class.span.start);
+        // `extends`: evaluate the parent once and expose it to the methods as the grammar-illegal
+        // names ` super` (the parent constructor) and ` superproto` (its prototype), which a
+        // method or the constructor captures exactly when it writes `super`.
+        let parent = class
+            .heritage
+            .as_ref()
+            .map(|heritage| self.expression(&heritage.expression));
+        let mut parent_prototype = None;
+        if let Some(parent) = parent {
+            let proto = self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object: parent,
+                    key: PropertyKey::new("prototype"),
+                },
+            );
+            let super_slot = self.declare(" super");
+            self.bind(" super", super_slot, parent);
+            let proto_slot = self.declare(" superproto");
+            self.bind(" superproto", proto_slot, proto);
+            parent_prototype = Some(proto);
         }
 
         let shape = crisol_value::Shapes::new().root();
         let prototype = self.emit(Type::Object(None), Op::CreateObject { shape });
+        // An instance inherits the parent's methods through the prototype chain:
+        // `B.prototype.[[Prototype]] = A.prototype`.
+        if let Some(parent_prototype) = parent_prototype {
+            self.emit_effect(Op::SetPrototype {
+                object: prototype,
+                prototype: parent_prototype,
+            });
+        }
         let mut constructor = None;
 
         for element in &class.body.body {
@@ -2184,9 +2258,14 @@ impl Lowering {
         let constructor = match constructor {
             Some(closure) => closure,
             None => {
-                // No explicit constructor: the class still needs one, because `new` has to
-                // call something. It does nothing.
-                let (id, captures) = self.implicit_constructor(name);
+                // No explicit constructor: the class still needs one, because `new` has to call
+                // something. A base class's does nothing; a derived class's calls `super()` so the
+                // parent still runs.
+                let (id, captures) = if parent.is_some() {
+                    self.implicit_derived_constructor(name)
+                } else {
+                    self.implicit_constructor(name)
+                };
                 self.close_over(id, &captures)
             }
         };
@@ -2195,6 +2274,14 @@ impl Lowering {
             key: PropertyKey::new("prototype"),
             value: prototype,
         });
+        // A static call reaches the parent's statics through the constructor's own chain:
+        // `B.[[Prototype]] = A`.
+        if let Some(parent) = parent {
+            self.emit_effect(Op::SetPrototype {
+                object: constructor,
+                prototype: parent,
+            });
+        }
         constructor
     }
 
@@ -2224,6 +2311,61 @@ impl Lowering {
         (
             FunctionId(u32::try_from(index).expect("functions fit in u32")),
             Vec::new(),
+        )
+    }
+
+    /// The constructor a *derived* class without an explicit one still gets: `constructor(...) {
+    /// super(...); }`. It forwards no arguments — this engine has no rest/spread to forward them
+    /// with — so `new B()` runs the parent's constructor but `new B(x)` does not pass `x` on
+    /// (D-243). It captures ` super` the same way any method that writes `super` does.
+    fn implicit_derived_constructor(&mut self, name: &str) -> (FunctionId, Vec<String>) {
+        let index = self.functions.len();
+        let mut function = Function::new(&format!("{name}.constructor"));
+        function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        let entry = function.entry;
+        self.functions.push(function);
+        self.scopes.push(Scope {
+            function: index,
+            current: entry,
+            terminated: false,
+            slots: HashMap::new(),
+            next_slot: 0,
+            captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
+            breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
+        });
+        // **Recorded on the function**, exactly as `lower_function` does, so the backend binds the
+        // incoming receiver to this slot — without it `this` reads `undefined` and `super()`
+        // initialises nothing.
+        let this_slot = self.declare("this");
+        self.functions[index].this_slot = Some(this_slot);
+        // `super()`: call the captured parent constructor with the `this` being built.
+        let super_slot = self.slot(" super");
+        let super_ctor = self.read(super_slot);
+        let this_value = self.read(this_slot);
+        let call = self.emit(
+            Type::Unknown,
+            Op::Call {
+                callee: super_ctor,
+                this_value,
+                args: Vec::new(),
+            },
+        );
+        self.propagate(call);
+        self.terminate(Terminator::Return(None));
+        let scope = self.scopes.pop().expect("just pushed");
+        let names: Vec<String> = scope
+            .captures
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let slots: Vec<u32> = scope.captures.iter().map(|(_, slot)| *slot).collect();
+        self.functions[index].captures = slots;
+        (
+            FunctionId(u32::try_from(index).expect("functions fit in u32")),
+            names,
         )
     }
 

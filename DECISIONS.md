@@ -6741,3 +6741,34 @@ patterns — it gathers into a fresh object/array this has no runtime copy for),
 step-by-step protocol, so a `.return()` on early completion is not observed — the same limit the
 `for-of` lowering already has. Proper `var` hoisting of pattern names is not done; `slot` declares
 on miss, so a decl-before-use `var {a} = …` still binds.
+
+## D-243
+
+**`class extends` and `super`.**
+
+Status: Accepted
+
+One new IR op, `SetPrototype { object, prototype }` (through `crisol-ir`, `crisol-codegen`, and a
+`crisol_set_prototype` ABI fn over the existing `set_prototype_of`), plus frontend lowering:
+
+- **The chain.** `class B extends A` evaluates the parent once, then links `B.prototype`'s
+  `[[Prototype]]` to `A.prototype` (so an instance inherits the parent's methods and `instanceof A`
+  holds) and `B`'s to `A` (so a static call reaches the parent's statics). That is all
+  `SetPrototype` is for.
+- **`super`.** The parent constructor and its prototype are exposed to the class body as the
+  grammar-illegal locals ` super` and ` superproto`, which a method or constructor **captures**
+  exactly when it writes `super` — the same closure machinery every other capture uses, so nothing
+  new was needed for scoping. `super(...)` calls ` super` with the current `this`; `super.m(...)`
+  loads `m` off ` superproto` but calls it with the current `this`; `super.x` reads ` superproto`.
+- **The derived implicit constructor.** A derived class with no constructor gets
+  `constructor(...) { super(...); }` — built by hand like the base implicit one, but recording
+  `this_slot` (the base one does not, which cost an hour: the receiver was never bound, so `this`
+  read `undefined` and `super()` initialised nothing) and capturing ` super`.
+
+Simplifications, each a deliberate deviation not a silent gap: `this` is allocated up front from
+`new.target.prototype` (crisol's existing model), so `super()` **initialises** rather than
+allocates and the this-before-`super` TDZ is not enforced; the implicit derived constructor
+forwards **no** arguments (no rest/spread yet), so `new B()` runs the parent but `new B(x)` does
+not pass `x`; and `extends` of a native (`Array`, `Error`) does not adopt the exotic behaviour,
+since `super()` runs the native as a plain call. Class fields and static members remain unsupported
+(noted), and the corpus honesty test now names a field rather than `extends`.

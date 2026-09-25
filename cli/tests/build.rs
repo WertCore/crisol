@@ -204,11 +204,12 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("a working directory");
     let file = directory.join("main.js");
-    // A class still lowers to a recorded gap rather than to nothing. This case has to be
-    // replaced whenever the construct it names becomes supported — which is the point: the test
-    // is about *refusing*, so it must always name something actually refused. It has named
-    // `for-of` and then a regular expression literal, and been rewritten each time one landed.
-    std::fs::write(&file, "class A extends Object {} return 1;").expect("write");
+    // This case has to be replaced whenever the construct it names becomes supported — which is
+    // the point: the test is about *refusing*, so it must always name something actually refused.
+    // It has named `for-of`, a regular expression literal, and `class extends`, and been rewritten
+    // each time one landed. An array hole is refused because a hole is not `undefined` (D-64) and
+    // the IR cannot yet say which a position holds.
+    std::fs::write(&file, "let a = [1, , 3]; return 1;").expect("write");
 
     let error =
         crisol::build::build(&file, &directory.join("main"), &runtime).expect_err("should refuse");
@@ -3217,6 +3218,49 @@ fn destructuring_declarations_bind_each_name() {
         "destr-for-of-object",
         "let s = 0; for (const {x} of [{x: 1}, {x: 2}]) { s = s + x; } return s;",
         "3",
+    );
+}
+
+/// `class B extends A`: `super(...)` in a derived constructor, an inherited method reached through
+/// the prototype chain, `super.m()` calling up with the current receiver, `instanceof` across the
+/// chain, and the implicit derived constructor that calls `super()`.
+#[test]
+fn subclasses_extend_and_call_super() {
+    check(
+        "extends-super-ctor",
+        "class A { constructor(x) { this.x = x; } } \
+         class B extends A { constructor(x) { super(x); } } \
+         return new B(5).x;",
+        "5",
+    );
+    check(
+        "extends-inherited-method",
+        "class A { m() { return 1; } } class B extends A { } return new B().m();",
+        "1",
+    );
+    check(
+        "extends-super-method",
+        "class A { m() { return 1; } } \
+         class B extends A { m() { return super.m() + 1; } } \
+         return new B().m();",
+        "2",
+    );
+    check(
+        "extends-instanceof",
+        "class A { } class B extends A { } return (new B() instanceof A) && (new B() instanceof B);",
+        "true",
+    );
+    check(
+        "extends-super-then-own-field",
+        "class A { constructor() { this.x = 10; } } \
+         class B extends A { constructor() { super(); this.y = this.x + 5; } } \
+         return new B().y;",
+        "15",
+    );
+    check(
+        "extends-implicit-ctor-runs-parent",
+        "class A { constructor() { this.tag = \"a\"; } } class B extends A { } return new B().tag;",
+        "a",
     );
 }
 
