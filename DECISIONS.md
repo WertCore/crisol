@@ -6685,3 +6685,26 @@ Known gaps, deferred: `DataView`, `Atomics`, `BigInt64Array`/`BigUint64Array` (n
 resizable `ArrayBuffer`, buffer detachment, `%TypedArray%` reachable as a distinct intrinsic, and
 `@@species` on the copying methods. `ArrayBuffer.isView` answers for typed arrays only until
 `DataView` exists.
+
+## D-241
+
+**`DataView`, on the same byte store.**
+
+Status: Accepted
+
+The other view over an `ArrayBuffer`, and the next `ReferenceError: … is not defined` after
+`Temporal` in a broad sample. It reuses everything D-240 built: the raw byte store, and the
+`ElementKind` codec — extended with `read_ordered`/`to_bytes_ordered`, which reverse the bytes for
+a big-endian call. That is the one thing a `DataView` needs that a typed array does not: its byte
+order is an argument, defaulting to big-endian, where a typed array is always the platform's
+native little-endian.
+
+A `DataView` is branded and carries its buffer, byte offset and byte length as hidden properties,
+exactly as a typed array does. `buffer`/`byteLength`/`byteOffset` are accessor getters; the
+sixteen `getInt8`…`setFloat64` are two shared bodies (`data_view_get`/`data_view_set`) behind
+sixteen one-line wrappers a small macro stamps out — the value is coerced before the range is
+checked, since its `valueOf` is observable. The constructor joins `GLOBAL_NATIVES`, the prototype
+members extend `TYPED_NATIVES` (still last in the dispatch chain, so the typed-array indices before
+them do not move), and `ArrayBuffer.isView` now answers for a `DataView` too.
+
+Deferred, as for the typed arrays: detachment, `@@species`, and resizable buffers.

@@ -3096,6 +3096,66 @@ fn typed_arrays_view_a_buffer() {
     );
 }
 
+/// A `DataView` over an `ArrayBuffer`: reading and writing one value at an offset, the explicit
+/// byte order (big-endian by default), the sign and float codecs, a shared buffer another view
+/// sees, and a read past the end that is a `RangeError`.
+#[test]
+fn data_views_read_and_write_a_buffer() {
+    check(
+        "dv-byte-length",
+        "return new DataView(new ArrayBuffer(8)).byteLength;",
+        "8",
+    );
+    check(
+        "dv-int8-roundtrip",
+        "let d = new DataView(new ArrayBuffer(4)); d.setInt8(0, 5); return d.getInt8(0);",
+        "5",
+    );
+    check(
+        "dv-int8-signed",
+        "let d = new DataView(new ArrayBuffer(4)); d.setInt8(0, 200); return d.getInt8(0);",
+        "-56",
+    );
+    // 258 is 0x0102: big-endian writes the high byte first, little-endian the low byte.
+    check(
+        "dv-big-endian",
+        "let d = new DataView(new ArrayBuffer(2)); d.setInt16(0, 258); return d.getUint8(0);",
+        "1",
+    );
+    check(
+        "dv-little-endian",
+        "let d = new DataView(new ArrayBuffer(2)); d.setInt16(0, 258, true); return d.getUint8(0);",
+        "2",
+    );
+    check(
+        "dv-float64",
+        "let d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, 3.5); return d.getFloat64(0);",
+        "3.5",
+    );
+    check(
+        "dv-byte-offset",
+        "let b = new ArrayBuffer(8); let d = new DataView(b, 2); return d.byteOffset;",
+        "2",
+    );
+    check(
+        "dv-is-view",
+        "return ArrayBuffer.isView(new DataView(new ArrayBuffer(4)));",
+        "true",
+    );
+    check(
+        "dv-shares-buffer",
+        "let b = new ArrayBuffer(4); let d = new DataView(b); let a = new Uint8Array(b); \
+         d.setUint8(1, 42); return a[1];",
+        "42",
+    );
+    check(
+        "dv-out-of-range",
+        "let d = new DataView(new ArrayBuffer(2)); \
+         try { d.getInt32(0); return \"no\"; } catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+}
+
 /// The shape still names the slot, so re-assigning must bring the property back.
 #[test]
 fn a_deleted_property_can_be_assigned_again() {

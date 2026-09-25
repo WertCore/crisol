@@ -606,6 +606,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(TYPED_ARRAY_PROTOTYPE.with(std::cell::Cell::get));
         TYPED_ARRAY_PROTOTYPES
             .with(|protos| roots.extend(protos.iter().filter_map(std::cell::Cell::get)));
+        roots.extend(DATA_VIEW_PROTOTYPE.with(std::cell::Cell::get));
         // The microtask queue. It is data rather than closures precisely so this walk is
         // possible — a queue of `Box<dyn FnOnce>` hides its captures from the collector, and
         // a settled value reachable only from one would be freed under it. Everything *else*
@@ -692,6 +693,9 @@ thread_local! {
     /// [`TYPED_ARRAY_PROTOTYPE`].
     static TYPED_ARRAY_PROTOTYPES: [std::cell::Cell<Option<GcRef>>; 9] =
         const { [const { std::cell::Cell::new(None) }; 9] };
+    /// The prototype every `DataView` inherits from.
+    static DATA_VIEW_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
     /// The microtask queue. Drained to empty, and jobs queued by jobs run in the same drain,
     /// which is what "microtasks run to completion" means.
     ///
@@ -1677,6 +1681,7 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Uint32Array", make_uint32_array),
     ("Float32Array", make_float32_array),
     ("Float64Array", make_float64_array),
+    ("DataView", make_data_view),
 ];
 
 /// The nine typed-array constructor names, in [`ELEMENT_KINDS`] order.
@@ -1708,6 +1713,25 @@ const TYPED_NATIVES: &[Native] = &[
     typed_array_set,                // TA_SET_METHOD
     typed_array_subarray,           // TA_SUBARRAY_METHOD
     typed_array_slice,              // TA_SLICE_METHOD
+    data_view_buffer,               // DV_BUFFER_GET
+    data_view_byte_length,          // DV_BYTE_LENGTH_GET
+    data_view_byte_offset,          // DV_BYTE_OFFSET_GET
+    dv_get_int8,                    // DV_GET_BASE, then the rest in DATA_VIEW_KINDS order
+    dv_get_uint8,
+    dv_get_int16,
+    dv_get_uint16,
+    dv_get_int32,
+    dv_get_uint32,
+    dv_get_float32,
+    dv_get_float64,
+    dv_set_int8, // DV_SET_BASE, then the rest in DATA_VIEW_KINDS order
+    dv_set_uint8,
+    dv_set_int16,
+    dv_set_uint16,
+    dv_set_int32,
+    dv_set_uint32,
+    dv_set_float32,
+    dv_set_float64,
 ];
 
 /// Indices into [`TYPED_NATIVES`].
@@ -1722,6 +1746,26 @@ const TA_TAG_GET: usize = 7;
 const TA_SET_METHOD: usize = 8;
 const TA_SUBARRAY_METHOD: usize = 9;
 const TA_SLICE_METHOD: usize = 10;
+const DV_BUFFER_GET: usize = 11;
+const DV_BYTE_LENGTH_GET: usize = 12;
+const DV_BYTE_OFFSET_GET: usize = 13;
+/// Where the eight `getX` bodies begin, then the eight `setX` bodies, each in
+/// [`DATA_VIEW_KINDS`] order.
+const DV_GET_BASE: usize = 14;
+const DV_SET_BASE: usize = 22;
+
+/// The eight kinds a `DataView` reads and writes, in the order [`DV_GET_BASE`]/[`DV_SET_BASE`]
+/// lay them out — `Uint8Clamped` is absent, so this is not [`ELEMENT_KINDS`].
+const DATA_VIEW_KINDS: [(&str, ElementKind); 8] = [
+    ("Int8", ElementKind::I8),
+    ("Uint8", ElementKind::U8),
+    ("Int16", ElementKind::I16),
+    ("Uint16", ElementKind::U16),
+    ("Int32", ElementKind::I32),
+    ("Uint32", ElementKind::U32),
+    ("Float32", ElementKind::F32),
+    ("Float64", ElementKind::F64),
+];
 
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
 /// order [`crisol_closure_code`] chains them. Shared by the two places that address the table so
@@ -2325,6 +2369,36 @@ impl ElementKind {
         }
         out
     }
+
+    /// [`ElementKind::read`], honouring `little_endian` — for a `DataView`, whose byte order is a
+    /// per-call argument rather than the native one a typed array uses. A typed array is always
+    /// native (little-endian on every target), so it stays on `read`.
+    fn read_ordered(self, b: &[u8], little_endian: bool) -> f64 {
+        if little_endian {
+            self.read(b)
+        } else {
+            let count = self.bytes();
+            let mut reversed = [0u8; 8];
+            for index in 0..count {
+                reversed[index] = b[count - 1 - index];
+            }
+            self.read(&reversed[..count])
+        }
+    }
+
+    /// [`ElementKind::to_bytes`], honouring `little_endian`; see [`ElementKind::read_ordered`].
+    fn to_bytes_ordered(self, value: f64, little_endian: bool) -> [u8; 8] {
+        let native = self.to_bytes(value);
+        if little_endian {
+            return native;
+        }
+        let count = self.bytes();
+        let mut reversed = [0u8; 8];
+        for index in 0..count {
+            reversed[index] = native[count - 1 - index];
+        }
+        reversed
+    }
 }
 
 /// `value` reduced modulo `2**bits`, as `ToInt{8,16,32}`/`ToUint{8,16,32}` require. A non-finite
@@ -2523,8 +2597,7 @@ extern "C" fn make_array_buffer(
     }
 }
 
-/// `ArrayBuffer.isView(value)` — whether `value` is a typed array (or, once it exists, a
-/// `DataView`).
+/// `ArrayBuffer.isView(value)` — whether `value` is a typed array or a `DataView`.
 extern "C" fn array_buffer_is_view(
     _closure: u64,
     _this_value: u64,
@@ -2534,7 +2607,7 @@ extern "C" fn array_buffer_is_view(
 ) -> u64 {
     // SAFETY: as above.
     let value = unsafe { argument(argc, argv, 0) };
-    boolean(is_typed_array(value)).to_bits()
+    boolean(is_typed_array(value) || is_data_view(value)).to_bits()
 }
 
 /// `get ArrayBuffer.prototype.byteLength`.
@@ -3020,6 +3093,252 @@ extern "C" fn make_float64_array(
     // SAFETY: as above.
     unsafe { new_typed_array(ElementKind::F64, argc, argv) }
 }
+
+// ============================== DataView ==============================
+//
+// A `DataView` is the other view over an `ArrayBuffer`: it reads and writes one value at an
+// explicit byte offset, in a byte order given per call (big-endian by default, unlike a typed
+// array's native order). It reuses the byte store and the `ElementKind` codec through the
+// endian-aware `read_ordered`/`to_bytes_ordered`.
+
+/// The mark every `DataView` carries.
+const DATA_VIEW_BRAND: &str = "__dataView";
+/// A `DataView`'s backing `ArrayBuffer`, first byte, and byte length, as hidden properties.
+const DV_BUFFER: &str = "__dvBuffer";
+const DV_OFFSET: &str = "__dvOffset";
+const DV_LENGTH: &str = "__dvByteLength";
+
+/// Whether `object` is a `DataView`.
+fn is_data_view(object: u64) -> bool {
+    own_flag(object, DATA_VIEW_BRAND)
+}
+
+/// A `DataView`'s buffer, byte offset and byte length, or `None` if `object` is not one.
+fn data_view_parts(object: u64) -> Option<(u64, usize, usize)> {
+    let offset = count_of(property_number(object, DV_OFFSET)?);
+    let length = count_of(property_number(object, DV_LENGTH)?);
+    let buffer = property_of(object, DV_BUFFER);
+    Some((buffer, offset, length))
+}
+
+/// `new DataView(buffer, byteOffset, byteLength)`.
+extern "C" fn make_data_view(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let buffer = unsafe { argument(argc, argv, 0) };
+    if !is_array_buffer(buffer) {
+        return raise(
+            "first argument to DataView must be an ArrayBuffer",
+            "TypeError",
+        );
+    }
+    with_rooted(&[buffer], || {
+        let total = handle_of(buffer)
+            .and_then(|handle| with_runtime(|runtime| runtime.heap.byte_len(handle)))
+            .unwrap_or(0);
+        // SAFETY: as above.
+        let byte_offset = match to_index(unsafe { argument(argc, argv, 1) }) {
+            Ok(offset) => offset,
+            Err(thrown) => return thrown,
+        };
+        if byte_offset > total {
+            return raise("offset is outside the buffer", "RangeError");
+        }
+        // SAFETY: as above.
+        let length_arg = unsafe { argument(argc, argv, 2) };
+        let byte_length = if Value::from_bits(length_arg).is_undefined() {
+            total - byte_offset
+        } else {
+            let requested = match to_index(length_arg) {
+                Ok(length) => length,
+                Err(thrown) => return thrown,
+            };
+            if byte_offset + requested > total {
+                return raise("length is outside the buffer", "RangeError");
+            }
+            requested
+        };
+        let object = crisol_create_object();
+        with_rooted(&[object, buffer], || {
+            if let Some(handle) = handle_of(object) {
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, DATA_VIEW_BRAND, Value::TRUE);
+                    runtime.define_hidden(handle, DV_BUFFER, Value::from_bits(buffer));
+                    runtime.define_hidden(
+                        handle,
+                        DV_OFFSET,
+                        Value::number(index_number(byte_offset)),
+                    );
+                    runtime.define_hidden(
+                        handle,
+                        DV_LENGTH,
+                        Value::number(index_number(byte_length)),
+                    );
+                    if let Some(prototype) = DATA_VIEW_PROTOTYPE.with(std::cell::Cell::get) {
+                        runtime.heap.set_prototype(handle, Some(prototype));
+                    }
+                });
+            }
+        });
+        object
+    })
+}
+
+/// `get DataView.prototype.buffer`.
+extern "C" fn data_view_buffer(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if !is_data_view(this_value) {
+        return raise("this is not a DataView", "TypeError");
+    }
+    property_of(this_value, DV_BUFFER)
+}
+
+/// `get DataView.prototype.byteLength`.
+extern "C" fn data_view_byte_length(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    match property_number(this_value, DV_LENGTH) {
+        Some(length) if is_data_view(this_value) => Value::number(length).to_bits(),
+        _ => raise("this is not a DataView", "TypeError"),
+    }
+}
+
+/// `get DataView.prototype.byteOffset`.
+extern "C" fn data_view_byte_offset(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    match property_number(this_value, DV_OFFSET) {
+        Some(offset) if is_data_view(this_value) => Value::number(offset).to_bits(),
+        _ => raise("this is not a DataView", "TypeError"),
+    }
+}
+
+/// The shared body behind every `DataView.prototype.getX`.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values.
+unsafe fn data_view_get(this_value: u64, kind: ElementKind, argc: u64, argv: *const u64) -> u64 {
+    if !is_data_view(this_value) {
+        return raise("this is not a DataView", "TypeError");
+    }
+    // SAFETY: the caller promises `argc` readable values at `argv`.
+    let byte_offset = match to_index(unsafe { argument(argc, argv, 0) }) {
+        Ok(offset) => offset,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: as above.
+    let little_endian = is_truthy(Value::from_bits(unsafe { argument(argc, argv, 1) }));
+    let Some((buffer, view_offset, byte_length)) = data_view_parts(this_value) else {
+        return raise("this is not a DataView", "TypeError");
+    };
+    if byte_offset + kind.bytes() > byte_length {
+        return raise("offset is outside the DataView", "RangeError");
+    }
+    let Some(handle) = handle_of(buffer) else {
+        return raise("the DataView's buffer is gone", "TypeError");
+    };
+    match with_runtime(|runtime| {
+        runtime
+            .heap
+            .read_bytes(handle, view_offset + byte_offset, kind.bytes())
+    }) {
+        Some(bytes) => Value::number(kind.read_ordered(&bytes, little_endian)).to_bits(),
+        None => raise("offset is outside the DataView", "RangeError"),
+    }
+}
+
+/// The shared body behind every `DataView.prototype.setX`.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values.
+unsafe fn data_view_set(this_value: u64, kind: ElementKind, argc: u64, argv: *const u64) -> u64 {
+    if !is_data_view(this_value) {
+        return raise("this is not a DataView", "TypeError");
+    }
+    // SAFETY: the caller promises `argc` readable values at `argv`.
+    let byte_offset = match to_index(unsafe { argument(argc, argv, 0) }) {
+        Ok(offset) => offset,
+        Err(thrown) => return thrown,
+    };
+    // **The value is coerced before the range is checked**, because its `valueOf` is observable
+    // and the specification runs it first. SAFETY: as above.
+    let value = match coerce_number(unsafe { argument(argc, argv, 1) }) {
+        Ok(value) => value,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: as above.
+    let little_endian = is_truthy(Value::from_bits(unsafe { argument(argc, argv, 2) }));
+    let Some((buffer, view_offset, byte_length)) = data_view_parts(this_value) else {
+        return raise("this is not a DataView", "TypeError");
+    };
+    if byte_offset + kind.bytes() > byte_length {
+        return raise("offset is outside the DataView", "RangeError");
+    }
+    let Some(handle) = handle_of(buffer) else {
+        return raise("the DataView's buffer is gone", "TypeError");
+    };
+    let bytes = kind.to_bytes_ordered(value, little_endian);
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .write_bytes(handle, view_offset + byte_offset, &bytes[..kind.bytes()])
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+/// The sixteen `DataView.prototype.get`/`set` bodies, each naming its kind and sharing
+/// [`data_view_get`]/[`data_view_set`].
+macro_rules! data_view_accessor {
+    ($name:ident, $kind:expr, $op:ident) => {
+        extern "C" fn $name(
+            _closure: u64,
+            this_value: u64,
+            _new_target: u64,
+            argc: u64,
+            argv: *const u64,
+        ) -> u64 {
+            // SAFETY: the convention guarantees `argc` readable values at `argv`.
+            unsafe { $op(this_value, $kind, argc, argv) }
+        }
+    };
+}
+
+data_view_accessor!(dv_get_int8, ElementKind::I8, data_view_get);
+data_view_accessor!(dv_get_uint8, ElementKind::U8, data_view_get);
+data_view_accessor!(dv_get_int16, ElementKind::I16, data_view_get);
+data_view_accessor!(dv_get_uint16, ElementKind::U16, data_view_get);
+data_view_accessor!(dv_get_int32, ElementKind::I32, data_view_get);
+data_view_accessor!(dv_get_uint32, ElementKind::U32, data_view_get);
+data_view_accessor!(dv_get_float32, ElementKind::F32, data_view_get);
+data_view_accessor!(dv_get_float64, ElementKind::F64, data_view_get);
+data_view_accessor!(dv_set_int8, ElementKind::I8, data_view_set);
+data_view_accessor!(dv_set_uint8, ElementKind::U8, data_view_set);
+data_view_accessor!(dv_set_int16, ElementKind::I16, data_view_set);
+data_view_accessor!(dv_set_uint16, ElementKind::U16, data_view_set);
+data_view_accessor!(dv_set_int32, ElementKind::I32, data_view_set);
+data_view_accessor!(dv_set_uint32, ElementKind::U32, data_view_set);
+data_view_accessor!(dv_set_float32, ElementKind::F32, data_view_set);
+data_view_accessor!(dv_set_float64, ElementKind::F64, data_view_set);
 
 /// `RegExp.escape(string)` — a string that, used as a pattern, matches itself literally.
 ///
@@ -11588,6 +11907,13 @@ impl Runtime {
                 );
             }
         }
+        if let (Some(constructor), Some(prototype)) = (
+            self.global_object(globals.handle(), "DataView"),
+            DATA_VIEW_PROTOTYPE.with(std::cell::Cell::get),
+        ) {
+            self.define_hidden(constructor, "prototype", prototype.to_value());
+            self.define_linking(prototype, "constructor", constructor.to_value());
+        }
 
         // **Every global that is a function inherits from `Function.prototype`.** They did
         // not: a global was built before that object existed, so `Date.bind` was `undefined`
@@ -12269,6 +12595,39 @@ impl Runtime {
                 "BYTES_PER_ELEMENT",
                 Value::number(index_number(kind.bytes())),
             );
+        }
+
+        // `DataView.prototype`: three getters and the sixteen `getX`/`setX` methods.
+        {
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            DATA_VIEW_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+            self.inherit_from_object(prototype.handle());
+            for (name, offset) in [
+                ("buffer", DV_BUFFER_GET),
+                ("byteLength", DV_BYTE_LENGTH_GET),
+                ("byteOffset", DV_BYTE_OFFSET_GET),
+            ] {
+                let getter = self.native_function(base + offset);
+                self.install_accessor(prototype.handle(), name, getter);
+            }
+            for (index, (name, _)) in DATA_VIEW_KINDS.iter().enumerate() {
+                let getter = self.native_function(base + DV_GET_BASE + index);
+                self.define_method(
+                    prototype.handle(),
+                    "DataView.prototype",
+                    &format!("get{name}"),
+                    getter.to_value(),
+                );
+                let setter = self.native_function(base + DV_SET_BASE + index);
+                self.define_method(
+                    prototype.handle(),
+                    "DataView.prototype",
+                    &format!("set{name}"),
+                    setter.to_value(),
+                );
+            }
         }
     }
 }
