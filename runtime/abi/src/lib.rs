@@ -4878,6 +4878,24 @@ extern "C" fn object_define_setter(
 ///
 /// **Own means own**: a property found on the prototype answers `false`, which is the whole
 /// reason this exists rather than `key in object`.
+/// `HasOwnProperty(object, key)` — own, and covering the array elements, `length` and string
+/// characters that have no shape slot.
+///
+/// **The key may be a string, a number or a symbol.** `hasOwnProperty("0")` passes the string
+/// `"0"`, which `as_index` (a number test) does not see — so the element check was skipped and
+/// an array element read as absent, which is what made every `verifyProperty` test report
+/// "N should be an own property" (D-237).
+fn has_own_key(object: u64, key: u64) -> bool {
+    if Value::from_bits(key).kind() == crisol_value::Kind::Symbol {
+        return key_of(Value::from_bits(key))
+            .is_some_and(|key| own_property_keyed(object, &key).is_some());
+    }
+    let Some(name) = to_text(key) else {
+        return false;
+    };
+    own_property(object, &name).is_some() || derived_own_property(object, &name).is_some()
+}
+
 extern "C" fn object_has_own_property(
     _closure: u64,
     this_value: u64,
@@ -4889,17 +4907,8 @@ extern "C" fn object_has_own_property(
         return thrown;
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let Some(name) = to_text(unsafe { argument(argc, argv, 0) }) else {
-        return Value::FALSE.to_bits();
-    };
-    if let Some(index) = as_index(Value::from_bits(
-        // SAFETY: as above.
-        unsafe { argument(argc, argv, 0) },
-    )) && let Some((_, length)) = elements_of(this_value)
-    {
-        return boolean(index < length).to_bits();
-    }
-    boolean(own_property(this_value, &name).is_some()).to_bits()
+    let key = unsafe { argument(argc, argv, 0) };
+    boolean(has_own_key(this_value, key)).to_bits()
 }
 
 /// `Object.prototype.propertyIsEnumerable`.
@@ -8068,7 +8077,14 @@ extern "C" fn object_define_property(
                 crisol_property_load(descriptor, read_value.as_ptr(), read_value.len() as u64)
             };
             if Value::from_bits(given).kind() != crisol_value::Kind::Undefined {
-                let wanted = to_number(given);
+                // **`ToNumber`, which runs `valueOf`/`toString`** — a length given as an object
+                // that coerces to a number is coerced through them, not read as `NaN`. `to_number`
+                // skipped `ToPrimitive` and made `{length: {value: {toString: () => "2"}}}` a
+                // `RangeError` (D-236).
+                let wanted = match coerce_number(given) {
+                    Ok(wanted) => wanted,
+                    Err(thrown) => return thrown,
+                };
                 if !wanted.is_finite()
                     || wanted < 0.0
                     || wanted.fract() != 0.0
@@ -9065,19 +9081,14 @@ extern "C" fn object_has_own(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let target = unsafe { argument(argc, argv, 0) };
+    if let Some(thrown) = reject_nullish(target, "cannot read a property") {
+        return thrown;
+    }
     // SAFETY: as above.
     let key = unsafe { argument(argc, argv, 1) };
-    let Some(wanted) = to_text(key) else {
-        return Value::FALSE.to_bits();
-    };
-    // **Own**, so the prototype chain is not walked — which is the whole point of the method,
-    // and the reason it cannot be written as a property read against `undefined`.
-    if own_keys(target).contains(&wanted) {
-        Value::TRUE
-    } else {
-        Value::FALSE
-    }
-    .to_bits()
+    // **Own**, so the prototype chain is not walked — the whole point of the method — and
+    // covering elements/`length`/characters through the shared `has_own_key` (D-237).
+    boolean(has_own_key(target, key)).to_bits()
 }
 
 /// Whether writing `name` on `object` would be refused rather than performed.

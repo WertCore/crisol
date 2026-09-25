@@ -6837,6 +6837,85 @@ fn defining_length_through_a_descriptor_resizes() {
          return Object.getOwnPropertyNames(a).indexOf(\"__fixedLength\");",
         "-1",
     );
+    // **A length value is coerced through `ToNumber`**, which runs `valueOf`/`toString` — an
+    // object that stringifies to a number sets the length, rather than being read as `NaN`.
+    check(
+        "define-length-object-coerces",
+        "let a = []; let seen = \"\"; \
+         Object.defineProperty(a, \"length\", {value: {valueOf: function () { seen = seen + \"v\"; return {}; }, \
+             toString: function () { seen = seen + \"t\"; return \"2\"; }}}); \
+         return a.length + \":\" + seen;",
+        "2:vt",
+    );
+    // A length that coerces to a non-integer is still a RangeError.
+    check(
+        "define-length-object-non-integer",
+        "let a = []; \
+         try { Object.defineProperty(a, \"length\", {value: {valueOf: function () { return 1.5; }}}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
+/// **Defining an array index behaves like defining any property**: it can grow the array, take
+/// attribute-only descriptors, and hold an accessor that reads back through the getter.
+#[test]
+fn defining_an_array_index_covers_the_descriptor_cases() {
+    // Growing an empty array by defining index 0.
+    check(
+        "define-index-grows",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 9}); \
+         return a.hasOwnProperty(\"0\") + \",\" + a.length + \",\" + a[0];",
+        "true,1,9",
+    );
+    // An attribute-only descriptor still creates the property (value undefined).
+    check(
+        "define-index-attributes-only",
+        "let a = []; Object.defineProperty(a, \"0\", {configurable: true}); \
+         let d = Object.getOwnPropertyDescriptor(a, \"0\"); \
+         return (d !== undefined) + \",\" + d.value + \",\" + d.configurable;",
+        "true,undefined,true",
+    );
+    // An accessor on an array index is invoked on read.
+    check(
+        "define-index-accessor",
+        "let a = []; Object.defineProperty(a, \"0\", {get: function () { return 42; }}); \
+         return a[0];",
+        "42",
+    );
+    // The exact 15.2.3.7-6-a-226 sequence: define index 0, then redefine via defineProperties.
+    check(
+        "define-properties-index-redefine",
+        "let a = []; Object.defineProperty(a, \"0\", {configurable: true}); \
+         Object.defineProperties(a, {\"0\": {configurable: false}}); \
+         let d = Object.getOwnPropertyDescriptor(a, \"0\"); \
+         return d.value + \",\" + d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "undefined,false,false,false",
+    );
+    // **`Function.prototype.call.bind(method)`** — the pattern test262's propertyHelper uses
+    // for `__hasOwnProperty`. If it is wrong, every `verifyProperty` test fails identically.
+    check(
+        "call-bind-hasownproperty",
+        "let h = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+         let a = {x: 1}; return h(a, \"x\") + \",\" + h(a, \"y\");",
+        "true,false",
+    );
+    check(
+        "call-bind-on-array-index",
+        "let h = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+         let a = []; Object.defineProperty(a, \"0\", {value: 9}); return h(a, \"0\");",
+        "true",
+    );
+    // **`delete` on a non-configurable element fails and keeps it** — which is what
+    // test262's `verifyProperty` probes, and what makes those cases report "0 should be an own
+    // property" when it wrongly succeeds.
+    check(
+        "delete-non-configurable-element",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 5, configurable: false}); \
+         let gone = delete a[0]; \
+         return gone + \",\" + a.hasOwnProperty(\"0\") + \",\" + a[0];",
+        "false,true,5",
+    );
 }
 
 /// **An array owns `length`**, even though nothing stores it — `getOwnPropertyNames` has to

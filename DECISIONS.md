@@ -6560,3 +6560,56 @@ the method directly, or passing it to `Array.from`, got nothing.
 iterator (D-232's approach), wired onto `String.prototype` under the symbol. By code point, not
 code unit, so an astral character is one step. With `%IteratorPrototype%[Symbol.iterator]`
 (D-232) it is itself iterable, so `Array.from(s[Symbol.iterator]())` works.
+
+## D-236
+
+**A length descriptor value is coerced through `ToNumber`, running `valueOf`/`toString`.**
+
+Status: Accepted
+
+`Object.defineProperty(arr, "length", {value: {toString: () => "2"}})` was a `RangeError`. The
+length path used `to_number`, which answers `NaN` for an object without calling `valueOf` or
+`toString` — so a length given as a coercible object read as `NaN` and failed the integer
+check. `coerce_number` runs `ToPrimitive` (both methods, in order) and propagates a throw from
+them, which is what the specification's `ToUint32(ToNumber(value))` requires.
+
+## D-237
+
+**`hasOwnProperty` recognises the properties that have no shape slot.**
+
+Status: Accepted
+
+`[].hasOwnProperty("0")` — after the index was defined — answered `false`, and so did
+`hasOwnProperty("length")` on any array. The element check used `as_index`, which reads a
+*number* value, but `hasOwnProperty` is called with the *string* `"0"`; the string never
+parsed, the element branch was skipped, and a shape lookup that cannot see an element answered
+false.
+
+This was the single highest-impact bug in the corpus: test262's `verifyProperty` opens with
+`assert(__hasOwnProperty(obj, name), name + " should be an own property")`, and `name` is a
+string — so **every** `verifyProperty`-based test on an array element, `length`, or a string
+character failed identically, ~127 of them in the sampled set alone.
+
+`has_own_key` now checks the shape slot *and* `derived_own_property` (which knows elements,
+`length` and string characters), and handles a symbol key by identity. `Object.prototype.
+hasOwnProperty` and `Object.hasOwn` both route through it.
+
+**Still open**: an accessor defined on an array or arguments *index that already holds an
+element* is shadowed by the element on read (`arg[0]` answers the element, not the getter),
+because the element and the accessor slot coexist and reads check the element first. Closing it
+needs the element removed when an index becomes an accessor — element/slot unification, larger
+than this and left for its own change.
+
+## D-238
+
+**The local acceptance loop needs `cargo build -p crisol-abi` before `cargo test`.**
+
+Status: Accepted
+
+A runtime change in `crisol-abi` does not reach the acceptance suite through `cargo test` alone.
+The suite compiles each JS program to a native binary and links it against
+`target/debug/libcrisol_abi.a` — the **staticlib**, which only `cargo build -p crisol-abi`
+emits. `cargo test` rebuilds the *rlib* the harness itself uses, not the staticlib the programs
+link, so a fix appears to have no effect until the archive is rebuilt. Always
+`cargo build -p crisol-abi && cargo test -p crisol --test build`. (The CI has this as a
+separate step for the same reason; the local loop has to do it by hand.)
