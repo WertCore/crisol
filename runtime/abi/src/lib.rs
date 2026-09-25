@@ -2472,6 +2472,22 @@ fn typed_array_element_store(object: u64, index: usize, value: u64) -> Option<u6
 }
 
 /// Builds an `ArrayBuffer` of `length` zeroed bytes.
+/// The most bytes a buffer may hold. `ToIndex` admits values up to `2**53 - 1`, and
+/// `new ArrayBuffer(2 ** 53)` must answer a `RangeError` rather than attempt to reserve seven
+/// petabytes — an allocation that aborts the process rather than failing. Two gibibytes is the
+/// ceiling every mainstream engine draws and comfortably more than any test asks to allocate.
+const MAX_BYTE_LENGTH: usize = 0x7FFF_FFFF;
+
+/// `count` elements of `per` bytes as a total byte length, or the `RangeError` for a total that
+/// overflows or exceeds [`MAX_BYTE_LENGTH`] — the `CreateByteDataBlock` failure the specification
+/// raises, in place of an allocation that would abort.
+fn checked_byte_length(count: usize, per: usize) -> Result<usize, u64> {
+    count
+        .checked_mul(per)
+        .filter(|&total| total <= MAX_BYTE_LENGTH)
+        .ok_or_else(|| raise("invalid array buffer length", "RangeError"))
+}
+
 fn new_array_buffer(length: usize) -> u64 {
     let object = crisol_create_object();
     with_rooted(&[object], || {
@@ -2501,7 +2517,10 @@ extern "C" fn make_array_buffer(
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
-    new_array_buffer(length)
+    match checked_byte_length(length, 1) {
+        Ok(length) => new_array_buffer(length),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `ArrayBuffer.isView(value)` — whether `value` is a typed array (or, once it exists, a
@@ -2613,10 +2632,14 @@ fn make_typed_array(kind: ElementKind, buffer: u64, offset: usize, length: usize
     object
 }
 
-/// `new TA(length)` — a fresh buffer sized to hold `length` elements.
-fn typed_array_over_new_buffer(kind: ElementKind, length: usize) -> u64 {
-    let buffer = new_array_buffer(length * kind.bytes());
-    with_rooted(&[buffer], || make_typed_array(kind, buffer, 0, length))
+/// `new TA(length)` — a fresh buffer sized to hold `length` elements, or the `RangeError` for a
+/// length too large to allocate.
+fn typed_array_over_new_buffer(kind: ElementKind, length: usize) -> Result<u64, u64> {
+    let bytes = checked_byte_length(length, kind.bytes())?;
+    let buffer = new_array_buffer(bytes);
+    Ok(with_rooted(&[buffer], || {
+        make_typed_array(kind, buffer, 0, length)
+    }))
 }
 
 /// `new TA(buffer, byteOffset, length)` — a view over an existing buffer.
@@ -2673,7 +2696,10 @@ fn typed_array_from_elements(kind: ElementKind, source: u64) -> u64 {
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
-    let result = typed_array_over_new_buffer(kind, length);
+    let result = match typed_array_over_new_buffer(kind, length) {
+        Ok(result) => result,
+        Err(thrown) => return thrown,
+    };
     with_rooted(&[result, source], || {
         for index in 0..length {
             let element = match indexed_get_checked(source, index) {
@@ -2716,7 +2742,10 @@ unsafe fn new_typed_array(kind: ElementKind, argc: u64, argv: *const u64) -> u64
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
-    typed_array_over_new_buffer(kind, length)
+    match typed_array_over_new_buffer(kind, length) {
+        Ok(result) => result,
+        Err(thrown) => thrown,
+    }
 }
 
 /// `get %TypedArray%.prototype.length`.
@@ -2879,7 +2908,10 @@ extern "C" fn typed_array_slice(
         Err(thrown) => return thrown,
     };
     let count = end.saturating_sub(start);
-    let result = typed_array_over_new_buffer(kind, count);
+    let result = match typed_array_over_new_buffer(kind, count) {
+        Ok(result) => result,
+        Err(thrown) => return thrown,
+    };
     with_rooted(&[result, this_value], || {
         for index in 0..count {
             let element = typed_array_element_load(this_value, start + index);

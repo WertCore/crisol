@@ -3080,6 +3080,20 @@ fn typed_arrays_view_a_buffer() {
         "return Object.prototype.toString.call(new Int8Array(1));",
         "[object Int8Array]",
     );
+    // A length past what can be allocated is a RangeError, not an attempt to reserve petabytes
+    // that aborts the process.
+    check(
+        "ab-huge-throws",
+        "try { new ArrayBuffer(7881299347898368); return \"no\"; } \
+         catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+    check(
+        "ta-huge-throws",
+        "try { new Float64Array(9007199254740000); return \"no\"; } \
+         catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
 }
 
 /// The shape still names the slot, so re-assigning must bring the property back.
