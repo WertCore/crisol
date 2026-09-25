@@ -2116,6 +2116,78 @@ extern "C" fn unconstructable(
     raise("this constructor is not supported", "TypeError")
 }
 
+/// `RegExp.escape(string)` — a string that, used as a pattern, matches itself literally.
+///
+/// **A string is required, not coerced.** `RegExp.escape(1)` is a `TypeError`; escaping a number
+/// would invite passing one by mistake and quietly matching `"1"`.
+///
+/// The first character, when it is a letter or digit, is hex-escaped so the result can never
+/// begin a quantifier or merge with what precedes it; the pattern syntax characters take a
+/// backslash; control characters, white space and a set of punctuators become `\xHH`/`\uHHHH`;
+/// everything else stands for itself.
+extern "C" fn regexp_escape(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    if Value::from_bits(value).kind() != crisol_value::Kind::String {
+        return raise("RegExp.escape needs a string", "TypeError");
+    }
+    let Some(text) = text_of(value) else {
+        return new_string("");
+    };
+    let mut out = String::new();
+    for (position, ch) in text.chars().enumerate() {
+        if position == 0 && ch.is_ascii_alphanumeric() {
+            push_regexp_hex(ch, &mut out);
+        } else {
+            encode_for_regexp_escape(ch, &mut out);
+        }
+    }
+    new_string(&out)
+}
+
+/// One character of `RegExp.escape`'s output, after the leading-alphanumeric rule.
+fn encode_for_regexp_escape(ch: char, out: &mut String) {
+    match ch {
+        '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        | '/' => {
+            out.push('\\');
+            out.push(ch);
+        }
+        '\t' => out.push_str("\\t"),
+        '\n' => out.push_str("\\n"),
+        '\u{0B}' => out.push_str("\\v"),
+        '\u{0C}' => out.push_str("\\f"),
+        '\r' => out.push_str("\\r"),
+        // The "other punctuators" the specification escapes, plus white space and the line and
+        // paragraph separators — each as a hex escape rather than a backslash.
+        ',' | '-' | '=' | '<' | '>' | '#' | '&' | '!' | '%' | ':' | ';' | '@' | '~' | '\''
+        | '`' | '"' | ' ' | '\u{A0}' | '\u{2028}' | '\u{2029}' | '\u{FEFF}' => {
+            push_regexp_hex(ch, out);
+        }
+        ch if (ch as u32) <= 0x1F => push_regexp_hex(ch, out),
+        ch => out.push(ch),
+    }
+}
+
+/// A character as `\xHH` for a single byte, or one `\uHHHH` per UTF-16 code unit above that.
+fn push_regexp_hex(ch: char, out: &mut String) {
+    let point = ch as u32;
+    if point <= 0xFF {
+        out.push_str(&format!("\\x{point:02x}"));
+    } else {
+        let mut buffer = [0u16; 2];
+        for unit in ch.encode_utf16(&mut buffer) {
+            out.push_str(&format!("\\u{unit:04x}"));
+        }
+    }
+}
+
 /// `RegExp(source, flags)` and `new RegExp(source, flags)`.
 extern "C" fn make_regexp(
     _closure: u64,
@@ -2552,6 +2624,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("global", "Proxy", 2),
     ("Reflect", "apply", 3),
     ("Reflect", "construct", 2),
+    ("RegExp", "escape", 1),
     ("Map", "groupBy", 2),
     ("Error", "isError", 1),
     ("Reflect", "defineProperty", 3),
@@ -7350,6 +7423,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Reflect", "preventExtensions", reflect_prevent_extensions),
     ("Reflect", "apply", reflect_apply),
     ("Reflect", "construct", reflect_construct),
+    ("RegExp", "escape", regexp_escape),
     ("Map", "groupBy", map_group_by),
     ("Error", "isError", error_is_error),
 ];

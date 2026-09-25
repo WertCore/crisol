@@ -6530,3 +6530,18 @@ specification's order. A non-string tag is ignored; a getter that throws propaga
 from. The builtin `RegExp` and `Arguments` tags are still not distinguished (they need a brand
 this does not carry), so `Object.prototype.toString.call(/x/)` remains `"[object Object]"` —
 recorded rather than pretended.
+
+## D-234
+
+**`RegExp.escape` — a string that matches itself as a pattern.**
+
+Status: Accepted
+
+The ES2025 static was missing. It requires a string (a number is a `TypeError`, not coerced),
+and produces a pattern that matches the input literally: the pattern syntax characters take a
+backslash, control characters and white space and a set of punctuators become `\xHH`/`\uHHHH`,
+and — the one non-obvious rule — a leading letter or digit is hex-escaped so the result can
+never begin a quantifier or fuse with what precedes it.
+
+New static method, zero blast radius: a wrong escape only fails `RegExp.escape`'s own tests, it
+cannot regress anything else — which is why it was a good one to add without a local compile.

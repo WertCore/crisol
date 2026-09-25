@@ -4420,6 +4420,42 @@ fn object_to_string_reports_a_tag() {
     );
 }
 
+/// `RegExp.escape(str)` — a string that matches itself literally as a pattern.
+#[test]
+fn regexp_escape_makes_a_literal_pattern() {
+    // A syntax character takes a backslash; an ordinary one does not.
+    check("regexp-escape-dot", "return RegExp.escape(\".\");", "\\.");
+    check(
+        "regexp-escape-underscore",
+        "return RegExp.escape(\"_\");",
+        "_",
+    );
+    check(
+        "regexp-escape-syntax",
+        "return RegExp.escape(\"(a)\");",
+        "\\(a\\)",
+    );
+    // A leading letter or digit is hex-escaped so the result cannot begin a quantifier.
+    check(
+        "regexp-escape-leading-digit",
+        "return RegExp.escape(\"1\");",
+        "\\x31",
+    );
+    // Round-trip: the escaped string, as a pattern, matches the original and not a near miss.
+    check(
+        "regexp-escape-roundtrip",
+        "let r = new RegExp(RegExp.escape(\"$.^\")); \
+         return r.test(\"$.^\") + \",\" + r.test(\"x\");",
+        "true,false",
+    );
+    // A non-string argument is a TypeError, not coerced.
+    check(
+        "regexp-escape-non-string",
+        "try { RegExp.escape(1); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **The bound arguments come first and the call's own follow**, which is what makes
 /// `f.bind(null, 1)(2)` the same as `f(1, 2)`.
 #[test]
