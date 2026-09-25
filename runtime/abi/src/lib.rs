@@ -14262,8 +14262,18 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
 
     // An element is removed by shortening the array when it is the last one, and otherwise left
     // as `undefined` — a hole and an `undefined` element differ (D-64) and nothing here can say
-    // which it is yet.
-    if let Some(index) = as_index(key_value) {
+    // which it is yet. An index reaches here spelled as text too — `delete o["0"]`, which is
+    // exactly how the harness's `isConfigurable` deletes — so a string that is the canonical
+    // spelling of one names the element, not a slot (see `crisol_property_store`). Without this
+    // the delete silently found no slot, answered `true`, and left the element in place, so a
+    // configurable element read back as non-configurable.
+    let element_index = as_index(key_value).or_else(|| {
+        (key_value.kind() == crisol_value::Kind::String)
+            .then(|| text_of(key_value.to_bits()))
+            .flatten()
+            .and_then(|text| canonical_index(&text))
+    });
+    if let Some(index) = element_index {
         // Read before the borrow below: this is a hidden property, so asking is a property
         // load, and a property load enters the runtime itself.
         let configurable = element_rule(object, index).configurable;

@@ -6613,3 +6613,26 @@ emits. `cargo test` rebuilds the *rlib* the harness itself uses, not the staticl
 link, so a fix appears to have no effect until the archive is rebuilt. Always
 `cargo build -p crisol-abi && cargo test -p crisol --test build`. (The CI has this as a
 separate step for the same reason; the local loop has to do it by hand.)
+
+## D-239
+
+**`delete` resolves an index spelled as text, not only a numeric key.**
+
+Status: Accepted
+
+`delete o[key]` took the element branch only when `key` was a *number* (`as_index`, which reads
+`Value::as_number`). Called with the string `"0"` — which is how the harness's `isConfigurable`
+deletes, and how any `delete o["0"]` reaches the runtime — the branch was skipped, the fallback
+shape lookup found no slot (an element has none), and the delete answered `true` **without
+removing anything**. Paired with the D-237 `hasOwnProperty` fix this was newly observable:
+`isConfigurable` deletes, then asks `!hasOwnProperty`, and the element it failed to remove was
+still there, so a configurable element read back as non-configurable and `verifyProperty`
+failed. The element branch now also resolves a `String` key through `canonical_index` — the same
+canonicalisation the set/load paths already use (`o["01"]` is a property named `"01"`, not
+element one). `Reflect.deleteProperty` routes through the same `crisol_delete`, so it is covered.
+
+Known limit: this makes the *last* element genuinely gone (the branch truncates, and for an
+array `length == element_count`), which is the common `verifyProperty` shape — a single-element
+array's index `"0"`. A non-last element can only be set to `undefined`, and D-64's hole/undefined
+conflation still reports it present, so `delete a["1"]` on `[1,2,3]` cannot yet make index one
+absent. Real holes are the fix and are out of scope here.

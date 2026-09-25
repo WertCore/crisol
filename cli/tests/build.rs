@@ -2949,6 +2949,20 @@ fn delete_removes_a_property() {
         "let o = {a: 1}; delete o[\"a\"]; return o.a;",
         "undefined",
     );
+    // An index spelled as text names the element, so `delete a[\"0\"]` removes it — the same way
+    // the harness's `isConfigurable` deletes. This answered `true` without removing anything
+    // until the string spelling was resolved to the index, so the element stayed and
+    // `hasOwnProperty` still saw it.
+    check(
+        "delete-array-index-string",
+        "let a = [9]; delete a[\"0\"]; return a.hasOwnProperty(\"0\");",
+        "false",
+    );
+    check(
+        "delete-array-index-string-configurable",
+        "let a = [9]; let gone = delete a[\"0\"]; return gone && !a.hasOwnProperty(\"0\");",
+        "true",
+    );
 }
 
 /// **`delete` asks whether the property is gone afterwards, not whether it removed anything**,
