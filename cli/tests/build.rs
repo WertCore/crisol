@@ -3156,6 +3156,70 @@ fn data_views_read_and_write_a_buffer() {
     );
 }
 
+/// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults
+/// (taken only when the value is `undefined`), holes, nesting, a computed key, a string source,
+/// and the `TypeError` a nullish source raises.
+#[test]
+fn destructuring_declarations_bind_each_name() {
+    check(
+        "destr-object",
+        "let {a, b} = {a: 1, b: 2}; return a + b;",
+        "3",
+    );
+    check("destr-rename", "let {a: x} = {a: 5}; return x;", "5");
+    check("destr-default", "let {a = 7} = {}; return a;", "7");
+    check(
+        "destr-default-skipped",
+        "let {a = 7} = {a: 1}; return a;",
+        "1",
+    );
+    check(
+        "destr-object-nested",
+        "let {a: {b}} = {a: {b: 9}}; return b;",
+        "9",
+    );
+    check(
+        "destr-computed-key",
+        "let k = \"a\"; let {[k]: v} = {a: 3}; return v;",
+        "3",
+    );
+    check("destr-array", "let [a, b] = [1, 2]; return a + b;", "3");
+    check("destr-array-hole", "let [, b] = [1, 2]; return b;", "2");
+    check("destr-array-default", "let [a = 5] = []; return a;", "5");
+    check("destr-array-nested", "let [[a]] = [[8]]; return a;", "8");
+    check(
+        "destr-array-string",
+        "let [a, b] = \"hi\"; return a + b;",
+        "hi",
+    );
+    check(
+        "destr-array-over-read",
+        "let [a, b, c] = [1, 2]; return c;",
+        "undefined",
+    );
+    check(
+        "destr-mixed",
+        "let {a: [x, y]} = {a: [1, 2]}; return x + y;",
+        "3",
+    );
+    check("destr-var", "var {a} = {a: 4}; return a;", "4");
+    check(
+        "destr-null-throws",
+        "try { let {a} = null; return \"no\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    check(
+        "destr-for-of-array",
+        "let s = 0; for (const [a, b] of [[1, 2], [3, 4]]) { s = s + a + b; } return s;",
+        "10",
+    );
+    check(
+        "destr-for-of-object",
+        "let s = 0; for (const {x} of [{x: 1}, {x: 2}]) { s = s + x; } return s;",
+        "3",
+    );
+}
+
 /// The shape still names the slot, so re-assigning must bring the property back.
 #[test]
 fn a_deleted_property_can_be_assigned_again() {

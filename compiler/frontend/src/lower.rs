@@ -319,32 +319,195 @@ impl Lowering {
     fn variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'_>) {
         let hoisted = declaration.kind.is_var();
         for declarator in &declaration.declarations {
-            let Some(name) = declarator.id.get_identifier_name() else {
-                self.note("destructuring declaration", declarator.span.start);
-                continue;
-            };
             // **A `var` with no initialiser does nothing here.** The hoist already set it to
             // `undefined`; assigning again would clobber a value an earlier statement gave it,
-            // which is what `var x;` after `x = 1` must not do.
-            if hoisted && declarator.init.is_none() {
+            // which is what `var x;` after `x = 1` must not do. Only a plain identifier can be
+            // written without an initialiser — a destructuring declaration's grammar requires
+            // one — so this stays on the identifier fast path.
+            if let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) = &declarator.id {
+                if hoisted && declarator.init.is_none() {
+                    continue;
+                }
+                let value = match &declarator.init {
+                    Some(init) => self.expression(init),
+                    None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+                };
+                if hoisted {
+                    // The binding already exists, from the hoist. `slot` finds it; `declare`
+                    // would make a second one and leave every reader of the first looking at
+                    // `undefined`.
+                    let slot = self.slot(identifier.name.as_str());
+                    self.write(slot, value);
+                } else {
+                    // `declare`, not `slot`: a `let` shadows an outer binding rather than
+                    // capturing it.
+                    let slot = self.declare(identifier.name.as_str());
+                    self.bind(identifier.name.as_str(), slot, value);
+                }
                 continue;
             }
             let value = match &declarator.init {
                 Some(init) => self.expression(init),
                 None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
             };
-            if hoisted {
-                // The binding already exists, from the hoist. `slot` finds it; `declare` would
-                // make a second one and leave every reader of the first looking at `undefined`.
-                let slot = self.slot(name.as_str());
-                self.write(slot, value);
-            } else {
-                // `declare`, not `slot`: a `let` shadows an outer binding rather than
-                // capturing it.
-                let slot = self.declare(name.as_str());
-                self.bind(name.as_str(), slot, value);
+            self.bind_pattern(&declarator.id, value, hoisted, declarator.span.start);
+        }
+    }
+
+    /// Binds `value` to a destructuring `pattern`, declaring (or, for a hoisted `var`, writing)
+    /// each name it names. Recursive, because a pattern nests: `{a: [b, c]}` reads `a` and then
+    /// destructures the array it holds. `span` is only for the notes the unsupported parts emit.
+    ///
+    /// **Array elements are read through `Op::Iterate`**, the same list `for-of` walks, rather
+    /// than the specification's step-by-step iterator protocol — so it covers arrays and strings
+    /// and matches this engine's `for-of`, and a `.return()` on early completion is not observed.
+    /// Object properties are read by name (or through the computed path), left to right.
+    fn bind_pattern(
+        &mut self,
+        pattern: &oxc_ast::ast::BindingPattern<'_>,
+        value: ValueId,
+        hoisted: bool,
+        span: u32,
+    ) {
+        match pattern {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) => {
+                if hoisted {
+                    let slot = self.slot(identifier.name.as_str());
+                    self.write(slot, value);
+                } else {
+                    let slot = self.declare(identifier.name.as_str());
+                    self.bind(identifier.name.as_str(), slot, value);
+                }
+            }
+            // `left = default`: the default is taken only when the value is `undefined`, and its
+            // expression runs only then, because it may have effects.
+            oxc_ast::ast::BindingPattern::AssignmentPattern(assignment) => {
+                let resolved = self.default_if_undefined(value, &assignment.right);
+                self.bind_pattern(&assignment.left, resolved, hoisted, span);
+            }
+            oxc_ast::ast::BindingPattern::ObjectPattern(object) => {
+                if object.rest.is_some() {
+                    // A rest element gathers the remaining own enumerable keys into a fresh
+                    // object — a runtime copy this does not have yet.
+                    self.note("object rest pattern", span);
+                }
+                for property in &object.properties {
+                    let read = self.read_binding_key(value, &property.key, property.computed, span);
+                    self.bind_pattern(&property.value, read, hoisted, span);
+                }
+            }
+            oxc_ast::ast::BindingPattern::ArrayPattern(array) => {
+                if array.rest.is_some() {
+                    self.note("array rest pattern", span);
+                }
+                // `Op::Iterate` raises on a non-iterable, so `let [a] = null` throws as it must —
+                // the signal has to be honoured here or the reads below would run over it.
+                let iterated = self.emit(Type::Object(None), Op::Iterate { object: value });
+                let values = self.propagate(iterated);
+                for (index, element) in array.elements.iter().enumerate() {
+                    // A hole (`[, a]`) binds nothing but still advances the position.
+                    let Some(pattern) = element else {
+                        continue;
+                    };
+                    #[expect(clippy::cast_precision_loss, reason = "a destructuring arity")]
+                    let position = index as f64;
+                    let key = self.emit(Type::Number, Op::Const(Constant::Number(position)));
+                    let read = self.emit(
+                        Type::Unknown,
+                        Op::ComputedLoad {
+                            object: values,
+                            key,
+                        },
+                    );
+                    let read = self.propagate(read);
+                    self.bind_pattern(pattern, read, hoisted, span);
+                }
             }
         }
+    }
+
+    /// Reads the property a binding pattern's key names — `{a}` and `{a: x}` by name, `{[k]: x}`
+    /// and `{0: x}` through the computed path, where the number-to-name rule lives.
+    fn read_binding_key(
+        &mut self,
+        object: ValueId,
+        key: &Key<'_>,
+        computed: bool,
+        span: u32,
+    ) -> ValueId {
+        let name = if computed {
+            None
+        } else {
+            match key {
+                Key::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
+                Key::StringLiteral(literal) => Some(literal.value.to_string()),
+                _ => None,
+            }
+        };
+        let read = match name {
+            Some(name) => self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object,
+                    key: PropertyKey::new(&name),
+                },
+            ),
+            None => match self.property_key_value(key) {
+                Some(key) => self.emit(Type::Unknown, Op::ComputedLoad { object, key }),
+                None => {
+                    self.note("property key", span);
+                    self.emit(Type::Undefined, Op::Const(Constant::Undefined))
+                }
+            },
+        };
+        self.propagate(read)
+    }
+
+    /// `value` unless it is `undefined`, in which case the `default` expression — evaluated only
+    /// then, since it may have effects. The branch-and-join a conditional uses (see
+    /// [`Self::conditional`]).
+    fn default_if_undefined(&mut self, value: ValueId, default: &Expression<'_>) -> ValueId {
+        let slot = self.temporary();
+        let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+        let missing = self.emit(
+            Type::Bool,
+            Op::Compare {
+                op: CompareOp::StrictEqual,
+                left: value,
+                right: undefined,
+            },
+        );
+        let then_block = self.new_block();
+        let else_block = self.new_block();
+        let join = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition: missing,
+            then_block,
+            then_args: Vec::new(),
+            else_block,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(then_block);
+        let fallback = self.expression(default);
+        self.emit_effect(Op::Store {
+            slot,
+            value: fallback,
+        });
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+
+        self.switch_to(else_block);
+        self.emit_effect(Op::Store { slot, value });
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+
+        self.switch_to(join);
+        self.emit(Type::Unknown, Op::Load { slot })
     }
 
     /// `for (name in object) body`.
@@ -503,12 +666,16 @@ impl Lowering {
                 let Some(first) = declaration.declarations.first() else {
                     return;
                 };
-                let Some(name) = first.id.get_identifier_name() else {
-                    self.note("destructuring for-in binding", declaration.span.start);
-                    return;
-                };
-                let slot = self.declare(name.as_str());
-                self.bind(name.as_str(), slot, value);
+                match first.id.get_identifier_name() {
+                    Some(name) => {
+                        let slot = self.declare(name.as_str());
+                        self.bind(name.as_str(), slot, value);
+                    }
+                    // `for (const [a, b] of pairs)` / `for (const {x} in obj)`: the loop variable
+                    // is a destructuring pattern, bound afresh each iteration. `let`-scoped, so
+                    // `declare` (hoisted = false).
+                    None => self.bind_pattern(&first.id, value, false, declaration.span.start),
+                }
             }
             oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(identifier) => {
                 let slot = self.slot(identifier.name.as_str());

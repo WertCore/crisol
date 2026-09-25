@@ -6708,3 +6708,36 @@ members extend `TYPED_NATIVES` (still last in the dispatch chain, so the typed-a
 them do not move), and `ArrayBuffer.isView` now answers for a `DataView` too.
 
 Deferred, as for the typed arrays: detachment, `@@species`, and resizable buffers.
+
+## D-242
+
+**Destructuring, in declarations and `for`-loop bindings.**
+
+Status: Accepted
+
+The largest `refused` cluster after BigInt, and — unlike a missing built-in subsystem — one that
+is used *pervasively* through the corpus, so accepting the syntax lets far more than the directly-
+counted cases run. `bind_pattern` is a recursive lowering that, given a source value and a
+`BindingPattern`, declares (or, for a hoisted `var`, writes) each name:
+
+- **Identifier** — `declare`+`bind`, as a plain `let` does.
+- **`x = default`** — the default is taken only when the value is `undefined`, and its expression
+  runs only then (it may have effects), through the branch-and-join a conditional uses.
+- **Object pattern** — each property read by name, or through the computed path for `{[k]: x}` and
+  `{0: x}`; nesting via recursion. Reading a property of a nullish source throws, which is how
+  `let {a} = null` is a `TypeError`.
+- **Array pattern** — through `Op::Iterate`, the same list `for-of` walks, then indexed. So it
+  covers arrays and strings and matches this engine's `for-of`, holes advance without binding, and
+  out-of-range reads are `undefined` (so a default fills them).
+
+Wired into `variable_declaration` (the identifier fast path stays, since only it can be written
+with no initialiser — `var x;`) and into the `for (const [a] of xs)` / `for (const {x} in o)` loop
+binding.
+
+Deferred, each with a note rather than a wrong answer: **rest** (`...r`, in both object and array
+patterns — it gathers into a fresh object/array this has no runtime copy for), destructuring
+**parameters** and **catch** bindings, and **assignment**-target destructuring (`[a] = x` with no
+`let`). Array patterns use `Op::Iterate`'s eager materialisation rather than the specification's
+step-by-step protocol, so a `.return()` on early completion is not observed — the same limit the
+`for-of` lowering already has. Proper `var` hoisting of pattern names is not done; `slot` declares
+on miss, so a decl-before-use `var {a} = …` still binds.
