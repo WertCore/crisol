@@ -2480,6 +2480,21 @@ fn is_array_buffer(object: u64) -> bool {
     own_flag(object, ARRAY_BUFFER_BRAND)
 }
 
+/// The mark a detached `ArrayBuffer` carries. Detaching also shrinks the byte store to zero, so
+/// `byteLength` and every element read fall out of that on their own; this flag is what the length
+/// getters consult to report `0` rather than the view's original element count.
+const ARRAY_BUFFER_DETACHED: &str = "__detached";
+
+/// Whether `buffer` has been detached (by `$262.detachArrayBuffer`).
+fn is_detached(buffer: u64) -> bool {
+    own_flag(buffer, ARRAY_BUFFER_DETACHED)
+}
+
+/// Whether the buffer a typed array or `DataView` views has been detached.
+fn view_is_detached(view: u64, buffer_key: &str) -> bool {
+    is_detached(property_of(view, buffer_key))
+}
+
 /// Whether `object` is a typed array.
 fn is_typed_array(object: u64) -> bool {
     own_flag(object, TYPED_ARRAY_BRAND)
@@ -2609,6 +2624,29 @@ extern "C" fn array_buffer_is_view(
     // SAFETY: as above.
     let value = unsafe { argument(argc, argv, 0) };
     boolean(is_typed_array(value) || is_data_view(value)).to_bits()
+}
+
+/// `$262.detachArrayBuffer(buffer)` — the test262 host hook that models a buffer being transferred
+/// away. Marks it detached and shrinks its byte store to nothing, so `byteLength` reads `0`, every
+/// element read comes back `undefined` (the store is too short), and the length getters report `0`.
+extern "C" fn host_detach_array_buffer(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let buffer = unsafe { argument(argc, argv, 0) };
+    if is_array_buffer(buffer)
+        && let Some(handle) = handle_of(buffer)
+    {
+        with_runtime(|runtime| {
+            runtime.heap.attach_bytes(handle, 0);
+            runtime.define_hidden(handle, ARRAY_BUFFER_DETACHED, Value::TRUE);
+        });
+    }
+    Value::NULL.to_bits()
 }
 
 /// `get ArrayBuffer.prototype.byteLength`.
@@ -2831,6 +2869,10 @@ extern "C" fn typed_array_length_getter(
     _argv: *const u64,
 ) -> u64 {
     match property_number(this_value, TA_LENGTH) {
+        // **A detached buffer makes the view zero-length**, whatever its original element count.
+        Some(_) if is_typed_array(this_value) && view_is_detached(this_value, TA_BUFFER) => {
+            Value::number(0.0).to_bits()
+        }
         Some(length) if is_typed_array(this_value) => Value::number(length).to_bits(),
         _ => raise("this is not a typed array", "TypeError"),
     }
@@ -2847,6 +2889,9 @@ extern "C" fn typed_array_byte_length_getter(
     let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
         return raise("this is not a typed array", "TypeError");
     };
+    if view_is_detached(this_value, TA_BUFFER) {
+        return Value::number(0.0).to_bits();
+    }
     Value::number(index_number(length * kind.bytes())).to_bits()
 }
 
@@ -8688,6 +8733,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("RegExp", "escape", regexp_escape),
     ("Map", "groupBy", map_group_by),
     ("Error", "isError", error_is_error),
+    ("$262", "detachArrayBuffer", host_detach_array_buffer),
 ];
 
 /// Whether `value` is the exception signal, **clearing the pending throw if it is**.
@@ -17020,7 +17066,7 @@ const NOT_CONSTRUCTORS: &[&str] = &["parseInt", "parseFloat", "isNaN", "isFinite
 ///
 /// Every other name [`NAMESPACE_NATIVES`] hangs a method on is either already a global function
 /// — `String`, `Number`, `Date` — or one of the two that is both a namespace and a constructor.
-const NAMESPACES_ONLY: &[&str] = &["Math", "JSON", "Reflect"];
+const NAMESPACES_ONLY: &[&str] = &["Math", "JSON", "Reflect", "$262"];
 
 /// Whether `new value` is allowed — the specification's [[Construct]].
 ///

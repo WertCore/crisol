@@ -3157,6 +3157,35 @@ fn data_views_read_and_write_a_buffer() {
     );
 }
 
+/// `$262.detachArrayBuffer` transfers a buffer away: its `byteLength` and every view's `length`
+/// become zero, and reads come back `undefined`.
+#[test]
+fn detaching_a_buffer_empties_its_views() {
+    check(
+        "detach-buffer-byte-length",
+        "let ab = new ArrayBuffer(8); $262.detachArrayBuffer(ab); return ab.byteLength;",
+        "0",
+    );
+    check(
+        "detach-view-length",
+        "let ab = new ArrayBuffer(8); let ta = new Int8Array(ab); \
+         $262.detachArrayBuffer(ab); return ta.length;",
+        "0",
+    );
+    check(
+        "detach-view-read",
+        "let ab = new ArrayBuffer(8); let ta = new Int8Array(ab); ta[0] = 5; \
+         $262.detachArrayBuffer(ab); return ta[0];",
+        "undefined",
+    );
+    check(
+        "detach-is-view-still",
+        "let ta = new Int8Array(4); $262.detachArrayBuffer(ta.buffer); \
+         return ArrayBuffer.isView(ta);",
+        "true",
+    );
+}
+
 /// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults
 /// (taken only when the value is `undefined`), holes, nesting, a computed key, a string source,
 /// and the `TypeError` a nullish source raises.

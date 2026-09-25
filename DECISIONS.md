@@ -6772,3 +6772,25 @@ forwards **no** arguments (no rest/spread yet), so `new B()` runs the parent but
 not pass `x`; and `extends` of a native (`Array`, `Error`) does not adopt the exotic behaviour,
 since `super()` runs the native as a plain call. Class fields and static members remain unsupported
 (noted), and the corpus honesty test now names a field rather than `extends`.
+
+## D-244
+
+**`$262.detachArrayBuffer` and buffer detachment.**
+
+Status: Accepted
+
+test262's detachment tests reach for `$262.detachArrayBuffer(ab)` — the biggest single use of the
+`$262` host object, and the "$262 is not defined" line in the corpus. A real engine has the *runner*
+inject `$262`; crisol's runner does not, so it is registered as an engine namespace instead
+(`NAMESPACE_NATIVES` + `NAMESPACES_ONLY`) — harmless, since no real program names `$262`, and it
+unblocks the tests. Only `detachArrayBuffer` is provided; the other `$262` members are not.
+
+Detaching **shrinks the byte store to zero** (`attach_bytes(handle, 0)`) and sets a `__detached`
+flag. Most of the observable consequences then fall out of the shrunk store for free: `byteLength`
+reads `0`, and every typed-array element read misses (`read_bytes` on a zero-length store) and comes
+back `undefined`. The one thing that does not fall out is the view's `length`, which is stored at
+construction — so the `length`/`byteLength` getters consult the flag and report `0` when detached.
+
+Deferred: the exact `TypeError`-on-detached that many operations owe (a `DataView` read on a
+detached buffer answers `RangeError` from the short store rather than `TypeError`), and the rest of
+the `$262` surface (`createRealm`, `evalScript`, `agent`, `global`, `gc`, `IsHTMLDDA`).
