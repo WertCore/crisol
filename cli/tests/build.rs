@@ -1138,6 +1138,49 @@ fn every_string_method_requires_a_coercible_receiver() {
     );
 }
 
+/// **A `Number.prototype` method needs a number receiver — `thisNumberValue`, not coercion.**
+///
+/// `Number.prototype.valueOf.call("5")` is a `TypeError`, not `5`; a string that happens to
+/// coerce to a number is still not a Number.
+#[test]
+fn a_number_method_requires_a_number_receiver() {
+    for method in ["toString", "valueOf", "toFixed"] {
+        check(
+            &format!("number-{method}-on-string"),
+            &format!(
+                "try {{ Number.prototype.{method}.call(\"5\"); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("number-{method}-on-object"),
+            &format!(
+                "try {{ Number.prototype.{method}.call({{}}); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A real number and a Number wrapper both work.
+    check(
+        "number-tostring-primitive",
+        "return (255).toString(16);",
+        "ff",
+    );
+    check("number-valueof-primitive", "return (42).valueOf();", "42");
+    check(
+        "number-tofixed-primitive",
+        "return (3.14159).toFixed(2);",
+        "3.14",
+    );
+    check(
+        "number-valueof-wrapper",
+        "return Number.prototype.valueOf.call(new Number(7));",
+        "7",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

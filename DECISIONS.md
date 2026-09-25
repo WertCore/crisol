@@ -6385,3 +6385,19 @@ coerced to `"5"`. `coercible_text` would coerce it, so those two keep their own 
 they are.
 
 Mechanical, one pattern applied 19 times, which is why it is one commit rather than nineteen.
+
+## D-227
+
+**A `Number.prototype` method needs a number receiver, `thisNumberValue`-strict.**
+
+Status: Accepted
+
+`Number.prototype.valueOf.call("5")` answered `5`. It should be a `TypeError`:
+`thisNumberValue` accepts only a number or a Number wrapper, where `this_number` coerced
+anything through `ToNumber`. The same shape as Boolean (D-223) and the distinction that a
+string which *happens* to coerce is still not a Number.
+
+`require_number` replaces `this_number` — a number primitive answers itself, a wrapper answers
+the primitive it stores (detected by `as_number` on the shared slot returning `Some`, which a
+string or boolean wrapper does not), everything else throws. `toString`, `toLocaleString`,
+`valueOf` and `toFixed` route through it; `this_number` had no other caller and is gone.

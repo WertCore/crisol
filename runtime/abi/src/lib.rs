@@ -1797,11 +1797,23 @@ const BOOLEAN_NATIVES: &[(&str, Native)] =
 /// **An object receiver is read, not coerced.** `new Number(5).valueOf()` has to find the five
 /// the wrapper was built with, and coercing the wrapper would run its own `valueOf` — which is
 /// this function, and does not end (D-146).
-fn this_number(this_value: u64) -> f64 {
-    if handle_of(this_value).is_some() {
-        return property_number(this_value, STRING_PRIMITIVE).unwrap_or(f64::NAN);
+/// `thisNumberValue` — the number a receiver *is*, or a `TypeError` if it is not one.
+///
+/// **Stricter than coercion.** `Number.prototype.valueOf.call("5")` is a `TypeError`, not `5`:
+/// the receiver must be a number or a Number wrapper, where [`this_number`] coerced anything.
+/// A wrapper keeps its primitive in the shared slot, so `as_number` answering `Some` is what
+/// says this one holds a number rather than a string or a boolean.
+fn require_number(this_value: u64) -> Result<f64, u64> {
+    let held = Value::from_bits(this_value);
+    if held.kind() == crisol_value::Kind::Number {
+        return Ok(held.as_number().unwrap_or(f64::NAN));
     }
-    to_number(this_value)
+    if handle_of(this_value).is_some()
+        && let Some(value) = property_number(this_value, STRING_PRIMITIVE)
+    {
+        return Ok(value);
+    }
+    Err(raise("this is not a Number", "TypeError"))
 }
 
 /// `Number.prototype.toString(radix)`.
@@ -1812,7 +1824,10 @@ extern "C" fn number_to_text(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let value = this_number(this_value);
+    let value = match require_number(this_value) {
+        Ok(value) => value,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let radix = to_number(unsafe { argument(argc, argv, 0) });
     if !radix.is_finite() || radix == 10.0 {
@@ -1863,7 +1878,10 @@ extern "C" fn number_value_of(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    from_number(this_number(this_value))
+    match require_number(this_value) {
+        Ok(value) => from_number(value),
+        Err(thrown) => thrown,
+    }
 }
 
 /// `Number.prototype.toFixed(digits)`.
@@ -1874,7 +1892,10 @@ extern "C" fn number_to_fixed(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let value = this_number(this_value);
+    let value = match require_number(this_value) {
+        Ok(value) => value,
+        Err(thrown) => return thrown,
+    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let digits = to_number(unsafe { argument(argc, argv, 0) });
     let digits = if digits.is_finite() { digits } else { 0.0 };
