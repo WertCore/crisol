@@ -6545,3 +6545,18 @@ never begin a quantifier or fuse with what precedes it.
 
 New static method, zero blast radius: a wrong escape only fails `RegExp.escape`'s own tests, it
 cannot regress anything else — which is why it was a good one to add without a local compile.
+
+## D-235
+
+**`String.prototype[Symbol.iterator]` — a code-point iterator as a callable method.**
+
+Status: Accepted
+
+`[...s]` and `for (const c of s)` already walked a string by code point through
+`crisol_iterate`'s fast path, but `s[Symbol.iterator]` was `undefined` — so a program calling
+the method directly, or passing it to `Array.from`, got nothing.
+
+`string_iterator` snapshots the code points into an array and returns an ordinary array
+iterator (D-232's approach), wired onto `String.prototype` under the symbol. By code point, not
+code unit, so an astral character is one step. With `%IteratorPrototype%[Symbol.iterator]`
+(D-232) it is itself iterable, so `Array.from(s[Symbol.iterator]())` works.

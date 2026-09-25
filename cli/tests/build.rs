@@ -4456,6 +4456,40 @@ fn regexp_escape_makes_a_literal_pattern() {
     );
 }
 
+/// `String.prototype[Symbol.iterator]` — a code-point iterator reachable as a method.
+#[test]
+fn a_string_answers_symbol_iterator() {
+    check(
+        "string-symbol-iterator-exists",
+        "return typeof \"a\"[Symbol.iterator];",
+        "function",
+    );
+    check(
+        "string-iterator-next",
+        "let it = \"ab\"[Symbol.iterator](); return it.next().value + it.next().value;",
+        "ab",
+    );
+    // By code point: an astral character is a single step.
+    check(
+        "string-iterator-astral",
+        "let it = \"\\u{1f4a9}x\"[Symbol.iterator](); \
+         return (it.next().value === \"\\u{1f4a9}\") + \",\" + it.next().value;",
+        "true,x",
+    );
+    // The iterator is itself iterable, so Array.from drains it.
+    check(
+        "string-iterator-array-from",
+        "return Array.from(\"ab\"[Symbol.iterator]()).join(\",\");",
+        "a,b",
+    );
+    // Exhaustion.
+    check(
+        "string-iterator-done",
+        "let it = \"a\"[Symbol.iterator](); it.next(); return it.next().done;",
+        "true",
+    );
+}
+
 /// **The bound arguments come first and the call's own follow**, which is what makes
 /// `f.bind(null, 1)(2)` the same as `f(1, 2)`.
 #[test]

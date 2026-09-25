@@ -2709,6 +2709,7 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     regexp_symbol_replace,
     regexp_symbol_split,
     iterator_self,
+    string_iterator,
 ];
 
 /// Where a `resolve`/`reject` function keeps the promise it settles.
@@ -2833,6 +2834,9 @@ const REGEXP_SYMBOL_NAMES: &[&str] = &["match", "search", "replace", "split"];
 /// The index within [`ANONYMOUS_NATIVES`] of `%IteratorPrototype%[Symbol.iterator]`, which
 /// answers its own receiver so that an iterator is itself iterable.
 const ITERATOR_SELF: usize = 11;
+
+/// The index within [`ANONYMOUS_NATIVES`] of `String.prototype[Symbol.iterator]`.
+const STRING_ITERATOR: usize = 12;
 
 /// Marks an array whose `length` has been made non-writable.
 ///
@@ -4123,6 +4127,30 @@ fn drain_microtasks() {
 /// The specification has no limit and an endless chain is specified to starve the loop. This
 /// exists so a test runner reports rather than hangs; no terminating program reaches it.
 const MICROTASK_LIMIT: usize = 1_000_000;
+
+/// `String.prototype[Symbol.iterator]` — a string iterator over its code points.
+///
+/// **By code point, not code unit**, so an astral character is one step, not two — the same
+/// walk `for (const c of s)` already takes through `crisol_iterate`'s fast path, but reachable
+/// now as a method a program can call directly. A snapshot into an array reuses the array
+/// iterator (D-232), so there is no new iterator type.
+extern "C" fn string_iterator(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
+    with_rooted(&[this_value], || {
+        let points: Vec<String> = text.chars().map(|point| point.to_string()).collect();
+        let array = names_as_array(&points);
+        with_rooted(&[array], || new_array_iterator(array, 1.0))
+    })
+}
 
 /// `%IteratorPrototype%[Symbol.iterator]` — an iterator is its own iterable.
 ///
@@ -10211,6 +10239,17 @@ impl Runtime {
                 NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ITERATOR_SELF;
             let function = self.native_function(index);
             self.define_keyed(prototype, &key, function.to_value());
+        }
+
+        // **A string answers `Symbol.iterator` with a code-point iterator.** `[...s]` already
+        // works through the fast path, but `s[Symbol.iterator]()` needs the method itself.
+        if let Some(prototype) = STRING_PROTOTYPE.with(std::cell::Cell::get) {
+            let index =
+                NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + STRING_ITERATOR;
+            let function = self.native_function(index);
+            self.define_keyed(prototype, &key, function.to_value());
+            let text = self.string("[Symbol.iterator]");
+            self.define_named(function, "name", text);
         }
 
         // **The regular-expression protocol.** `String.prototype.match` is *defined* as
