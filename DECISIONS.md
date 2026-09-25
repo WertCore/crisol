@@ -6401,3 +6401,25 @@ string which *happens* to coerce is still not a Number.
 the primitive it stores (detected by `as_number` on the shared slot returning `Some`, which a
 string or boolean wrapper does not), everything else throws. `toString`, `toLocaleString`,
 `valueOf` and `toFixed` route through it; `this_number` had no other caller and is gone.
+
+## D-228
+
+**`every`, `some` and the `find` family `ToObject` their receiver.**
+
+Status: Accepted
+
+`Array.prototype.every.call(2.5, cb)` ran `cb` with the primitive `2.5` as its array argument,
+so `obj instanceof Number` was false and a whole family of test262's `this-value` cases failed.
+The specification's first step is `O = ToObject(this)`: a primitive is boxed, a nullish receiver
+throws. `object_receiver` does that — `to_object` returns a real array unchanged, so the fast
+path is untouched — and the three helpers read length and elements from the box and pass it as
+the callback's third argument.
+
+The box is rooted for the length read and the whole callback loop, since a boxed primitive is a
+fresh object held by nothing else.
+
+**Only `every`/`some`/`find`/`findIndex`/`findLast`/`findLastIndex` this batch** — the ones whose
+structure is a plain scan. `map`, `filter`, `forEach`, `reduce` and `reduceRight` want the same
+`ToObject` and are the follow-up; they were left out because their result-array and seed logic
+makes the change bigger, and one localizable batch at a time is worth more than one broad one
+that is hard to bisect when it fails.

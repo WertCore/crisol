@@ -1556,50 +1556,49 @@ extern "C" fn array_at(
 
 /// `findLast` and `findLastIndex`, which walk backwards.
 fn find_last_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
-    let length = match indexed_length(this_value) {
-        Ok(length) => length,
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let callback = unsafe { argument(argc, argv, 0) };
-    // **Checked before a single element is read.** `[1, 2].map(5)` throws
-    // rather than calling nothing twice and answering `[undefined,
-    // undefined]` — which is what reaching `crisol_not_a_function` per
-    // element produced, and it looked like a working call every time.
-    if !is_callable(callback) {
-        return raise("a callback must be a function", "TypeError");
-    }
-    // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
-    // SAFETY: as above.
-    let this_arg = unsafe { argument(argc, argv, 1) };
     with_rooted(&live, || {
-        for index in (0..length).rev() {
-            let element = match indexed_get_checked(this_value, index) {
-                Ok(element) => element,
+        with_rooted(&[receiver], || {
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
                 Err(thrown) => return thrown,
             };
-            let verdict = call_value(
-                callback,
-                this_arg,
-                &[element, index_value(index), this_value],
-            );
-            if Value::from_bits(verdict).is_exception() {
-                return verdict;
+            // SAFETY: as above.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
             }
-            if is_truthy(Value::from_bits(verdict)) {
-                return if want_index {
-                    index_value(index)
-                } else {
-                    element
+            // SAFETY: as above.
+            let this_arg = unsafe { argument(argc, argv, 1) };
+            for index in (0..length).rev() {
+                let element = match indexed_get_checked(receiver, index) {
+                    Ok(element) => element,
+                    Err(thrown) => return thrown,
                 };
+                let verdict =
+                    call_value(callback, this_arg, &[element, index_value(index), receiver]);
+                if Value::from_bits(verdict).is_exception() {
+                    return verdict;
+                }
+                if is_truthy(Value::from_bits(verdict)) {
+                    return if want_index {
+                        index_value(index)
+                    } else {
+                        element
+                    };
+                }
             }
-        }
-        if want_index {
-            Value::number(-1.0).to_bits()
-        } else {
-            Value::UNDEFINED.to_bits()
-        }
+            if want_index {
+                Value::number(-1.0).to_bits()
+            } else {
+                Value::UNDEFINED.to_bits()
+            }
+        })
     })
 }
 
@@ -12860,53 +12859,52 @@ extern "C" fn array_unshift(
 
 /// `find` and `findIndex`, which differ only in what they answer with.
 fn find_with(this_value: u64, argc: u64, argv: *const u64, want_index: bool) -> u64 {
-    let length = match indexed_length(this_value) {
-        Ok(length) => length,
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let callback = unsafe { argument(argc, argv, 0) };
-    // **Checked before a single element is read.** `[1, 2].map(5)` throws
-    // rather than calling nothing twice and answering `[undefined,
-    // undefined]` — which is what reaching `crisol_not_a_function` per
-    // element produced, and it looked like a working call every time.
-    if !is_callable(callback) {
-        return raise("a callback must be a function", "TypeError");
-    }
-    // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
-    // SAFETY: as above.
-    let this_arg = unsafe { argument(argc, argv, 1) };
     with_rooted(&live, || {
-        for index in 0..length {
-            // **`find` reads a hole**, unlike `forEach` which skips one — it visits every
-            // index, so a throwing getter has to propagate rather than be skipped.
-            let element = match indexed_get_checked(this_value, index) {
-                Ok(element) => element,
+        with_rooted(&[receiver], || {
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
                 Err(thrown) => return thrown,
             };
-            let verdict = call_value(
-                callback,
-                this_arg,
-                &[element, index_value(index), this_value],
-            );
-            if Value::from_bits(verdict).is_exception() {
-                return verdict;
+            // SAFETY: as above.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
             }
-            if is_truthy(Value::from_bits(verdict)) {
-                return if want_index {
-                    index_value(index)
-                } else {
-                    element
+            // SAFETY: as above.
+            let this_arg = unsafe { argument(argc, argv, 1) };
+            for index in 0..length {
+                // **`find` reads a hole**, unlike `forEach` which skips one — it visits every
+                // index, so a throwing getter has to propagate rather than be skipped.
+                let element = match indexed_get_checked(receiver, index) {
+                    Ok(element) => element,
+                    Err(thrown) => return thrown,
                 };
+                let verdict =
+                    call_value(callback, this_arg, &[element, index_value(index), receiver]);
+                if Value::from_bits(verdict).is_exception() {
+                    return verdict;
+                }
+                if is_truthy(Value::from_bits(verdict)) {
+                    return if want_index {
+                        index_value(index)
+                    } else {
+                        element
+                    };
+                }
             }
-        }
-        // **`find` answers `undefined` and `findIndex` answers `-1`** when nothing matches.
-        if want_index {
-            Value::number(-1.0).to_bits()
-        } else {
-            Value::UNDEFINED.to_bits()
-        }
+            // **`find` answers `undefined` and `findIndex` answers `-1`** when nothing matches.
+            if want_index {
+                Value::number(-1.0).to_bits()
+            } else {
+                Value::UNDEFINED.to_bits()
+            }
+        })
     })
 }
 
@@ -12933,45 +12931,61 @@ extern "C" fn array_find_index(
 }
 
 /// `every` and `some`, which differ only in what stops them.
+/// `ToObject(this)` for the generic array methods, or a `TypeError` for a nullish receiver.
+///
+/// **A primitive receiver is boxed, not read raw.** `Array.prototype.every.call(2.5, cb)` runs
+/// `cb` with a `Number` object as the array — `obj instanceof Number` is true — where reading
+/// `2.5` directly gave the callback a primitive. `to_object` returns a real array unchanged, so
+/// the fast path is untouched.
+fn object_receiver(this_value: u64) -> Result<u64, u64> {
+    to_object(this_value).ok_or_else(|| {
+        raise(
+            "an array method needs a receiver that is not null or undefined",
+            "TypeError",
+        )
+    })
+}
+
 fn quantify(this_value: u64, argc: u64, argv: *const u64, want_all: bool) -> u64 {
-    let length = match indexed_length(this_value) {
-        Ok(length) => length,
+    // ToObject first, so a primitive receiver is boxed and a nullish one throws before the
+    // length is read or the callback checked.
+    let receiver = match object_receiver(this_value) {
+        Ok(receiver) => receiver,
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let callback = unsafe { argument(argc, argv, 0) };
-    // **Checked before a single element is read.** `[1, 2].map(5)` throws
-    // rather than calling nothing twice and answering `[undefined,
-    // undefined]` — which is what reaching `crisol_not_a_function` per
-    // element produced, and it looked like a working call every time.
-    if !is_callable(callback) {
-        return raise("a callback must be a function", "TypeError");
-    }
-    // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
-    // SAFETY: as above.
-    let this_arg = unsafe { argument(argc, argv, 1) };
     with_rooted(&live, || {
-        for index in 0..length {
-            let element = match indexed_get_checked(this_value, index) {
-                Ok(element) => element,
+        with_rooted(&[receiver], || {
+            let length = match indexed_length(receiver) {
+                Ok(length) => length,
                 Err(thrown) => return thrown,
             };
-            let verdict = call_value(
-                callback,
-                this_arg,
-                &[element, index_value(index), this_value],
-            );
-            if Value::from_bits(verdict).is_exception() {
-                return verdict;
+            // SAFETY: as above.
+            let callback = unsafe { argument(argc, argv, 0) };
+            if !is_callable(callback) {
+                return raise("a callback must be a function", "TypeError");
             }
-            if is_truthy(Value::from_bits(verdict)) != want_all {
-                return if want_all { Value::FALSE } else { Value::TRUE }.to_bits();
+            // SAFETY: as above.
+            let this_arg = unsafe { argument(argc, argv, 1) };
+            for index in 0..length {
+                let element = match indexed_get_checked(receiver, index) {
+                    Ok(element) => element,
+                    Err(thrown) => return thrown,
+                };
+                let verdict =
+                    call_value(callback, this_arg, &[element, index_value(index), receiver]);
+                if Value::from_bits(verdict).is_exception() {
+                    return verdict;
+                }
+                if is_truthy(Value::from_bits(verdict)) != want_all {
+                    return if want_all { Value::FALSE } else { Value::TRUE }.to_bits();
+                }
             }
-        }
-        // **Empty is `true` for `every` and `false` for `some`**, which follows from each
-        // stopping on the opposite answer and neither ever stopping.
-        if want_all { Value::TRUE } else { Value::FALSE }.to_bits()
+            // **Empty is `true` for `every` and `false` for `some`**, which follows from each
+            // stopping on the opposite answer and neither ever stopping.
+            if want_all { Value::TRUE } else { Value::FALSE }.to_bits()
+        })
     })
 }
 

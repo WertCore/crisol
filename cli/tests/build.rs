@@ -1181,6 +1181,50 @@ fn a_number_method_requires_a_number_receiver() {
     );
 }
 
+/// **`every`/`some`/`find` `ToObject` their receiver**, so a primitive is boxed: the callback's
+/// third argument is the object, and the length comes from it.
+#[test]
+fn a_quantifier_boxes_a_primitive_receiver() {
+    // `to_object` gives a string wrapper a real `length`, so the callback runs once per unit
+    // and sees an object as the array argument.
+    check(
+        "every-boxes-string-receiver",
+        "let count = 0; let obj_kind = \"\"; \
+         Array.prototype.every.call(\"abc\", function (v, i, obj) { \
+             count = count + 1; obj_kind = typeof obj; return true; }); \
+         return count + \":\" + obj_kind;",
+        "3:object",
+    );
+    check(
+        "some-boxes-string-receiver",
+        "return Array.prototype.some.call(\"x\", function (v, i, obj) { \
+             return typeof obj === \"object\"; });",
+        "true",
+    );
+    // A nullish receiver throws before anything runs.
+    for method in ["every", "some", "find", "findIndex", "findLast"] {
+        check(
+            &format!("{method}-on-undefined-throws"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(undefined, function () {{}}); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A real array still walks unchanged, and the callback still sees the array itself.
+    check(
+        "every-real-array-unchanged",
+        "return [1, 2, 3].every(function (x) { return x > 0; });",
+        "true",
+    );
+    check(
+        "find-real-array-sees-array",
+        "let a = [5]; return a.find(function (v, i, obj) { return obj === a; });",
+        "5",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(
