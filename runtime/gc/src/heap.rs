@@ -71,6 +71,14 @@ struct Object {
     ///
     /// Holds no references, so the collector traces nothing through it.
     text: Option<Box<str>>,
+    /// The bytes, for an `ArrayBuffer`. `None` for everything else.
+    ///
+    /// A raw byte store, not a `Vec<Value>` of small numbers: an `ArrayBuffer` holds bytes, and
+    /// a `Value` per byte would cost eight times the memory it models and read each one through
+    /// the number-boxing path. Like `text` it holds no references, so the collector traces
+    /// nothing through it, and like `text` its length is fixed once set — every `ArrayBuffer`
+    /// but a resizable one, which is not implemented.
+    bytes: Option<Box<[u8]>>,
     /// What each property permits, for the ones that are not the default.
     ///
     /// **Per object rather than in the shape**, which is not where a production engine puts
@@ -601,6 +609,89 @@ impl Heap {
         }
     }
 
+    /// Attaches a fixed-length, zeroed byte store of `length` bytes, replacing any it had.
+    ///
+    /// An `ArrayBuffer`'s backing store. Separate from `elements`, which are `Value`s.
+    pub fn attach_bytes(&self, handle: GcRef, length: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.bytes = Some(vec![0u8; length].into_boxed_slice());
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// How many bytes `handle`'s store holds, or `None` if it has none.
+    #[must_use]
+    pub fn byte_len(&self, handle: GcRef) -> Option<usize> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.bytes.as_ref().map(|bytes| bytes.len()),
+            State::Free => None,
+        }
+    }
+
+    /// Reads `count` bytes at `offset`, or `None` if the store is absent or the range is past
+    /// its end.
+    #[must_use]
+    pub fn read_bytes(&self, handle: GcRef, offset: usize, count: usize) -> Option<Vec<u8>> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object
+                .bytes
+                .as_ref()?
+                .get(offset..offset.checked_add(count)?)
+                .map(<[u8]>::to_vec),
+            State::Free => None,
+        }
+    }
+
+    /// Writes `data` at `offset`, returning whether the range fit inside the store.
+    pub fn write_bytes(&self, handle: GcRef, offset: usize, data: &[u8]) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                let Some(end) = offset.checked_add(data.len()) else {
+                    return false;
+                };
+                match object
+                    .bytes
+                    .as_mut()
+                    .and_then(|bytes| bytes.get_mut(offset..end))
+                {
+                    Some(slice) => {
+                        slice.copy_from_slice(data);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            State::Free => false,
+        }
+    }
+
     /// Reads engine-private state, which no property access can reach.
     #[must_use]
     pub fn internal(&self, handle: GcRef, index: u32) -> Option<Value> {
@@ -808,6 +899,7 @@ impl Heap {
             internals: vec![Value::UNDEFINED; internals],
             elements: None,
             text: None,
+            bytes: None,
             attributes: None,
             deleted: None,
         };

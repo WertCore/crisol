@@ -602,6 +602,10 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BOOLEAN_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(ARRAY_BUFFER_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(TYPED_ARRAY_PROTOTYPE.with(std::cell::Cell::get));
+        TYPED_ARRAY_PROTOTYPES
+            .with(|protos| roots.extend(protos.iter().filter_map(std::cell::Cell::get)));
         // The microtask queue. It is data rather than closures precisely so this walk is
         // possible — a queue of `Box<dyn FnOnce>` hides its captures from the collector, and
         // a settled value reachable only from one would be freed under it. Everything *else*
@@ -676,6 +680,18 @@ thread_local! {
     /// The prototype every boolean inherits from.
     static BOOLEAN_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
+    /// The prototype every `ArrayBuffer` inherits from.
+    static ARRAY_BUFFER_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%TypedArray%.prototype` — where every typed array's shared methods and getters live, and
+    /// what each per-kind prototype below inherits from.
+    static TYPED_ARRAY_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// The nine per-kind prototypes (`Int8Array.prototype`, …), in [`ELEMENT_KINDS`] order. Each
+    /// carries its own `BYTES_PER_ELEMENT` and `constructor` and inherits the shared methods from
+    /// [`TYPED_ARRAY_PROTOTYPE`].
+    static TYPED_ARRAY_PROTOTYPES: [std::cell::Cell<Option<GcRef>>; 9] =
+        const { [const { std::cell::Cell::new(None) }; 9] };
     /// The microtask queue. Drained to empty, and jobs queued by jobs run in the same drain,
     /// which is what "microtasks run to completion" means.
     ///
@@ -1651,7 +1667,83 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Symbol", make_symbol),
     ("Promise", make_promise),
     ("Proxy", make_proxy),
+    ("ArrayBuffer", make_array_buffer),
+    ("Int8Array", make_int8_array),
+    ("Uint8Array", make_uint8_array),
+    ("Uint8ClampedArray", make_uint8_clamped_array),
+    ("Int16Array", make_int16_array),
+    ("Uint16Array", make_uint16_array),
+    ("Int32Array", make_int32_array),
+    ("Uint32Array", make_uint32_array),
+    ("Float32Array", make_float32_array),
+    ("Float64Array", make_float64_array),
 ];
+
+/// The nine typed-array constructor names, in [`ELEMENT_KINDS`] order.
+const TYPED_ARRAY_NAMES: [&str; 9] = [
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+];
+
+/// The natives behind the `ArrayBuffer` and typed-array prototypes, installed by hand in
+/// [`Runtime::build_typed_array_prototypes`] rather than looked up by name, so this table is a
+/// plain list addressed by the constants below. Appended after every other table, so the indices
+/// before it never move.
+const TYPED_NATIVES: &[Native] = &[
+    array_buffer_byte_length,       // AB_BYTE_LENGTH
+    array_buffer_slice,             // AB_SLICE
+    array_buffer_is_view,           // AB_IS_VIEW
+    typed_array_length_getter,      // TA_LENGTH_GET
+    typed_array_byte_length_getter, // TA_BYTE_LENGTH_GET
+    typed_array_byte_offset_getter, // TA_BYTE_OFFSET_GET
+    typed_array_buffer_getter,      // TA_BUFFER_GET
+    typed_array_tag_getter,         // TA_TAG_GET
+    typed_array_set,                // TA_SET_METHOD
+    typed_array_subarray,           // TA_SUBARRAY_METHOD
+    typed_array_slice,              // TA_SLICE_METHOD
+];
+
+/// Indices into [`TYPED_NATIVES`].
+const AB_BYTE_LENGTH: usize = 0;
+const AB_SLICE: usize = 1;
+const AB_IS_VIEW: usize = 2;
+const TA_LENGTH_GET: usize = 3;
+const TA_BYTE_LENGTH_GET: usize = 4;
+const TA_BYTE_OFFSET_GET: usize = 5;
+const TA_BUFFER_GET: usize = 6;
+const TA_TAG_GET: usize = 7;
+const TA_SET_METHOD: usize = 8;
+const TA_SUBARRAY_METHOD: usize = 9;
+const TA_SLICE_METHOD: usize = 10;
+
+/// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
+/// order [`crisol_closure_code`] chains them. Shared by the two places that address the table so
+/// they cannot drift.
+fn typed_natives_base() -> usize {
+    NATIVES.len()
+        + GLOBAL_NATIVES.len()
+        + NAMESPACE_NATIVES.len()
+        + ANONYMOUS_NATIVES.len()
+        + FUNCTION_NATIVES.len()
+        + STRING_NATIVES.len()
+        + REGEXP_NATIVES.len()
+        + DATE_NATIVES.len()
+        + OBJECT_NATIVES.len()
+        + PROMISE_NATIVES.len()
+        + MAP_NATIVES.len()
+        + SET_NATIVES.len()
+        + SYMBOL_NATIVES.len()
+        + ARRAY_ITERATOR_NATIVES.len()
+        + NUMBER_NATIVES.len()
+        + BOOLEAN_NATIVES.len()
+}
 
 /// Where a symbol keeps its description.
 const SYMBOL_DESCRIPTION: &str = "description";
@@ -2114,6 +2206,787 @@ extern "C" fn unconstructable(
     _argv: *const u64,
 ) -> u64 {
     raise("this constructor is not supported", "TypeError")
+}
+
+// ============================== Typed arrays ==============================
+//
+// An `ArrayBuffer` is an object carrying the [`ARRAY_BUFFER_BRAND`] and a raw byte store on its
+// heap cell (see `Heap::attach_bytes`). A typed array is an object carrying the
+// [`TYPED_ARRAY_BRAND`] and four hidden properties naming its buffer, byte offset, element count
+// and element kind; its integer indices read and write the buffer through the kind's codec
+// rather than living in an `elements` vector. Both follow the `Map`/`Set` shape — a brand plus a
+// backing store — so nothing in the value representation had to change.
+
+/// The mark every `ArrayBuffer` carries, so a method can tell one from any other object.
+const ARRAY_BUFFER_BRAND: &str = "__arrayBuffer";
+/// The mark every typed array carries; see [`ARRAY_BUFFER_BRAND`].
+const TYPED_ARRAY_BRAND: &str = "__typedArray";
+/// A typed array's backing `ArrayBuffer`, as a hidden property.
+const TA_BUFFER: &str = "__taBuffer";
+/// A typed array's first byte within its buffer.
+const TA_OFFSET: &str = "__taOffset";
+/// A typed array's element count.
+const TA_LENGTH: &str = "__taLength";
+/// A typed array's element kind, as the tag [`ElementKind::tag`] gives.
+const TA_KIND: &str = "__taKind";
+
+/// The nine element kinds a typed array can have. `BigInt64`/`BigUint64` are absent because
+/// BigInt is not implemented.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElementKind {
+    I8,
+    U8,
+    U8Clamped,
+    I16,
+    U16,
+    I32,
+    U32,
+    F32,
+    F64,
+}
+
+/// The kinds in tag order — the order every table that lists the typed arrays uses.
+const ELEMENT_KINDS: [ElementKind; 9] = [
+    ElementKind::I8,
+    ElementKind::U8,
+    ElementKind::U8Clamped,
+    ElementKind::I16,
+    ElementKind::U16,
+    ElementKind::I32,
+    ElementKind::U32,
+    ElementKind::F32,
+    ElementKind::F64,
+];
+
+impl ElementKind {
+    /// The kind for a tag, or `None` if the tag names no kind.
+    fn from_tag(tag: usize) -> Option<Self> {
+        ELEMENT_KINDS.get(tag).copied()
+    }
+
+    /// This kind's position in [`ELEMENT_KINDS`], the number stored in [`TA_KIND`].
+    fn tag(self) -> usize {
+        self as usize
+    }
+
+    /// How many bytes one element occupies.
+    fn bytes(self) -> usize {
+        match self {
+            Self::I8 | Self::U8 | Self::U8Clamped => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+
+    /// The constructor name, which is also the `Symbol.toStringTag`.
+    fn ctor_name(self) -> &'static str {
+        match self {
+            Self::I8 => "Int8Array",
+            Self::U8 => "Uint8Array",
+            Self::U8Clamped => "Uint8ClampedArray",
+            Self::I16 => "Int16Array",
+            Self::U16 => "Uint16Array",
+            Self::I32 => "Int32Array",
+            Self::U32 => "Uint32Array",
+            Self::F32 => "Float32Array",
+            Self::F64 => "Float64Array",
+        }
+    }
+
+    /// Decodes one element from `b`, which is exactly [`ElementKind::bytes`] long and
+    /// little-endian, the native order of every target crisol builds for.
+    fn read(self, b: &[u8]) -> f64 {
+        match self {
+            Self::I8 => f64::from(i8::from_le_bytes([b[0]])),
+            Self::U8 | Self::U8Clamped => f64::from(b[0]),
+            Self::I16 => f64::from(i16::from_le_bytes([b[0], b[1]])),
+            Self::U16 => f64::from(u16::from_le_bytes([b[0], b[1]])),
+            Self::I32 => f64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            Self::U32 => f64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            Self::F32 => f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            Self::F64 => f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        }
+    }
+
+    /// Encodes `value` into the first [`ElementKind::bytes`] of the returned array, applying the
+    /// kind's conversion — `ToInt8`/`ToUint8`/`ToUint8Clamp` and their wider cousins for the
+    /// integers, a narrowing for `Float32`.
+    fn to_bytes(self, value: f64) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        match self {
+            Self::U8Clamped => out[0] = clamp_to_u8(value),
+            Self::F32 => out[..4].copy_from_slice(&narrow_to_f32(value).to_le_bytes()),
+            Self::F64 => out = value.to_le_bytes(),
+            _ => {
+                let bits = self.bytes() * 8;
+                out = wrap_to_bits(value, bits).to_le_bytes();
+            }
+        }
+        out
+    }
+}
+
+/// `value` reduced modulo `2**bits`, as `ToInt{8,16,32}`/`ToUint{8,16,32}` require. A non-finite
+/// value becomes zero; the low `bits` bits of the result are the two's-complement pattern a
+/// signed read decodes back to the right negative number.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "reduced into `0..2**bits`, which is at most `2**32` and non-negative"
+)]
+fn wrap_to_bits(value: f64, bits: usize) -> u64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let modulus = two_pow(bits);
+    value.trunc().rem_euclid(modulus) as u64
+}
+
+/// `2**bits`, as an exact `f64` — `bits` is 8, 16 or 32.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "an exact power of two below 2**53"
+)]
+fn two_pow(bits: usize) -> f64 {
+    (1u64 << bits) as f64
+}
+
+/// `ToUint8Clamp(value)`: `NaN` and anything at or below zero clamp to zero, anything at or above
+/// 255 to 255, and the rest round half to even.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "every path clamps into `0..=255` before the cast"
+)]
+fn clamp_to_u8(value: f64) -> u8 {
+    if value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    if value >= 255.0 {
+        return 255;
+    }
+    let floor = value.floor();
+    let frac = value - floor;
+    let rounded = if frac < 0.5 {
+        floor
+    } else if frac > 0.5 {
+        floor + 1.0
+    } else if (floor as i64) % 2 == 0 {
+        floor
+    } else {
+        floor + 1.0
+    };
+    rounded as u8
+}
+
+/// `value` narrowed to `Float32`, the storage a `Float32Array` keeps.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the narrowing is the point"
+)]
+fn narrow_to_f32(value: f64) -> f32 {
+    value as f32
+}
+
+/// `f64` read back as a `usize` count crisol stored itself, so it is a small non-negative
+/// integer.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a count crisol wrote, so non-negative and within range"
+)]
+fn count_of(value: f64) -> usize {
+    value as usize
+}
+
+/// Whether `object` is an `ArrayBuffer`.
+fn is_array_buffer(object: u64) -> bool {
+    own_flag(object, ARRAY_BUFFER_BRAND)
+}
+
+/// Whether `object` is a typed array.
+fn is_typed_array(object: u64) -> bool {
+    own_flag(object, TYPED_ARRAY_BRAND)
+}
+
+/// A typed array's buffer, byte offset, element count and kind, or `None` if `object` is not one
+/// or is missing a field.
+fn typed_array_parts(object: u64) -> Option<(u64, usize, usize, ElementKind)> {
+    let kind = ElementKind::from_tag(count_of(property_number(object, TA_KIND)?))?;
+    let offset = count_of(property_number(object, TA_OFFSET)?);
+    let length = count_of(property_number(object, TA_LENGTH)?);
+    let buffer = property_of(object, TA_BUFFER);
+    Some((buffer, offset, length, kind))
+}
+
+/// `ToIndex(value)` — a non-negative integer no larger than `2**53 - 1`, or the `RangeError` it
+/// is not one.
+fn to_index(value: u64) -> Result<usize, u64> {
+    let number = coerce_number(value)?;
+    let integer = if number.is_nan() { 0.0 } else { number.trunc() };
+    if integer < 0.0 || integer > crisol_builtins::MAX_SAFE_INTEGER {
+        return Err(raise("invalid length or index", "RangeError"));
+    }
+    Ok(count_of(integer))
+}
+
+/// Reads a typed array's element `index`, or `undefined` when it is out of range or the buffer is
+/// gone. The caller has already established that `object` is a typed array.
+fn typed_array_element_load(object: u64, index: usize) -> u64 {
+    let Some((buffer, offset, length, kind)) = typed_array_parts(object) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    if index >= length {
+        return Value::UNDEFINED.to_bits();
+    }
+    let Some(handle) = handle_of(buffer) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    let at = offset + index * kind.bytes();
+    match with_runtime(|runtime| runtime.heap.read_bytes(handle, at, kind.bytes())) {
+        Some(bytes) => Value::number(kind.read(&bytes)).to_bits(),
+        None => Value::UNDEFINED.to_bits(),
+    }
+}
+
+/// Writes `value` to a typed array's element `index`, coercing it to a number first. An index out
+/// of range is a no-op, as the specification's integer-indexed `[[Set]]` requires. Returns the
+/// exception if coercion threw. The caller has established that `object` is a typed array.
+fn typed_array_element_store(object: u64, index: usize, value: u64) -> Option<u64> {
+    // **The coercion happens even when the index is out of range**, because it can run a
+    // `valueOf` the specification observes, and the store is skipped only afterwards.
+    let number = match coerce_number(value) {
+        Ok(number) => number,
+        Err(thrown) => return Some(thrown),
+    };
+    let (buffer, offset, length, kind) = typed_array_parts(object)?;
+    if index >= length {
+        return None;
+    }
+    let handle = handle_of(buffer)?;
+    let at = offset + index * kind.bytes();
+    let bytes = kind.to_bytes(number);
+    with_runtime(|runtime| runtime.heap.write_bytes(handle, at, &bytes[..kind.bytes()]));
+    None
+}
+
+/// Builds an `ArrayBuffer` of `length` zeroed bytes.
+fn new_array_buffer(length: usize) -> u64 {
+    let object = crisol_create_object();
+    with_rooted(&[object], || {
+        if let Some(handle) = handle_of(object) {
+            with_runtime(|runtime| {
+                runtime.heap.attach_bytes(handle, length);
+                runtime.define_hidden(handle, ARRAY_BUFFER_BRAND, Value::TRUE);
+                if let Some(prototype) = ARRAY_BUFFER_PROTOTYPE.with(std::cell::Cell::get) {
+                    runtime.heap.set_prototype(handle, Some(prototype));
+                }
+            });
+        }
+    });
+    object
+}
+
+/// `new ArrayBuffer(length)`.
+extern "C" fn make_array_buffer(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let length = match to_index(unsafe { argument(argc, argv, 0) }) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
+    new_array_buffer(length)
+}
+
+/// `ArrayBuffer.isView(value)` — whether `value` is a typed array (or, once it exists, a
+/// `DataView`).
+extern "C" fn array_buffer_is_view(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    let value = unsafe { argument(argc, argv, 0) };
+    boolean(is_typed_array(value)).to_bits()
+}
+
+/// `get ArrayBuffer.prototype.byteLength`.
+extern "C" fn array_buffer_byte_length(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if !is_array_buffer(this_value) {
+        return raise("this is not an ArrayBuffer", "TypeError");
+    }
+    let length = handle_of(this_value)
+        .and_then(|handle| with_runtime(|runtime| runtime.heap.byte_len(handle)))
+        .unwrap_or(0);
+    #[expect(clippy::cast_precision_loss, reason = "a byte length crisol allocated")]
+    let length = length as f64;
+    Value::number(length).to_bits()
+}
+
+/// `ArrayBuffer.prototype.slice(start, end)` — a fresh buffer holding the chosen bytes.
+extern "C" fn array_buffer_slice(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !is_array_buffer(this_value) {
+        return raise("this is not an ArrayBuffer", "TypeError");
+    }
+    let Some(handle) = handle_of(this_value) else {
+        return raise("this is not an ArrayBuffer", "TypeError");
+    };
+    let total = with_runtime(|runtime| runtime.heap.byte_len(handle)).unwrap_or(0);
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let start = match relative_index(unsafe { argument(argc, argv, 0) }, total, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: as above.
+    let end_arg = unsafe { argument(argc, argv, 1) };
+    let end = if Value::from_bits(end_arg).is_undefined() {
+        total
+    } else {
+        match relative_index(end_arg, total, total) {
+            Ok(end) => end,
+            Err(thrown) => return thrown,
+        }
+    };
+    let count = end.saturating_sub(start);
+    let bytes =
+        with_runtime(|runtime| runtime.heap.read_bytes(handle, start, count)).unwrap_or_default();
+    let fresh = new_array_buffer(count);
+    with_rooted(&[fresh], || {
+        if let Some(into) = handle_of(fresh) {
+            with_runtime(|runtime| runtime.heap.write_bytes(into, 0, &bytes));
+        }
+    });
+    fresh
+}
+
+/// A count as an `f64`, for storing in a hidden property or handing back from a getter.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a count crisol allocated, below 2**53"
+)]
+fn index_number(count: usize) -> f64 {
+    count as f64
+}
+
+/// The per-kind prototype a typed array of `kind` inherits from.
+fn typed_array_prototype(kind: ElementKind) -> Option<GcRef> {
+    TYPED_ARRAY_PROTOTYPES.with(|protos| protos[kind.tag()].get())
+}
+
+/// Builds a typed array of `kind` viewing `length` elements of `buffer` from `offset`.
+fn make_typed_array(kind: ElementKind, buffer: u64, offset: usize, length: usize) -> u64 {
+    let object = crisol_create_object();
+    with_rooted(&[object, buffer], || {
+        if let Some(handle) = handle_of(object) {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, TYPED_ARRAY_BRAND, Value::TRUE);
+                runtime.define_hidden(handle, TA_BUFFER, Value::from_bits(buffer));
+                runtime.define_hidden(handle, TA_OFFSET, Value::number(index_number(offset)));
+                runtime.define_hidden(handle, TA_LENGTH, Value::number(index_number(length)));
+                runtime.define_hidden(handle, TA_KIND, Value::number(index_number(kind.tag())));
+                if let Some(prototype) = typed_array_prototype(kind) {
+                    runtime.heap.set_prototype(handle, Some(prototype));
+                }
+            });
+        }
+    });
+    object
+}
+
+/// `new TA(length)` — a fresh buffer sized to hold `length` elements.
+fn typed_array_over_new_buffer(kind: ElementKind, length: usize) -> u64 {
+    let buffer = new_array_buffer(length * kind.bytes());
+    with_rooted(&[buffer], || make_typed_array(kind, buffer, 0, length))
+}
+
+/// `new TA(buffer, byteOffset, length)` — a view over an existing buffer.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values.
+unsafe fn typed_array_over_buffer(
+    kind: ElementKind,
+    buffer: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let per = kind.bytes();
+    // SAFETY: the caller promises `argc` readable values at `argv`.
+    let byte_offset = match to_index(unsafe { argument(argc, argv, 1) }) {
+        Ok(offset) => offset,
+        Err(thrown) => return thrown,
+    };
+    if !byte_offset.is_multiple_of(per) {
+        return raise("start offset is not aligned", "RangeError");
+    }
+    let total = handle_of(buffer)
+        .and_then(|handle| with_runtime(|runtime| runtime.heap.byte_len(handle)))
+        .unwrap_or(0);
+    if byte_offset > total {
+        return raise("offset is outside the buffer", "RangeError");
+    }
+    // SAFETY: as above.
+    let length_arg = unsafe { argument(argc, argv, 2) };
+    let length = if Value::from_bits(length_arg).is_undefined() {
+        let span = total - byte_offset;
+        if !span.is_multiple_of(per) {
+            return raise("byte length is not aligned", "RangeError");
+        }
+        span / per
+    } else {
+        let requested = match to_index(length_arg) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
+        if byte_offset + requested * per > total {
+            return raise("length is outside the buffer", "RangeError");
+        }
+        requested
+    };
+    make_typed_array(kind, buffer, byte_offset, length)
+}
+
+/// `new TA(source)` where `source` is a typed array or an array-like — copy its elements, coerced
+/// to this kind, into a fresh buffer.
+fn typed_array_from_elements(kind: ElementKind, source: u64) -> u64 {
+    let length = match walk_length(source) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
+    let result = typed_array_over_new_buffer(kind, length);
+    with_rooted(&[result, source], || {
+        for index in 0..length {
+            let element = match indexed_get_checked(source, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
+            if let Some(thrown) = typed_array_element_store(result, index, element) {
+                return thrown;
+            }
+        }
+        result
+    })
+}
+
+/// The shared body behind every `new Int8Array(...)` and its siblings.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values.
+unsafe fn new_typed_array(kind: ElementKind, argc: u64, argv: *const u64) -> u64 {
+    // SAFETY: the caller promises `argc` readable values at `argv`.
+    let arg0 = unsafe { argument(argc, argv, 0) };
+    // **Only a true object is a buffer or a source.** A string or a number is a length, even
+    // though a string is a heap cell here — `new Int8Array("5")` is five elements long.
+    if matches!(Value::from_bits(arg0).kind(), crisol_value::Kind::Object) {
+        // **`arg0` is rooted across the allocations below.** It arrived in `argv`, which the
+        // collector does not scan (D-208), so a source array or buffer is otherwise freed the
+        // moment the fresh buffer's allocation collects under stress — and the copy then reads a
+        // reclaimed cell back as zeroes.
+        return with_rooted(&[arg0], || {
+            if is_array_buffer(arg0) {
+                // SAFETY: as above.
+                unsafe { typed_array_over_buffer(kind, arg0, argc, argv) }
+            } else {
+                typed_array_from_elements(kind, arg0)
+            }
+        });
+    }
+    let length = match to_index(arg0) {
+        Ok(length) => length,
+        Err(thrown) => return thrown,
+    };
+    typed_array_over_new_buffer(kind, length)
+}
+
+/// `get %TypedArray%.prototype.length`.
+extern "C" fn typed_array_length_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    match property_number(this_value, TA_LENGTH) {
+        Some(length) if is_typed_array(this_value) => Value::number(length).to_bits(),
+        _ => raise("this is not a typed array", "TypeError"),
+    }
+}
+
+/// `get %TypedArray%.prototype.byteLength`.
+extern "C" fn typed_array_byte_length_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    Value::number(index_number(length * kind.bytes())).to_bits()
+}
+
+/// `get %TypedArray%.prototype.byteOffset`.
+extern "C" fn typed_array_byte_offset_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    match property_number(this_value, TA_OFFSET) {
+        Some(offset) if is_typed_array(this_value) => Value::number(offset).to_bits(),
+        _ => raise("this is not a typed array", "TypeError"),
+    }
+}
+
+/// `get %TypedArray%.prototype.buffer`.
+extern "C" fn typed_array_buffer_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if !is_typed_array(this_value) {
+        return raise("this is not a typed array", "TypeError");
+    }
+    property_of(this_value, TA_BUFFER)
+}
+
+/// `get %TypedArray%.prototype[Symbol.toStringTag]` — the kind's name, or `undefined` for a
+/// receiver that is not a typed array (the specification returns `undefined` here rather than
+/// throwing, so `Object.prototype.toString.call({})` still works).
+extern "C" fn typed_array_tag_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    match typed_array_parts(this_value) {
+        Some((_, _, _, kind)) => new_string(kind.ctor_name()),
+        None => Value::UNDEFINED.to_bits(),
+    }
+}
+
+/// `%TypedArray%.prototype.set(source, offset)` — copy `source`'s elements in at `offset`.
+extern "C" fn typed_array_set(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, _)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let offset = match to_index(unsafe { argument(argc, argv, 1) }) {
+        Ok(offset) => offset,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: as above.
+    let source = unsafe { argument(argc, argv, 0) };
+    let source_length = match walk_length(source) {
+        Ok(source_length) => source_length,
+        Err(thrown) => return thrown,
+    };
+    if offset + source_length > length {
+        return raise("source is too large", "RangeError");
+    }
+    with_rooted(&[this_value, source], || {
+        for index in 0..source_length {
+            let element = match indexed_get_checked(source, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
+            if let Some(thrown) = typed_array_element_store(this_value, offset + index, element) {
+                return thrown;
+            }
+        }
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// `%TypedArray%.prototype.subarray(start, end)` — a view over the same buffer.
+extern "C" fn typed_array_subarray(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((buffer, byte_offset, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let start = match relative_index(unsafe { argument(argc, argv, 0) }, length, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: as above.
+    let end = match relative_index(unsafe { argument(argc, argv, 1) }, length, length) {
+        Ok(end) => end,
+        Err(thrown) => return thrown,
+    };
+    let count = end.saturating_sub(start);
+    with_rooted(&[buffer], || {
+        make_typed_array(kind, buffer, byte_offset + start * kind.bytes(), count)
+    })
+}
+
+/// `%TypedArray%.prototype.slice(start, end)` — a fresh typed array with copied elements.
+extern "C" fn typed_array_slice(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let start = match relative_index(unsafe { argument(argc, argv, 0) }, length, 0) {
+        Ok(start) => start,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: as above.
+    let end = match relative_index(unsafe { argument(argc, argv, 1) }, length, length) {
+        Ok(end) => end,
+        Err(thrown) => return thrown,
+    };
+    let count = end.saturating_sub(start);
+    let result = typed_array_over_new_buffer(kind, count);
+    with_rooted(&[result, this_value], || {
+        for index in 0..count {
+            let element = typed_array_element_load(this_value, start + index);
+            typed_array_element_store(result, index, element);
+        }
+    });
+    result
+}
+
+/// The nine `new Int8Array(...)` bodies. Each names its kind and shares [`new_typed_array`].
+extern "C" fn make_int8_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    unsafe { new_typed_array(ElementKind::I8, argc, argv) }
+}
+
+extern "C" fn make_uint8_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::U8, argc, argv) }
+}
+
+extern "C" fn make_uint8_clamped_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::U8Clamped, argc, argv) }
+}
+
+extern "C" fn make_int16_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::I16, argc, argv) }
+}
+
+extern "C" fn make_uint16_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::U16, argc, argv) }
+}
+
+extern "C" fn make_int32_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::I32, argc, argv) }
+}
+
+extern "C" fn make_uint32_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::U32, argc, argv) }
+}
+
+extern "C" fn make_float32_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::F32, argc, argv) }
+}
+
+extern "C" fn make_float64_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::F64, argc, argv) }
 }
 
 /// `RegExp.escape(string)` — a string that, used as a pattern, matches itself literally.
@@ -10174,6 +11047,9 @@ impl Runtime {
         runtime.build_date_prototype();
         runtime.build_collection_prototypes();
         runtime.build_array_prototype();
+        // Before `build_globals`: it points each constructor's `prototype` at the shared object
+        // these fill, and the cells must hold something by then.
+        runtime.build_typed_array_prototypes();
         runtime.build_globals();
         // **Last, because it needs both halves.** A symbol-keyed method needs the prototypes
         // *and* the well-known symbols, and the symbols are made inside `build_globals`.
@@ -10225,6 +11101,7 @@ impl Runtime {
             (&ARRAY_PROTOTYPE, "values"),
             (&MAP_PROTOTYPE, "entries"),
             (&SET_PROTOTYPE, "values"),
+            (&TYPED_ARRAY_PROTOTYPE, "values"),
         ] {
             let Some(prototype) = cell.with(std::cell::Cell::get) else {
                 continue;
@@ -10240,6 +11117,31 @@ impl Runtime {
                 continue;
             };
             self.define_keyed(prototype, &key, method);
+        }
+
+        // **`%TypedArray%.prototype[Symbol.toStringTag]` is a getter**, so
+        // `Object.prototype.toString.call(new Int8Array())` reads `"Int8Array"` and answers
+        // `"[object Int8Array]"`. Installed as an accessor under the well-known symbol, which is
+        // read off `Symbol` the way the regular-expression ones below are.
+        if let Some(prototype) = TYPED_ARRAY_PROTOTYPE.with(std::cell::Cell::get) {
+            let tag = {
+                let named = PropertyKey::new("toStringTag");
+                self.heap
+                    .shape_of(symbol)
+                    .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                    .and_then(|slot| self.heap.get(symbol, slot.index()))
+                    .and_then(|value| value.as_address())
+            };
+            if let Some(tag) = tag {
+                KEY_SYMBOLS.with(|symbols| {
+                    if let Ok(mut entries) = symbols.try_borrow_mut() {
+                        entries.insert(Value::symbol(tag).to_bits());
+                    }
+                });
+                let getter = self.native_function(typed_natives_base() + TA_TAG_GET);
+                let tag_key = PropertyKey::symbol(tag, "Symbol.toStringTag");
+                self.install_accessor_keyed(prototype, &tag_key, getter);
+            }
         }
 
         // **An iterator is its own iterable.** `%IteratorPrototype%` defines
@@ -10623,6 +11525,35 @@ impl Runtime {
                 // what made something, and `Array.prototype.constructor` is what a subclass
                 // replaces; neither existed, so both answered `undefined`.
                 self.define_linking(prototype, "constructor", constructor.to_value());
+            }
+        }
+
+        // The typed-array family, kept apart because the per-kind prototypes come from an array
+        // indexed by kind rather than a named cell, and because the constructors carry members
+        // (`BYTES_PER_ELEMENT`, `isView`) the ones above do not.
+        if let (Some(constructor), Some(prototype)) = (
+            self.global_object(globals.handle(), "ArrayBuffer"),
+            ARRAY_BUFFER_PROTOTYPE.with(std::cell::Cell::get),
+        ) {
+            self.define_hidden(constructor, "prototype", prototype.to_value());
+            self.define_linking(prototype, "constructor", constructor.to_value());
+            let is_view = self.native_function(typed_natives_base() + AB_IS_VIEW);
+            self.define_method(constructor, "ArrayBuffer", "isView", is_view.to_value());
+        }
+        for kind in ELEMENT_KINDS {
+            let name = TYPED_ARRAY_NAMES[kind.tag()];
+            let prototype = TYPED_ARRAY_PROTOTYPES.with(|protos| protos[kind.tag()].get());
+            if let (Some(constructor), Some(prototype)) =
+                (self.global_object(globals.handle(), name), prototype)
+            {
+                self.define_hidden(constructor, "prototype", prototype.to_value());
+                self.define_linking(prototype, "constructor", constructor.to_value());
+                // `BYTES_PER_ELEMENT` lives on the constructor as well as the prototype.
+                self.define_frozen(
+                    constructor,
+                    "BYTES_PER_ELEMENT",
+                    Value::number(index_number(kind.bytes())),
+                );
             }
         }
 
@@ -11142,6 +12073,172 @@ impl Runtime {
             );
         }
     }
+
+    /// Installs an accessor property whose getter is `getter` and whose setter is absent, with the
+    /// attributes a built-in getter carries: writable makes no sense for one, and it is not
+    /// enumerable but is configurable. The stored value is the `[getter, setter]` pair the read
+    /// path decodes (see `crisol_property_load`).
+    fn install_accessor(&self, object: GcRef, name: &str, getter: GcRef) {
+        self.install_accessor_keyed(object, &PropertyKey::new(name), getter);
+    }
+
+    /// [`Runtime::install_accessor`] for a key that may be a symbol.
+    fn install_accessor_keyed(&self, object: GcRef, key: &PropertyKey, getter: GcRef) {
+        // **Built through `self`, not the free `array_of_values`.** This runs inside
+        // `Runtime::new`, where `with_runtime` would re-enter the thread-local that is still
+        // initialising — the crash every builder avoids by touching `self.heap` directly. The
+        // getter is rooted across the pair's allocation, since `native_function` hands back an
+        // unrooted handle and `alloc` may collect under stress.
+        let pair = {
+            let scope = self.heap.scope();
+            let _held = scope.root(getter);
+            let shape = self.shapes.borrow().root();
+            let pair = scope.alloc(shape, 0);
+            self.heap.make_array(pair.handle(), 2);
+            self.heap.set_element(pair.handle(), 0, getter.to_value());
+            self.heap.set_element(pair.handle(), 1, Value::UNDEFINED);
+            pair.handle()
+        };
+        self.define_keyed(object, key, pair.to_value());
+        let slot = self
+            .heap
+            .shape_of(object)
+            .and_then(|shape| self.shapes.borrow().lookup(shape, key));
+        if let Some(slot) = slot {
+            self.heap.set_attributes(
+                object,
+                slot.index(),
+                crisol_value::Attributes {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                },
+            );
+        }
+    }
+
+    /// Points a set of `%TypedArray%.prototype` methods at the identical `Array.prototype`
+    /// functions. Each of these reads and writes through `length` and the integer indices, which
+    /// a typed array answers from its buffer — so the array method works over one unchanged. The
+    /// ones that would build a plain array (`map`, `filter`, `slice`, `toReversed`, …) are absent:
+    /// a typed array's must build a typed array, so it has its own.
+    fn alias_array_methods(&self, target: GcRef) {
+        const REUSED: &[&str] = &[
+            "at",
+            "join",
+            "toString",
+            "toLocaleString",
+            "indexOf",
+            "lastIndexOf",
+            "includes",
+            "forEach",
+            "reduce",
+            "reduceRight",
+            "every",
+            "some",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "fill",
+            "reverse",
+            "copyWithin",
+            "keys",
+            "values",
+            "entries",
+        ];
+        let Some(source) = ARRAY_PROTOTYPE.with(std::cell::Cell::get) else {
+            return;
+        };
+        for name in REUSED {
+            let key = PropertyKey::new(name);
+            let method = self
+                .heap
+                .shape_of(source)
+                .and_then(|shape| self.shapes.borrow().lookup(shape, &key))
+                .and_then(|slot| self.heap.get(source, slot.index()));
+            if let Some(method) = method {
+                self.define_method(target, "TypedArray.prototype", name, method);
+            }
+        }
+    }
+
+    /// Builds `ArrayBuffer.prototype`, `%TypedArray%.prototype` and the nine per-kind prototypes.
+    ///
+    /// Runs before `build_globals`, which reads the cells this fills to point each constructor's
+    /// `prototype` at the shared object rather than the fresh one every global otherwise gets. The
+    /// symbol-keyed members (`Symbol.iterator`, `Symbol.toStringTag`) wait for
+    /// `build_symbol_keyed_methods`, because the well-known symbols do not exist yet.
+    fn build_typed_array_prototypes(&self) {
+        let base = typed_natives_base();
+
+        // `ArrayBuffer.prototype`.
+        {
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            ARRAY_BUFFER_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+            self.inherit_from_object(prototype.handle());
+            let getter = self.native_function(base + AB_BYTE_LENGTH);
+            self.install_accessor(prototype.handle(), "byteLength", getter);
+            let slice = self.native_function(base + AB_SLICE);
+            self.define_method(
+                prototype.handle(),
+                "ArrayBuffer.prototype",
+                "slice",
+                slice.to_value(),
+            );
+        }
+
+        // `%TypedArray%.prototype`, shared by every kind.
+        let shared = {
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            TYPED_ARRAY_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+            self.inherit_from_object(prototype.handle());
+            for (name, offset) in [
+                ("length", TA_LENGTH_GET),
+                ("byteLength", TA_BYTE_LENGTH_GET),
+                ("byteOffset", TA_BYTE_OFFSET_GET),
+                ("buffer", TA_BUFFER_GET),
+            ] {
+                let getter = self.native_function(base + offset);
+                self.install_accessor(prototype.handle(), name, getter);
+            }
+            for (name, offset) in [
+                ("set", TA_SET_METHOD),
+                ("subarray", TA_SUBARRAY_METHOD),
+                ("slice", TA_SLICE_METHOD),
+            ] {
+                let method = self.native_function(base + offset);
+                self.define_method(
+                    prototype.handle(),
+                    "TypedArray.prototype",
+                    name,
+                    method.to_value(),
+                );
+            }
+            self.alias_array_methods(prototype.handle());
+            prototype.handle()
+        };
+
+        // The nine per-kind prototypes, each inheriting the shared one and carrying its own
+        // `BYTES_PER_ELEMENT`.
+        for kind in ELEMENT_KINDS {
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            TYPED_ARRAY_PROTOTYPES.with(|protos| protos[kind.tag()].set(Some(prototype.handle())));
+            self.heap.set_prototype(prototype.handle(), Some(shared));
+            self.define_frozen(
+                prototype.handle(),
+                "BYTES_PER_ELEMENT",
+                Value::number(index_number(kind.bytes())),
+            );
+        }
+    }
 }
 
 thread_local! {
@@ -11237,6 +12334,21 @@ pub unsafe extern "C" fn crisol_property_store(
         return Value::UNDEFINED.to_bits();
     };
     let key = PropertyKey::new(&name);
+
+    // **A typed array's integer index writes its buffer, not a slot.** Digit-leading only, as
+    // the load is. The coercion of `value` runs even for an out-of-range index — it can observe a
+    // `valueOf` — so a canonical index defers to `typed_array_element_store`, which coerces first
+    // and only then checks the range, and a digit-leading non-index coerces and discards.
+    if name.as_bytes().first().is_some_and(u8::is_ascii_digit) && is_typed_array(object) {
+        return match canonical_index(&name) {
+            Some(index) => typed_array_element_store(object, index, value)
+                .unwrap_or(Value::UNDEFINED.to_bits()),
+            None => match coerce_number(value) {
+                Ok(_) => Value::UNDEFINED.to_bits(),
+                Err(thrown) => thrown,
+            },
+        };
+    }
 
     // **Assigning to an array's `length` resizes it.** `length` is not stored anywhere — it
     // *is* the element count — so writing it has to change the elements rather than add a
@@ -11485,6 +12597,18 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
         return Value::UNDEFINED.to_bits();
     };
     let key = PropertyKey::new(&name);
+
+    // **A typed array's integer index reads its buffer, not a slot.** Only a digit-leading key
+    // can name an element — `length`, `buffer` and the methods are found by the ordinary walk on
+    // the prototype — so the brand check stays off every named load and every ordinary object.
+    if name.as_bytes().first().is_some_and(u8::is_ascii_digit) && is_typed_array(object) {
+        return match canonical_index(&name) {
+            Some(index) => typed_array_element_load(object, index),
+            // A digit-leading string that is not a canonical index ("1.5", "01") still names no
+            // element on a typed array: `undefined`, and never the prototype.
+            None => Value::UNDEFINED.to_bits(),
+        };
+    }
 
     let found = with_runtime(|runtime| {
         // `length` on an array is not stored anywhere — it *is* the element count, and has to
@@ -13657,9 +14781,15 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + NUMBER_NATIVES.len();
-        return BOOLEAN_NATIVES
+        if let Some((_, function)) = BOOLEAN_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + BOOLEAN_NATIVES.len();
+        // **Last, and a plain list**: `TYPED_NATIVES` is addressed by the `AB_*`/`TA_*` constants,
+        // not by name, so it holds bare functions rather than `(name, function)` pairs.
+        return TYPED_NATIVES
             .get(native.wrapping_sub(offset))
-            .map_or(fallback, |(_, function)| *function as *const u8);
+            .map_or(fallback, |function| *function as *const u8);
     }
     #[expect(
         clippy::cast_possible_truncation,

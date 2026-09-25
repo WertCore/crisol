@@ -6636,3 +6636,52 @@ array `length == element_count`), which is the common `verifyProperty` shape —
 array's index `"0"`. A non-last element can only be set to `undefined`, and D-64's hole/undefined
 conflation still reports it present, so `delete a["1"]` on `[1,2,3]` cannot yet make index one
 absent. Real holes are the fix and are out of scope here.
+
+## D-240
+
+**`ArrayBuffer` and the typed arrays, built on a raw byte store.**
+
+Status: Accepted
+
+The corpus histogram put the typed-array family (`TypedArray.prototype`, the constructors,
+`DataView`, `ArrayBuffer`, `Atomics`) at the top of the *actionable* backlog — roughly a tenth
+of a broad built-ins sample, second only to `Temporal`, which is a far larger standalone feature.
+So this lands the family, less `DataView`/`Atomics`/the BigInt-backed kinds, which follow.
+
+Shape. An `ArrayBuffer` is an ordinary object carrying a brand and a **raw byte store** on its
+heap cell — a new `Option<Box<[u8]>>` beside `text`, holding no references and traced like it
+(nothing), fixed-length like it. A `Vec<Value>` of small numbers would cost eight times the
+memory and read each byte through the number-boxing path; the requirement that crisol be tight on
+memory made the raw store the only defensible choice. A typed array is an object with a brand and
+four hidden properties — buffer, byte offset, element count, element kind — whose integer indices
+read and write the buffer through a per-kind little-endian codec (`ElementKind`), the native order
+of every target crisol builds for. Both follow the `Map`/`Set` pattern (a brand plus a backing
+store), so the value representation did not change.
+
+Integration points, each chosen to stay off the hot path:
+
+- **Indexing** hooks `crisol_property_load`/`_store` in the one branch a digit-leading key takes,
+  and only there does it test the brand — a named load (`length`, a method) and every ordinary
+  object pay nothing. `crisol_computed_load`/`_store` funnel here because a typed array has no
+  `elements` vector for their fast paths to hit.
+- **`length`/`byteLength`/`byteOffset`/`buffer`/`Symbol.toStringTag`** are accessor getters on
+  `%TypedArray%.prototype`, found by the ordinary chain walk.
+- **The generic methods** (`forEach`, `reduce`, `indexOf`, `join`, `reverse`, `fill`, the
+  iterators, …) are the *same* `Array.prototype` functions, aliased on: each works through
+  `length` and the indices, which a typed array answers from its buffer. The ones that must build
+  a typed array rather than an `Array` (`map`, `filter`, `slice`, `subarray`, `set`) are its own.
+- **The constructors** join `GLOBAL_NATIVES`, so `is_constructor` and the global binding come for
+  free; their prototypes are re-pointed at the shared per-kind objects in `build_globals`, exactly
+  as `Array`'s and `Map`'s are. The prototype methods and getters are a new `TYPED_NATIVES` table
+  appended **last** in the `crisol_closure_code` dispatch chain, where nothing before it moves.
+
+Two rooting hazards, both GC-stress-only and both found by the macOS/Linux stress run: an argument
+array reaches a constructor through `argv`, which the collector does not scan (D-208), so it is
+rooted before the fresh buffer is allocated or the copy reads it back as zeroes; and the accessor
+pair is built through `self.heap` rather than the free `array_of_values`, whose `with_runtime`
+would re-enter the thread-local that `Runtime::new` is still initialising.
+
+Known gaps, deferred: `DataView`, `Atomics`, `BigInt64Array`/`BigUint64Array` (no BigInt), a
+resizable `ArrayBuffer`, buffer detachment, `%TypedArray%` reachable as a distinct intrinsic, and
+`@@species` on the copying methods. `ArrayBuffer.isView` answers for typed arrays only until
+`DataView` exists.

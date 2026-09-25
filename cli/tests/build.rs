@@ -2998,6 +2998,90 @@ fn delete_refuses_a_non_configurable_property() {
     );
 }
 
+/// An `ArrayBuffer` and a typed array over it: a length, integer indices that read and write the
+/// buffer through the element codec, the per-kind conversions, the shared-buffer aliasing two
+/// views see, `BYTES_PER_ELEMENT`, and the `Symbol.toStringTag`.
+#[test]
+fn typed_arrays_view_a_buffer() {
+    check(
+        "ab-construct",
+        "let b = new ArrayBuffer(8); return 42;",
+        "42",
+    );
+    check(
+        "ta-construct",
+        "let a = new Float64Array(3); return 42;",
+        "42",
+    );
+    check("ta-length", "return new Float64Array(3).length;", "3");
+    check(
+        "ta-byte-length",
+        "return new Int32Array(4).byteLength;",
+        "16",
+    );
+    check(
+        "ab-byte-length",
+        "return new ArrayBuffer(8).byteLength;",
+        "8",
+    );
+    check(
+        "ta-get-set",
+        "let a = new Int8Array(2); a[0] = 5; return a[0];",
+        "5",
+    );
+    check(
+        "ta-unsigned-wrap",
+        "let a = new Uint8Array(1); a[0] = 256; return a[0];",
+        "0",
+    );
+    check(
+        "ta-signed-wrap",
+        "let a = new Int8Array(1); a[0] = 200; return a[0];",
+        "-56",
+    );
+    check(
+        "ta-clamped",
+        "let a = new Uint8ClampedArray(1); a[0] = 300; return a[0];",
+        "255",
+    );
+    check(
+        "ta-bytes-per-element",
+        "return Float64Array.BYTES_PER_ELEMENT;",
+        "8",
+    );
+    check(
+        "ta-out-of-range",
+        "let a = new Int8Array(1); return a[5];",
+        "undefined",
+    );
+    check(
+        "ta-over-buffer",
+        "let b = new ArrayBuffer(8); let a = new Float64Array(b); return a.length;",
+        "1",
+    );
+    check(
+        "ta-from-array",
+        "let a = new Int16Array([1, 2, 3]); return a[2];",
+        "3",
+    );
+    check(
+        "ta-shared-buffer",
+        "let b = new ArrayBuffer(4); let a = new Int32Array(b); let c = new Uint8Array(b); \
+         a[0] = 1; return c[0];",
+        "1",
+    );
+    check(
+        "ta-forEach",
+        "let s = 0; new Int8Array([1, 2, 3]).forEach(function (x) { s = s + x; }); return s;",
+        "6",
+    );
+    check(
+        "ta-tag",
+        "return Object.prototype.toString.call(new Int8Array(1));",
+        "[object Int8Array]",
+    );
+}
+
 /// The shape still names the slot, so re-assigning must bring the property back.
 #[test]
 fn a_deleted_property_can_be_assigned_again() {
