@@ -12495,18 +12495,57 @@ extern "C" fn array_last_index_of(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let length = match indexed_length(this_value) {
-        Ok(length) => length,
-        Err(thrown) => return thrown,
-    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
-    for index in (0..length).rev() {
-        if same_value(Value::from_bits(indexed_get(this_value, index)), wanted) {
-            return index_value(index);
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let length = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
+        };
+        if length == 0 {
+            return Value::number(-1.0).to_bits();
         }
-    }
-    Value::number(-1.0).to_bits()
+        // SAFETY: as above.
+        let wanted = unsafe { argument(argc, argv, 0) };
+        #[expect(clippy::cast_precision_loss, reason = "a length below 2^32")]
+        let span = length as f64;
+        // **`fromIndex` defaults to the last index, not zero** — the walk starts from the end.
+        let from = if argc >= 2 {
+            match integer_argument(argc, argv, 1) {
+                Ok(from) => from,
+                Err(thrown) => return thrown,
+            }
+        } else {
+            span - 1.0
+        };
+        let start = if from >= 0.0 {
+            from.min(span - 1.0)
+        } else {
+            span + from
+        };
+        if start < 0.0 {
+            return Value::number(-1.0).to_bits();
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "checked non-negative and clamped to len-1 above"
+        )]
+        let start = start as usize;
+        for index in (0..=start).rev() {
+            if !indexed_has(this_value, index) {
+                continue;
+            }
+            let element = match indexed_get_checked(this_value, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
+            if strict_equal_bool(element, wanted) {
+                return index_value(index);
+            }
+        }
+        Value::number(-1.0).to_bits()
+    })
 }
 
 /// `Array.prototype.includes`.
@@ -13037,6 +13076,36 @@ extern "C" fn array_fill(
 }
 
 /// `Array.prototype.indexOf`, by `===` on numbers and by identity otherwise.
+/// `HasProperty` for an array-like index — whether the position is actually there.
+///
+/// **A hole is not `undefined`.** `indexOf`/`lastIndexOf` skip an absent index rather than
+/// comparing it as `undefined`, so `[, undefined].lastIndexOf(undefined)` finds index 1 and not
+/// index 0. A dense array is present exactly in range; anything else asks the `in` operator,
+/// which walks the prototype chain as `HasProperty` does.
+fn indexed_has(value: u64, index: usize) -> bool {
+    if let Some((_, length)) = elements_of(value) {
+        return index < length;
+    }
+    if handle_of(value).is_none() {
+        return false;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "an index below 2^32")]
+    let key = Value::number(index as f64).to_bits();
+    Value::from_bits(crisol_in(key, value))
+        .as_boolean()
+        .unwrap_or(false)
+}
+
+/// `IsStrictlyEqual(a, b)` as a bool — the comparison `indexOf` and `lastIndexOf` use.
+///
+/// **`===`, not `SameValue`.** `[NaN].indexOf(NaN)` is `-1` and `[-0].indexOf(0)` is `0`; the
+/// two rules differ at exactly `NaN` and signed zero, and these methods take the strict one.
+fn strict_equal_bool(a: u64, b: u64) -> bool {
+    Value::from_bits(crisol_strict_equal(a, b))
+        .as_boolean()
+        .unwrap_or(false)
+}
+
 extern "C" fn array_index_of(
     _closure: u64,
     this_value: u64,
@@ -13051,19 +13120,41 @@ extern "C" fn array_index_of(
             Ok(length) => length,
             Err(thrown) => return thrown,
         };
+        // **`len == 0` answers before `fromIndex` is even coerced**, which the specification's
+        // step order requires and a throwing `valueOf` there would otherwise observe.
+        if length == 0 {
+            return Value::number(-1.0).to_bits();
+        }
         // SAFETY: as above.
-        let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
-        for index in 0..length {
-            let element = Value::from_bits(indexed_get(this_value, index));
-            // `indexOf` uses strict equality, so `NaN` is never found — `[NaN].indexOf(NaN)` is
-            // `-1`. That much this always had right.
-            //
-            // **Strings compare by their characters, and this compared bits.** Two cells
-            // holding `"b"` are different values, so `["a", "b"].indexOf("b")` answered `-1`
-            // for as long as this method has existed — no test looked for a string, and every
-            // test that did look used numbers, where comparing bits happens to agree.
-            // `same_value` is the shared rule (D-114) this predates and never adopted.
-            if same_value(element, wanted) {
+        let wanted = unsafe { argument(argc, argv, 0) };
+        let from = match integer_argument(argc, argv, 1) {
+            Ok(from) => from,
+            Err(thrown) => return thrown,
+        };
+        #[expect(clippy::cast_precision_loss, reason = "a length below 2^32")]
+        let span = length as f64;
+        // A negative `fromIndex` counts from the end; past the end means no match.
+        let start = if from >= 0.0 {
+            from.min(span)
+        } else {
+            (span + from).max(0.0)
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped into 0..=len just above"
+        )]
+        let start = start as usize;
+        for index in start..length {
+            // A missing index is skipped, not compared as `undefined`.
+            if !indexed_has(this_value, index) {
+                continue;
+            }
+            let element = match indexed_get_checked(this_value, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
+            if strict_equal_bool(element, wanted) {
                 return index_value(index);
             }
         }

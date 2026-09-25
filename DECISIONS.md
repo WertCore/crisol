@@ -6439,3 +6439,29 @@ The species probe reads the boxed receiver, matching `ToObject` then `ArraySpeci
 
 With this, every callback-taking `Array.prototype` method treats its receiver the way the
 specification's first step does, and a nullish one throws before the callback rather than after.
+
+## D-230
+
+**`indexOf`/`lastIndexOf` skip absent indices, compare strictly, and read `fromIndex`.**
+
+Status: Accepted
+
+`Array.prototype.lastIndexOf.call({1: null, length: 2}, undefined)` answered `0` — it read the
+absent index `0` as `undefined` and matched. The specification does `HasProperty` at each index
+and skips a hole; `indexed_has` (dense arrays by range, everything else through the `in`
+operator, which walks the chain like `HasProperty`) is that check.
+
+Two more corrections in the same methods:
+
+- **Strict equality, not `SameValue`.** They compared with `same_value`, which finds `NaN` and
+  separates `-0` from `0` — backwards for `indexOf`, whose rule is `===`. And `same_value` as
+  written compared *bits*, so `["a", "b"].indexOf("b")` was `-1` for as long as the method
+  existed, because two string cells holding `"b"` are different addresses. `strict_equal_bool`
+  goes through `crisol_strict_equal`, which compares strings by value.
+- **`fromIndex`.** It was ignored. `indexOf` starts there (negative counts from the end),
+  `lastIndexOf` defaults it to the last index and walks down. It is coerced after the
+  `len == 0` early return, which is the specification's step order and observable through a
+  throwing `valueOf`.
+
+`same_value` keeps its other callers (`defineProperty`'s value check, `includes` via
+`SameValueZero`), so the rule that is right *there* is untouched.

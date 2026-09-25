@@ -1272,6 +1272,66 @@ fn the_result_building_methods_box_their_receiver() {
     );
 }
 
+/// **`indexOf`/`lastIndexOf`: skip absent indices, compare with `===`, honour `fromIndex`.**
+///
+/// A hole is not `undefined`; the comparison is strict (so `NaN` is never found and `-0`
+/// equals `0`); and a string element compares by value, which `same_value`-on-bits got wrong.
+#[test]
+fn index_of_skips_holes_and_compares_strictly() {
+    // Basic.
+    check("indexof-basic", "return [1, 2, 3].indexOf(2);", "1");
+    check(
+        "lastindexof-basic",
+        "return [1, 2, 3, 2].lastIndexOf(2);",
+        "3",
+    );
+    check("indexof-absent", "return [1, 2, 3].indexOf(9);", "-1");
+    // **Strings compare by value**, which the old bit-compare missed.
+    check(
+        "indexof-string",
+        "return [\"a\", \"b\", \"c\"].indexOf(\"b\");",
+        "1",
+    );
+    check(
+        "lastindexof-string",
+        "return [\"a\", \"b\", \"a\"].lastIndexOf(\"a\");",
+        "2",
+    );
+    // Strict equality: NaN is never found, -0 equals 0.
+    check("indexof-nan", "return [NaN].indexOf(NaN);", "-1");
+    check("indexof-neg-zero", "return [-0].indexOf(0);", "0");
+    // An absent index is skipped, not read as undefined.
+    check(
+        "lastindexof-skips-hole",
+        "let o = {1: null, 2: undefined, length: 2}; \
+         return Array.prototype.lastIndexOf.call(o, undefined);",
+        "-1",
+    );
+    check(
+        "lastindexof-finds-present",
+        "let o = {1: null, 2: undefined, length: 2}; \
+         return Array.prototype.lastIndexOf.call(o, null);",
+        "1",
+    );
+    // fromIndex.
+    check("indexof-fromindex", "return [1, 2, 1].indexOf(1, 1);", "2");
+    check(
+        "indexof-fromindex-negative",
+        "return [1, 2, 3].indexOf(2, -2);",
+        "1",
+    );
+    check(
+        "lastindexof-fromindex",
+        "return [1, 2, 1].lastIndexOf(1, 1);",
+        "0",
+    );
+    check(
+        "indexof-fromindex-past-end",
+        "return [1, 2, 3].indexOf(1, 5);",
+        "-1",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(
