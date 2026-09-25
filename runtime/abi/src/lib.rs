@@ -12559,25 +12559,62 @@ extern "C" fn array_includes(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    let length = match indexed_length(this_value) {
-        Ok(length) => length,
-        Err(thrown) => return thrown,
-    };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let wanted = Value::from_bits(unsafe { argument(argc, argv, 0) });
-    let seeking_nan = wanted.as_number().is_some_and(f64::is_nan);
-    for index in 0..length {
-        let element = Value::from_bits(indexed_get(this_value, index));
-        let found = if seeking_nan {
-            element.as_number().is_some_and(f64::is_nan)
-        } else {
-            same_value(element, wanted)
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let length = match indexed_length(this_value) {
+            Ok(length) => length,
+            Err(thrown) => return thrown,
         };
-        if found {
-            return Value::TRUE.to_bits();
+        if length == 0 {
+            return Value::FALSE.to_bits();
         }
-    }
-    Value::FALSE.to_bits()
+        // SAFETY: as above.
+        let wanted = unsafe { argument(argc, argv, 0) };
+        let from = match integer_argument(argc, argv, 1) {
+            Ok(from) => from,
+            Err(thrown) => return thrown,
+        };
+        #[expect(clippy::cast_precision_loss, reason = "a length below 2^32")]
+        let span = length as f64;
+        let start = if from >= 0.0 {
+            from.min(span)
+        } else {
+            (span + from).max(0.0)
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped into 0..=len just above"
+        )]
+        let start = start as usize;
+        // **SameValueZero**, which is strict equality *except* that `NaN` matches `NaN` —
+        // so `[NaN].includes(NaN)` is true where `indexOf` is `-1`, and `-0` still equals `0`.
+        // Written with `strict_equal_bool` so a string compares by value, not by cell address
+        // (the bug `same_value` carried here, the twin of D-230).
+        let seeking_nan = Value::from_bits(wanted)
+            .as_number()
+            .is_some_and(f64::is_nan);
+        for index in start..length {
+            // **`includes` does not skip a hole** — it reads it as `undefined`, unlike
+            // `indexOf`. So no `HasProperty` check here, only the propagating read.
+            let element = match indexed_get_checked(this_value, index) {
+                Ok(element) => element,
+                Err(thrown) => return thrown,
+            };
+            let found = if seeking_nan {
+                Value::from_bits(element)
+                    .as_number()
+                    .is_some_and(f64::is_nan)
+            } else {
+                strict_equal_bool(element, wanted)
+            };
+            if found {
+                return Value::TRUE.to_bits();
+            }
+        }
+        Value::FALSE.to_bits()
+    })
 }
 
 /// `Array.prototype.join`.

@@ -1332,6 +1332,40 @@ fn index_of_skips_holes_and_compares_strictly() {
     );
 }
 
+/// `includes` is `indexOf`'s SameValueZero twin: it finds `NaN`, treats `-0` as `0`, compares
+/// strings by value, honours `fromIndex`, and reads a hole as `undefined` rather than skipping.
+#[test]
+fn includes_uses_same_value_zero() {
+    check("includes-basic", "return [1, 2, 3].includes(2);", "true");
+    check("includes-absent", "return [1, 2, 3].includes(9);", "false");
+    check(
+        "includes-string",
+        "return [\"a\", \"b\"].includes(\"b\");",
+        "true",
+    );
+    // Finds NaN, where indexOf does not.
+    check("includes-nan", "return [NaN].includes(NaN);", "true");
+    check("indexof-nan-not-found", "return [NaN].indexOf(NaN);", "-1");
+    // -0 equals 0.
+    check("includes-neg-zero", "return [0].includes(-0);", "true");
+    // fromIndex.
+    check(
+        "includes-fromindex",
+        "return [1, 2, 1].includes(1, 1);",
+        "true",
+    );
+    check(
+        "includes-fromindex-absent",
+        "return [1, 2, 3].includes(1, 1);",
+        "false",
+    );
+    check(
+        "includes-fromindex-negative",
+        "return [1, 2, 3].includes(1, -1);",
+        "false",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

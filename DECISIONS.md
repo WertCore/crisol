@@ -6465,3 +6465,19 @@ Two more corrections in the same methods:
 
 `same_value` keeps its other callers (`defineProperty`'s value check, `includes` via
 `SameValueZero`), so the rule that is right *there* is untouched.
+
+## D-231
+
+**`includes` is `indexOf`'s SameValueZero twin, and carried the same bugs.**
+
+Status: Accepted
+
+`["a", "b"].includes("b")` was false — the same `same_value`-on-bits bug as D-230, here in
+`array_includes`. It also separated `-0` from `0` (SameValueZero treats them equal) and ignored
+`fromIndex`.
+
+Rewritten to match D-230's shape: `strict_equal_bool` for the comparison, plus an explicit
+`NaN`-matches-`NaN` clause — which is exactly SameValueZero, the rule `includes` takes and
+`indexOf` does not. `fromIndex` is read after the `len == 0` early return. The one difference
+from `indexOf` is deliberate: `includes` does **not** skip a hole, it reads it as `undefined`,
+so there is no `HasProperty` check — only the throwing-getter-propagating read.
