@@ -9253,6 +9253,11 @@ extern "C" fn math_random(
 /// this takes what `for-of` takes (an array or a string) and otherwise reads `length` and
 /// indexes, which covers any `{length, 0, 1, …}`. A user-defined iterable that is not
 /// array-like answers an empty array rather than its elements: a gap, not a decision.
+/// Whether `value` is iterable — has a callable `Symbol.iterator`, inherited or own.
+fn has_symbol_iterator(value: u64) -> bool {
+    iterator_key().is_some_and(|key| is_callable(symbol_property_load(value, &key)))
+}
+
 extern "C" fn array_from(
     _closure: u64,
     _this_value: u64,
@@ -9290,6 +9295,28 @@ extern "C" fn array_from(
                 });
             }
             None => {
+                // **An iterable takes the iterator path** — `Array.from(m.keys())` and
+                // `Array.from(anySet)` drain via `Symbol.iterator` rather than reading a
+                // `length` that an iterator does not have.
+                if has_symbol_iterator(source) {
+                    let taken = crisol_iterate(source);
+                    if Value::from_bits(taken).is_exception() {
+                        return taken;
+                    }
+                    return with_rooted(&[taken], || {
+                        let values: Vec<u64> = match elements_of(taken) {
+                            Some((array, length)) => {
+                                (0..length).map(|index| element_at(array, index)).collect()
+                            }
+                            None => Vec::new(),
+                        };
+                        if is_callable(mapper) {
+                            map_into_array(&values, mapper)
+                        } else {
+                            array_of_values(&values)
+                        }
+                    });
+                }
                 // Array-like: `length` and indices.
                 let count = property_number(source, "length").unwrap_or(0.0);
                 #[expect(

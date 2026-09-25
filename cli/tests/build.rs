@@ -8778,12 +8778,17 @@ fn the_built_ins_answer_to_symbol_iterator() {
          return it.next().value + \",\" + it.next().value;",
         "1,2",
     );
-    // `Map` and `Set` have no `values` or `entries` to alias yet, so they are not wired —
-    // asserted here so the gap is visible rather than assumed closed.
+    // `Map` and `Set` now answer to `Symbol.iterator` — aliases of `entries` and `values`
+    // respectively (D-232).
     check(
-        "set-has-no-symbol-iterator-yet",
-        "return typeof Set.prototype[Symbol.iterator];",
-        "undefined",
+        "map-symbol-iterator-is-entries",
+        "return Map.prototype[Symbol.iterator] === Map.prototype.entries;",
+        "true",
+    );
+    check(
+        "set-symbol-iterator-is-values",
+        "return Set.prototype[Symbol.iterator] === Set.prototype.values;",
+        "true",
     );
 }
 
