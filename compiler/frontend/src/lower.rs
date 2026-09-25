@@ -145,6 +145,23 @@ struct Scope {
     /// Where `continue` goes, innermost last. Separate from `breaks` because a `switch` is a
     /// `break` target and not a `continue` one.
     continues: Vec<BlockId>,
+    /// Set while lowering a generator body: the resume points `yield` has produced. `None` for an
+    /// ordinary function, so a `yield` outside a generator is refused rather than miscompiled.
+    generator: Option<GenState>,
+}
+
+/// What a generator body accumulates as it lowers: one resume point per `yield`, and which slots
+/// are the body's own locals (kept on the generator object so they survive a suspension).
+struct GenState {
+    /// The next resume-state number to hand out; `0` is the body's start.
+    next_state: u32,
+    /// `(state, block)` for each `yield`'s resume point, for the entry dispatch.
+    resumes: Vec<(u32, BlockId)>,
+    /// Slots that are the body's own locals or parameters, with the hidden key they live under on
+    /// the generator object. A `Variable` would be lost on suspension; a property on the object is
+    /// not — which is what lets a loop counter survive a `yield`. Captures are **not** in here:
+    /// they are re-loaded from the closure at every resume, so they persist on their own.
+    locals: HashMap<u32, String>,
 }
 
 // **The three jump-target stacks live here and not on `Lowering`, because a `BlockId` names a
@@ -180,6 +197,18 @@ struct Lowering {
 /// and a measurement before inventing machinery to make it faster.
 const CELL_KEY: &str = "value";
 
+/// The hidden keys the generator lowering and the runtime's `crisol_make_generator` share: the
+/// resume state, the value passed to `next`, the value `yield` produced, and the return value.
+const GEN_STATE_KEY: &str = "__genState";
+const GEN_SENT_KEY: &str = "__genSent";
+const GEN_YIELDED_KEY: &str = "__genYielded";
+const GEN_RETURN_KEY: &str = "__genReturn";
+/// The caller's `this`, kept on the generator object because the body's own `this` is the object.
+const GEN_THIS_KEY: &str = "__genThis";
+/// The body's return value tells the runtime what it did: `0` yielded, `1` finished.
+const GEN_YIELD_SIGNAL: f64 = 0.0;
+const GEN_DONE_SIGNAL: f64 = 1.0;
+
 impl Lowering {
     fn new(name: &str) -> Self {
         // Function zero is the program itself. Stamped rather than left to the default, so
@@ -202,6 +231,7 @@ impl Lowering {
                 breaks: Vec::new(),
                 handlers: Vec::new(),
                 continues: Vec::new(),
+                generator: None,
             }],
             unsupported: Vec::new(),
         };
@@ -329,7 +359,7 @@ impl Lowering {
                     continue;
                 }
                 let value = match &declarator.init {
-                    Some(init) => self.expression(init),
+                    Some(init) => self.value_expression(init),
                     None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
                 };
                 if hoisted {
@@ -996,13 +1026,17 @@ impl Lowering {
         }
 
         for (name, declaration) in &named {
-            let (id, captures) = self.lower_function(
-                name,
-                &declaration.params,
-                declaration.body.as_deref(),
-                None,
-                true,
-            );
+            let (id, captures) = if declaration.generator {
+                self.lower_generator(name, &declaration.params, declaration.body.as_deref())
+            } else {
+                self.lower_function(
+                    name,
+                    &declaration.params,
+                    declaration.body.as_deref(),
+                    None,
+                    true,
+                )
+            };
             let closure = self.close_over(id, &captures);
             let slot = self.declare(name);
             self.write(slot, closure);
@@ -1075,6 +1109,19 @@ impl Lowering {
     /// Every read of a local goes through here, so a shared variable cannot be read directly by
     /// some path that forgot — which would produce a stale value rather than a failure.
     fn read(&mut self, slot: u32) -> ValueId {
+        // A generator local is a property of the generator object (`this`), read fresh each time so
+        // a value stored before a suspension is seen after it.
+        if let Some(key) = self.gen_local_key(slot) {
+            let this_slot = self.this_slot();
+            let this = self.emit(Type::Unknown, Op::Load { slot: this_slot });
+            return self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object: this,
+                    key: PropertyKey::new(&key),
+                },
+            );
+        }
         let held = self.emit(Type::Unknown, Op::Load { slot });
         if self.scope().cells.contains(&slot) {
             return self.emit(
@@ -1088,8 +1135,19 @@ impl Lowering {
         held
     }
 
-    /// Writes a variable, through its cell when it has one.
+    /// Writes a variable, through its cell when it has one, or onto the generator object when it is
+    /// a generator local.
     fn write(&mut self, slot: u32, value: ValueId) {
+        if let Some(key) = self.gen_local_key(slot) {
+            let this_slot = self.this_slot();
+            let this = self.emit(Type::Unknown, Op::Load { slot: this_slot });
+            self.emit_effect(Op::PropertyStore {
+                object: this,
+                key: PropertyKey::new(&key),
+                value,
+            });
+            return;
+        }
         if self.scope().cells.contains(&slot) {
             let cell = self.emit(Type::Unknown, Op::Load { slot });
             self.emit_effect(Op::PropertyStore {
@@ -1100,6 +1158,19 @@ impl Lowering {
             return;
         }
         self.emit_effect(Op::Store { slot, value });
+    }
+
+    /// The hidden key a slot's value lives under on the generator object, or `None` when the slot is
+    /// not a generator local (an ordinary function, `this`, or a capture).
+    fn gen_local_key(&self, slot: u32) -> Option<String> {
+        self.scope().generator.as_ref()?.locals.get(&slot).cloned()
+    }
+
+    /// The slot holding the current function's `this` — the generator object, in a generator body.
+    fn this_slot(&self) -> u32 {
+        self.functions[self.scope().function]
+            .this_slot
+            .expect("a function that reads a generator local binds `this`")
     }
 
     /// Binds a freshly declared variable to its first value.
@@ -1188,6 +1259,11 @@ impl Lowering {
 
         let slot = self.declare(name);
         if captured {
+            // A capture is not a generator local: it re-loads from the closure at every resume, so
+            // it must not be redirected onto the generator object (where nothing stores it).
+            if let Some(generator) = self.scope_mut().generator.as_mut() {
+                generator.locals.remove(&slot);
+            }
             self.scope_mut().captures.push((name.to_owned(), slot));
             if self.shared.contains(name) {
                 // The value arriving is the *cell* the enclosing scope made, not a copy of
@@ -1212,6 +1288,14 @@ impl Lowering {
         let slot = scope.next_slot;
         scope.next_slot += 1;
         scope.slots.insert(name.to_owned(), slot);
+        // In a generator body a newly declared local lives on the generator object, so it survives
+        // a suspension. `this` is the object itself and is never redirected; captures are removed
+        // from this set again in `slot`, since they re-load from the closure on their own.
+        if name != "this"
+            && let Some(generator) = scope.generator.as_mut()
+        {
+            generator.locals.insert(slot, format!("$g_{name}"));
+        }
         slot
     }
 
@@ -1241,17 +1325,46 @@ impl Lowering {
         }
         match statement {
             Statement::ExpressionStatement(statement) => {
-                self.expression(&statement.expression);
+                // A `yield e;` at statement level suspends and discards the sent value — the safe,
+                // common position where nothing is live across the suspension.
+                if self.is_plain_yield(&statement.expression) {
+                    let Expression::YieldExpression(yield_expression) = &statement.expression
+                    else {
+                        unreachable!("is_plain_yield checked the shape")
+                    };
+                    self.lower_yield(yield_expression.argument.as_ref());
+                } else {
+                    self.expression(&statement.expression);
+                }
             }
             Statement::VariableDeclaration(declaration) => {
                 self.variable_declaration(declaration);
             }
             Statement::ReturnStatement(statement) => {
-                let value = statement
-                    .argument
-                    .as_ref()
-                    .map(|argument| self.expression(argument));
-                self.terminate(Terminator::Return(value));
+                // Inside a generator, `return e` is not the function's return — it finishes the
+                // generator with `e` as the result and hands the body's `DONE` signal back.
+                if self.scope().generator.is_some() {
+                    let value = match &statement.argument {
+                        Some(argument) => self.expression(argument),
+                        None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+                    };
+                    let this_slot = self.slot("this");
+                    let this = self.read(this_slot);
+                    self.emit_effect(Op::PropertyStore {
+                        object: this,
+                        key: PropertyKey::new(GEN_RETURN_KEY),
+                        value,
+                    });
+                    let done =
+                        self.emit(Type::Number, Op::Const(Constant::Number(GEN_DONE_SIGNAL)));
+                    self.terminate(Terminator::Return(Some(done)));
+                } else {
+                    let value = statement
+                        .argument
+                        .as_ref()
+                        .map(|argument| self.expression(argument));
+                    self.terminate(Terminator::Return(value));
+                }
             }
             Statement::IfStatement(statement) => {
                 let condition = self.expression(&statement.test);
@@ -1463,7 +1576,9 @@ impl Lowering {
             }
             Expression::BinaryExpression(binary) => self.binary(binary),
             Expression::AssignmentExpression(assignment) => {
-                let value = self.expression(&assignment.right);
+                // The right side is evaluated first, so a `yield` there is safe: the target is
+                // resolved afterwards, in the resume block, with nothing live across the suspension.
+                let value = self.value_expression(&assignment.right);
                 // Matched on the target's *shape*, not on `get_identifier_name`: that helper
                 // reports the **property** name for `this.x`, so using it turned `this.x = x`
                 // into `x = x` — a silently wrong translation with no note, which is the one
@@ -1624,13 +1739,17 @@ impl Lowering {
                     .id
                     .as_ref()
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                let (id, names) = self.lower_function(
-                    &name,
-                    &function.params,
-                    function.body.as_deref(),
-                    None,
-                    true,
-                );
+                let (id, names) = if function.generator {
+                    self.lower_generator(&name, &function.params, function.body.as_deref())
+                } else {
+                    self.lower_function(
+                        &name,
+                        &function.params,
+                        function.body.as_deref(),
+                        None,
+                        true,
+                    )
+                };
                 self.close_over(id, &names)
             }
             Expression::ArrowFunctionExpression(arrow) => {
@@ -1676,7 +1795,31 @@ impl Lowering {
             }
             Expression::ThisExpression(_) => {
                 let slot = self.slot("this");
-                self.read(slot)
+                let this = self.read(slot);
+                // In a generator body the `this` slot is the generator object; the caller's `this`
+                // is kept on it under `GEN_THIS_KEY`.
+                if self.scope().generator.is_some() {
+                    return self.emit(
+                        Type::Unknown,
+                        Op::PropertyLoad {
+                            object: this,
+                            key: PropertyKey::new(GEN_THIS_KEY),
+                        },
+                    );
+                }
+                this
+            }
+            Expression::YieldExpression(yield_expression) => {
+                // A `yield` handled in a safe position (a statement, or the right of an initialiser
+                // or simple assignment) never reaches here. Anywhere else it could leave a compiler
+                // temporary live across the suspension, which this lowering cannot spill yet, so it
+                // is refused rather than miscompiled.
+                if self.scope().generator.is_none() {
+                    self.note("yield outside a generator", yield_expression.span.start);
+                } else {
+                    self.note("yield in expression position", yield_expression.span.start);
+                }
+                self.placeholder()
             }
             Expression::UnaryExpression(unary) => self.unary(unary),
             Expression::TemplateLiteral(template) => self.template(template),
@@ -2009,6 +2152,287 @@ impl Lowering {
         self.emit(Type::Unknown, Op::Load { slot })
     }
 
+    /// Lowers `function* name(params) { body }` and returns the **outer** function — the one a call
+    /// runs — plus the names it captures. The outer builds a generator object and returns it
+    /// without running the body; a separate *body* function is the state machine `next` steps
+    /// (D-246). Locals and parameters live on that object, so a loop counter survives a `yield`; a
+    /// `yield` is handled in statement or simple-assignment position, and refused elsewhere (where a
+    /// compiler temporary could be live across the suspension).
+    fn lower_generator(
+        &mut self,
+        name: &str,
+        params: &oxc_ast::ast::FormalParameters<'_>,
+        body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+    ) -> (FunctionId, Vec<String>) {
+        let (body_id, body_captures) = self.lower_generator_body(name, params, body);
+
+        let index = self.functions.len();
+        let mut outer = Function::new(name);
+        outer.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        let entry = outer.entry;
+        self.functions.push(outer);
+        self.scopes.push(Scope {
+            function: index,
+            current: entry,
+            terminated: false,
+            slots: HashMap::new(),
+            next_slot: 0,
+            captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
+            breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
+            generator: None,
+        });
+        let this_slot = self.declare("this");
+        self.functions[index].this_slot = Some(this_slot);
+        let mut parameter_slots = Vec::with_capacity(params.items.len());
+        for param in &params.items {
+            match param.pattern.get_identifier_name() {
+                Some(param_name) => parameter_slots.push(self.declare(param_name.as_str())),
+                None => {
+                    self.note("destructuring parameter", param.span.start);
+                    parameter_slots.push(self.temporary());
+                }
+            }
+        }
+        // Build the generator object over the body closure and the caller's `this`, store each
+        // parameter on it under the key the body reads it by, and return it.
+        let body_closure = self.close_over(body_id, &body_captures);
+        let this_value = self.read(this_slot);
+        let generator = self.emit(
+            Type::Object(None),
+            Op::MakeGenerator {
+                body: body_closure,
+                this_value,
+            },
+        );
+        for (param, slot) in params.items.iter().zip(&parameter_slots) {
+            if let Some(param_name) = param.pattern.get_identifier_name() {
+                let value = self.read(*slot);
+                self.emit_effect(Op::PropertyStore {
+                    object: generator,
+                    key: PropertyKey::new(&format!("$g_{param_name}")),
+                    value,
+                });
+            }
+        }
+        self.functions[index].parameters = parameter_slots;
+        self.terminate(Terminator::Return(Some(generator)));
+
+        let scope = self.scopes.pop().expect("just pushed");
+        let names: Vec<String> = scope
+            .captures
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let slots: Vec<u32> = scope.captures.iter().map(|(_, slot)| *slot).collect();
+        self.functions[index].captures = slots;
+        (
+            FunctionId(u32::try_from(index).expect("functions fit in u32")),
+            names,
+        )
+    }
+
+    /// The state-machine body of a generator. Its `this` is the generator object; `yield` stores
+    /// the value and the next state on it and returns a signal; the entry dispatches on the stored
+    /// state to the block after the `yield` that suspended.
+    fn lower_generator_body(
+        &mut self,
+        name: &str,
+        params: &oxc_ast::ast::FormalParameters<'_>,
+        body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+    ) -> (FunctionId, Vec<String>) {
+        let index = self.functions.len();
+        let mut function = Function::new(&format!("{name}~body"));
+        function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        let entry = function.entry;
+        self.functions.push(function);
+        self.scopes.push(Scope {
+            function: index,
+            current: entry,
+            terminated: false,
+            slots: HashMap::new(),
+            next_slot: 0,
+            captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
+            breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
+            generator: Some(GenState {
+                next_state: 1,
+                resumes: Vec::new(),
+                locals: HashMap::new(),
+            }),
+        });
+        // The body's `this` is the generator object — how it reaches its resume state and its
+        // locals.
+        let this_slot = self.declare("this");
+        self.functions[index].this_slot = Some(this_slot);
+        // Declare the parameters as generator locals (`declare` marks them, so reads redirect to
+        // the generator object). The outer function stores the incoming argument values under the
+        // matching keys, so the body sees them and they survive suspension.
+        for param in &params.items {
+            if let Some(param_name) = param.pattern.get_identifier_name() {
+                self.declare(param_name.as_str());
+            }
+        }
+
+        // Lower the body into a start block; the entry (block zero) becomes the dispatch below.
+        let start = self.new_block();
+        self.switch_to(start);
+        if let Some(body) = body {
+            for statement in &body.statements {
+                self.statement(statement);
+            }
+        }
+        // Falling off the end finishes with `undefined`.
+        if !self.scope().terminated {
+            let this = self.read(this_slot);
+            let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+            self.emit_effect(Op::PropertyStore {
+                object: this,
+                key: PropertyKey::new(GEN_RETURN_KEY),
+                value: undefined,
+            });
+            let done = self.emit(Type::Number, Op::Const(Constant::Number(GEN_DONE_SIGNAL)));
+            self.terminate(Terminator::Return(Some(done)));
+        }
+
+        // The entry dispatch: read the stored state and jump to the matching resume block. State 0
+        // is the start; each `yield` recorded its own. Re-read `this`/state per comparison so no
+        // value has to live across the chain's blocks.
+        let resumes = self
+            .scope()
+            .generator
+            .as_ref()
+            .map(|generator| generator.resumes.clone())
+            .unwrap_or_default();
+        self.switch_to(entry);
+        let mut targets = vec![(0u32, start)];
+        targets.extend(resumes);
+        for (state, block) in targets {
+            let this = self.read(this_slot);
+            let stored = self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object: this,
+                    key: PropertyKey::new(GEN_STATE_KEY),
+                },
+            );
+            let wanted = self.emit(Type::Number, Op::Const(Constant::Number(f64::from(state))));
+            let matches = self.emit(
+                Type::Bool,
+                Op::Compare {
+                    op: CompareOp::StrictEqual,
+                    left: stored,
+                    right: wanted,
+                },
+            );
+            let next = self.new_block();
+            self.terminate(Terminator::Branch {
+                condition: matches,
+                then_block: block,
+                then_args: Vec::new(),
+                else_block: next,
+                else_args: Vec::new(),
+            });
+            self.switch_to(next);
+        }
+        // An unreachable state (or an exhausted generator re-entered) simply finishes.
+        let done = self.emit(Type::Number, Op::Const(Constant::Number(GEN_DONE_SIGNAL)));
+        self.terminate(Terminator::Return(Some(done)));
+
+        let scope = self.scopes.pop().expect("just pushed");
+        let names: Vec<String> = scope
+            .captures
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let slots: Vec<u32> = scope.captures.iter().map(|(_, slot)| *slot).collect();
+        self.functions[index].captures = slots;
+        (
+            FunctionId(u32::try_from(index).expect("functions fit in u32")),
+            names,
+        )
+    }
+
+    /// The mechanics of one `yield`: store the value and the next resume state on the generator,
+    /// return the yield signal, then continue in a fresh resume block whose value is what `next`
+    /// sent in. The caller must be in statement or simple-assignment position, so no compiler
+    /// temporary is live across the suspension (the resume block is entered from the entry
+    /// dispatch, not from before the `yield`).
+    fn lower_yield(&mut self, argument: Option<&Expression<'_>>) -> ValueId {
+        let value = match argument {
+            Some(argument) => self.expression(argument),
+            None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+        };
+        let this_slot = self.slot("this");
+        let this = self.read(this_slot);
+        self.emit_effect(Op::PropertyStore {
+            object: this,
+            key: PropertyKey::new(GEN_YIELDED_KEY),
+            value,
+        });
+        let state = {
+            let generator = self
+                .scope_mut()
+                .generator
+                .as_mut()
+                .expect("a yield outside a generator is refused by the caller");
+            let state = generator.next_state;
+            generator.next_state += 1;
+            state
+        };
+        let this = self.read(this_slot);
+        let state_const = self.emit(Type::Number, Op::Const(Constant::Number(f64::from(state))));
+        self.emit_effect(Op::PropertyStore {
+            object: this,
+            key: PropertyKey::new(GEN_STATE_KEY),
+            value: state_const,
+        });
+        let signal = self.emit(Type::Number, Op::Const(Constant::Number(GEN_YIELD_SIGNAL)));
+        self.terminate(Terminator::Return(Some(signal)));
+
+        let resume = self.new_block();
+        self.scope_mut()
+            .generator
+            .as_mut()
+            .expect("checked above")
+            .resumes
+            .push((state, resume));
+        self.switch_to(resume);
+        let this = self.read(this_slot);
+        self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: this,
+                key: PropertyKey::new(GEN_SENT_KEY),
+            },
+        )
+    }
+
+    /// Whether an expression is a `yield` that [`Self::lower_yield`] can handle here (not a
+    /// delegating `yield*`, and inside a generator).
+    fn is_plain_yield(&self, expression: &Expression<'_>) -> bool {
+        matches!(expression, Expression::YieldExpression(yield_expression)
+            if !yield_expression.delegate)
+            && self.scope().generator.is_some()
+    }
+
+    /// A value expression that may itself be a `yield` — the right side of an initialiser or a
+    /// simple assignment, the positions where a `yield`'s sent value is bound with nothing else
+    /// live across the suspension.
+    fn value_expression(&mut self, expression: &Expression<'_>) -> ValueId {
+        if self.is_plain_yield(expression) {
+            let Expression::YieldExpression(yield_expression) = expression else {
+                unreachable!("is_plain_yield checked the shape")
+            };
+            return self.lower_yield(yield_expression.argument.as_ref());
+        }
+        self.expression(expression)
+    }
+
     /// Lowers a nested function and returns its id plus the names it captured.
     ///
     /// The captures come back as *names* because they must be resolved again in the **enclosing**
@@ -2049,6 +2473,7 @@ impl Lowering {
             breaks: Vec::new(),
             handlers: Vec::new(),
             continues: Vec::new(),
+            generator: None,
         });
 
         if binds_this {
@@ -2304,6 +2729,7 @@ impl Lowering {
             breaks: Vec::new(),
             handlers: Vec::new(),
             continues: Vec::new(),
+            generator: None,
         });
         self.declare("this");
         self.terminate(Terminator::Return(None));
@@ -2335,6 +2761,7 @@ impl Lowering {
             breaks: Vec::new(),
             handlers: Vec::new(),
             continues: Vec::new(),
+            generator: None,
         });
         // **Recorded on the function**, exactly as `lower_function` does, so the backend binds the
         // incoming receiver to this slot — without it `this` reads `undefined` and `super()`

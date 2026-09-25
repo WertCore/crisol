@@ -189,6 +189,7 @@ const TRUTHY_SYMBOL: &str = "crisol_truthy";
 const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
 const DELETE_SYMBOL: &str = "crisol_delete";
 const SET_PROTOTYPE_SYMBOL: &str = "crisol_set_prototype";
+const MAKE_GENERATOR_SYMBOL: &str = "crisol_make_generator";
 const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
 const ITERATE_SYMBOL: &str = "crisol_iterate";
 const CREATE_REGEXP_SYMBOL: &str = "crisol_create_regexp";
@@ -260,6 +261,8 @@ struct ObjectHelpers<T> {
     delete: T,
     /// `crisol_set_prototype(object, prototype) -> object`
     set_prototype: T,
+    /// `crisol_make_generator(body, this) -> generator object`
+    make_generator: T,
     /// `crisol_enumerate(object) -> array of names`
     enumerate: T,
     /// `crisol_iterate(value) -> something indexable`
@@ -394,6 +397,11 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     set_prototype.params.push(AbiParam::new(types::I64));
     set_prototype.returns.push(AbiParam::new(types::I64));
 
+    let mut make_generator = module.make_signature();
+    make_generator.params.push(AbiParam::new(types::I64));
+    make_generator.params.push(AbiParam::new(types::I64));
+    make_generator.returns.push(AbiParam::new(types::I64));
+
     let mut enumerate = module.make_signature();
     enumerate.params.push(AbiParam::new(types::I64));
     enumerate.returns.push(AbiParam::new(types::I64));
@@ -476,6 +484,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         global_load: declare(GLOBAL_LOAD_SYMBOL, &global_load)?,
         delete: declare(DELETE_SYMBOL, &delete)?,
         set_prototype: declare(SET_PROTOTYPE_SYMBOL, &set_prototype)?,
+        make_generator: declare(MAKE_GENERATOR_SYMBOL, &make_generator)?,
         enumerate: declare(ENUMERATE_SYMBOL, &enumerate)?,
         iterate: declare(ITERATE_SYMBOL, &iterate)?,
         create_regexp: declare(CREATE_REGEXP_SYMBOL, &create_regexp)?,
@@ -1019,6 +1028,9 @@ impl Backend for Cranelift {
             set_prototype: self
                 .module
                 .declare_func_in_func(self.objects.set_prototype, &mut context.func),
+            make_generator: self
+                .module
+                .declare_func_in_func(self.objects.make_generator, &mut context.func),
             enumerate: self
                 .module
                 .declare_func_in_func(self.objects.enumerate, &mut context.func),
@@ -1775,6 +1787,15 @@ impl Lowering<'_> {
                     .call(self.objects.set_prototype, &[object, prototype]);
                 Some(self.builder.inst_results(call)[0])
             }
+            Op::MakeGenerator { body, this_value } => {
+                let body = self.value(*body);
+                let this_value = self.value(*this_value);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.make_generator, &[body, this_value]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::ComputedLoad { object, key } => {
                 let object = self.value(*object);
                 let key = self.value(*key);
@@ -2243,6 +2264,9 @@ impl Jit {
             set_prototype: self
                 .module
                 .declare_func_in_func(self.objects.set_prototype, &mut context.func),
+            make_generator: self
+                .module
+                .declare_func_in_func(self.objects.make_generator, &mut context.func),
             enumerate: self
                 .module
                 .declare_func_in_func(self.objects.enumerate, &mut context.func),

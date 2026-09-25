@@ -6810,3 +6810,68 @@ different dialect of the same mode, not an addition), `flags` reports it in the 
 previously-absent `hasIndices`) as a data property. That clears the "invalid regular expression
 flags" cases that were only failing because the flag was refused, and set operations like
 `/[[a-z]&&[aeiou]]/v` now match through `regress`.
+
+## D-246
+
+**Generators — the design, and why it is a focused effort rather than one commit.**
+
+Status: Designed, not yet implemented
+
+A generator cannot be a suspended native stack (crisol is AOT — there is no interpreter to
+suspend, and locals are Cranelift `Variable`s that vanish on return). But it does **not** need a
+codegen change either. The workable shape is a frontend state-machine transform over the existing
+ops plus a runtime generator object:
+
+- **`function* g(...)` splits into two functions.** The outer one, called as `g(...)`, allocates a
+  generator object (prototype `%GeneratorPrototype%`), stores the parameters and `__state = 0` on
+  it, and returns it without running the body. The inner *body* function runs the state machine
+  with the generator object as its `this`.
+- **The body's locals and resume-state live on that object**, as hidden properties, so they persist
+  across suspension. Reading/writing a generator local lowers to a property load/store on `this`
+  rather than an `Op::Load`/`Store` — the one invasive frontend change, a "generator mode" in the
+  variable path.
+- **Entry dispatches on `this.__state`**: a chain of `Compare`+`Branch` (no new terminator) that
+  jumps to the block right after the `yield` that suspended.
+- **`yield e`** → `this.__yielded = e; this.__state = N; return YIELD_SIGNAL`; the resume block
+  reads the sent value from `this.__sent`. **`return e`** → `this.__return = e; return DONE_SIGNAL`.
+- **Restriction:** no SSA temporary may be live across a `yield`, so statement-position and
+  `x = yield e` are supported and `a + (yield b)` is refused (noted, not miscompiled) until a
+  live-value spill lands.
+
+Two prerequisites generators share with any iterable, and the reason this is multi-piece rather
+than one commit: **the iterator protocol** (`for-of` today only walks arrays/strings via
+`crisol_iterate`; it must learn to drive `Symbol.iterator`/`next()`), and a **lazy `for-of`**
+(today it eagerly materialises through `Op::Iterate`, which would run a generator to completion up
+front — wrong for an infinite one and for yield timing). Plus the runtime `%GeneratorPrototype%`
+(`next`/`return`/`throw`/`Symbol.iterator`). Each is correct or it is silently wrong about laziness,
+so it is landed as a deliberate sequence, not rushed.
+
+## D-247
+
+**Generators, implemented — the D-246 design, and the scope that made it landable.**
+
+Status: Accepted
+
+The design in D-246 became feasible on one discovery: `crisol_iterate` **already drains the
+iterator protocol** (`iterate_by_protocol`) for anything with a `Symbol.iterator`. So a finite
+generator, once it *is* a proper iterable, works in `for-of`/spread/`Array.from` with **no change to
+iteration** — the feared for-of rewrite was unnecessary. `next()` steps it lazily; only an infinite
+generator in `for-of` stays eager (a noted limit).
+
+What shipped: one IR op `MakeGenerator{body, this}` (ir/codegen + `crisol_make_generator`); the
+runtime `%GeneratorPrototype%` and generator object (state/done/sent/yielded/return/this/body as
+hidden properties); and the frontend transform — `function*` splits into an **outer** function
+(builds the generator, stores the parameters, returns it) and a **body** function whose `this` is
+the generator object. The body's locals and parameters live on that object (`declare` marks them,
+`read`/`write` redirect to `this."$g_<name>"`, captures excluded since they re-load from the
+closure), so a loop counter and a parameter survive a `yield` — the case that makes generators
+useful. `yield` stores the value and the next state and returns a signal; the entry dispatches on
+the stored state to the block after the suspending `yield`; `return e` finishes with `e`.
+
+Restriction kept from the design: `yield` is handled in statement and simple-assignment position
+(where nothing is live across the suspension) and refused in a complex expression position, since
+spilling a live SSA temporary across a `yield` is not done. Also deferred: `yield*` delegation, and
+`return`/`throw` running the generator's `finally`/`catch` (they finish abruptly). One rooting bug
+found under GC stress and fixed the D-208 way — `crisol_make_generator` roots `body`/`this` before
+allocating, since the caller holds the body closure only in an SSA value the stack map does not yet
+carry, so allocating first collected it and the generator carried an uncallable object.

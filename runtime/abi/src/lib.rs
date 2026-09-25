@@ -74,6 +74,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_global_load",
     "crisol_delete",
     "crisol_set_prototype",
+    "crisol_make_generator",
     "crisol_enumerate",
     "crisol_iterate",
     "crisol_create_regexp",
@@ -608,6 +609,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         TYPED_ARRAY_PROTOTYPES
             .with(|protos| roots.extend(protos.iter().filter_map(std::cell::Cell::get)));
         roots.extend(DATA_VIEW_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(GENERATOR_PROTOTYPE.with(std::cell::Cell::get));
         // The microtask queue. It is data rather than closures precisely so this walk is
         // possible — a queue of `Box<dyn FnOnce>` hides its captures from the collector, and
         // a settled value reachable only from one would be freed under it. Everything *else*
@@ -696,6 +698,10 @@ thread_local! {
         const { [const { std::cell::Cell::new(None) }; 9] };
     /// The prototype every `DataView` inherits from.
     static DATA_VIEW_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%GeneratorPrototype%` — where a generator's `next`/`return`/`throw`/`[Symbol.iterator]`
+    /// live.
+    static GENERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// The microtask queue. Drained to empty, and jobs queued by jobs run in the same drain,
     /// which is what "microtasks run to completion" means.
@@ -1766,6 +1772,14 @@ const DATA_VIEW_KINDS: [(&str, ElementKind); 8] = [
     ("Uint32", ElementKind::U32),
     ("Float32", ElementKind::F32),
     ("Float64", ElementKind::F64),
+];
+
+/// The methods on `%GeneratorPrototype%`. `[Symbol.iterator]` is installed separately, since it is
+/// keyed by a symbol.
+const GENERATOR_NATIVES: &[(&str, Native)] = &[
+    ("next", generator_next),
+    ("return", generator_return),
+    ("throw", generator_throw),
 ];
 
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
@@ -3385,6 +3399,169 @@ data_view_accessor!(dv_set_int32, ElementKind::I32, data_view_set);
 data_view_accessor!(dv_set_uint32, ElementKind::U32, data_view_set);
 data_view_accessor!(dv_set_float32, ElementKind::F32, data_view_set);
 data_view_accessor!(dv_set_float64, ElementKind::F64, data_view_set);
+
+// ============================== Generators ==============================
+//
+// A generator cannot be a suspended native stack — crisol is ahead-of-time, and locals are
+// registers that do not survive a return. Instead, `function*` lowers to a plain function whose
+// `this` is a *generator object*: its locals, parameters, resume-state and the caller's `this`
+// live on that object as hidden properties, so they persist across suspension, and `yield` stores
+// the value and the next state and returns a signal. The object here holds that state and drives
+// the body; the state-machine shape is the frontend's (D-246). A finite generator is drained by
+// the existing iterator protocol (`iterate_by_protocol`), so `for-of`/spread over one work without
+// any change to iteration; `next()` is what steps it lazily.
+
+/// The mark every generator object carries.
+const GENERATOR_BRAND: &str = "__generator";
+const GEN_STATE: &str = "__genState";
+const GEN_DONE: &str = "__genDone";
+const GEN_SENT: &str = "__genSent";
+const GEN_YIELDED: &str = "__genYielded";
+const GEN_RETURN: &str = "__genReturn";
+const GEN_THIS: &str = "__genThis";
+const GEN_BODY: &str = "__genBody";
+
+/// What the body returns to report what it did: `1` for a return or fall-off, anything else for a
+/// `yield` (the frontend uses `0`). A thrown exception is the exception signal, handled first.
+const GEN_SIGNAL_DONE: f64 = 1.0;
+
+/// Whether `value` is a generator object.
+fn is_generator(value: u64) -> bool {
+    own_flag(value, GENERATOR_BRAND)
+}
+
+/// An iterator result `{ value, done }`.
+fn iterator_result(value: u64, done: bool) -> u64 {
+    let object = crisol_create_object();
+    with_rooted(&[object, value], || {
+        if let Some(into) = handle_of(object) {
+            with_runtime(|runtime| {
+                runtime.define(into, "value", Value::from_bits(value));
+                runtime.define(into, "done", boolean(done));
+            });
+        }
+    });
+    object
+}
+
+/// `crisol_make_generator(body, this)` — the object a `function*` returns. The outer function
+/// stores the parameters on it and returns it; the body runs only on the first `next`.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_make_generator(body: u64, this_value: u64) -> u64 {
+    // **`body` and `this_value` are rooted before the allocation below.** They arrive in registers,
+    // which the collector does not scan (D-208), and the caller holds the body closure only in an
+    // SSA value, which is not on the stack map either — so allocating the object first collects the
+    // closure under stress, and the generator ends up carrying a plain object it cannot call.
+    with_rooted(&[body, this_value], || {
+        let object = crisol_create_object();
+        with_rooted(&[object], || {
+            if let Some(handle) = handle_of(object) {
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, GENERATOR_BRAND, Value::TRUE);
+                    runtime.define_hidden(handle, GEN_STATE, Value::number(0.0));
+                    runtime.define_hidden(handle, GEN_DONE, Value::FALSE);
+                    runtime.define_hidden(handle, GEN_BODY, Value::from_bits(body));
+                    runtime.define_hidden(handle, GEN_THIS, Value::from_bits(this_value));
+                    if let Some(prototype) = GENERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+                        runtime.heap.set_prototype(handle, Some(prototype));
+                    }
+                });
+            }
+        });
+        object
+    })
+}
+
+/// Marks a generator finished, so every later `next` answers `{ value: undefined, done: true }`.
+fn set_generator_done(generator: u64) {
+    if let Some(handle) = handle_of(generator) {
+        with_runtime(|runtime| runtime.define_hidden(handle, GEN_DONE, Value::TRUE));
+    }
+}
+
+/// Runs the body once from its stored resume state and turns the signal into an iterator result.
+fn generator_resume(generator: u64) -> u64 {
+    let body = property_of(generator, GEN_BODY);
+    // The body is called with the generator object as its `this` — that is how it reaches its own
+    // locals and resume state.
+    let signal = with_rooted(&[generator, body], || call_value(body, generator, &[]));
+    if Value::from_bits(signal).is_exception() {
+        set_generator_done(generator);
+        return signal;
+    }
+    if Value::from_bits(signal).as_number() == Some(GEN_SIGNAL_DONE) {
+        set_generator_done(generator);
+        let returned = property_of(generator, GEN_RETURN);
+        return iterator_result(returned, true);
+    }
+    let yielded = property_of(generator, GEN_YIELDED);
+    iterator_result(yielded, false)
+}
+
+/// `%GeneratorPrototype%.next(value)`.
+extern "C" fn generator_next(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !is_generator(this_value) {
+        return raise("this is not a generator", "TypeError");
+    }
+    if is_truthy(Value::from_bits(property_of(this_value, GEN_DONE))) {
+        return iterator_result(Value::UNDEFINED.to_bits(), true);
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let sent = unsafe { argument(argc, argv, 0) };
+    if let Some(handle) = handle_of(this_value) {
+        with_rooted(&[this_value, sent], || {
+            with_runtime(|runtime| runtime.define_hidden(handle, GEN_SENT, Value::from_bits(sent)));
+        });
+    }
+    generator_resume(this_value)
+}
+
+/// `%GeneratorPrototype%.return(value)` — finishes the generator and answers `{ value, done: true }`.
+///
+/// **The `finally` blocks a real `return` would run are not run** (that needs the body resumed in a
+/// return mode); this is the abrupt form, which is what a generator with no `try`/`finally` does.
+extern "C" fn generator_return(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !is_generator(this_value) {
+        return raise("this is not a generator", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    set_generator_done(this_value);
+    iterator_result(value, true)
+}
+
+/// `%GeneratorPrototype%.throw(value)` — finishes the generator and throws `value`.
+///
+/// **A `try`/`catch` inside the generator does not catch it** (that needs the body resumed with the
+/// exception at the suspension point); this is the uncaught form.
+extern "C" fn generator_throw(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !is_generator(this_value) {
+        return raise("this is not a generator", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    set_generator_done(this_value);
+    crisol_throw(value)
+}
 
 /// `RegExp.escape(string)` — a string that, used as a pattern, matches itself literally.
 ///
@@ -11565,6 +11742,15 @@ impl Runtime {
             self.define_keyed(prototype, &key, function.to_value());
         }
 
+        // **A generator is its own iterator**, the same way — so `for-of` and spread over a
+        // generator reach its `next` through the protocol.
+        if let Some(prototype) = GENERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+            let index =
+                NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ITERATOR_SELF;
+            let function = self.native_function(index);
+            self.define_keyed(prototype, &key, function.to_value());
+        }
+
         // **A string answers `Symbol.iterator` with a code-point iterator.** `[...s]` already
         // works through the fast path, but `s[Symbol.iterator]()` needs the method itself.
         if let Some(prototype) = STRING_PROTOTYPE.with(std::cell::Cell::get) {
@@ -12687,6 +12873,21 @@ impl Runtime {
                     &format!("set{name}"),
                     setter.to_value(),
                 );
+            }
+        }
+
+        // `%GeneratorPrototype%`: `next`/`return`/`throw`. Its `[Symbol.iterator]` is added in
+        // `build_symbol_keyed_methods`, once the well-known symbols exist.
+        {
+            let gen_base = typed_natives_base() + TYPED_NATIVES.len();
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            GENERATOR_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+            self.inherit_from_object(prototype.handle());
+            for (index, (name, _)) in GENERATOR_NATIVES.iter().enumerate() {
+                let method = self.native_function(gen_base + index);
+                self.define_method(prototype.handle(), "Generator", name, method.to_value());
             }
         }
     }
@@ -15236,11 +15437,15 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + BOOLEAN_NATIVES.len();
-        // **Last, and a plain list**: `TYPED_NATIVES` is addressed by the `AB_*`/`TA_*` constants,
-        // not by name, so it holds bare functions rather than `(name, function)` pairs.
-        return TYPED_NATIVES
+        // A plain list: `TYPED_NATIVES` is addressed by the `AB_*`/`TA_*` constants, not by name,
+        // so it holds bare functions rather than `(name, function)` pairs.
+        if let Some(function) = TYPED_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + TYPED_NATIVES.len();
+        return GENERATOR_NATIVES
             .get(native.wrapping_sub(offset))
-            .map_or(fallback, |function| *function as *const u8);
+            .map_or(fallback, |(_, function)| *function as *const u8);
     }
     #[expect(
         clippy::cast_possible_truncation,

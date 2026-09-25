@@ -129,6 +129,9 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::SetPrototype { object, prototype } => {
             write!(f, "set-prototype {object} <- {prototype}")
         }
+        Op::MakeGenerator { body, this_value } => {
+            write!(f, "make-generator {body} this={this_value}")
+        }
         Op::CreateObject { shape } => write!(f, "object #{}", shape.index()),
         Op::CaughtValue => write!(f, "caught"),
         Op::GlobalLoad { name } => write!(f, "global {name:?}"),

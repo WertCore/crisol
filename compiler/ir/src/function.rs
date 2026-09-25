@@ -475,6 +475,16 @@ pub enum Op {
         /// The new prototype.
         prototype: ValueId,
     },
+    /// Builds the generator object a `function*` returns: an object carrying the state-machine
+    /// `body` closure and the caller's `this_value`, with `%GeneratorPrototype%` and the initial
+    /// resume state. The outer function stores the parameters on it and returns it; the body runs
+    /// only when `next` is first called.
+    MakeGenerator {
+        /// The state-machine body closure.
+        body: ValueId,
+        /// The `this` the generator was called with, kept for the body to read.
+        this_value: ValueId,
+    },
     /// Allocates an object.
     CreateObject {
         /// Its initial shape.
@@ -574,6 +584,7 @@ impl Op {
                 | Self::CreateArray { .. }
                 | Self::Closure { .. }
                 | Self::Await { .. }
+                | Self::MakeGenerator { .. }
         )
     }
 
@@ -603,6 +614,7 @@ impl Op {
             | Self::Iterate { object } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
             Self::SetPrototype { object, prototype } => vec![*object, *prototype],
+            Self::MakeGenerator { body, this_value } => vec![*body, *this_value],
             Self::DefineAccessor {
                 object,
                 getter,

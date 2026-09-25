@@ -3207,6 +3207,58 @@ fn regexp_v_flag_does_set_operations() {
     );
 }
 
+/// `function*` and `yield`: a generator returns an object that steps lazily through `next`, drains
+/// through `for-of` and spread, carries a loop counter and parameters across suspensions, receives
+/// the value passed to `next`, and reports its return value as `done`.
+#[test]
+fn generators_yield_and_resume() {
+    check(
+        "gen-next-drive",
+        "function* g() { yield 1; yield 2; } let it = g(); \
+         let a = it.next(); let b = it.next(); let c = it.next(); \
+         return a.value + \",\" + a.done + \";\" + b.value + \",\" + b.done + \";\" + c.value + \",\" + c.done;",
+        "1,false;2,false;undefined,true",
+    );
+    check(
+        "gen-for-of",
+        "function* g() { yield 1; yield 2; yield 3; } \
+         let s = 0; for (const x of g()) { s = s + x; } return s;",
+        "6",
+    );
+    check(
+        "gen-spread",
+        "function* g() { yield 1; yield 2; } return [...g()].length;",
+        "2",
+    );
+    check(
+        "gen-return-value",
+        "function* g() { yield 1; return 9; } \
+         let it = g(); it.next(); let s = it.next(); return \"\" + s.value + s.done;",
+        "9true",
+    );
+    check(
+        "gen-sent-value",
+        "function* g() { let x = yield 1; return x + 10; } \
+         let it = g(); it.next(); return it.next(5).value;",
+        "15",
+    );
+    // The loop counter and the parameter both cross the suspensions — they live on the generator
+    // object, not in registers lost on return.
+    check(
+        "gen-loop-counter",
+        "function* range(n) { for (let i = 0; i < n; i = i + 1) { yield i; } } \
+         let s = 0; for (const x of range(4)) { s = s + x; } return s;",
+        "6",
+    );
+    check(
+        "gen-param-persists",
+        "function* g(a) { yield a; yield a; } let it = g(7); \
+         let x = it.next(); let y = it.next(); \
+         return x.value + \",\" + x.done + \";\" + y.value + \",\" + y.done;",
+        "7,false;7,false",
+    );
+}
+
 /// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults
 /// (taken only when the value is `undefined`), holes, nesting, a computed key, a string source,
 /// and the `TypeError` a nullish source raises.
