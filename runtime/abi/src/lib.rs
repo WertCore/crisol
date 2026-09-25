@@ -2635,6 +2635,7 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     regexp_symbol_search,
     regexp_symbol_replace,
     regexp_symbol_split,
+    iterator_self,
 ];
 
 /// Where a `resolve`/`reject` function keeps the promise it settles.
@@ -2755,6 +2756,10 @@ const REGEXP_SYMBOL_METHODS: usize = 7;
 
 /// The symbols those four answer to, in the order the table holds them.
 const REGEXP_SYMBOL_NAMES: &[&str] = &["match", "search", "replace", "split"];
+
+/// The index within [`ANONYMOUS_NATIVES`] of `%IteratorPrototype%[Symbol.iterator]`, which
+/// answers its own receiver so that an iterator is itself iterable.
+const ITERATOR_SELF: usize = 11;
 
 /// Marks an array whose `length` has been made non-writable.
 ///
@@ -4046,6 +4051,136 @@ fn drain_microtasks() {
 /// exists so a test runner reports rather than hangs; no terminating program reaches it.
 const MICROTASK_LIMIT: usize = 1_000_000;
 
+/// `%IteratorPrototype%[Symbol.iterator]` — an iterator is its own iterable.
+///
+/// **This is what makes `Array.from(map.keys())` and `[...someIterator]` work.** `Array.from`
+/// and spread ask their argument for `Symbol.iterator`; an iterator answers itself, so the
+/// same drain loop that consumes a Map consumes the iterator a Map's `keys()` returns.
+extern "C" fn iterator_self(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    this_value
+}
+
+/// A snapshot iterator over a Map or Set — its keys, values, or `[key, value]` entries.
+///
+/// **A snapshot, not a live view.** The specification iterates lazily, so a deletion made
+/// during the loop is observed; this materialises the contents once into an array and hands
+/// back an ordinary array iterator over it. Every ordinary use — `for (x of m)`, `[...m]`,
+/// `Array.from(m.keys())` — sees the same result; only a program that mutates the collection
+/// *while* iterating it can tell the difference (D-232). Reusing the array iterator is why this
+/// needs no new prototype or dispatch entry.
+///
+/// `want`: 0 keys, 1 values, 2 entries.
+fn collection_iterator(this_value: u64, is_map: bool, want: u8) -> u64 {
+    let Some((array, length)) = entries_of(this_value) else {
+        return new_array_iterator(crisol_create_array(0), 1.0);
+    };
+    let stride = if is_map { 2 } else { 1 };
+    with_rooted(&[this_value], || {
+        let mut items: Vec<u64> = Vec::new();
+        let mut index = 0;
+        while index < length {
+            let key = element_at(array, index);
+            let value = if is_map {
+                element_at(array, index + 1)
+            } else {
+                key
+            };
+            let item = match want {
+                0 => key,
+                1 => value,
+                // An entry is its own two-element array, which allocates — so the items
+                // gathered so far, and the key and value, stay rooted across the build.
+                _ => with_rooted(&items, || {
+                    with_rooted(&[key, value], || array_of_values(&[key, value]))
+                }),
+            };
+            items.push(item);
+            index += stride;
+        }
+        // The array iterator walks a real array's *values*, so a keys/values/entries snapshot
+        // is always read with kind 1.
+        let snapshot = with_rooted(&items, || array_of_values(&items));
+        with_rooted(&[snapshot], || new_array_iterator(snapshot, 1.0))
+    })
+}
+
+/// `Map.prototype.keys`.
+extern "C" fn map_keys(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
+    collection_iterator(this_value, true, 0)
+}
+
+/// `Map.prototype.values`.
+extern "C" fn map_values(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
+    collection_iterator(this_value, true, 1)
+}
+
+/// `Map.prototype.entries`, and `Map.prototype[Symbol.iterator]`.
+extern "C" fn map_entries(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_map(this_value) {
+        return thrown;
+    }
+    collection_iterator(this_value, true, 2)
+}
+
+/// `Set.prototype.values`, which is also `keys` and `Set.prototype[Symbol.iterator]` — a set's
+/// key *is* its value.
+extern "C" fn set_values(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    collection_iterator(this_value, false, 1)
+}
+
+/// `Set.prototype.entries`, whose entries are `[value, value]`.
+extern "C" fn set_entries(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    collection_iterator(this_value, false, 2)
+}
+
 const MAP_NATIVES: &[(&str, Native)] = &[
     ("get", map_get),
     ("set", map_set),
@@ -4053,6 +4188,9 @@ const MAP_NATIVES: &[(&str, Native)] = &[
     ("delete", map_delete),
     ("clear", collection_clear),
     ("forEach", map_for_each),
+    ("keys", map_keys),
+    ("values", map_values),
+    ("entries", map_entries),
 ];
 
 /// Methods on `Set.prototype`.
@@ -4062,6 +4200,9 @@ const SET_NATIVES: &[(&str, Native)] = &[
     ("delete", set_delete),
     ("clear", collection_clear),
     ("forEach", set_for_each),
+    ("keys", set_values),
+    ("values", set_values),
+    ("entries", set_entries),
 ];
 
 /// Where `key` sits in the backing array, stepping by `stride`.
@@ -9918,7 +10059,15 @@ impl Runtime {
         // iteration is the character walk `crisol_iterate` already performs — pointing the
         // symbol at some other method would be worse than leaving the fast path to answer.
         // The loop is a loop because the list is the part that grows.
-        for (cell, name) in [(&ARRAY_PROTOTYPE, "values")] {
+        // **`Symbol.iterator` is an alias to a named method**, the same object: `Array` and
+        // `Set` iterate by `values`, `Map` by `entries` — which is why `for (const [k, v] of m)`
+        // destructures a pair. Each is read back off its prototype and defined a second time
+        // under the symbol.
+        for (cell, name) in [
+            (&ARRAY_PROTOTYPE, "values"),
+            (&MAP_PROTOTYPE, "entries"),
+            (&SET_PROTOTYPE, "values"),
+        ] {
             let Some(prototype) = cell.with(std::cell::Cell::get) else {
                 continue;
             };
@@ -9933,6 +10082,16 @@ impl Runtime {
                 continue;
             };
             self.define_keyed(prototype, &key, method);
+        }
+
+        // **An iterator is its own iterable.** `%IteratorPrototype%` defines
+        // `[Symbol.iterator]` to return `this`, which is what lets `Array.from(map.keys())` and
+        // `[...anIterator]` drain an iterator directly rather than only the collection behind it.
+        if let Some(prototype) = ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+            let index =
+                NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ITERATOR_SELF;
+            let function = self.native_function(index);
+            self.define_keyed(prototype, &key, function.to_value());
         }
 
         // **The regular-expression protocol.** `String.prototype.match` is *defined* as

@@ -1366,6 +1366,76 @@ fn includes_uses_same_value_zero() {
     );
 }
 
+/// **Map and Set are iterable.** `keys`/`values`/`entries` return iterators, the collection
+/// itself is iterable (entries for a Map, values for a Set), and an iterator is its own
+/// iterable so `Array.from` and spread drain it.
+#[test]
+fn a_map_or_set_iterates() {
+    // Direct `next()` on each iterator kind.
+    check(
+        "map-values-next",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         let it = m.values(); return it.next().value + \",\" + it.next().value;",
+        "1,2",
+    );
+    check(
+        "map-keys-next",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         let it = m.keys(); return it.next().value + \",\" + it.next().value;",
+        "a,b",
+    );
+    check(
+        "map-entries-next",
+        "let m = new Map(); m.set(\"x\", 9); \
+         let e = m.entries().next().value; return e[0] + \":\" + e[1];",
+        "x:9",
+    );
+    // for-of over a Map yields [key, value] pairs (its default iterator is entries).
+    check(
+        "map-for-of",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         let s = \"\"; for (let e of m) { s = s + e[0] + e[1]; } return s;",
+        "a1b2",
+    );
+    // Array.from over an iterator (needs the iterator to be its own iterable).
+    check(
+        "array-from-map-keys",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         return Array.from(m.keys()).join(\",\");",
+        "a,b",
+    );
+    // Set: spread and for-of, deduplicated and in insertion order.
+    check(
+        "set-spread",
+        "let st = new Set(); st.add(1); st.add(2); st.add(1); return [...st].join(\",\");",
+        "1,2",
+    );
+    check(
+        "set-for-of",
+        "let st = new Set(); st.add(\"p\"); st.add(\"q\"); \
+         let out = \"\"; for (let v of st) { out = out + v; } return out;",
+        "pq",
+    );
+    // Set.entries yields [value, value].
+    check(
+        "set-entries",
+        "let st = new Set(); st.add(5); \
+         let e = st.entries().next().value; return e[0] + \",\" + e[1];",
+        "5,5",
+    );
+    // Receiver checks on the new methods.
+    check(
+        "map-keys-on-non-map",
+        "try { Map.prototype.keys.call({}); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "set-values-on-map",
+        "try { Set.prototype.values.call(new Map()); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 #[test]
 fn filter_keeps_what_the_callback_accepts() {
     check(

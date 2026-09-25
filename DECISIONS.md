@@ -6481,3 +6481,31 @@ Rewritten to match D-230's shape: `strict_equal_bool` for the comparison, plus a
 `indexOf` does not. `fromIndex` is read after the `len == 0` early return. The one difference
 from `indexOf` is deliberate: `includes` does **not** skip a hole, it reads it as `undefined`,
 so there is no `HasProperty` check — only the throwing-getter-propagating read.
+
+## D-232
+
+**Map and Set iterate, over a snapshot, by reusing the array iterator.**
+
+Status: Accepted
+
+`map.keys()`, `.values()`, `.entries()` and the Set equivalents were missing — `for (x of map)`,
+`[...set]` and `Array.from(m.keys())` all failed with "is not a function", and it was the
+blocker behind several Map/Set cases (including `Map.groupBy`'s tests, which use
+`Array.from(map.keys())`).
+
+**Built on the array iterator, not a new one.** Each method collects the current contents into
+an array and returns an ordinary array iterator over it. That reuse is the whole point: no new
+iterator prototype, no new dispatch entry in the negative-index space — the riskiest thing to
+add blind — just three more entries in `MAP_NATIVES`/`SET_NATIVES`, whose offsets are
+`.len()`-chained and self-adjust.
+
+**A snapshot, not a live view.** The specification iterates lazily and observes a deletion made
+mid-loop; this materialises once. Every ordinary use sees the same result, and only a program
+that mutates the collection *while* iterating it can tell — the one corpus case that does
+(`delete/does-not-break-iterators`) stays failing, recorded rather than hidden. Closing it needs
+the live iterator object that D-194 also wants for arrays.
+
+`Map.prototype[Symbol.iterator]` aliases `entries`, `Set.prototype[Symbol.iterator]` aliases
+`values` — the same-object aliasing the array already used. And `%IteratorPrototype%` gained
+`[Symbol.iterator]` returning `this` (`iterator_self`), so an iterator is its own iterable and
+`Array.from`/spread drain it directly, not only the collection behind it.
