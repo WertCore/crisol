@@ -7163,3 +7163,23 @@ Two audit entries turned out to be **already implemented** and were left alone: 
 flag getter (`source`, `flags`, `global`, `ignoreCase`, …) already answers. One is **deferred**:
 `String.prototype.normalize` needs Unicode decomposition tables this build does not carry, and an
 identity stand-in would be a lie that fails every real case — so it stays absent, like full `Intl`.
+
+## D-258
+
+**The ES2024 `Set` combinators. (`Map.groupBy` was already there.)**
+
+Status: Accepted
+
+`Set.prototype` gains `union`, `intersection`, `difference`, `symmetricDifference`, `isSubsetOf`,
+`isSupersetOf` and `isDisjointFrom`. The four that return a set collect the surviving elements into a
+`Vec` — reading an element allocates nothing, so this is safe before the result is built — and hand
+them to a shared `build_set`, which allocates the set with the values rooted across it and then adds
+each with a `SameValueZero` dedup (`find_entry`, not Rust bit-equality, so `0` and `-0` coincide and
+`NaN` matches `NaN`). The three predicates answer a boolean with no allocation at all.
+
+The specification accepts any *set-like* object — one exposing `size`, `has` and `keys` — and reads
+membership through the argument's `has`. This reads a real `Set`'s entries directly and refuses
+anything else (`require_set_argument`), which is right for every ordinary call and wrong only for a
+`Map` or a hand-rolled set-like passed as the argument — the one part still owed, and the reason these
+are not yet fully conformant. `Map.groupBy` needed nothing: it was already implemented and registered,
+one of several audit "gaps" that were not.

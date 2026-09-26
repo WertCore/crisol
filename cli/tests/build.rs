@@ -1286,6 +1286,57 @@ fn the_remaining_built_in_methods_are_present() {
     );
 }
 
+/// The ES2024 `Set` combinators (D-258): `union`, `intersection`, `difference`,
+/// `symmetricDifference`, and the three predicates.
+#[test]
+fn sets_have_their_es2024_combinators() {
+    // A small harness: build a set, and read one back in sorted order for a stable comparison.
+    let prelude = "function mk(a) { var s = new Set(); for (var i = 0; i < a.length; i++) s.add(a[i]); return s; } \
+                   function srt(s) { var r = []; for (var x of s) r.push(x); r.sort(); return r.join(\"\"); } ";
+    check(
+        "set-union",
+        &format!(
+            "{prelude} return srt(mk([1, 2, 3]).union(mk([2, 3, 4]))) + \",\" + mk([1]).union(mk([2])).size;"
+        ),
+        "1234,2",
+    );
+    check(
+        "set-intersection",
+        &format!("{prelude} return srt(mk([1, 2, 3]).intersection(mk([2, 3, 4])));"),
+        "23",
+    );
+    check(
+        "set-difference",
+        &format!("{prelude} return srt(mk([1, 2, 3]).difference(mk([2, 3, 4])));"),
+        "1",
+    );
+    check(
+        "set-symmetric-difference",
+        &format!("{prelude} return srt(mk([1, 2, 3]).symmetricDifference(mk([2, 3, 4])));"),
+        "14",
+    );
+    check(
+        "set-predicates",
+        &format!(
+            "{prelude} var a = mk([1, 2, 3]); \
+             return mk([1, 2]).isSubsetOf(a) + \",\" + a.isSupersetOf(mk([1, 2])) + \",\" + \
+             a.isDisjointFrom(mk([9])) + \",\" + a.isDisjointFrom(mk([3]));"
+        ),
+        "true,true,true,false",
+    );
+    // The receiver is checked, and so is the argument.
+    check(
+        "set-union-on-non-set",
+        "try { Set.prototype.union.call([], new Set()); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "set-union-non-set-argument",
+        "try { new Set().union([1, 2]); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **A string method on `null`/`undefined` or a symbol is a `TypeError`.**
 ///
 /// `ToString(RequireObjectCoercible(this))`: nullish fails the first step, a symbol the second.

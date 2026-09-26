@@ -7682,6 +7682,13 @@ const SET_NATIVES: &[(&str, Native)] = &[
     ("keys", set_values),
     ("values", set_values),
     ("entries", set_entries),
+    ("union", set_union),
+    ("intersection", set_intersection),
+    ("difference", set_difference),
+    ("symmetricDifference", set_symmetric_difference),
+    ("isSubsetOf", set_is_subset_of),
+    ("isSupersetOf", set_is_superset_of),
+    ("isDisjointFrom", set_is_disjoint_from),
 ];
 
 /// Where `key` sits in the backing array, stepping by `stride`.
@@ -7952,6 +7959,232 @@ extern "C" fn set_delete(
     };
     remove_entry(this_value, array, length, at, 1);
     Value::TRUE.to_bits()
+}
+
+/// The backing array and length of a `Set` argument to one of the ES2024 combinators, or the
+/// `TypeError` for anything else.
+///
+/// **The specification accepts any *set-like* object** — one carrying `size`, `has` and `keys` —
+/// and reads membership through its `has`; this accepts a real `Set` and reads its entries directly
+/// (D-258). Every ordinary call passes a `Set`; a `Map` or a plain object is refused rather than
+/// adapted, the one part of these still owed.
+fn require_set_argument(value: u64) -> Result<(GcRef, usize), u64> {
+    if !own_flag(value, SET_BRAND) {
+        return Err(raise("the argument must be a Set", "TypeError"));
+    }
+    entries_of(value).ok_or_else(|| raise("the argument must be a Set", "TypeError"))
+}
+
+/// Builds a `Set` from `values`, dropping any a `SameValueZero` match already admitted.
+fn build_set(values: &[u64]) -> u64 {
+    // The values may be heap references, rooted across the collection's allocation; the additions
+    // below only grow a Rust `Vec`, so nothing collects once the set exists.
+    with_rooted(values, || {
+        let result = new_collection(SET_PROTOTYPE.with(std::cell::Cell::get), true);
+        with_rooted(&[result], || {
+            if let Some((array, _)) = entries_of(result) {
+                let mut length = 0;
+                for &value in values {
+                    if find_entry(array, length, 1, value).is_none() {
+                        with_runtime(|runtime| {
+                            runtime
+                                .heap
+                                .set_element(array, length, Value::from_bits(value));
+                        });
+                        length += 1;
+                    }
+                }
+                set_collection_size(result, length, 1);
+            }
+        });
+        result
+    })
+}
+
+/// `Set.prototype.union` — a new set with every element of either.
+extern "C" fn set_union(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (other_array, other_length) = match require_set_argument(unsafe { argument(argc, argv, 0) })
+    {
+        Ok(parts) => parts,
+        Err(thrown) => return thrown,
+    };
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    let mut values: Vec<u64> = (0..length).map(|index| element_at(array, index)).collect();
+    values.extend((0..other_length).map(|index| element_at(other_array, index)));
+    build_set(&values)
+}
+
+/// `Set.prototype.intersection` — a new set with the elements in both.
+extern "C" fn set_intersection(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (other_array, other_length) = match require_set_argument(unsafe { argument(argc, argv, 0) })
+    {
+        Ok(parts) => parts,
+        Err(thrown) => return thrown,
+    };
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    let values: Vec<u64> = (0..length)
+        .map(|index| element_at(array, index))
+        .filter(|&value| find_entry(other_array, other_length, 1, value).is_some())
+        .collect();
+    build_set(&values)
+}
+
+/// `Set.prototype.difference` — a new set with the elements of this one that are not in the other.
+extern "C" fn set_difference(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (other_array, other_length) = match require_set_argument(unsafe { argument(argc, argv, 0) })
+    {
+        Ok(parts) => parts,
+        Err(thrown) => return thrown,
+    };
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    let values: Vec<u64> = (0..length)
+        .map(|index| element_at(array, index))
+        .filter(|&value| find_entry(other_array, other_length, 1, value).is_none())
+        .collect();
+    build_set(&values)
+}
+
+/// `Set.prototype.symmetricDifference` — a new set with the elements in exactly one of the two.
+extern "C" fn set_symmetric_difference(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (other_array, other_length) = match require_set_argument(unsafe { argument(argc, argv, 0) })
+    {
+        Ok(parts) => parts,
+        Err(thrown) => return thrown,
+    };
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    let mut values: Vec<u64> = (0..length)
+        .map(|index| element_at(array, index))
+        .filter(|&value| find_entry(other_array, other_length, 1, value).is_none())
+        .collect();
+    values.extend(
+        (0..other_length)
+            .map(|index| element_at(other_array, index))
+            .filter(|&value| find_entry(array, length, 1, value).is_none()),
+    );
+    build_set(&values)
+}
+
+/// `Set.prototype.isSubsetOf` — whether every element of this one is in the other.
+extern "C" fn set_is_subset_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (other_array, other_length) = match require_set_argument(unsafe { argument(argc, argv, 0) })
+    {
+        Ok(parts) => parts,
+        Err(thrown) => return thrown,
+    };
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::TRUE.to_bits();
+    };
+    let subset = (0..length)
+        .all(|index| find_entry(other_array, other_length, 1, element_at(array, index)).is_some());
+    boolean(subset).to_bits()
+}
+
+/// `Set.prototype.isSupersetOf` — whether every element of the other is in this one.
+extern "C" fn set_is_superset_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (other_array, other_length) = match require_set_argument(unsafe { argument(argc, argv, 0) })
+    {
+        Ok(parts) => parts,
+        Err(thrown) => return thrown,
+    };
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    let superset = (0..other_length)
+        .all(|index| find_entry(array, length, 1, element_at(other_array, index)).is_some());
+    boolean(superset).to_bits()
+}
+
+/// `Set.prototype.isDisjointFrom` — whether the two share no element.
+extern "C" fn set_is_disjoint_from(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_set(this_value) {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (other_array, other_length) = match require_set_argument(unsafe { argument(argc, argv, 0) })
+    {
+        Ok(parts) => parts,
+        Err(thrown) => return thrown,
+    };
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::TRUE.to_bits();
+    };
+    let disjoint = (0..length)
+        .all(|index| find_entry(other_array, other_length, 1, element_at(array, index)).is_none());
+    boolean(disjoint).to_bits()
 }
 
 /// `Set.prototype.forEach`, which passes `(value, value, set)`.
