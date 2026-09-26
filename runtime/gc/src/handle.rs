@@ -55,7 +55,7 @@ impl GcRef {
 
     /// Packs the handle into the 47 bits a [`Value`] carries.
     ///
-    /// A slot wider than [`SLOT_BITS`] would overlap the generation and silently name the wrong
+    /// A slot wider than `SLOT_BITS` would overlap the generation and silently name the wrong
     /// object; it cannot happen — two billion slots is more memory than exists — but the debug
     /// assertion says so out loud rather than leaving a truncation to be discovered downstream.
     #[must_use]
