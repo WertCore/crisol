@@ -7070,3 +7070,36 @@ the combine propagated since a BigInt mix or a getter can throw. The logical for
 `??=`) short-circuit: the right side is evaluated and stored only when the current value permits
 (truthy, falsy, nullish). Plain `=` is untouched. A member target for a *logical* assignment is the
 one case still refused.
+
+## D-255
+
+**The four weak built-ins, held strongly — and the argument-rooting rule a native constructor obeys.**
+
+Status: Accepted
+
+`WeakMap`, `WeakSet`, `WeakRef` and `FinalizationRegistry` are registered as global constructors with
+prototypes. This collector is a non-moving mark-sweep that traces every reachable cell, so all four
+hold their referents **strongly**: a `WeakRef` never reports its target collected, and a registry's
+cleanup callback never runs. That is observably weaker than the specification only for a program that
+forces a collection and depends on one happening — the shape test262 marks as such — while every
+synchronous operation (`get`/`set`/`has`/`delete`/`add`/`deref`/`register`/`unregister`) and every
+CanBeHeldWeakly type check behaves as required. A weak map and set reuse the `Map`/`Set` backing array
+and `find_entry` machinery, minus the `size` a weak collection does not have; a `WeakRef` is a
+one-entry collection; a registry keeps `[target, held, token]` triples so `unregister` can find them.
+
+The methods live in one `WEAK_NATIVES` table chained last in `crisol_closure_code`, installed on the
+four prototypes by hand (they take disjoint subsets, so the one-table-per-prototype build loop does
+not fit). Symbols that are not registered qualify as weak keys, per the spec's 2023 addition.
+
+The lesson worth keeping is a GC-safety rule this exposed. `new WeakRef(o)` was reclaiming `o` under
+GC stress even while the `WeakRef` was reachable. The cause was ordering: the constructor read the
+argument, then called `new_weak_collection` — a *GC-heap allocation* — and only then rooted the
+argument. An argument arrives in `argv`, which the compiled caller does not keep on its stack once the
+call is made, so the allocation's collection ran with the target unrooted and freed it, leaving the
+WeakRef holding a stale handle. `Map`/`Set`'s `set`/`add` never hit this because they only grow a Rust
+`Vec`, which is not a safepoint. **A native that allocates on the GC heap must root every argument it
+intends to keep before the first allocation, not before the eventual store.** Found only because the
+acceptance harness re-runs each case under `CRISOL_GC_STRESS`; a normal run collects too rarely to
+land in the window. (Also: `cargo build -p crisol` does not rebuild the `staticlib` a compiled program
+links — `cargo build -p crisol-abi` does. A runtime edit tested through the CLI is invisible until it
+is rebuilt, which cost real time here.)

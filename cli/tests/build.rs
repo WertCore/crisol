@@ -989,6 +989,124 @@ fn a_map_or_set_method_rejects_a_wrong_receiver() {
     );
 }
 
+/// The `Math` methods that are not one plain `f64` call: the bit-level `clz32`/`imul`/`fround`
+/// and the hyperbolic/`expm1`/`log1p` family (D-255).
+#[test]
+fn math_has_its_bit_level_and_hyperbolic_methods() {
+    check("math-clz32-one", "return Math.clz32(1);", "31");
+    check("math-clz32-zero", "return Math.clz32(0);", "32");
+    check("math-imul", "return Math.imul(3, 4);", "12");
+    check("math-imul-wraps", "return Math.imul(0xffffffff, 5);", "-5");
+    check("math-fround-exact", "return Math.fround(1.5);", "1.5");
+    check(
+        "math-fround-rounds",
+        "return Math.fround(1.1) === 1.100000023841858;",
+        "true",
+    );
+    check("math-sinh", "return Math.sinh(0);", "0");
+    check("math-cosh", "return Math.cosh(0);", "1");
+    check("math-tanh-inf", "return Math.tanh(Infinity);", "1");
+    check("math-expm1", "return Math.expm1(0);", "0");
+    check("math-log1p", "return Math.log1p(0);", "0");
+    check("math-asinh", "return Math.asinh(0);", "0");
+    check("math-acosh", "return Math.acosh(1);", "0");
+    check("math-atanh", "return Math.atanh(0);", "0");
+}
+
+/// `WeakMap`, `WeakSet`, `WeakRef` and `FinalizationRegistry` (D-255). The referents are held
+/// strongly, so every synchronous operation and type check behaves as required; only a
+/// collection-dependent test would see the difference.
+#[test]
+fn weak_collections_have_their_synchronous_surface() {
+    // WeakMap: object keys round-trip; a primitive key throws on `set`, is absent on `get`/`has`.
+    check(
+        "weakmap-roundtrip",
+        "var k = {}; var m = new WeakMap(); m.set(k, 42); return m.get(k) + \",\" + m.has(k);",
+        "42,true",
+    );
+    check(
+        "weakmap-delete",
+        "var k = {}; var m = new WeakMap(); m.set(k, 1); \
+         var d = m.delete(k); return d + \",\" + m.has(k);",
+        "true,false",
+    );
+    check(
+        "weakmap-set-primitive-throws",
+        "try { new WeakMap().set(1, 2); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "weakmap-get-missing",
+        "return new WeakMap().get({});",
+        "undefined",
+    );
+    check(
+        "weakmap-chains",
+        "var a = {}, b = {}; var m = new WeakMap(); \
+         return (m.set(a, 1) === m) + \",\" + m.set(b, 2).get(b);",
+        "true,2",
+    );
+    // WeakSet.
+    check(
+        "weakset-roundtrip",
+        "var v = {}; var s = new WeakSet(); s.add(v); return s.has(v) + \",\" + s.has({});",
+        "true,false",
+    );
+    check(
+        "weakset-add-primitive-throws",
+        "try { new WeakSet().add(3); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // WeakRef holds strongly, so `deref` always answers the target here.
+    check(
+        "weakref-deref",
+        "var o = { x: 5 }; var r = new WeakRef(o); return r.deref().x;",
+        "5",
+    );
+    check(
+        "weakref-primitive-throws",
+        "try { new WeakRef(1); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // FinalizationRegistry: the register/unregister API and its guards.
+    check(
+        "finreg-register-unregister",
+        "var t = {}, tok = {}; var f = new FinalizationRegistry(function () {}); \
+         f.register(t, 7, tok); return f.unregister(tok);",
+        "true",
+    );
+    check(
+        "finreg-unregister-absent",
+        "var f = new FinalizationRegistry(function () {}); return f.unregister({});",
+        "false",
+    );
+    check(
+        "finreg-noncallable-throws",
+        "try { new FinalizationRegistry(5); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "finreg-same-target-and-held-throws",
+        "var t = {}; \
+         try { new FinalizationRegistry(function () {}).register(t, t); return 1; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The brand and backing store stay invisible to reflection.
+    check(
+        "weakmap-hides-internals",
+        "var m = new WeakMap(); m.set({}, 1); return Object.getOwnPropertyNames(m).length;",
+        "0",
+    );
+    // A weak method on the wrong brand is a TypeError, as the collections' own methods are.
+    check(
+        "weakmap-get-on-weakset",
+        "try { WeakMap.prototype.get.call(new WeakSet(), {}); return 1; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **A string method on `null`/`undefined` or a symbol is a `TypeError`.**
 ///
 /// `ToString(RequireObjectCoercible(this))`: nullish fails the first step, a symbol the second.

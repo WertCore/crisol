@@ -661,6 +661,10 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(DATA_VIEW_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(GENERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BIGINT_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(WEAKMAP_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(WEAKSET_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(WEAKREF_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(FINALIZATION_REGISTRY_PROTOTYPE.with(std::cell::Cell::get));
         // The microtask queue. It is data rather than closures precisely so this walk is
         // possible — a queue of `Box<dyn FnOnce>` hides its captures from the collector, and
         // a settled value reachable only from one would be freed under it. Everything *else*
@@ -757,6 +761,18 @@ thread_local! {
     /// `BigInt.prototype` — what `ToObject` gives a BigInt wrapper, and where `toString` and
     /// `valueOf` live.
     static BIGINT_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `WeakMap.prototype` — where `get`/`set`/`has`/`delete` live.
+    static WEAKMAP_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `WeakSet.prototype` — where `add`/`has`/`delete` live.
+    static WEAKSET_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `WeakRef.prototype` — where `deref` lives.
+    static WEAKREF_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `FinalizationRegistry.prototype` — where `register`/`unregister` live.
+    static FINALIZATION_REGISTRY_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// The microtask queue. Drained to empty, and jobs queued by jobs run in the same drain,
     /// which is what "microtasks run to completion" means.
@@ -1747,6 +1763,10 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("BigUint64Array", make_biguint64_array),
     ("DataView", make_data_view),
     ("BigInt", bigint_global),
+    ("WeakMap", make_weakmap),
+    ("WeakSet", make_weakset),
+    ("WeakRef", make_weakref),
+    ("FinalizationRegistry", make_finalization_registry),
 ];
 
 /// The eleven typed-array constructor names, in [`ELEMENT_KINDS`] order.
@@ -1849,6 +1869,40 @@ const BIGINT_NATIVES: &[(&str, Native)] = &[
     ("toLocaleString", bigint_to_locale_string),
     ("valueOf", bigint_value_of),
 ];
+
+/// The methods across all four weak built-ins' prototypes (D-255), in one table because they are
+/// installed by hand rather than through the one-table-per-prototype build loop. Addressed by the
+/// `WEAKMAP_*`/`WEAKSET_*`/`WEAKREF_*`/`FINREG_*` constants; chained last in
+/// [`crisol_closure_code`], after [`BIGINT_NATIVES`]. The two `("has"/"delete", …)` pairs are
+/// separate entries because a WeakMap's and a WeakSet's differ in stride.
+const WEAK_NATIVES: &[(&str, Native)] = &[
+    ("get", weakmap_get),
+    ("set", weakmap_set),
+    ("has", weakmap_has),
+    ("delete", weakmap_delete),
+    ("add", weakset_add),
+    ("has", weakset_has),
+    ("delete", weakset_delete),
+    ("deref", weakref_deref),
+    ("register", finreg_register),
+    ("unregister", finreg_unregister),
+];
+const WEAKMAP_GET: usize = 0;
+const WEAKMAP_SET: usize = 1;
+const WEAKMAP_HAS: usize = 2;
+const WEAKMAP_DELETE: usize = 3;
+const WEAKSET_ADD: usize = 4;
+const WEAKSET_HAS: usize = 5;
+const WEAKSET_DELETE: usize = 6;
+const WEAKREF_DEREF: usize = 7;
+const FINREG_REGISTER: usize = 8;
+const FINREG_UNREGISTER: usize = 9;
+
+/// The global index at which [`WEAK_NATIVES`] begins — every table before it, in
+/// [`crisol_closure_code`] order. Shared by the build and the dispatch so they cannot drift.
+fn weak_natives_base() -> usize {
+    typed_natives_base() + TYPED_NATIVES.len() + GENERATOR_NATIVES.len() + BIGINT_NATIVES.len()
+}
 
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
 /// order [`crisol_closure_code`] chains them. Shared by the two places that address the table so
@@ -2333,6 +2387,498 @@ extern "C" fn unconstructable(
     _argv: *const u64,
 ) -> u64 {
     raise("this constructor is not supported", "TypeError")
+}
+
+// ============================== Weak collections ==============================
+//
+// `WeakMap`, `WeakSet`, `WeakRef` and `FinalizationRegistry` (D-255). The collector here is
+// non-moving and traces every reachable cell, so these hold their referents *strongly* — a
+// `WeakRef` never reports its target collected, and a registry's cleanup callback never runs. That
+// is observably weaker than the specification only for a program that forces a collection and
+// depends on one happening, which is exactly the shape test262 marks as such. Every synchronous
+// operation — `get`/`set`/`has`/`delete`/`add`/`deref`/`register`/`unregister` and the CanBeHeldWeakly
+// type checks that guard them — behaves as required. A weak map and a weak set reuse the same
+// backing array and `find_entry`/`elements_of` machinery as `Map`/`Set`, minus the `size`, which
+// a weak collection does not have.
+
+/// The mark a `WeakMap` carries.
+const WEAKMAP_BRAND: &str = "__weakMap";
+/// The mark a `WeakSet` carries.
+const WEAKSET_BRAND: &str = "__weakSet";
+/// The mark a `WeakRef` carries.
+const WEAKREF_BRAND: &str = "__weakRef";
+/// The mark a `FinalizationRegistry` carries.
+const FINREG_BRAND: &str = "__finalizationRegistry";
+/// A `FinalizationRegistry`'s cleanup callback, as a hidden property.
+const FINREG_CALLBACK: &str = "__finRegCallback";
+
+/// Whether `value` satisfies the specification's *CanBeHeldWeakly*: an object, or a symbol that is
+/// not in the `Symbol.for` registry. A registered symbol is permanent, so holding it weakly would
+/// mean nothing, and the specification excludes it; every other symbol and every object qualifies,
+/// and no primitive does.
+fn can_be_weak_key(value: u64) -> bool {
+    match Value::from_bits(value).kind() {
+        crisol_value::Kind::Object => true,
+        crisol_value::Kind::Symbol => !is_registered_symbol(value),
+        _ => false,
+    }
+}
+
+/// Whether `value` is a symbol handed out by `Symbol.for` — the one kind of symbol that cannot be
+/// a weak key. Scans the registry by identity, which is small because it holds only symbols a
+/// program has registered by name.
+fn is_registered_symbol(value: u64) -> bool {
+    SYMBOL_REGISTRY.with(|registry| {
+        registry
+            .try_borrow()
+            .is_ok_and(|entries| entries.values().any(|&bits| bits == value))
+    })
+}
+
+/// Builds a weak collection: an object carrying `brand`, an empty backing array, and `prototype`.
+/// Unlike [`new_collection`] it writes no `size`, since no weak collection reports one.
+fn new_weak_collection(prototype: Option<GcRef>, brand: &str) -> u64 {
+    let object = crisol_create_object();
+    with_rooted(&[object], || {
+        let Some(handle) = handle_of(object) else {
+            return;
+        };
+        let entries = array_of_values(&[]);
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, COLLECTION_ENTRIES, Value::from_bits(entries));
+            runtime.define_hidden(handle, brand, Value::TRUE);
+            if let Some(prototype) = prototype {
+                runtime.heap.set_prototype(handle, Some(prototype));
+            }
+        });
+    });
+    object
+}
+
+/// Removes the `stride`-wide entry at `at`, closing the gap so insertion order survives — the
+/// [`remove_entry`] a weak collection needs, without the `size` write it does not.
+fn weak_remove_entry(array: GcRef, length: usize, at: usize, stride: usize) {
+    with_runtime(|runtime| {
+        for index in at..length - stride {
+            let moved = runtime
+                .heap
+                .element(array, index + stride)
+                .unwrap_or(Value::UNDEFINED);
+            runtime.heap.set_element(array, index, moved);
+        }
+        runtime.heap.truncate_elements(array, length - stride);
+    });
+}
+
+/// `new WeakMap()`. The optional iterable argument is ignored, as `new Map()`'s is.
+extern "C" fn make_weakmap(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_weak_collection(WEAKMAP_PROTOTYPE.with(std::cell::Cell::get), WEAKMAP_BRAND)
+}
+
+/// `new WeakSet()`. The optional iterable argument is ignored, as `new Set()`'s is.
+extern "C" fn make_weakset(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_weak_collection(WEAKSET_PROTOTYPE.with(std::cell::Cell::get), WEAKSET_BRAND)
+}
+
+/// `new WeakRef(target)` — throws unless `target` can be held weakly.
+///
+/// The referent lives in a one-element backing array reached through `WEAKREF_TARGET`, not in a
+/// property slot directly. Both are traced, but a value inside an array's elements is the shape
+/// `Map`/`Set` already prove survives precise-rooting under GC stress at a `deref().x` seam, where
+/// a value in a slot of a now-dead container was being reclaimed a beat early.
+extern "C" fn make_weakref(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(target) {
+        return raise(
+            "WeakRef: target must be an object or a non-registered symbol",
+            "TypeError",
+        );
+    }
+    // **`target` is rooted before `new_weak_collection` runs**, not just before `set_element`.
+    // The collection is a GC-heap allocation, and `target` arrives in `argv` — which the compiled
+    // caller does not keep on its stack once the argument is passed. Allocating first and rooting
+    // second let a stress collection reclaim `target` out from under the constructor, so the
+    // WeakRef ended up holding a stale handle. It is the same store `WeakMap`/`WeakSet` use, whose
+    // `set`/`add` only ever grow a Rust `Vec` and so never reach a collection with an unrooted
+    // argument.
+    with_rooted(&[target], || {
+        let object =
+            new_weak_collection(WEAKREF_PROTOTYPE.with(std::cell::Cell::get), WEAKREF_BRAND);
+        with_rooted(&[object, target], || {
+            if let Some((array, _)) = entries_of(object) {
+                with_runtime(|runtime| {
+                    runtime.heap.set_element(array, 0, Value::from_bits(target));
+                });
+            }
+        });
+        object
+    })
+}
+
+/// `new FinalizationRegistry(cleanupCallback)` — throws unless the callback is callable.
+extern "C" fn make_finalization_registry(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if !is_callable(callback) {
+        return raise(
+            "FinalizationRegistry: cleanup callback must be callable",
+            "TypeError",
+        );
+    }
+    // `callback` is rooted before the collection is allocated, for the reason `make_weakref`
+    // spells out: an argument in `argv` is not on the compiled caller's stack, so allocating
+    // first would let a stress collection reclaim it.
+    with_rooted(&[callback], || {
+        let object = new_weak_collection(
+            FINALIZATION_REGISTRY_PROTOTYPE.with(std::cell::Cell::get),
+            FINREG_BRAND,
+        );
+        with_rooted(&[object, callback], || {
+            if let Some(handle) = handle_of(object) {
+                with_runtime(|runtime| {
+                    runtime.define_hidden(handle, FINREG_CALLBACK, Value::from_bits(callback));
+                });
+            }
+        });
+        object
+    })
+}
+
+/// `WeakMap.prototype.get` — `undefined` for a missing or non-weak-holdable key, never a throw.
+extern "C" fn weakmap_get(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKMAP_BRAND) {
+        return raise("this is not a WeakMap", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(key) {
+        return Value::UNDEFINED.to_bits();
+    }
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    find_entry(array, length, 2, key).map_or_else(
+        || Value::UNDEFINED.to_bits(),
+        |at| element_at(array, at + 1),
+    )
+}
+
+/// `WeakMap.prototype.set` — throws unless the key can be held weakly; returns the map.
+extern "C" fn weakmap_set(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKMAP_BRAND) {
+        return raise("this is not a WeakMap", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(key) {
+        return raise(
+            "WeakMap key must be an object or a non-registered symbol",
+            "TypeError",
+        );
+    }
+    // SAFETY: as above.
+    let value = unsafe { argument(argc, argv, 1) };
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    match find_entry(array, length, 2, key) {
+        Some(at) => with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(array, at + 1, Value::from_bits(value));
+        }),
+        None => with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(array, length, Value::from_bits(key));
+            runtime
+                .heap
+                .set_element(array, length + 1, Value::from_bits(value));
+        }),
+    }
+    this_value
+}
+
+/// `WeakMap.prototype.has` — `false`, never a throw, for a non-weak-holdable key.
+extern "C" fn weakmap_has(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKMAP_BRAND) {
+        return raise("this is not a WeakMap", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(key) {
+        return Value::FALSE.to_bits();
+    }
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    boolean(find_entry(array, length, 2, key).is_some()).to_bits()
+}
+
+/// `WeakMap.prototype.delete` — `false` for a key that was not present or cannot be one.
+extern "C" fn weakmap_delete(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKMAP_BRAND) {
+        return raise("this is not a WeakMap", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let key = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(key) {
+        return Value::FALSE.to_bits();
+    }
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    match find_entry(array, length, 2, key) {
+        Some(at) => {
+            weak_remove_entry(array, length, at, 2);
+            Value::TRUE.to_bits()
+        }
+        None => Value::FALSE.to_bits(),
+    }
+}
+
+/// `WeakSet.prototype.add` — throws unless the value can be held weakly; returns the set.
+extern "C" fn weakset_add(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKSET_BRAND) {
+        return raise("this is not a WeakSet", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(value) {
+        return raise(
+            "WeakSet value must be an object or a non-registered symbol",
+            "TypeError",
+        );
+    }
+    let Some((array, length)) = entries_of(this_value) else {
+        return this_value;
+    };
+    if find_entry(array, length, 1, value).is_none() {
+        with_runtime(|runtime| {
+            runtime
+                .heap
+                .set_element(array, length, Value::from_bits(value));
+        });
+    }
+    this_value
+}
+
+/// `WeakSet.prototype.has` — `false`, never a throw, for a non-weak-holdable value.
+extern "C" fn weakset_has(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKSET_BRAND) {
+        return raise("this is not a WeakSet", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(value) {
+        return Value::FALSE.to_bits();
+    }
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    boolean(find_entry(array, length, 1, value).is_some()).to_bits()
+}
+
+/// `WeakSet.prototype.delete` — `false` for a value that was not present or cannot be one.
+extern "C" fn weakset_delete(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKSET_BRAND) {
+        return raise("this is not a WeakSet", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(value) {
+        return Value::FALSE.to_bits();
+    }
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    match find_entry(array, length, 1, value) {
+        Some(at) => {
+            weak_remove_entry(array, length, at, 1);
+            Value::TRUE.to_bits()
+        }
+        None => Value::FALSE.to_bits(),
+    }
+}
+
+/// `WeakRef.prototype.deref` — the referent, which this strong-holding implementation always has.
+extern "C" fn weakref_deref(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, WEAKREF_BRAND) {
+        return raise("this is not a WeakRef", "TypeError");
+    }
+    entries_of(this_value).map_or_else(
+        || Value::UNDEFINED.to_bits(),
+        |(array, _)| element_at(array, 0),
+    )
+}
+
+/// `FinalizationRegistry.prototype.register(target, heldValue, unregisterToken?)`.
+///
+/// Records the entry so `unregister` can find it by token. The cleanup callback never runs, since
+/// nothing is ever collected here, which is a conforming choice for a callback whose timing the
+/// specification leaves to the host.
+extern "C" fn finreg_register(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, FINREG_BRAND) {
+        return raise("this is not a FinalizationRegistry", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let target = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let held = unsafe { argument(argc, argv, 1) };
+    // SAFETY: as above.
+    let token = unsafe { argument(argc, argv, 2) };
+    if !can_be_weak_key(target) {
+        return raise(
+            "register: target must be an object or a non-registered symbol",
+            "TypeError",
+        );
+    }
+    if same_value(Value::from_bits(target), Value::from_bits(held)) {
+        return raise(
+            "register: target and held value must not be the same",
+            "TypeError",
+        );
+    }
+    if token != Value::UNDEFINED.to_bits() && !can_be_weak_key(token) {
+        return raise(
+            "register: unregister token must be an object or a non-registered symbol",
+            "TypeError",
+        );
+    }
+    let Some((array, length)) = entries_of(this_value) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .set_element(array, length, Value::from_bits(target));
+        runtime
+            .heap
+            .set_element(array, length + 1, Value::from_bits(held));
+        runtime
+            .heap
+            .set_element(array, length + 2, Value::from_bits(token));
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+/// `FinalizationRegistry.prototype.unregister(unregisterToken)` — removes every entry registered
+/// with that token, answering whether any were.
+extern "C" fn finreg_unregister(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, FINREG_BRAND) {
+        return raise("this is not a FinalizationRegistry", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let token = unsafe { argument(argc, argv, 0) };
+    if !can_be_weak_key(token) {
+        return raise(
+            "unregister: token must be an object or a non-registered symbol",
+            "TypeError",
+        );
+    }
+    let Some((array, mut length)) = entries_of(this_value) else {
+        return Value::FALSE.to_bits();
+    };
+    let mut removed = false;
+    // Walk from the end so a removal does not shift entries still ahead of the cursor.
+    let mut at = length;
+    while at >= 3 {
+        at -= 3;
+        if same_value(
+            Value::from_bits(element_at(array, at + 2)),
+            Value::from_bits(token),
+        ) {
+            weak_remove_entry(array, length, at, 3);
+            length -= 3;
+            removed = true;
+        }
+    }
+    boolean(removed).to_bits()
 }
 
 // ============================== Typed arrays ==============================
@@ -4561,6 +5107,17 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Math", "exp", 1),
     ("Math", "floor", 1),
     ("Math", "hypot", 2),
+    ("Math", "expm1", 1),
+    ("Math", "log1p", 1),
+    ("Math", "sinh", 1),
+    ("Math", "cosh", 1),
+    ("Math", "tanh", 1),
+    ("Math", "asinh", 1),
+    ("Math", "acosh", 1),
+    ("Math", "atanh", 1),
+    ("Math", "fround", 1),
+    ("Math", "clz32", 1),
+    ("Math", "imul", 2),
     ("Math", "log", 1),
     ("Math", "log10", 1),
     ("Math", "log2", 1),
@@ -9506,6 +10063,17 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Math", "min", math_min),
     ("Math", "max", math_max),
     ("Math", "random", math_random),
+    ("Math", "expm1", math_expm1),
+    ("Math", "log1p", math_log1p),
+    ("Math", "sinh", math_sinh),
+    ("Math", "cosh", math_cosh),
+    ("Math", "tanh", math_tanh),
+    ("Math", "asinh", math_asinh),
+    ("Math", "acosh", math_acosh),
+    ("Math", "atanh", math_atanh),
+    ("Math", "fround", math_fround),
+    ("Math", "clz32", math_clz32),
+    ("Math", "imul", math_imul),
     ("Array", "of", array_of),
     ("Proxy", "revocable", proxy_revocable),
     ("Promise", "all", promise_all),
@@ -10726,6 +11294,11 @@ const INTERNAL_PROPERTIES: &[&str] = &[
     COLLECTION_ENTRIES,
     MAP_BRAND,
     SET_BRAND,
+    WEAKMAP_BRAND,
+    WEAKSET_BRAND,
+    WEAKREF_BRAND,
+    FINREG_BRAND,
+    FINREG_CALLBACK,
     BOUND_TARGET,
     BOUND_THIS,
     BOUND_ARGS,
@@ -11289,6 +11862,54 @@ math_unary!(math_tan, "`Math.tan`.", f64::tan);
 math_unary!(math_asin, "`Math.asin`.", f64::asin);
 math_unary!(math_acos, "`Math.acos`.", f64::acos);
 math_unary!(math_atan, "`Math.atan`.", f64::atan);
+math_unary!(
+    math_expm1,
+    "`Math.expm1` — `exp(x) - 1`, accurate for small `x`.",
+    f64::exp_m1
+);
+math_unary!(
+    math_log1p,
+    "`Math.log1p` — `log(1 + x)`, accurate for small `x`.",
+    f64::ln_1p
+);
+math_unary!(math_sinh, "`Math.sinh`.", f64::sinh);
+math_unary!(math_cosh, "`Math.cosh`.", f64::cosh);
+math_unary!(math_tanh, "`Math.tanh`.", f64::tanh);
+math_unary!(math_asinh, "`Math.asinh`.", f64::asinh);
+math_unary!(math_acosh, "`Math.acosh`.", f64::acosh);
+math_unary!(math_atanh, "`Math.atanh`.", f64::atanh);
+math_unary!(
+    math_fround,
+    "`Math.fround` — the nearest `f32`, widened back.",
+    |value| f64::from(narrow_to_f32(value))
+);
+
+/// `Math.clz32(x)` — leading zero bits of `ToUint32(x)`.
+extern "C" fn math_clz32(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = to_uint32(math_argument(argc, argv));
+    from_number(f64::from(value.leading_zeros()))
+}
+
+/// `Math.imul(a, b)` — the C-like 32-bit integer multiply, wrapping modulo 2³².
+extern "C" fn math_imul(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let a = to_int32(to_number(unsafe { argument(argc, argv, 0) }));
+    // SAFETY: as above.
+    let b = to_int32(to_number(unsafe { argument(argc, argv, 1) }));
+    from_number(f64::from(a.wrapping_mul(b)))
+}
 
 /// `Math.round`.
 ///
@@ -12739,6 +13360,13 @@ impl Runtime {
             ("Boolean", BOOLEAN_PROTOTYPE.with(std::cell::Cell::get)),
             ("Promise", PROMISE_PROTOTYPE.with(std::cell::Cell::get)),
             ("BigInt", BIGINT_PROTOTYPE.with(std::cell::Cell::get)),
+            ("WeakMap", WEAKMAP_PROTOTYPE.with(std::cell::Cell::get)),
+            ("WeakSet", WEAKSET_PROTOTYPE.with(std::cell::Cell::get)),
+            ("WeakRef", WEAKREF_PROTOTYPE.with(std::cell::Cell::get)),
+            (
+                "FinalizationRegistry",
+                FINALIZATION_REGISTRY_PROTOTYPE.with(std::cell::Cell::get),
+            ),
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -13534,6 +14162,58 @@ impl Runtime {
                     name,
                     method.to_value(),
                 );
+            }
+        }
+
+        // The four weak built-ins (D-255). One `WEAK_NATIVES` table, addressed by the `WEAKMAP_*`
+        // constants, feeds four prototypes with disjoint method subsets — so the shared build loop
+        // above (one table per prototype) does not fit, and each is installed by hand from a base
+        // continuing after the BigInt natives.
+        {
+            let weak_base = weak_natives_base();
+            for (cell, owner, methods) in [
+                (
+                    &WEAKMAP_PROTOTYPE,
+                    "WeakMap.prototype",
+                    &[
+                        ("get", WEAKMAP_GET),
+                        ("set", WEAKMAP_SET),
+                        ("has", WEAKMAP_HAS),
+                        ("delete", WEAKMAP_DELETE),
+                    ][..],
+                ),
+                (
+                    &WEAKSET_PROTOTYPE,
+                    "WeakSet.prototype",
+                    &[
+                        ("add", WEAKSET_ADD),
+                        ("has", WEAKSET_HAS),
+                        ("delete", WEAKSET_DELETE),
+                    ][..],
+                ),
+                (
+                    &WEAKREF_PROTOTYPE,
+                    "WeakRef.prototype",
+                    &[("deref", WEAKREF_DEREF)][..],
+                ),
+                (
+                    &FINALIZATION_REGISTRY_PROTOTYPE,
+                    "FinalizationRegistry.prototype",
+                    &[
+                        ("register", FINREG_REGISTER),
+                        ("unregister", FINREG_UNREGISTER),
+                    ][..],
+                ),
+            ] {
+                let shape = self.shapes.borrow().root();
+                let scope = self.heap.scope();
+                let prototype = scope.alloc(shape, 0);
+                cell.with(|slot| slot.set(Some(prototype.handle())));
+                self.inherit_from_object(prototype.handle());
+                for &(name, offset) in methods {
+                    let method = self.native_function(weak_base + offset);
+                    self.define_method(prototype.handle(), owner, name, method.to_value());
+                }
             }
         }
     }
@@ -16108,7 +16788,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + GENERATOR_NATIVES.len();
-        return BIGINT_NATIVES
+        if let Some((_, function)) = BIGINT_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + BIGINT_NATIVES.len();
+        return WEAK_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
