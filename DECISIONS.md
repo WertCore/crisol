@@ -6983,3 +6983,26 @@ Both `CallSpread` and `ObjectExtend` `can_collect` and are exception-propagated 
 drained iterator, a getter, or the call itself can throw. Deferred: **`new C(...xs)`** (construct
 spread needs the apply-construct path) and destructuring rest (`[...a]`/`{...r}` on the binding
 side, which gathers rather than spreads).
+
+## D-251
+
+**Optional chaining, and the nullish-test bug it uncovered.**
+
+Status: Accepted
+
+`a?.b`, `a?.[k]` and `f?.()` lower entirely in the frontend: a `ChainExpression` becomes a result
+slot, a shared short-circuit block and an end block, and each link recurses through `chain_expr` so a
+nested `?.` reaches the *same* short block. At each `?.`, a branch on the base's nullishness either
+jumps to short (the whole chain becomes `undefined`) or continues; a non-optional link is an ordinary
+access or call. That the short-circuit skips the rest of the chain — `a?.b.c` with `a` null is
+`undefined`, not a throw on `.c` — is exactly why the wrapping `ChainExpression` is needed rather than
+handling `optional` on each member in isolation. Optional calls keep the receiver the same way the
+plain call path does. Deferred: a spread argument inside an optional call, and `a?.#x`.
+
+Building it surfaced a latent bug in `is_nullish` (used by `??` since D-?, and now `?.`): it computed
+`x === null | x === undefined`, but `|` is `crisol_bit_or`, which returns a **number** (`1`/`0`) while
+the result was typed `Bool`. The branch that consumes a `Bool` condition bit-compares it to boxed
+`true` (that is sound *only* for a real boolean), so a number `1` failed the compare and every nullish
+operand took the wrong edge — `null ?? x` would have answered `null`. It went unseen because `??` had
+no nullish-left test. Replaced with `x == null` (loose), which is true for exactly `null` and
+`undefined` and answers a real boolean, and is one comparison rather than three.

@@ -2037,6 +2037,7 @@ impl Lowering {
             }
             Expression::UpdateExpression(update) => self.update(update),
             Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression),
+            Expression::ChainExpression(chain) => self.chain(chain),
             other => {
                 self.note(expression_kind(other), 0);
                 self.placeholder()
@@ -2252,34 +2253,186 @@ impl Lowering {
 
     /// `a === null || a === undefined`, as `??` and `?.` need it.
     fn is_nullish(&mut self, value: ValueId) -> ValueId {
+        // **`value == null` (loose), not `=== null | === undefined`.** Loose equality against
+        // `null` is true for exactly `null` and `undefined` and answers a real boolean. The
+        // earlier form OR-ed two `===` results with `|` — but `|` is `crisol_bit_or`, which
+        // returns a *number* (`1`/`0`) while the value was typed `Bool`, so the branch that
+        // consumes it bit-compared a number to boxed `true` and took the wrong edge for a nullish
+        // operand. That silently mis-drove both `??` and `?.`.
         let null = self.emit(Type::Null, Op::Const(Constant::Null));
-        let is_null = self.emit(
-            Type::Bool,
-            Op::Compare {
-                op: CompareOp::StrictEqual,
-                left: value,
-                right: null,
-            },
-        );
-        let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
-        let is_undefined = self.emit(
-            Type::Bool,
-            Op::Compare {
-                op: CompareOp::StrictEqual,
-                left: value,
-                right: undefined,
-            },
-        );
-        // A bitwise or, not a logical one: both operands are already booleans, so there is
-        // nothing to short-circuit and no side effect to skip.
         self.emit(
             Type::Bool,
             Op::Binary {
-                op: BinaryOp::BitOr,
-                left: is_null,
-                right: is_undefined,
+                op: BinaryOp::LooseEqual,
+                left: value,
+                right: null,
             },
         )
+    }
+
+    /// `a?.b.c`, `a?.[k]`, `f?.()` — an optional chain (D-251). Each `?.` short-circuits the whole
+    /// chain to `undefined` when its base is nullish; otherwise it evaluates as an ordinary access
+    /// or call. The result travels through a slot so the short-circuit and the full evaluation both
+    /// write one place.
+    fn chain(&mut self, chain: &oxc_ast::ast::ChainExpression<'_>) -> ValueId {
+        let result = self.temporary();
+        let short = self.new_block();
+        let end = self.new_block();
+        let value = match &chain.expression {
+            oxc_ast::ast::ChainElement::CallExpression(call) => self.chain_call(call, short),
+            element => match element.as_member_expression() {
+                Some(oxc_ast::ast::MemberExpression::StaticMemberExpression(member)) => {
+                    self.chain_static(member, short)
+                }
+                Some(oxc_ast::ast::MemberExpression::ComputedMemberExpression(member)) => {
+                    self.chain_computed(member, short)
+                }
+                // A private field (`a?.#x`) or a TS-only element is not lowered.
+                _ => {
+                    self.note("optional chain", chain.span.start);
+                    self.placeholder()
+                }
+            },
+        };
+        self.emit_effect(Op::Store {
+            slot: result,
+            value,
+        });
+        self.terminate(Terminator::Jump {
+            target: end,
+            args: Vec::new(),
+        });
+
+        self.switch_to(short);
+        let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+        self.emit_effect(Op::Store {
+            slot: result,
+            value: undefined,
+        });
+        self.terminate(Terminator::Jump {
+            target: end,
+            args: Vec::new(),
+        });
+
+        self.switch_to(end);
+        self.emit(Type::Unknown, Op::Load { slot: result })
+    }
+
+    /// One link of a chain: a member access or call recurses here so its own `?.`s reach the same
+    /// short-circuit block; anything else is the chain's base and lowers normally.
+    fn chain_expr(&mut self, expression: &Expression<'_>, short: BlockId) -> ValueId {
+        match expression {
+            Expression::StaticMemberExpression(member) => self.chain_static(member, short),
+            Expression::ComputedMemberExpression(member) => self.chain_computed(member, short),
+            Expression::CallExpression(call) => self.chain_call(call, short),
+            Expression::ParenthesizedExpression(inner) => self.chain_expr(&inner.expression, short),
+            other => self.expression(other),
+        }
+    }
+
+    /// Branches to `short` when `value` is nullish, otherwise continues in a fresh block — the one
+    /// `?.` link.
+    fn short_circuit_if_nullish(&mut self, value: ValueId, short: BlockId) {
+        let nullish = self.is_nullish(value);
+        let cont = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition: nullish,
+            then_block: short,
+            then_args: Vec::new(),
+            else_block: cont,
+            else_args: Vec::new(),
+        });
+        self.switch_to(cont);
+    }
+
+    fn chain_static(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'_>,
+        short: BlockId,
+    ) -> ValueId {
+        let object = self.chain_expr(&member.object, short);
+        if member.optional {
+            self.short_circuit_if_nullish(object, short);
+        }
+        let value = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object,
+                key: PropertyKey::new(member.property.name.as_str()),
+            },
+        );
+        self.propagate(value)
+    }
+
+    fn chain_computed(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression<'_>,
+        short: BlockId,
+    ) -> ValueId {
+        let object = self.chain_expr(&member.object, short);
+        if member.optional {
+            self.short_circuit_if_nullish(object, short);
+        }
+        let key = self.expression(&member.expression);
+        let value = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+        self.propagate(value)
+    }
+
+    fn chain_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>, short: BlockId) -> ValueId {
+        // The callee, and the receiver a method call must pass — the same shapes the plain call
+        // path handles, but with each member's `?.` short-circuiting the chain.
+        let (callee, this_value) = match &call.callee {
+            Expression::StaticMemberExpression(member) => {
+                let object = self.chain_expr(&member.object, short);
+                if member.optional {
+                    self.short_circuit_if_nullish(object, short);
+                }
+                let method = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object,
+                        key: PropertyKey::new(member.property.name.as_str()),
+                    },
+                );
+                (self.propagate(method), object)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.chain_expr(&member.object, short);
+                if member.optional {
+                    self.short_circuit_if_nullish(object, short);
+                }
+                let key = self.expression(&member.expression);
+                let method = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+                (self.propagate(method), object)
+            }
+            other => {
+                let callee = self.chain_expr(other, short);
+                let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+                (callee, undefined)
+            }
+        };
+        if call.optional {
+            self.short_circuit_if_nullish(callee, short);
+        }
+        let mut args = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            if let Some(expression) = argument.as_expression() {
+                args.push(self.expression(expression));
+            } else {
+                // Spread inside an optional call is rare; refused rather than miscompiled.
+                self.note("spread argument", call.span.start);
+                args.push(self.placeholder());
+            }
+        }
+        let result = self.emit(
+            Type::Unknown,
+            Op::Call {
+                callee,
+                this_value,
+                args,
+            },
+        );
+        self.propagate(result)
     }
 
     /// `test ? consequent : alternate`, which is control flow for the same reason as `&&`.

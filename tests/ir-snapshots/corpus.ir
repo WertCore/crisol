@@ -1324,18 +1324,15 @@ bb0:  ; entry
     v1: unknown = load $1
     store $2, v1
     v2: null = const null
-    v3: bool = eq v1, v2
-    v4: undefined = const undefined
-    v5: bool = eq v1, v4
-    v6: bool = | v3, v5
-    branch v6 -> bb1, bb2
+    v3: bool = == v1, v2
+    branch v3 -> bb1, bb2
 bb1:
-    v7: number = const 1.0
-    store $2, v7
+    v4: number = const 1.0
+    store $2, v4
     jump bb2
 bb2:
-    v8: unknown = load $2
-    store $3, v8
+    v5: unknown = load $2
+    store $3, v5
     return
 }
 

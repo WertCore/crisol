@@ -9786,6 +9786,83 @@ fn spread_unpacks_into_calls_and_objects() {
     );
 }
 
+/// Optional chaining `?.`: a nullish base short-circuits the whole chain to `undefined`, on member
+/// access, computed access and calls; a non-nullish one behaves as the ordinary operation.
+#[test]
+fn optional_chaining_short_circuits_on_nullish() {
+    // A present chain reads through.
+    check(
+        "optional-present",
+        "let a = { b: { c: 5 } }; return a?.b?.c;",
+        "5",
+    );
+    // A nullish base gives undefined.
+    check(
+        "optional-null-base",
+        "let a = null; return a?.b;",
+        "undefined",
+    );
+    // Short-circuit at an inner link.
+    check(
+        "optional-inner-null",
+        "let a = { b: null }; return a?.b?.c;",
+        "undefined",
+    );
+    // The short-circuit skips the rest of the chain, `.c.d` included.
+    check(
+        "optional-skips-rest",
+        "let a = undefined; return typeof a?.b.c.d;",
+        "undefined",
+    );
+    // Computed access.
+    check(
+        "optional-computed",
+        "let a = { x: 7 }; return a?.[\"x\"];",
+        "7",
+    );
+    check(
+        "optional-computed-null",
+        "let a = null; return typeof a?.[\"x\"];",
+        "undefined",
+    );
+    // An optional call: present runs, absent gives undefined without calling.
+    check(
+        "optional-call-present",
+        "let o = { m: function () { return 3; } }; return o.m?.();",
+        "3",
+    );
+    check(
+        "optional-call-absent",
+        "let o = {}; return typeof o.m?.();",
+        "undefined",
+    );
+    // A method reached through `?.` keeps its receiver.
+    check(
+        "optional-call-keeps-this",
+        "let o = { n: 10, m: function () { return this.n; } }; return o?.m();",
+        "10",
+    );
+    // **The short-circuit does not evaluate the arguments** — `a` is null, so `count = 1` never
+    // runs and the call never happens.
+    check(
+        "optional-does-not-evaluate-args",
+        "let count = 0; let a = null; let r = a?.b(count = 1); \
+         return typeof r + \":\" + count;",
+        "undefined:0",
+    );
+
+    // `??` shares the nullish test the same fix corrected: a nullish left takes the right, a
+    // present-but-falsy left (`0`) does not.
+    check("coalesce-null-left", "let a = null; return a ?? 5;", "5");
+    check("coalesce-undefined-left", "let a; return a ?? 5;", "5");
+    check("coalesce-zero-left", "let a = 0; return a ?? 5;", "0");
+    check(
+        "coalesce-empty-string-left",
+        "let a = \"\"; return a ?? \"x\";",
+        "",
+    );
+}
+
 /// **A proxy answers through its handler, or forwards to its target when there is no trap** —
 /// which is what makes a handler with one trap a pass-through for everything else.
 #[test]

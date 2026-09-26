@@ -415,8 +415,9 @@ fn nullish_coalescing_tests_for_null_not_for_falsiness() {
     let nullish = lower("nullish", "let a = 0; let b = a ?? 1;").expect("parses");
     let dump = nullish.program().to_string();
     assert!(
-        dump.contains("const null") && dump.contains("const undefined"),
-        "`??` should compare against both nullish values:\n{dump}"
+        dump.contains("const null") && dump.contains("== "),
+        "`??` should test nullishness with `== null`, which covers null and undefined and \
+         answers a real boolean:\n{dump}"
     );
 
     let or = lower("or", "let a = 0; let b = a || 1;").expect("parses");
