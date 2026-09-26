@@ -299,12 +299,13 @@ fn a_handle_round_trips_through_a_value() {
 }
 
 #[test]
-fn a_handle_fits_the_forty_eight_bits_a_value_carries() {
-    // The coupling between D-53 and this crate: a handle that did not fit would have to be
-    // boxed, and every object reference in the language would cost an indirection.
+fn a_handle_fits_the_forty_seven_bits_a_value_carries() {
+    // The coupling between D-53 (narrowed by D-248) and this crate: a handle that did not fit
+    // would have to be boxed, and every object reference in the language would cost an
+    // indirection. BigInt's tag took a payload bit from the slot, not the generation.
     let handle = GcRef::from_address(Address::new(Address::MAX).expect("in range"));
     assert_eq!(handle.to_address().get(), Address::MAX);
-    assert_eq!(handle.slot(), u32::MAX);
+    assert_eq!(handle.slot(), (1_u32 << 31) - 1);
     assert_eq!(handle.generation(), u16::MAX);
 }
 
@@ -423,4 +424,311 @@ fn a_mixed_workload_under_stress_mode_keeps_exactly_what_is_reachable() {
     assert!(heap.is_live(anchor.handle()));
     assert_eq!(heap.live(), 1, "only the anchor is reachable now");
     assert!(heap.stats().collections >= 50);
+}
+
+// ---- roots the shadow stack cannot see (ROADMAP §3.1) ----------------------------------
+
+/// Compiled machine code holds values in registers and frame slots and pushes nothing onto the
+/// shadow stack, so to `mark` they look exactly like garbage.
+///
+/// Both halves are here deliberately. "It survived" says nothing unless it could have died,
+/// and the first test is what makes the second one evidence rather than decoration.
+
+#[test]
+fn an_object_only_a_compiled_frame_holds_dies_when_nothing_reports_it() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    {
+        let scope = heap.scope();
+        scope.alloc(shape, 1);
+    }
+    // The scope is gone. A compiled frame still holding this is exactly the situation, and
+    // with no provider installed the collector cannot know that.
+    assert_eq!(
+        heap.collect().swept,
+        1,
+        "unreported, so indistinguishable from garbage"
+    );
+    assert_eq!(heap.live(), 0);
+}
+
+#[test]
+fn an_object_only_a_compiled_frame_holds_survives_when_a_provider_reports_it() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let held = {
+        let scope = heap.scope();
+        scope.alloc(shape, 1).handle()
+    };
+
+    // Stands in for the native frame walk. What the real one returns differs only in where it
+    // read the handle from; to `mark` both are a root no scope holds.
+    heap.set_extra_roots(Box::new(move || vec![held]));
+    assert!(heap.has_extra_roots());
+
+    assert_eq!(
+        heap.collect().swept,
+        0,
+        "reported by the provider, so it is live"
+    );
+    assert_eq!(heap.live(), 1);
+}
+
+#[test]
+fn a_provider_root_keeps_what_it_points_at_alive_too() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    // A compiled frame reports one handle; the object graph hanging off it has to be traced
+    // as well, or the collector frees an object the program can still reach in one hop.
+    let held = {
+        let scope = heap.scope();
+        let root = scope.alloc(shape, 1);
+        let reachable = scope.alloc(shape, 1);
+        heap.set(root.handle(), 0, reachable.to_value());
+        root.handle()
+    };
+
+    heap.set_extra_roots(Box::new(move || vec![held]));
+
+    assert_eq!(heap.collect().swept, 0);
+    assert_eq!(
+        heap.live(),
+        2,
+        "the provider's root is traced, not just marked"
+    );
+}
+
+// ---- growing an object as properties are added -----------------------------------------
+
+#[test]
+fn a_transition_keeps_the_existing_values_and_leaves_the_new_slot_undefined() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let two = shapes.add(one, &PropertyKey::new("tail"));
+    let heap = Heap::new();
+
+    let scope = heap.scope();
+    let object = scope.alloc(one, 1);
+    let kept = scope.alloc(one, 1);
+    heap.set(object.handle(), 0, kept.to_value());
+
+    assert!(heap.transition(object.handle(), two, 2));
+    assert_eq!(heap.get(object.handle(), 0), Some(kept.to_value()));
+    assert_eq!(
+        heap.get(object.handle(), 1),
+        Some(Value::UNDEFINED),
+        "a new slot must not hold a plausible bit pattern"
+    );
+    assert_eq!(heap.shape_of(object.handle()), Some(two));
+}
+
+/// The claim that matters to the collector: a reference written into a slot that did not exist
+/// at allocation is still traced. A `transition` that grew the object without the marker
+/// knowing would free exactly the values an object literal's properties point at.
+#[test]
+fn a_reference_stored_in_a_grown_slot_is_traced() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let two = shapes.add(one, &PropertyKey::new("tail"));
+    let heap = Heap::new();
+
+    let holder = {
+        let scope = heap.scope();
+        let holder = scope.alloc(one, 1);
+        let target = scope.alloc(one, 1);
+        assert!(heap.transition(holder.handle(), two, 2));
+        heap.set(holder.handle(), 1, target.to_value());
+        holder.handle()
+    };
+    heap.set_extra_roots(Box::new(move || vec![holder]));
+
+    assert_eq!(heap.collect().swept, 0);
+    assert_eq!(heap.live(), 2, "the grown slot is traced like any other");
+}
+
+#[test]
+fn a_transition_that_would_shrink_is_refused() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let scope = heap.scope();
+    let object = scope.alloc(one, 2);
+    heap.set(object.handle(), 1, Value::TRUE);
+
+    // Shrinking would drop slot 1 silently, and with it any reference it held.
+    assert!(!heap.transition(object.handle(), shapes.root(), 1));
+    assert_eq!(heap.get(object.handle(), 1), Some(Value::TRUE));
+}
+
+#[test]
+fn a_transition_through_a_stale_handle_is_refused() {
+    let mut shapes = Shapes::new();
+    let one = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let stale = {
+        let scope = heap.scope();
+        scope.alloc(one, 1).handle()
+    };
+    heap.collect();
+    assert!(!heap.is_live(stale));
+    assert!(
+        !heap.transition(stale, one, 4),
+        "a freed slot must not be resurrected"
+    );
+}
+
+// ---- prototypes -------------------------------------------------------------------------
+
+/// The claim the collector has to honour: a prototype is reachable *through* its instances.
+///
+/// A class's methods live on one shared prototype object, and nothing else refers to it once
+/// the class expression is done. If it were not traced, the first collection would free it and
+/// every instance would carry a handle to a reclaimed object.
+#[test]
+fn a_prototype_reachable_only_through_an_instance_survives() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let instance = {
+        let scope = heap.scope();
+        let prototype = scope.alloc(shape, 1);
+        let instance = scope.alloc(shape, 1);
+        assert!(heap.set_prototype(instance.handle(), Some(prototype.handle())));
+        instance.handle()
+    };
+    heap.set_extra_roots(Box::new(move || vec![instance]));
+
+    assert_eq!(
+        heap.collect().swept,
+        0,
+        "the prototype is reachable through the instance"
+    );
+    assert_eq!(heap.live(), 2);
+    assert!(heap.prototype_of(instance).is_some_and(|p| heap.is_live(p)));
+}
+
+#[test]
+fn an_object_with_no_prototype_is_at_the_end_of_the_chain() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+    let object = scope.alloc(shape, 1);
+    assert_eq!(heap.prototype_of(object.handle()), None);
+}
+
+#[test]
+fn a_prototype_can_be_replaced_and_the_old_one_becomes_collectable() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let (instance, second) = {
+        let scope = heap.scope();
+        let first = scope.alloc(shape, 1);
+        let second = scope.alloc(shape, 1);
+        let instance = scope.alloc(shape, 1);
+        heap.set_prototype(instance.handle(), Some(first.handle()));
+        heap.set_prototype(instance.handle(), Some(second.handle()));
+        (instance.handle(), second.handle())
+    };
+    heap.set_extra_roots(Box::new(move || vec![instance]));
+
+    // The first prototype is now unreachable; the second is not.
+    assert_eq!(heap.collect().swept, 1);
+    assert_eq!(heap.prototype_of(instance), Some(second));
+}
+
+// ---- arrays -----------------------------------------------------------------------------
+
+/// Elements are references like any other, and the collector has to trace them. An array is
+/// often the only thing holding what it contains.
+#[test]
+fn an_object_reachable_only_from_an_array_element_survives() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+
+    let array = {
+        let scope = heap.scope();
+        let array = scope.alloc(shape, 0);
+        assert!(heap.make_array(array.handle(), 2));
+        let held = scope.alloc(shape, 1);
+        assert!(heap.set_element(array.handle(), 0, held.to_value()));
+        array.handle()
+    };
+    heap.set_extra_roots(Box::new(move || vec![array]));
+
+    assert_eq!(
+        heap.collect().swept,
+        0,
+        "the element is reachable through the array"
+    );
+    assert_eq!(heap.live(), 2);
+}
+
+#[test]
+fn an_array_is_distinguishable_from_an_object() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+
+    let object = scope.alloc(shape, 1);
+    assert_eq!(
+        heap.element_count(object.handle()),
+        None,
+        "an object has no length"
+    );
+
+    let empty = scope.alloc(shape, 0);
+    heap.make_array(empty.handle(), 0);
+    assert_eq!(
+        heap.element_count(empty.handle()),
+        Some(0),
+        "an empty array still has a length"
+    );
+}
+
+#[test]
+fn writing_past_the_end_grows_the_array() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+
+    let array = scope.alloc(shape, 0);
+    heap.make_array(array.handle(), 1);
+    assert!(heap.set_element(array.handle(), 3, Value::TRUE));
+    assert_eq!(heap.element_count(array.handle()), Some(4));
+    assert_eq!(heap.element(array.handle(), 3), Some(Value::TRUE));
+    assert_eq!(
+        heap.element(array.handle(), 2),
+        Some(Value::UNDEFINED),
+        "the gap is filled, not left holding whatever was there"
+    );
+}
+
+#[test]
+fn an_element_past_the_end_reads_as_nothing_rather_than_panicking() {
+    let mut shapes = Shapes::new();
+    let shape = linked(&mut shapes);
+    let heap = Heap::new();
+    let scope = heap.scope();
+    let array = scope.alloc(shape, 0);
+    heap.make_array(array.handle(), 2);
+    assert_eq!(heap.element(array.handle(), 9), None);
+    assert!(
+        !heap.set_element(scope.alloc(shape, 0).handle(), 0, Value::TRUE),
+        "an ordinary object has no elements to write"
+    );
 }

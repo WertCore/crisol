@@ -4,6 +4,11 @@
 //! phrased as "compiles to a standalone binary that runs and produces correct output" — a test
 //! that checked the binary existed would pass for a binary that printed nothing.
 //!
+//! **These link a prebuilt `libcrisol_abi.a`, which `cargo test -p crisol` does not rebuild.**
+//! Changing the runtime and re-running the tests therefore proves nothing until
+//! `cargo build -p crisol-abi` has run — a mutation to the runtime silently keeps passing
+//! otherwise, which is the shape of false negative this file is least able to notice.
+//!
 //! They skip when the runtime archive is absent rather than failing, because `cargo test`
 //! builds test binaries before it builds the `staticlib` a compiled program links against.
 //! `CRISOL_REQUIRE_BUILD=1` turns the absence into a failure, so CI cannot pass by finding
@@ -46,20 +51,102 @@ fn build_and_run(name: &str, source: &str) -> Option<String> {
     crisol::build::build(&file, &binary, &runtime)
         .unwrap_or_else(|error| panic!("{name} should build: {error}"));
 
-    let output = Command::new(&binary).output().expect("run the binary");
-    assert!(
-        output.status.success(),
-        "{name} exited with {:?}",
-        output.status.code()
-    );
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    Some(execute(name, &binary, false))
 }
 
+/// How long one acceptance program may run before it is killed.
+///
+/// Generous, because the second run of every case collects on **every** allocation and that
+/// is genuinely slow. Anything past it is not slow but stuck.
+const PROGRAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs a built program, optionally collecting on every allocation.
+///
+/// **Killed rather than waited for.** `Command::output` waits for ever, so one program that
+/// loops takes the whole suite with it — and a hung job reports nothing, holds a runner for
+/// its full hour, and reads as broken infrastructure rather than as the bug it is. A timeout
+/// turns the worst failure a test run can have into an ordinary one with a name attached.
+fn execute(name: &str, binary: &Path, stress: bool) -> String {
+    let mut command = Command::new(binary);
+    if stress {
+        command.env("CRISOL_GC_STRESS", "1");
+    }
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run the binary");
+    let deadline = std::time::Instant::now() + PROGRAM_TIMEOUT;
+    let output = loop {
+        match child.try_wait().expect("wait for the binary") {
+            Some(_) => break child.wait_with_output().expect("collect the output"),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    // **Killed before the panic**, not after: a panic alone leaves the
+                    // process running, which is the runner-holding half of the problem this
+                    // exists to stop.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "{name} did not finish within {}s{}",
+                        PROGRAM_TIMEOUT.as_secs(),
+                        if stress { " under GC stress" } else { "" }
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    };
+    // **The program's own stderr, which is where it says why.** Without it a failure reads as
+    // `exited with Some(1)` — true, and silent about the uncaught throw that caused it. The
+    // entry point prints `uncaught: …` precisely so somebody can read it.
+    assert!(
+        output.status.success(),
+        "{name} exited with {:?}{}: {}",
+        output.status.code(),
+        if stress { " under GC stress" } else { "" },
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Builds `source`, runs it **twice**, and requires the same answer both times.
+///
+/// The second run collects on every allocation. That is not extra caution — it is the only
+/// thing that tests rooting at all, and it has now caught two bugs that every ordinary run
+/// passed: stack map offsets read from the wrong end of the frame (D-93), and temporaries that
+/// never reach a slot being invisible to the collector (D-99).
+///
+/// Running *every* program both ways rather than writing separate stress tests, because the
+/// bugs it finds are not in the programs that look like they exercise the collector. `[{v: 1}]`
+/// does not look like a GC test.
 fn check(name: &str, source: &str, expected: &str) {
-    let Some(actual) = build_and_run(name, source) else {
+    let Some(runtime) = runtime() else {
         return;
     };
-    assert_eq!(actual, expected, "{name}: {source}");
+    let directory = std::env::temp_dir().join(format!("crisol-acceptance-{name}"));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime)
+        .unwrap_or_else(|error| panic!("{name} should build: {error}"));
+
+    assert_eq!(execute(name, &binary, false), expected, "{name}: {source}");
+    assert_eq!(
+        execute(name, &binary, true),
+        expected,
+        "{name} under GC stress: {source}"
+    );
+
+    // **Removed once it has passed, and kept when it has not.** A case that fails leaves its
+    // directory for reading; one that passes leaves nothing. Without this a full run left a
+    // scratch directory per case — a compiled binary each — and they accumulated across every
+    // run until the disk filled, which took out several test262 runs and a virtual machine
+    // before anyone connected the two.
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -117,8 +204,12 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("a working directory");
     let file = directory.join("main.js");
-    // A `for` loop still lowers to a recorded gap rather than to nothing.
-    std::fs::write(&file, "for (;;) { } return 1;").expect("write");
+    // This case has to be replaced whenever the construct it names becomes supported — which is
+    // the point: the test is about *refusing*, so it must always name something actually refused.
+    // It has named `for-of`, a regular expression literal, and `class extends`, and been rewritten
+    // each time one landed. An array hole is refused because a hole is not `undefined` (D-64) and
+    // the IR cannot yet say which a position holds.
+    std::fs::write(&file, "let a = [1, , 3]; return 1;").expect("write");
 
     let error =
         crisol::build::build(&file, &directory.join("main"), &runtime).expect_err("should refuse");
@@ -127,5 +218,10595 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
     assert!(
         matches!(error, crisol::build::BuildError::Unsupported { .. }),
         "{error:?}"
+    );
+}
+
+// ---- objects ---------------------------------------------------------------------------
+
+#[test]
+fn an_object_literal_allocates_and_its_property_reads_back() {
+    check("object-property", "let o = {a: 7}; return o.a;", "7");
+}
+
+#[test]
+fn a_property_added_after_allocation_reads_back() {
+    // The path `Heap::alloc` alone could not express: the object is allocated empty and gains
+    // a slot when the property is stored (D-92).
+    check("object-grow", "let o = {}; o.a = 5; return o.a;", "5");
+}
+
+#[test]
+fn several_properties_do_not_share_a_slot() {
+    check(
+        "object-several",
+        "let o = {}; o.a = 1; o.b = 2; o.c = 3; return o.a + o.b + o.c;",
+        "6",
+    );
+}
+
+#[test]
+fn a_missing_property_is_undefined() {
+    check("object-missing", "let o = {a: 1}; return o.b;", "undefined");
+}
+
+#[test]
+fn a_property_holding_an_object_can_be_reached_through_it() {
+    check(
+        "object-nested",
+        "let inner = {v: 4}; let outer = {}; outer.i = inner; return outer.i.v;",
+        "4",
+    );
+}
+
+/// §M13 asks for a GC stress mode. This is what it is for.
+///
+/// `CRISOL_GC_STRESS` collects on **every** allocation, so an object that the collector cannot
+/// see is freed before the next line rather than surviving until memory runs low. Each `{...}`
+/// below is an allocation, so by the last one every earlier object has been through several
+/// collections while live only in a compiled frame.
+///
+/// If the stack map table were empty, or registered too late, or read at the wrong frame
+/// offset, this prints garbage or crashes. Without stress mode it would pass either way, which
+/// is exactly why the mode exists.
+#[test]
+fn objects_survive_a_collection_at_every_allocation() {
+    let source = "let inner = {v: 4}; let outer = {}; outer.i = inner; \
+                  let a = {x: 1}; let b = {y: 2}; return outer.i.v + a.x + b.y;";
+    let Some(relaxed) = build_and_run("gc-stress-off", source) else {
+        return;
+    };
+    assert_eq!(relaxed, "7", "the answer without stress mode");
+
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-gc-stress-on");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("it should build");
+
+    let output = Command::new(&binary)
+        .env("CRISOL_GC_STRESS", "1")
+        .output()
+        .expect("run the binary");
+    assert!(output.status.success(), "it must not crash under stress");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "7",
+        "an object held only by a compiled frame must survive collection"
+    );
+}
+
+#[test]
+fn this_at_the_top_level_is_the_global_object() {
+    // **This asserted `undefined`, and its reason named the right rule about the wrong thing.**
+    // A *module*'s `this` is `undefined`; a script's is the global object, and scripts are all
+    // this engine compiles — the test262 runner skips the module flag outright. The entry point
+    // passes the value explicitly, so this still checks that it arrives rather than defaulting.
+    check("this-toplevel", "return typeof this;", "object");
+    check(
+        "this-toplevel-is-global",
+        "return this === globalThis;",
+        "true",
+    );
+}
+
+// ---- closures and calls ----------------------------------------------------------------
+
+#[test]
+fn a_function_can_be_called() {
+    check(
+        "call-simple",
+        "let f = function (a, b) { return a + b; }; return f(2, 3);",
+        "5",
+    );
+}
+
+#[test]
+fn a_closure_reads_what_it_captured() {
+    // The capture path end to end: `n` lives in the enclosing frame, is copied into the
+    // closure at creation, and is read back out through the callee's prologue.
+    check(
+        "call-capture",
+        "let n = 10; let add = function (x) { return x + n; }; return add(5);",
+        "15",
+    );
+}
+
+#[test]
+fn a_missing_argument_is_undefined_not_an_error() {
+    // The guarded load in the prologue. `b` was never passed, so `a + b` is `NaN` — which is
+    // the specification's answer, and is what distinguishes it from reading stack garbage.
+    check(
+        "call-missing-arg",
+        "let f = function (a, b) { return a + b; }; return f(1);",
+        "NaN",
+    );
+}
+
+#[test]
+fn extra_arguments_are_ignored() {
+    check(
+        "call-extra-args",
+        "let f = function (a) { return a; }; return f(7, 8, 9);",
+        "7",
+    );
+}
+
+#[test]
+fn calling_something_that_is_not_a_function_is_a_type_error() {
+    // This used to answer `undefined`, because there was no way to throw. The fallback that
+    // made it safe — a real function with the uniform signature — is now where the `TypeError`
+    // is raised, and no call site changed to make that happen (D-95).
+    check(
+        "call-non-function",
+        "let r = 0; try { let x = 5; x(); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+#[test]
+fn a_callback_passed_as_a_value_is_reached_indirectly() {
+    // The case the whole convention exists for: `apply` has no idea which function it holds.
+    check(
+        "call-callback",
+        "let twice = function (f, v) { return f(f(v)); }; \
+         let inc = function (x) { return x + 1; }; return twice(inc, 5);",
+        "7",
+    );
+}
+
+/// Closures allocate, so every one of them is a collection under stress — and a closure is
+/// reachable only from a compiled frame and from its own captures. If the captures were not
+/// traced, or the closure itself were not rooted, this returns garbage or crashes.
+#[test]
+fn closures_and_captures_survive_a_collection_at_every_allocation() {
+    let source = "let n = 10; \
+                  let add = function (x) { return x + n; }; \
+                  let twice = function (f, v) { return f(f(v)); }; \
+                  return twice(add, 1);";
+    let Some(relaxed) = build_and_run("closure-stress-off", source) else {
+        return;
+    };
+    assert_eq!(relaxed, "21");
+
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-closure-stress-on");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("it should build");
+
+    let output = Command::new(&binary)
+        .env("CRISOL_GC_STRESS", "1")
+        .output()
+        .expect("run the binary");
+    assert!(output.status.success(), "it must not crash under stress");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "21",
+        "a captured value must survive collection"
+    );
+}
+
+// ---- classes ----------------------------------------------------------------------------
+
+#[test]
+fn a_class_constructs_and_its_field_reads_back() {
+    check(
+        "class-field",
+        "class Point { constructor(x) { this.x = x; } } let p = new Point(4); return p.x;",
+        "4",
+    );
+}
+
+/// Methods live on one shared prototype, not on each instance, so this only works if the
+/// property lookup walks the chain.
+#[test]
+fn a_method_is_found_through_the_prototype() {
+    check(
+        "class-method",
+        "class Box { constructor(v) { this.v = v; } get() { return this.v; } } \
+         let b = new Box(9); return b.get();",
+        "9",
+    );
+}
+
+/// `this` inside a method is the receiver. Losing it is silent — the call still returns
+/// something, it is only `this` that is wrong.
+#[test]
+fn this_inside_a_method_is_the_receiver() {
+    check(
+        "class-this",
+        "class Sum { constructor(a, b) { this.a = a; this.b = b; } total() { return this.a + this.b; } } \
+         let s = new Sum(2, 3); return s.total();",
+        "5",
+    );
+}
+
+/// **A constructor returning an object replaces `this`; one returning a primitive does not.**
+/// Both halves, because a lowering that ignored the rule passes the second test.
+#[test]
+fn a_constructor_returning_a_primitive_still_yields_the_instance() {
+    check(
+        "class-return-primitive",
+        "class C { constructor() { this.x = 1; return 42; } } return new C().x;",
+        "1",
+    );
+}
+
+#[test]
+fn a_constructor_returning_an_object_replaces_the_instance() {
+    check(
+        "class-return-object",
+        "class C { constructor() { this.x = 1; return {x: 7}; } } return new C().x;",
+        "7",
+    );
+}
+
+#[test]
+fn two_instances_share_a_prototype_but_not_their_fields() {
+    check(
+        "class-two-instances",
+        "class P { constructor(n) { this.n = n; } get() { return this.n; } } \
+         let a = new P(1); let b = new P(2); return a.get() + b.get();",
+        "3",
+    );
+}
+
+/// Storing a property on a function must not break calling it.
+///
+/// A closure keeps its function index and captures as engine-private state. They used to live
+/// in the property slots, and a shape numbers properties from zero — so the first property
+/// stored on a function overwrote the index and the function silently stopped being callable.
+/// `class C {}` does exactly that to its own constructor, via `prototype`.
+#[test]
+fn a_property_on_a_function_does_not_break_calling_it() {
+    check(
+        "function-property",
+        "let f = function () { return 1; }; f.x = 5; return f();",
+        "1",
+    );
+    check(
+        "function-property-read",
+        "let f = function () { return 1; }; f.x = 5; return f.x;",
+        "5",
+    );
+}
+
+// ---- captured variables are shared, not copied (D-97) ----------------------------------
+
+/// JavaScript captures the **binding**, not the value. A closure that copied what it captured
+/// would pass every read-only test and give a plausible wrong answer the moment anything wrote.
+#[test]
+fn a_write_inside_a_closure_is_seen_outside_it() {
+    check(
+        "capture-write",
+        "let n = 0; let f = function () { n = 1; }; f(); return n;",
+        "1",
+    );
+}
+
+#[test]
+fn a_write_outside_a_closure_is_seen_inside_it() {
+    // The other direction, and the one a snapshot-at-creation implementation gets wrong even
+    // if writes from inside somehow worked.
+    check(
+        "capture-read-after",
+        "let n = 1; let f = function () { return n; }; n = 2; return f();",
+        "2",
+    );
+}
+
+#[test]
+fn a_counter_in_a_closure_accumulates() {
+    check(
+        "capture-counter",
+        "let total = 0; let add = function (x) { total = total + x; }; \
+         add(1); add(2); add(3); return total;",
+        "6",
+    );
+}
+
+#[test]
+fn two_closures_over_one_variable_see_each_other() {
+    check(
+        "capture-shared",
+        "let n = 0; let set = function (v) { n = v; }; let get = function () { return n; }; \
+         set(7); return get();",
+        "7",
+    );
+}
+
+/// A shared *parameter* has no cell to arrive in — the caller passes a plain value — so the
+/// callee wraps it at entry. Without that, this reads the unwrapped argument as a cell.
+#[test]
+fn a_captured_parameter_is_shared_too() {
+    check(
+        "capture-parameter",
+        "let outer = function (n) { let bump = function () { n = n + 1; }; bump(); return n; }; \
+         return outer(5);",
+        "6",
+    );
+}
+
+/// A variable nobody assigns must stay a plain value, or every closure pays for a cell.
+#[test]
+fn a_captured_but_never_assigned_variable_still_reads_correctly() {
+    check(
+        "capture-readonly",
+        "let n = 10; let f = function (x) { return x + n; }; return f(5);",
+        "15",
+    );
+}
+
+// ---- arrays -----------------------------------------------------------------------------
+
+#[test]
+fn an_array_literal_indexes_and_reports_its_length() {
+    check("array-index", "let a = [10, 20, 30]; return a[1];", "20");
+    check(
+        "array-length",
+        "let a = [10, 20, 30]; return a.length;",
+        "3",
+    );
+    check("array-empty", "let a = []; return a.length;", "0");
+}
+
+#[test]
+fn an_element_can_be_written() {
+    check(
+        "array-write",
+        "let a = [1, 2, 3]; a[0] = 9; return a[0];",
+        "9",
+    );
+}
+
+/// `a[5] = 1` on a shorter array grows it, and the gap reads as `undefined`.
+#[test]
+fn writing_past_the_end_grows_the_array() {
+    check("array-grow", "let a = [1]; a[3] = 7; return a.length;", "4");
+    check(
+        "array-gap",
+        "let a = [1]; a[3] = 7; return a[2];",
+        "undefined",
+    );
+}
+
+#[test]
+fn an_index_past_the_end_is_undefined() {
+    check("array-oob", "let a = [1, 2]; return a[9];", "undefined");
+}
+
+/// A computed key that is not an index is an ordinary property — `a["x"]` is not an element,
+/// and neither is `a[1.5]`.
+#[test]
+fn a_non_index_key_is_a_property_not_an_element() {
+    check(
+        "array-non-index",
+        "let a = [1, 2]; a[1.5] = 8; return a.length;",
+        "2",
+    );
+    check(
+        "array-non-index-read",
+        "let a = [1, 2]; return a[1.5];",
+        "undefined",
+    );
+}
+
+/// Element access on an object is property access: `o[0]` and `o["0"]` name the same thing.
+#[test]
+fn a_computed_key_on_an_object_is_a_property() {
+    check("object-computed", "let o = {}; o[0] = 5; return o[0];", "5");
+}
+
+#[test]
+fn an_element_can_hold_an_object_and_be_reached_through_it() {
+    check(
+        "array-of-objects",
+        "let a = [{v: 1}, {v: 2}]; return a[0].v + a[1].v;",
+        "3",
+    );
+}
+
+/// Arrays allocate, and every element is a reference the collector must trace.
+#[test]
+fn arrays_survive_a_collection_at_every_allocation() {
+    let source = "let a = [{v: 1}, {v: 2}, {v: 3}]; \
+                  let total = 0; \
+                  total = total + a[0].v; total = total + a[1].v; total = total + a[2].v; \
+                  return total;";
+    let Some(relaxed) = build_and_run("array-stress-off", source) else {
+        return;
+    };
+    assert_eq!(relaxed, "6");
+
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-array-stress-on");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("it should build");
+
+    let output = Command::new(&binary)
+        .env("CRISOL_GC_STRESS", "1")
+        .output()
+        .expect("run the binary");
+    assert!(output.status.success(), "it must not crash under stress");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "6");
+}
+
+// ---- array methods (§M13's last acceptance item) ----------------------------------------
+
+#[test]
+fn map_builds_a_new_array_from_a_callback() {
+    check(
+        "array-map",
+        "let a = [1, 2, 3]; let b = a.map(function (x) { return x * 2; }); return b[1];",
+        "4",
+    );
+    check(
+        "array-map-length",
+        "let a = [1, 2, 3]; return a.map(function (x) { return x; }).length;",
+        "3",
+    );
+}
+
+/// The callback gets `(element, index, array)`. Code that passes a method as a callback
+/// depends on the extra arguments arriving.
+#[test]
+fn a_callback_receives_the_index() {
+    check(
+        "array-map-index",
+        "let a = [10, 20, 30]; let b = a.map(function (x, i) { return i; }); return b[2];",
+        "2",
+    );
+}
+
+/// **The callback's `this` is the second argument, not the array.**
+///
+/// `[11].map(fn, o)` runs `fn` with `this === o`. Every iterating method passed the array as
+/// the receiver instead, so a callback that read `this` got the wrong object — silently, since
+/// the call still happened and still returned something.
+#[test]
+fn an_iterating_method_binds_this_to_its_second_argument() {
+    check(
+        "map-this-arg",
+        "return [1].map(function () { return this.tag; }, {tag: 7})[0];",
+        "7",
+    );
+    check(
+        "every-this-arg",
+        "return [1].every(function () { return this.ok; }, {ok: true});",
+        "true",
+    );
+    check(
+        "some-this-arg",
+        "return [1].some(function () { return this.ok; }, {ok: true});",
+        "true",
+    );
+    check(
+        "find-this-arg",
+        "return [5].find(function () { return this.ok; }, {ok: true});",
+        "5",
+    );
+    check(
+        "foreach-this-arg",
+        "let seen = 0; [1].forEach(function () { seen = this.tag; }, {tag: 9}); return seen;",
+        "9",
+    );
+    // Absent thisArg means the callback's `this` is not the array — whatever sloppy-mode
+    // substitution then applies, it is not the receiver the method was called on.
+    check(
+        "map-no-this-arg-is-not-the-array",
+        "let a = [1]; return a.map(function () { return this === a; })[0];",
+        "false",
+    );
+}
+
+/// A throw from the callback stops the walk and reaches the caller, rather than being stored
+/// as a result and the loop carrying on.
+#[test]
+fn a_throwing_callback_stops_an_iterating_method() {
+    for (name, call) in [
+        ("map", "[1, 2].map"),
+        ("filter", "[1, 2].filter"),
+        ("forEach", "[1, 2].forEach"),
+        ("find", "[1, 2].find"),
+        ("some", "[1, 2].some"),
+        ("every", "[1, 2].every"),
+    ] {
+        check(
+            &format!("{name}-throwing-callback"),
+            &format!(
+                "try {{ {call}(function () {{ throw new RangeError(\"x\"); }}); return \"no\"; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "RangeError",
+        );
+    }
+    // The walk stops at the throw — a later element is never visited.
+    check(
+        "foreach-stops-at-throw",
+        "let seen = 0; \
+         try { [1, 2, 3].forEach(function (x) { seen = x; if (x === 2) throw new Error(\"x\"); }); } \
+         catch (e) {} \
+         return seen;",
+        "2",
+    );
+}
+
+/// **A nullish receiver is a `TypeError`** — `RequireObjectCoercible` at the top of each
+/// iterator method. An iterator over `undefined` was made instead and answered `{done: true}`,
+/// which reads as a working empty walk.
+#[test]
+fn an_array_iterator_rejects_a_nullish_receiver() {
+    for method in ["keys", "values", "entries"] {
+        check(
+            &format!("{method}-on-undefined"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(undefined); return \"no\"; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("{method}-on-null"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(null); return \"no\"; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A real array-like still iterates.
+    check(
+        "values-on-array-like",
+        "let it = Array.prototype.values.call({0: \"a\", 1: \"b\", length: 2}); \
+         return it.next().value + it.next().value;",
+        "ab",
+    );
+}
+
+/// **The species protocol: `filter`/`map`/`slice`/`splice` consult `constructor[@@species]`
+/// before they touch an element.**
+///
+/// crisol cannot subclass `Array`, so the *result* is always a plain array — but the lookups
+/// are observable, and test262 checks each: a throwing `.constructor`, a throwing `@@species`,
+/// a species that is not a constructor, and a species constructor that is actually invoked
+/// (with `+0` for an empty `splice`). See D-222.
+#[test]
+fn a_species_aware_method_consults_the_constructor_first() {
+    // `.constructor` getter throws — and the callback never runs.
+    check(
+        "filter-ctor-getter-throws",
+        "let a = []; let n = 0;          Object.defineProperty(a, \"constructor\",              {get: function () { throw new RangeError(\"c\"); }});          try { a.filter(function () { n = n + 1; }); return \"no\"; }          catch (e) { return e.name + \":\" + n; }",
+        "RangeError:0",
+    );
+    // `@@species` getter throws — likewise before the callback.
+    check(
+        "filter-species-getter-throws",
+        "let a = []; let n = 0; a.constructor = {};          Object.defineProperty(a.constructor, Symbol.species,              {get: function () { throw new RangeError(\"s\"); }});          try { a.filter(function () { n = n + 1; }); return \"no\"; }          catch (e) { return e.name + \":\" + n; }",
+        "RangeError:0",
+    );
+    // A species constructor that throws, reached through `slice`.
+    check(
+        "slice-species-throws",
+        "let a = [1, 2]; a.constructor = {};          a.constructor[Symbol.species] = function () { throw new RangeError(\"x\"); };          try { a.slice(); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A species that is not a constructor is a `TypeError`.
+    check(
+        "map-species-not-constructor",
+        "let a = [1]; a.constructor = {}; a.constructor[Symbol.species] = 5;          try { a.map(function (x) { return x; }); return \"no\"; }          catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `splice(0, -0)` calls the species constructor with a single `+0` argument.
+    check(
+        "splice-species-neg-zero",
+        "let a = []; a.constructor = {}; let seen = \"none\";          a.constructor[Symbol.species] =              function () { seen = arguments.length + \":\" + arguments[0]; };          a.splice(0, -0); return seen;",
+        "1:0",
+    );
+    // A non-throwing species is genuinely invoked, and the method still answers a real array.
+    check(
+        "slice-species-invoked-result-still-works",
+        "let a = [1, 2, 3]; a.constructor = {}; let called = 0;          a.constructor[Symbol.species] = function () { called = called + 1; };          let r = a.slice(1); return called + \":\" + r.length + \":\" + r[0];",
+        "1:2:2",
+    );
+    // The ordinary case — no custom constructor — still builds the right array.
+    check(
+        "map-default-species-still-works",
+        "return [1, 2, 3].map(function (x) { return x * 2; }).join(\",\");",
+        "2,4,6",
+    );
+    // **A non-object, non-nullish constructor throws** — it is neither replaced by a species
+    // nor taken as the default.
+    check(
+        "slice-ctor-non-object",
+        "let a = [1, 2]; a.constructor = 1;          try { a.slice(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **A Date accessor on a non-Date receiver is a `TypeError`, not `NaN`.**
+///
+/// `thisTimeValue` throws before it reads; `NaN` is reserved for a real Date holding an invalid
+/// time. The mark is the hidden time slot, which only a real Date carries.
+#[test]
+fn a_date_accessor_rejects_a_non_date_receiver() {
+    for method in [
+        "getFullYear",
+        "getMonth",
+        "getDate",
+        "getDay",
+        "getHours",
+        "getTime",
+        "getTimezoneOffset",
+        "valueOf",
+        "toISOString",
+        "toString",
+        "toUTCString",
+        "toDateString",
+    ] {
+        check(
+            &format!("date-{method}-on-non-date"),
+            &format!(
+                "try {{ Date.prototype.{method}.call({{}}); return 1; }} catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // `Date.prototype` itself is not a Date, which is the receiver a program reaches by
+    // accident most often.
+    check(
+        "date-getfullyear-on-prototype",
+        "try { Date.prototype.getFullYear(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // **An invalid but real Date still answers rather than throwing** — the distinction the
+    // receiver check preserves.
+    check(
+        "invalid-date-get-time",
+        "return new Date(0 / 0).getTime();",
+        "NaN",
+    );
+    check(
+        "invalid-date-to-string",
+        "return new Date(0 / 0).toString();",
+        "Invalid Date",
+    );
+    // And a real Date still works through the checked path.
+    check(
+        "invalid-date-timezone-offset",
+        "return new Date(0 / 0).getTimezoneOffset();",
+        "NaN",
+    );
+    check("real-date-get-time", "return new Date(0).getTime();", "0");
+    check(
+        "real-date-utc-string",
+        "return new Date(0).toUTCString();",
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+    );
+}
+
+/// `Boolean.prototype.toString`/`valueOf` on a non-Boolean receiver is a `TypeError`.
+#[test]
+fn a_boolean_method_rejects_a_non_boolean_receiver() {
+    check(
+        "boolean-tostring-on-object",
+        "try { Boolean.prototype.toString.call({}); return \"no\"; }          catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "boolean-valueof-on-number",
+        "try { Boolean.prototype.valueOf.call(5); return \"no\"; }          catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A real boolean, and a Boolean wrapper, both still work.
+    check(
+        "boolean-tostring-primitive",
+        "return true.toString();",
+        "true",
+    );
+    check(
+        "boolean-valueof-wrapper",
+        "return Boolean.prototype.valueOf.call(new Boolean(false));",
+        "false",
+    );
+}
+
+/// **A Map or Set method on the wrong receiver is a `TypeError`.**
+///
+/// `thisMapData`/`thisSetData`: a non-object, a non-collection, and — because Map and Set share
+/// one backing store — a Map method on a Set (and the reverse) all throw before doing any work.
+#[test]
+fn a_map_or_set_method_rejects_a_wrong_receiver() {
+    for method in ["get", "set", "has", "delete", "forEach", "clear"] {
+        check(
+            &format!("map-{method}-on-non-object"),
+            &format!(
+                "try {{ Map.prototype.{method}.call(5); return 1; }} catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    for method in ["add", "has", "delete", "forEach", "clear"] {
+        check(
+            &format!("set-{method}-on-non-object"),
+            &format!(
+                "try {{ Set.prototype.{method}.call(undefined); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // Map and Set share a backing store, so the brand is what tells them apart.
+    check(
+        "map-get-on-set",
+        "try { Map.prototype.get.call(new Set(), 1); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "set-add-on-map",
+        "try { Set.prototype.add.call(new Map(), 1); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A real Map and Set still work through the checked path.
+    check(
+        "map-still-works-after-check",
+        "let m = new Map(); m.set(1, 2); return m.get(1) + \",\" + m.has(1) + \",\" + m.size;",
+        "2,true,1",
+    );
+    check(
+        "set-still-works-after-check",
+        "let s = new Set(); s.add(7); s.add(7); return s.has(7) + \",\" + s.size;",
+        "true,1",
+    );
+}
+
+/// The `Math` methods that are not one plain `f64` call: the bit-level `clz32`/`imul`/`fround`
+/// and the hyperbolic/`expm1`/`log1p` family (D-255).
+#[test]
+fn math_has_its_bit_level_and_hyperbolic_methods() {
+    check("math-clz32-one", "return Math.clz32(1);", "31");
+    check("math-clz32-zero", "return Math.clz32(0);", "32");
+    check("math-imul", "return Math.imul(3, 4);", "12");
+    check("math-imul-wraps", "return Math.imul(0xffffffff, 5);", "-5");
+    check("math-fround-exact", "return Math.fround(1.5);", "1.5");
+    check(
+        "math-fround-rounds",
+        "return Math.fround(1.1) === 1.100000023841858;",
+        "true",
+    );
+    check("math-sinh", "return Math.sinh(0);", "0");
+    check("math-cosh", "return Math.cosh(0);", "1");
+    check("math-tanh-inf", "return Math.tanh(Infinity);", "1");
+    check("math-expm1", "return Math.expm1(0);", "0");
+    check("math-log1p", "return Math.log1p(0);", "0");
+    check("math-asinh", "return Math.asinh(0);", "0");
+    check("math-acosh", "return Math.acosh(1);", "0");
+    check("math-atanh", "return Math.atanh(0);", "0");
+}
+
+/// `WeakMap`, `WeakSet`, `WeakRef` and `FinalizationRegistry` (D-255). The referents are held
+/// strongly, so every synchronous operation and type check behaves as required; only a
+/// collection-dependent test would see the difference.
+#[test]
+fn weak_collections_have_their_synchronous_surface() {
+    // WeakMap: object keys round-trip; a primitive key throws on `set`, is absent on `get`/`has`.
+    check(
+        "weakmap-roundtrip",
+        "var k = {}; var m = new WeakMap(); m.set(k, 42); return m.get(k) + \",\" + m.has(k);",
+        "42,true",
+    );
+    check(
+        "weakmap-delete",
+        "var k = {}; var m = new WeakMap(); m.set(k, 1); \
+         var d = m.delete(k); return d + \",\" + m.has(k);",
+        "true,false",
+    );
+    check(
+        "weakmap-set-primitive-throws",
+        "try { new WeakMap().set(1, 2); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "weakmap-get-missing",
+        "return new WeakMap().get({});",
+        "undefined",
+    );
+    check(
+        "weakmap-chains",
+        "var a = {}, b = {}; var m = new WeakMap(); \
+         return (m.set(a, 1) === m) + \",\" + m.set(b, 2).get(b);",
+        "true,2",
+    );
+    // WeakSet.
+    check(
+        "weakset-roundtrip",
+        "var v = {}; var s = new WeakSet(); s.add(v); return s.has(v) + \",\" + s.has({});",
+        "true,false",
+    );
+    check(
+        "weakset-add-primitive-throws",
+        "try { new WeakSet().add(3); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // WeakRef holds strongly, so `deref` always answers the target here.
+    check(
+        "weakref-deref",
+        "var o = { x: 5 }; var r = new WeakRef(o); return r.deref().x;",
+        "5",
+    );
+    check(
+        "weakref-primitive-throws",
+        "try { new WeakRef(1); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // FinalizationRegistry: the register/unregister API and its guards.
+    check(
+        "finreg-register-unregister",
+        "var t = {}, tok = {}; var f = new FinalizationRegistry(function () {}); \
+         f.register(t, 7, tok); return f.unregister(tok);",
+        "true",
+    );
+    check(
+        "finreg-unregister-absent",
+        "var f = new FinalizationRegistry(function () {}); return f.unregister({});",
+        "false",
+    );
+    check(
+        "finreg-noncallable-throws",
+        "try { new FinalizationRegistry(5); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "finreg-same-target-and-held-throws",
+        "var t = {}; \
+         try { new FinalizationRegistry(function () {}).register(t, t); return 1; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The brand and backing store stay invisible to reflection.
+    check(
+        "weakmap-hides-internals",
+        "var m = new WeakMap(); m.set({}, 1); return Object.getOwnPropertyNames(m).length;",
+        "0",
+    );
+    // A weak method on the wrong brand is a TypeError, as the collections' own methods are.
+    check(
+        "weakmap-get-on-weakset",
+        "try { WeakMap.prototype.get.call(new WeakSet(), {}); return 1; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// `%TypedArray%.prototype` map/filter/sort/toSorted/toReversed/with, and the `of`/`from` statics
+/// (D-256) — the members that must *build* a typed array rather than read through the indices the
+/// aliased `Array.prototype` methods already handle.
+#[test]
+fn typed_arrays_have_their_producing_methods() {
+    check(
+        "typed-map",
+        "var a = new Int8Array([1, 2, 3]); var m = a.map(function (x) { return x * 2; }); \
+         return m[0] + \",\" + m[2] + \",\" + (m instanceof Int8Array) + \",\" + a[0];",
+        "2,6,true,1",
+    );
+    check(
+        "typed-filter",
+        "var a = new Uint8Array([1, 2, 3, 4]); \
+         var f = a.filter(function (x) { return x % 2 === 0; }); \
+         return f.length + \",\" + f[0] + \",\" + f[1];",
+        "2,2,4",
+    );
+    // Default sort is numeric, not the string order Array.prototype.sort would impose.
+    check(
+        "typed-sort-numeric",
+        "var a = new Uint16Array([10, 2, 33, 4]); a.sort(); \
+         return a[0] + \",\" + a[1] + \",\" + a[2] + \",\" + a[3];",
+        "2,4,10,33",
+    );
+    check(
+        "typed-sort-comparator",
+        "var a = new Float64Array([1, 2, 3]); a.sort(function (x, y) { return y - x; }); \
+         return a[0] + \",\" + a[2];",
+        "3,1",
+    );
+    check(
+        "typed-to-sorted",
+        "var a = new Int16Array([3, 1, 2]); var s = a.toSorted(); \
+         return \"\" + s[0] + s[1] + s[2] + \",\" + a[0] + \",\" + (s instanceof Int16Array);",
+        "123,3,true",
+    );
+    check(
+        "typed-to-reversed",
+        "var a = new Int8Array([1, 2, 3]); var r = a.toReversed(); \
+         return \"\" + r[0] + r[1] + r[2] + \",\" + a[0];",
+        "321,1",
+    );
+    check(
+        "typed-with",
+        "var a = new Int8Array([1, 2, 3]); var w = a.with(1, 9); \
+         return \"\" + w[0] + w[1] + w[2] + \",\" + a[1];",
+        "193,2",
+    );
+    check(
+        "typed-with-out-of-range",
+        "try { new Int8Array([1]).with(5, 0); return 1; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // Statics: of from arguments, from over an array, an iterator, and with a map function.
+    check(
+        "typed-of",
+        "var o = Int16Array.of(10, 20, 30); \
+         return o.length + \",\" + o[2] + \",\" + (o instanceof Int16Array);",
+        "3,30,true",
+    );
+    check(
+        "typed-from-array",
+        "var f = Uint8Array.from([1, 2, 3]); return \"\" + f[0] + f[1] + f[2] + \",\" + f.length;",
+        "123,3",
+    );
+    check(
+        "typed-from-iterator-with-map",
+        "var f = Int8Array.from([1, 2, 3].values(), function (x) { return x * 10; }); \
+         return f[0] + \",\" + f[2];",
+        "10,30",
+    );
+    check(
+        "typed-from-non-iterable",
+        "try { Int8Array.from(5); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A BigInt typed array sorts by value, and maps back to a BigInt array.
+    check(
+        "typed-bigint-sort",
+        "var a = new BigInt64Array([3n, 1n, 2n]); a.sort(); \
+         return a[0] + \",\" + a[2] + \",\" + typeof a[0];",
+        "1,3,bigint",
+    );
+}
+
+/// The scattered built-in gaps (D-255…D-257): the `EvalError`/`URIError`/`AggregateError` error
+/// kinds, `Number.prototype.toExponential`/`toPrecision`, `DataView`'s BigInt accessors, and
+/// `String.prototype.matchAll`.
+#[test]
+fn the_remaining_built_in_methods_are_present() {
+    // Error kinds: name on the prototype, chained through Error, and AggregateError's `errors`.
+    check(
+        "eval-error",
+        "var e = new EvalError(\"x\"); return e.name + \",\" + e.message + \",\" + (e instanceof Error);",
+        "EvalError,x,true",
+    );
+    check(
+        "uri-error",
+        "return new URIError().name + \",\" + (new URIError() instanceof Error);",
+        "URIError,true",
+    );
+    check(
+        "aggregate-error",
+        "var a = new AggregateError([new Error(\"a\"), new TypeError(\"b\")], \"m\"); \
+         return a.name + \",\" + a.message + \",\" + a.errors.length + \",\" + a.errors[1].name;",
+        "AggregateError,m,2,TypeError",
+    );
+    // Number formatting.
+    check("to-precision", "return (123.456).toPrecision(4);", "123.5");
+    check(
+        "to-precision-exp",
+        "return (123.456).toPrecision(2);",
+        "1.2e+2",
+    );
+    check(
+        "to-precision-small",
+        "return (0.00001234).toPrecision(2);",
+        "0.000012",
+    );
+    check(
+        "to-precision-undef",
+        "return (12.34).toPrecision();",
+        "12.34",
+    );
+    check(
+        "to-exponential",
+        "return (12345).toExponential(2);",
+        "1.23e+4",
+    );
+    check(
+        "to-exponential-undef",
+        "return (12345).toExponential();",
+        "1.2345e+4",
+    );
+    check(
+        "to-exponential-neg",
+        "return (0.5).toExponential();",
+        "5e-1",
+    );
+    check(
+        "to-precision-range",
+        "try { (1).toPrecision(0); return 1; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // DataView BigInt accessors, including endianness.
+    check(
+        "dataview-bigint",
+        "var d = new DataView(new ArrayBuffer(16)); d.setBigInt64(0, -5n); \
+         d.setBigUint64(8, 18446744073709551615n); \
+         return d.getBigInt64(0) + \",\" + d.getBigUint64(8) + \",\" + typeof d.getBigInt64(0);",
+        "-5,18446744073709551615,bigint",
+    );
+    check(
+        "dataview-bigint-endian",
+        "var d = new DataView(new ArrayBuffer(8)); d.setBigInt64(0, 1n, true); \
+         return d.getBigInt64(0, true) + \",\" + (d.getBigInt64(0, false) === 1n);",
+        "1,false",
+    );
+    // matchAll: a real iterator over every match, with capture groups.
+    check(
+        "match-all",
+        "var out = []; \
+         for (var m of \"a1b2\".matchAll(/([a-z])(\\d)/g)) { out.push(m[1] + m[2]); } \
+         return out.join(\",\");",
+        "a1,b2",
+    );
+    check(
+        "match-all-spread",
+        "return [...\"xxx\".matchAll(/x/g)].length;",
+        "3",
+    );
+    check(
+        "match-all-non-global",
+        "try { \"a\".matchAll(/a/); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// The ES2024 `Set` combinators (D-258): `union`, `intersection`, `difference`,
+/// `symmetricDifference`, and the three predicates.
+#[test]
+fn sets_have_their_es2024_combinators() {
+    // A small harness: build a set, and read one back in sorted order for a stable comparison.
+    let prelude = "function mk(a) { var s = new Set(); for (var i = 0; i < a.length; i++) s.add(a[i]); return s; } \
+                   function srt(s) { var r = []; for (var x of s) r.push(x); r.sort(); return r.join(\"\"); } ";
+    check(
+        "set-union",
+        &format!(
+            "{prelude} return srt(mk([1, 2, 3]).union(mk([2, 3, 4]))) + \",\" + mk([1]).union(mk([2])).size;"
+        ),
+        "1234,2",
+    );
+    check(
+        "set-intersection",
+        &format!("{prelude} return srt(mk([1, 2, 3]).intersection(mk([2, 3, 4])));"),
+        "23",
+    );
+    check(
+        "set-difference",
+        &format!("{prelude} return srt(mk([1, 2, 3]).difference(mk([2, 3, 4])));"),
+        "1",
+    );
+    check(
+        "set-symmetric-difference",
+        &format!("{prelude} return srt(mk([1, 2, 3]).symmetricDifference(mk([2, 3, 4])));"),
+        "14",
+    );
+    check(
+        "set-predicates",
+        &format!(
+            "{prelude} var a = mk([1, 2, 3]); \
+             return mk([1, 2]).isSubsetOf(a) + \",\" + a.isSupersetOf(mk([1, 2])) + \",\" + \
+             a.isDisjointFrom(mk([9])) + \",\" + a.isDisjointFrom(mk([3]));"
+        ),
+        "true,true,true,false",
+    );
+    // The receiver is checked, and so is the argument.
+    check(
+        "set-union-on-non-set",
+        "try { Set.prototype.union.call([], new Set()); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "set-union-non-set-argument",
+        "try { new Set().union([1, 2]); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **A string method on `null`/`undefined` or a symbol is a `TypeError`.**
+///
+/// `ToString(RequireObjectCoercible(this))`: nullish fails the first step, a symbol the second.
+/// Answering `"undefined"` or empty instead read as a working call.
+#[test]
+fn a_string_method_requires_a_coercible_receiver() {
+    for method in [
+        "codePointAt",
+        "indexOf",
+        "includes",
+        "startsWith",
+        "endsWith",
+    ] {
+        check(
+            &format!("string-{method}-on-undefined"),
+            &format!(
+                "try {{ String.prototype.{method}.call(undefined); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("string-{method}-on-symbol"),
+            &format!(
+                "try {{ String.prototype.{method}.call(Symbol()); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A number receiver still coerces, which is the case the coercibility check must not break.
+    check(
+        "indexof-on-number",
+        "return String.prototype.indexOf.call(1234, \"3\");",
+        "2",
+    );
+}
+
+/// **`includes`/`startsWith`/`endsWith` take a position, and coerce it.**
+///
+/// `endsWith` measures a slice ending at its second argument; `includes`/`startsWith` start at
+/// theirs. A symbol there throws, like any index.
+#[test]
+fn the_search_methods_honour_their_position() {
+    check(
+        "endswith-at-position",
+        "return \"the future\".endsWith(\"future\", 10);",
+        "true",
+    );
+    check(
+        "endswith-short-of-position",
+        "return \"the future\".endsWith(\"the\", 3);",
+        "true",
+    );
+    check(
+        "endswith-wrong-position",
+        "return \"the future\".endsWith(\"future\", 3);",
+        "false",
+    );
+    check(
+        "startswith-at-position",
+        "return \"the future\".startsWith(\"future\", 4);",
+        "true",
+    );
+    check(
+        "includes-from-position",
+        "return \"abcabc\".includes(\"a\", 1);",
+        "true",
+    );
+    check(
+        "includes-past-position",
+        "return \"abc\".includes(\"a\", 1);",
+        "false",
+    );
+    check(
+        "includes-empty-needle",
+        "return \"abc\".includes(\"\");",
+        "true",
+    );
+    // A symbol position throws.
+    for method in ["includes", "startsWith", "endsWith"] {
+        check(
+            &format!("string-{method}-symbol-position"),
+            &format!(
+                "try {{ \"abc\".{method}(\"a\", Symbol()); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // The no-position cases still work.
+    check(
+        "startswith-plain",
+        "return \"abc\".startsWith(\"ab\");",
+        "true",
+    );
+    check("endswith-plain", "return \"abc\".endsWith(\"bc\");", "true");
+    check("includes-plain", "return \"abc\".includes(\"b\");", "true");
+}
+
+/// The rest of the string methods `RequireObjectCoercible` too — a sweep of the same fix as the
+/// six search methods, so a nullish or symbol receiver throws rather than reading as empty.
+#[test]
+fn every_string_method_requires_a_coercible_receiver() {
+    let methods = [
+        "charAt",
+        "at",
+        "slice",
+        "substring",
+        "substr",
+        "toUpperCase",
+        "toLowerCase",
+        "trim",
+        "trimStart",
+        "trimEnd",
+        "repeat",
+        "concat",
+        "split",
+    ];
+    for method in methods {
+        check(
+            &format!("string-sweep-{method}-on-undefined"),
+            &format!(
+                "try {{ String.prototype.{method}.call(undefined); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("string-sweep-{method}-on-symbol"),
+            &format!(
+                "try {{ String.prototype.{method}.call(Symbol()); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A number receiver still coerces through every one of them.
+    check(
+        "sweep-slice-on-number",
+        "return String.prototype.slice.call(12345, 1, 3);",
+        "23",
+    );
+    check(
+        "sweep-upper-on-boolean",
+        "return String.prototype.toUpperCase.call(true);",
+        "TRUE",
+    );
+}
+
+/// **A `Number.prototype` method needs a number receiver — `thisNumberValue`, not coercion.**
+///
+/// `Number.prototype.valueOf.call("5")` is a `TypeError`, not `5`; a string that happens to
+/// coerce to a number is still not a Number.
+#[test]
+fn a_number_method_requires_a_number_receiver() {
+    for method in ["toString", "valueOf", "toFixed"] {
+        check(
+            &format!("number-{method}-on-string"),
+            &format!(
+                "try {{ Number.prototype.{method}.call(\"5\"); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+        check(
+            &format!("number-{method}-on-object"),
+            &format!(
+                "try {{ Number.prototype.{method}.call({{}}); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A real number and a Number wrapper both work.
+    check(
+        "number-tostring-primitive",
+        "return (255).toString(16);",
+        "ff",
+    );
+    check("number-valueof-primitive", "return (42).valueOf();", "42");
+    check(
+        "number-tofixed-primitive",
+        "return (3.14159).toFixed(2);",
+        "3.14",
+    );
+    check(
+        "number-valueof-wrapper",
+        "return Number.prototype.valueOf.call(new Number(7));",
+        "7",
+    );
+}
+
+/// **`every`/`some`/`find` `ToObject` their receiver**, so a primitive is boxed: the callback's
+/// third argument is the object, and the length comes from it.
+#[test]
+fn a_quantifier_boxes_a_primitive_receiver() {
+    // `to_object` gives a string wrapper a real `length`, so the callback runs once per unit
+    // and sees an object as the array argument.
+    check(
+        "every-boxes-string-receiver",
+        "let count = 0; let obj_kind = \"\"; \
+         Array.prototype.every.call(\"abc\", function (v, i, obj) { \
+             count = count + 1; obj_kind = typeof obj; return true; }); \
+         return count + \":\" + obj_kind;",
+        "3:object",
+    );
+    check(
+        "some-boxes-string-receiver",
+        "return Array.prototype.some.call(\"x\", function (v, i, obj) { \
+             return typeof obj === \"object\"; });",
+        "true",
+    );
+    // A nullish receiver throws before anything runs.
+    for method in ["every", "some", "find", "findIndex", "findLast"] {
+        check(
+            &format!("{method}-on-undefined-throws"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(undefined, function () {{}}); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A real array still walks unchanged, and the callback still sees the array itself.
+    check(
+        "every-real-array-unchanged",
+        "return [1, 2, 3].every(function (x) { return x > 0; });",
+        "true",
+    );
+    check(
+        "find-real-array-sees-array",
+        "let a = [5]; return a.find(function (v, i, obj) { return obj === a; });",
+        "5",
+    );
+}
+
+/// `map`, `filter`, `forEach`, `reduce` and `reduceRight` `ToObject` their receiver too — the
+/// follow-up to D-228, completing the family.
+#[test]
+fn the_result_building_methods_box_their_receiver() {
+    // forEach over a boxed string runs once per code unit.
+    check(
+        "foreach-boxes-string",
+        "let n = 0; Array.prototype.forEach.call(\"ab\", function () { n = n + 1; }); return n;",
+        "2",
+    );
+    // map answers an array of the receiver's length; indices are real even where elements are not.
+    check(
+        "map-boxes-string",
+        "return Array.prototype.map.call(\"ab\", function (v, i) { return i; }).join(\",\");",
+        "0,1",
+    );
+    // reduce walks the boxed length.
+    check(
+        "reduce-boxes-string",
+        "return Array.prototype.reduce.call(\"abc\", function (acc) { return acc + 1; }, 0);",
+        "3",
+    );
+    // A nullish receiver throws for each of them, before the callback.
+    for method in ["map", "filter", "forEach", "reduce", "reduceRight"] {
+        check(
+            &format!("{method}-on-null-throws"),
+            &format!(
+                "try {{ Array.prototype.{method}.call(null, function () {{}}); return 1; }} \
+                 catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // Real arrays are unchanged, callback still sees the array itself.
+    check(
+        "map-real-array-unchanged",
+        "return [1, 2, 3].map(function (x) { return x * 2; }).join(\",\");",
+        "2,4,6",
+    );
+    check(
+        "foreach-real-array-sees-array",
+        "let a = [1]; let same = false; \
+         a.forEach(function (v, i, obj) { same = obj === a; }); return same;",
+        "true",
+    );
+}
+
+/// **`indexOf`/`lastIndexOf`: skip absent indices, compare with `===`, honour `fromIndex`.**
+///
+/// A hole is not `undefined`; the comparison is strict (so `NaN` is never found and `-0`
+/// equals `0`); and a string element compares by value, which `same_value`-on-bits got wrong.
+#[test]
+fn index_of_skips_holes_and_compares_strictly() {
+    // Basic.
+    check("indexof-basic", "return [1, 2, 3].indexOf(2);", "1");
+    check(
+        "lastindexof-basic",
+        "return [1, 2, 3, 2].lastIndexOf(2);",
+        "3",
+    );
+    check("indexof-absent", "return [1, 2, 3].indexOf(9);", "-1");
+    // **Strings compare by value**, which the old bit-compare missed.
+    check(
+        "indexof-string",
+        "return [\"a\", \"b\", \"c\"].indexOf(\"b\");",
+        "1",
+    );
+    check(
+        "lastindexof-string",
+        "return [\"a\", \"b\", \"a\"].lastIndexOf(\"a\");",
+        "2",
+    );
+    // Strict equality: NaN is never found, -0 equals 0.
+    check("indexof-nan", "return [NaN].indexOf(NaN);", "-1");
+    check("indexof-neg-zero", "return [-0].indexOf(0);", "0");
+    // An absent index is skipped, not read as undefined.
+    check(
+        "lastindexof-skips-hole",
+        "let o = {1: null, 2: undefined, length: 2}; \
+         return Array.prototype.lastIndexOf.call(o, undefined);",
+        "-1",
+    );
+    check(
+        "lastindexof-finds-present",
+        "let o = {1: null, 2: undefined, length: 2}; \
+         return Array.prototype.lastIndexOf.call(o, null);",
+        "1",
+    );
+    // fromIndex.
+    check("indexof-fromindex", "return [1, 2, 1].indexOf(1, 1);", "2");
+    check(
+        "indexof-fromindex-negative",
+        "return [1, 2, 3].indexOf(2, -2);",
+        "1",
+    );
+    check(
+        "lastindexof-fromindex",
+        "return [1, 2, 1].lastIndexOf(1, 1);",
+        "0",
+    );
+    check(
+        "indexof-fromindex-past-end",
+        "return [1, 2, 3].indexOf(1, 5);",
+        "-1",
+    );
+}
+
+/// `includes` is `indexOf`'s SameValueZero twin: it finds `NaN`, treats `-0` as `0`, compares
+/// strings by value, honours `fromIndex`, and reads a hole as `undefined` rather than skipping.
+#[test]
+fn includes_uses_same_value_zero() {
+    check("includes-basic", "return [1, 2, 3].includes(2);", "true");
+    check("includes-absent", "return [1, 2, 3].includes(9);", "false");
+    check(
+        "includes-string",
+        "return [\"a\", \"b\"].includes(\"b\");",
+        "true",
+    );
+    // Finds NaN, where indexOf does not.
+    check("includes-nan", "return [NaN].includes(NaN);", "true");
+    check("indexof-nan-not-found", "return [NaN].indexOf(NaN);", "-1");
+    // -0 equals 0.
+    check("includes-neg-zero", "return [0].includes(-0);", "true");
+    // fromIndex.
+    check(
+        "includes-fromindex",
+        "return [1, 2, 1].includes(1, 1);",
+        "true",
+    );
+    check(
+        "includes-fromindex-absent",
+        "return [1, 2, 3].includes(1, 1);",
+        "false",
+    );
+    check(
+        "includes-fromindex-negative",
+        "return [1, 2, 3].includes(1, -1);",
+        "false",
+    );
+}
+
+/// **Map and Set are iterable.** `keys`/`values`/`entries` return iterators, the collection
+/// itself is iterable (entries for a Map, values for a Set), and an iterator is its own
+/// iterable so `Array.from` and spread drain it.
+#[test]
+fn a_map_or_set_iterates() {
+    // Direct `next()` on each iterator kind.
+    check(
+        "map-values-next",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         let it = m.values(); return it.next().value + \",\" + it.next().value;",
+        "1,2",
+    );
+    check(
+        "map-keys-next",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         let it = m.keys(); return it.next().value + \",\" + it.next().value;",
+        "a,b",
+    );
+    check(
+        "map-entries-next",
+        "let m = new Map(); m.set(\"x\", 9); \
+         let e = m.entries().next().value; return e[0] + \":\" + e[1];",
+        "x:9",
+    );
+    // for-of over a Map yields [key, value] pairs (its default iterator is entries).
+    check(
+        "map-for-of",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         let s = \"\"; for (let e of m) { s = s + e[0] + e[1]; } return s;",
+        "a1b2",
+    );
+    // Array.from over an iterator (needs the iterator to be its own iterable).
+    check(
+        "array-from-map-keys",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); \
+         return Array.from(m.keys()).join(\",\");",
+        "a,b",
+    );
+    // Set: spread and for-of, deduplicated and in insertion order.
+    check(
+        "set-spread",
+        "let st = new Set(); st.add(1); st.add(2); st.add(1); return [...st].join(\",\");",
+        "1,2",
+    );
+    check(
+        "set-for-of",
+        "let st = new Set(); st.add(\"p\"); st.add(\"q\"); \
+         let out = \"\"; for (let v of st) { out = out + v; } return out;",
+        "pq",
+    );
+    // Set.entries yields [value, value].
+    check(
+        "set-entries",
+        "let st = new Set(); st.add(5); \
+         let e = st.entries().next().value; return e[0] + \",\" + e[1];",
+        "5,5",
+    );
+    // Receiver checks on the new methods.
+    check(
+        "map-keys-on-non-map",
+        "try { Map.prototype.keys.call({}); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "set-values-on-map",
+        "try { Set.prototype.values.call(new Map()); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+#[test]
+fn filter_keeps_what_the_callback_accepts() {
+    check(
+        "array-filter",
+        "let a = [1, 2, 3, 4]; let b = a.filter(function (x) { return x > 2; }); return b.length;",
+        "2",
+    );
+    check(
+        "array-filter-values",
+        "let a = [1, 2, 3, 4]; let b = a.filter(function (x) { return x > 2; }); return b[0];",
+        "3",
+    );
+}
+
+#[test]
+fn for_each_runs_for_its_effects() {
+    check(
+        "array-foreach",
+        "let total = 0; [1, 2, 3].forEach(function (x) { total = total + x; }); return total;",
+        "6",
+    );
+}
+
+/// **Without an initial value the first element is the seed**, not `undefined` — otherwise
+/// `[1, 2].reduce(add)` is `NaN` rather than `3`.
+#[test]
+fn reduce_seeds_from_the_first_element_when_given_no_initial_value() {
+    check(
+        "array-reduce",
+        "return [1, 2, 3].reduce(function (a, b) { return a + b; });",
+        "6",
+    );
+    check(
+        "array-reduce-seed",
+        "return [1, 2, 3].reduce(function (a, b) { return a + b; }, 10);",
+        "16",
+    );
+    // **Empty with no seed is a `TypeError`**, not `undefined`: there is no value to answer
+    // with, and inventing one makes the mistake quiet where the specification is loud.
+    check(
+        "array-reduce-empty-no-seed",
+        "try { [].reduce(function (a, b) { return a + b; }); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "array-reduce-empty-with-seed",
+        "return [].reduce(function (a, b) { return a + b; }, 7);",
+        "7",
+    );
+}
+
+/// The string methods that were simply missing, which is a `TypeError` rather than a wrong
+/// answer — and the largest single reason in the corpus report.
+#[test]
+fn the_remaining_string_methods_exist() {
+    // **`codePointAt` is what `charCodeAt` is not**: the whole character rather than half of
+    // a surrogate pair.
+    check("code-point-at", "return \"abc\".codePointAt(1);", "98");
+    check(
+        "code-point-at-astral",
+        "return \"\\u{1f4a9}\".codePointAt(0);",
+        "128169",
+    );
+    check(
+        "char-code-at-astral",
+        "return \"\\u{1f4a9}\".charCodeAt(0);",
+        "55357",
+    );
+    check(
+        "code-point-at-past-end",
+        "return \"a\".codePointAt(5);",
+        "undefined",
+    );
+    check(
+        "locale-compare-less",
+        "return \"a\".localeCompare(\"b\");",
+        "-1",
+    );
+    check(
+        "locale-compare-same",
+        "return \"a\".localeCompare(\"a\");",
+        "0",
+    );
+    check(
+        "locale-compare-more",
+        "return \"b\".localeCompare(\"a\");",
+        "1",
+    );
+    // **`substr`'s second argument is a count**, where `substring`'s is an end and `slice`'s
+    // is an end that may be negative. Three methods that look alike and disagree everywhere.
+    check("substr", "return \"abcdef\".substr(1, 3);", "bcd");
+    check(
+        "substr-negative-start",
+        "return \"abcdef\".substr(-2);",
+        "ef",
+    );
+    check("substr-no-count", "return \"abcdef\".substr(4);", "ef");
+    check(
+        "substring-differs",
+        "return \"abcdef\".substring(1, 3);",
+        "bc",
+    );
+    check("is-well-formed", "return \"ab\".isWellFormed();", "true");
+    check("to-well-formed", "return \"ab\".toWellFormed();", "ab");
+    check(
+        "to-locale-upper",
+        "return \"ab\".toLocaleUpperCase();",
+        "AB",
+    );
+}
+
+/// `Map.groupBy` and `Error.isError`.
+#[test]
+fn the_remaining_collection_and_error_statics_exist() {
+    // **The key is a value, not a name**, which is the whole difference from
+    // `Object.groupBy`: grouping by `1` and by `"1"` collides there and not here.
+    check(
+        "map-group-by",
+        "let m = Map.groupBy([1, 2, 3, 4], function (n) { return n % 2 === 0; }); \
+         return m.get(true).join(\",\") + \"|\" + m.get(false).join(\",\");",
+        "2,4|1,3",
+    );
+    check(
+        "map-group-by-keys-are-values",
+        "let m = Map.groupBy([1, \"1\"], function (v) { return v; }); return m.size;",
+        "2",
+    );
+    // **Not `instanceof`**: this reads the mark an error was made with, so a replaced
+    // prototype does not change the answer.
+    check(
+        "is-error-yes",
+        "return Error.isError(new TypeError(\"x\"));",
+        "true",
+    );
+    check("is-error-no", "return Error.isError({});", "false");
+    check("is-error-primitive", "return Error.isError(1);", "false");
+    check(
+        "is-error-reprototyped",
+        "let e = new Error(\"x\"); Object.setPrototypeOf(e, null); return Error.isError(e);",
+        "true",
+    );
+}
+
+/// **A getter is called on read; a data property holding a function is not.**
+///
+/// `{get x() { return 1; }}` was lowered as a property named `x` holding the function, so
+/// `o.x` answered the function and `o.x()` answered `1`. Nothing said so — which is the shape
+/// of failure D-59 exists to prevent, and it slipped through because the *parser* understood
+/// the syntax and the lowering quietly dropped what made it different.
+#[test]
+fn an_object_literal_can_define_an_accessor() {
+    check("literal-getter", "return ({get x() { return 1; }}).x;", "1");
+    check(
+        "literal-setter",
+        "let seen = 0; let o = {set x(v) { seen = v; }}; o.x = 7; return seen;",
+        "7",
+    );
+    // **One property with two functions on it**, not two properties — defining them
+    // separately would make the second replace the first.
+    check(
+        "literal-getter-and-setter",
+        "let held = 1;          let o = {get x() { return held; }, set x(v) { held = v * 2; }};          o.x = 5; return o.x;",
+        "10",
+    );
+    // A throw from a getter reaches the program, which is the whole reason a getter is not a
+    // stored value.
+    check(
+        "literal-getter-throws",
+        "let o = {get x() { throw new RangeError(\"x\"); }};          try { let n = o.x; return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // It reports as an accessor, which is what `getOwnPropertyDescriptor` is for.
+    check(
+        "literal-getter-descriptor",
+        "let d = Object.getOwnPropertyDescriptor({get x() { return 1; }}, \"x\");          return (typeof d.get) + \",\" + d.enumerable + \",\" + d.configurable;",
+        "function,true,true",
+    );
+    // A data property in the same literal is still a data property.
+    check(
+        "literal-mixed",
+        "let o = {a: 1, get b() { return 2; }}; return o.a + o.b;",
+        "3",
+    );
+}
+
+/// A class body's accessors are accessors too, and for the same reason.
+#[test]
+fn a_class_can_define_an_accessor() {
+    check(
+        "class-getter",
+        "class C { get x() { return 3; } } return new C().x;",
+        "3",
+    );
+    check(
+        "class-setter",
+        "class C { set x(v) { this.held = v; } }          let c = new C(); c.x = 4; return c.held;",
+        "4",
+    );
+    check(
+        "class-accessor-pair",
+        "class C { get x() { return this.h; } set x(v) { this.h = v + 1; } }          let c = new C(); c.x = 1; return c.x;",
+        "2",
+    );
+}
+
+/// **The array methods are generic over anything with a `length`.**
+///
+/// `Array.prototype.reverse.call({0: 1, 1: 2, length: 2})` reverses that object's properties.
+/// Reading `length` from a receiver that is not an array may also *throw*, and that has to
+/// reach the caller — a method that bailed out on the first line did neither, which is a
+/// silent no-op where the corpus expects work or an exception.
+#[test]
+fn the_array_methods_work_on_anything_with_a_length() {
+    check(
+        "generic-reverse",
+        "let o = {0: 1, 1: 2, 2: 3, length: 3}; Array.prototype.reverse.call(o); \
+         return o[0] + \",\" + o[1] + \",\" + o[2];",
+        "3,2,1",
+    );
+    check(
+        "generic-pop",
+        "let o = {0: 1, 1: 2, length: 2}; \
+         let taken = Array.prototype.pop.call(o); return taken + \",\" + o.length;",
+        "2,1",
+    );
+    check(
+        "generic-shift",
+        "let o = {0: 1, 1: 2, length: 2}; \
+         let taken = Array.prototype.shift.call(o); \
+         return taken + \",\" + o[0] + \",\" + o.length;",
+        "1,2,1",
+    );
+    check(
+        "generic-push",
+        "let o = {length: 0}; Array.prototype.push.call(o, \"a\"); \
+         return o[0] + \",\" + o.length;",
+        "a,1",
+    );
+    check(
+        "generic-unshift",
+        "let o = {0: \"b\", length: 1}; Array.prototype.unshift.call(o, \"a\"); \
+         return o[0] + o[1] + \",\" + o.length;",
+        "ab,2",
+    );
+    check(
+        "generic-fill",
+        "let o = {0: 1, 1: 2, length: 2}; Array.prototype.fill.call(o, 9); \
+         return o[0] + \",\" + o[1];",
+        "9,9",
+    );
+    check(
+        "generic-at",
+        "return Array.prototype.at.call({0: \"a\", 1: \"b\", length: 2}, -1);",
+        "b",
+    );
+    check(
+        "generic-reduce",
+        "return Array.prototype.reduce.call({0: 1, 1: 2, length: 2}, \
+             function (a, b) { return a + b; });",
+        "3",
+    );
+    check(
+        "generic-copy-within",
+        "let o = {0: 1, 1: 2, 2: 3, length: 3}; \
+         Array.prototype.copyWithin.call(o, 0, 1); \
+         return o[0] + \",\" + o[1] + \",\" + o[2];",
+        "2,3,3",
+    );
+    // **A `length` that throws reaches the caller** rather than becoming a quiet no-op.
+    check(
+        "generic-throwing-length",
+        "let o = {get length() { throw new RangeError(\"x\"); }}; \
+         try { Array.prototype.reverse.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // **A getter that throws stops the walk**, which is not politeness: `{length: 2 ** 53}`
+    // is two quadrillion positions, and a loop that swallows the throw is not slow but
+    // stuck. test262 reverses exactly this and expects the first step to reach the getter,
+    // which needs `ToLength`'s clamp rather than an array's.
+    check(
+        "generic-huge-length-throwing-getter",
+        "let o = {length: Math.pow(2, 53) + 2}; \
+         Object.defineProperty(o, \"9007199254740990\", \
+             {get: function () { throw new RangeError(\"stop\"); }}); \
+         try { Array.prototype.reverse.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "generic-symbol-length",
+        "let o = {length: Symbol()}; \
+         try { Array.prototype.fill.call(o, 1); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+#[test]
+fn push_appends_and_answers_the_new_length() {
+    check("array-push", "let a = [1]; a.push(2); return a[1];", "2");
+    check(
+        "array-push-length",
+        "let a = [1]; return a.push(2, 3);",
+        "3",
+    );
+}
+
+#[test]
+fn index_of_finds_an_element_or_reports_minus_one() {
+    check("array-indexof", "return [5, 6, 7].indexOf(6);", "1");
+    check(
+        "array-indexof-missing",
+        "return [5, 6, 7].indexOf(9);",
+        "-1",
+    );
+}
+
+/// The chained case, which is what "array methods" means in practice — and every intermediate
+/// array is a temporary nothing else holds.
+#[test]
+fn methods_chain() {
+    check(
+        "array-chain",
+        "return [1, 2, 3, 4] \
+           .filter(function (x) { return x > 1; }) \
+           .map(function (x) { return x * 10; }) \
+           .reduce(function (a, b) { return a + b; });",
+        "90",
+    );
+}
+
+// ---- hoisting and switch ----------------------------------------------------------------
+
+/// **A function declaration is usable above its own text.** Every test262 case depends on it —
+/// the suite's own `assert.js` defines helpers below the code that calls them.
+#[test]
+fn a_function_declaration_is_callable_before_it_appears() {
+    check(
+        "hoist-call-before",
+        "let r = f(); function f() { return 7; } return r;",
+        "7",
+    );
+}
+
+#[test]
+fn hoisting_works_inside_a_function_too() {
+    check(
+        "hoist-nested",
+        "function outer() { let r = inner(); function inner() { return 3; } return r; } return outer();",
+        "3",
+    );
+}
+
+#[test]
+fn a_switch_picks_the_matching_case() {
+    check(
+        "switch-match",
+        "let x = 2; let r = 0; switch (x) { case 1: r = 10; break; case 2: r = 20; break; } return r;",
+        "20",
+    );
+}
+
+/// **Cases fall through without `break`**, which is what makes a switch more than nested ifs.
+#[test]
+fn a_case_without_break_falls_through() {
+    check(
+        "switch-fallthrough",
+        "let r = 0; switch (1) { case 1: r = r + 1; case 2: r = r + 10; case 3: r = r + 100; } return r;",
+        "111",
+    );
+}
+
+#[test]
+fn break_stops_the_fall_through() {
+    check(
+        "switch-break",
+        "let r = 0; switch (1) { case 1: r = r + 1; break; case 2: r = r + 10; } return r;",
+        "1",
+    );
+}
+
+#[test]
+fn default_runs_when_nothing_matches() {
+    check(
+        "switch-default",
+        "let r = 0; switch (9) { case 1: r = 1; break; default: r = 5; } return r;",
+        "5",
+    );
+}
+
+/// **`default` is tested last but runs in its source position.** With a match it is skipped
+/// entirely; without one, control enters it and then falls through into what follows.
+#[test]
+fn default_before_a_case_still_falls_through_into_it() {
+    check(
+        "switch-default-first",
+        "let r = 0; switch (9) { default: r = r + 1; case 1: r = r + 10; } return r;",
+        "11",
+    );
+    check(
+        "switch-default-first-match",
+        "let r = 0; switch (1) { default: r = r + 1; case 1: r = r + 10; } return r;",
+        "10",
+    );
+}
+
+/// The discriminant is evaluated once, so `switch (f())` does not call `f` per case.
+#[test]
+fn the_discriminant_is_evaluated_once() {
+    check(
+        "switch-once",
+        "let calls = 0; let f = function () { calls = calls + 1; return 3; }; \
+         switch (f()) { case 1: break; case 2: break; case 3: break; } return calls;",
+        "1",
+    );
+}
+
+// ---- exceptions -------------------------------------------------------------------------
+
+#[test]
+fn a_thrown_value_is_caught() {
+    check(
+        "throw-catch",
+        "let r = 0; try { throw 5; } catch (e) { r = e; } return r;",
+        "5",
+    );
+}
+
+/// The point of propagation: a throw crosses a call boundary to reach the handler.
+#[test]
+fn a_throw_inside_a_call_reaches_the_callers_handler() {
+    check(
+        "throw-across-call",
+        "let f = function () { throw 7; }; let r = 0; try { f(); } catch (e) { r = e; } return r;",
+        "7",
+    );
+}
+
+#[test]
+fn a_throw_crosses_several_frames() {
+    check(
+        "throw-deep",
+        "let inner = function () { throw 3; }; \
+         let middle = function () { inner(); return 99; }; \
+         let outer = function () { middle(); return 98; }; \
+         let r = 0; try { outer(); } catch (e) { r = e; } return r;",
+        "3",
+    );
+}
+
+/// **Statements after a throwing call must not run.** A propagation that reached the handler
+/// but also continued would give the right caught value and the wrong everything else.
+#[test]
+fn nothing_after_a_throwing_call_runs() {
+    check(
+        "throw-skips-rest",
+        "let f = function () { throw 1; }; let r = 0; \
+         try { f(); r = 100; } catch (e) { r = r + 10; } return r;",
+        "10",
+    );
+}
+
+#[test]
+fn a_try_that_does_not_throw_skips_the_handler() {
+    check(
+        "try-no-throw",
+        "let r = 0; try { r = 1; } catch (e) { r = 2; } return r;",
+        "1",
+    );
+}
+
+#[test]
+fn a_caught_exception_can_be_an_object() {
+    check(
+        "throw-object",
+        "let r = 0; try { throw {code: 4}; } catch (e) { r = e.code; } return r;",
+        "4",
+    );
+}
+
+/// The handler is the *innermost* one, and an outer `try` is unaffected.
+#[test]
+fn nested_handlers_catch_at_the_innermost() {
+    check(
+        "throw-nested",
+        "let r = 0; \
+         try { try { throw 1; } catch (e) { r = r + 1; } r = r + 10; } catch (e) { r = r + 100; } \
+         return r;",
+        "11",
+    );
+}
+
+#[test]
+fn a_throw_from_a_catch_reaches_the_outer_handler() {
+    check(
+        "throw-rethrow",
+        "let r = 0; \
+         try { try { throw 1; } catch (e) { throw 2; } } catch (e) { r = e; } \
+         return r;",
+        "2",
+    );
+}
+
+/// A function *written inside* a `try` does not throw into that `try`'s handler.
+///
+/// The enclosing `catch` is reached by the **call**, not by the `throw` — which is why a
+/// function body must be lowered with no handler in scope. Lowered with one, its unwind block
+/// jumped to a `BlockId` belonging to the enclosing function; block numbering restarts per
+/// function, so that id named a real block *here* and the verifier saw nothing wrong. When it
+/// named the jumping block itself the result was `b .` — a program that spun instead of
+/// throwing, for ever (D-206).
+///
+/// Three cases because three stacks leaked, and only the first was reachable through a
+/// throw: the second calls the function from outside the `try` entirely, where the handler
+/// must not apply either, and the third is the same leak through a loop rather than a `try`.
+#[test]
+fn a_function_written_inside_a_try_has_no_handler_of_its_own() {
+    check(
+        "throw-in-function-defined-in-try",
+        "try { (function () { throw new RangeError(\"x\"); })(); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // Defined inside the `try`, called after it: there is no handler at all by then, so a
+    // lowering that kept one would jump into a finished construct.
+    check(
+        "throw-in-function-escaping-its-try",
+        "let f; try { f = function () { throw new RangeError(\"y\"); }; } catch (e) {} \
+         try { f(); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "throw-in-function-defined-in-a-loop",
+        "let f; for (let i = 0; i < 1; i = i + 1) { \
+             f = function () { throw new RangeError(\"z\"); }; } \
+         try { f(); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // The ordinary case in the same position, which is what says the handler was removed
+    // rather than the propagation broken.
+    check(
+        "no-throw-in-function-defined-in-try",
+        "try { return (function () { return \"ok\"; })(); } catch (e) { return \"caught\"; }",
+        "ok",
+    );
+}
+
+// ---- loops ------------------------------------------------------------------------------
+
+#[test]
+fn a_for_loop_runs_its_body_and_updates() {
+    check(
+        "for-sum",
+        "let t = 0; for (let i = 0; i < 4; i = i + 1) { t = t + i; } return t;",
+        "6",
+    );
+}
+
+/// **`continue` goes to the update, not the test.** Sharing a block for them makes this hang
+/// rather than answer wrongly, and only when a `continue` is present.
+#[test]
+fn continue_still_runs_the_update() {
+    check(
+        "for-continue",
+        "let t = 0; for (let i = 0; i < 4; i = i + 1) { if (i === 2) { continue; } t = t + i; } return t;",
+        "4",
+    );
+}
+
+#[test]
+fn break_leaves_a_loop() {
+    check(
+        "for-break",
+        "let t = 0; for (let i = 0; i < 10; i = i + 1) { if (i === 3) { break; } t = t + 1; } return t;",
+        "3",
+    );
+}
+
+#[test]
+fn a_while_loop_can_break_and_continue() {
+    check(
+        "while-break",
+        "let i = 0; let t = 0; while (true) { i = i + 1; if (i > 5) { break; } t = t + i; } return t;",
+        "15",
+    );
+}
+
+/// `do … while` runs its body before testing anything, which is the whole difference.
+#[test]
+fn a_do_while_runs_once_even_when_the_test_is_false() {
+    check(
+        "do-while-once",
+        "let t = 0; do { t = t + 1; } while (false); return t;",
+        "1",
+    );
+}
+
+#[test]
+fn a_loop_can_throw_out_of_itself() {
+    check(
+        "loop-throw",
+        "let r = 0; try { for (let i = 0; i < 10; i = i + 1) { if (i === 2) { throw i; } } } \
+         catch (e) { r = e; } return r;",
+        "2",
+    );
+}
+
+/// `instanceof` walks the prototype chain for the constructor's `prototype`.
+#[test]
+fn instanceof_recognises_an_instance_of_its_class() {
+    check(
+        "instanceof-true",
+        "class C { constructor() {} } let c = new C(); return c instanceof C;",
+        "true",
+    );
+}
+
+#[test]
+fn instanceof_rejects_an_unrelated_object_and_a_primitive() {
+    check(
+        "instanceof-other",
+        "class C { constructor() {} } class D { constructor() {} } \
+         let d = new D(); return d instanceof C;",
+        "false",
+    );
+    // `1 instanceof C` is `false`, not an error — a primitive has no chain to walk.
+    check(
+        "instanceof-primitive",
+        "class C { constructor() {} } return 1 instanceof C;",
+        "false",
+    );
+}
+
+// ---- strings ----------------------------------------------------------------------------
+
+#[test]
+fn a_string_literal_prints() {
+    check("string-literal", "return \"hello\";", "hello");
+}
+
+/// **Strings compare by their characters, not by identity.** Each literal allocates a fresh
+/// cell today, so an identity comparison would make this false.
+#[test]
+fn strings_compare_by_value() {
+    check("string-eq", "return \"a\" === \"a\";", "true");
+    check("string-ne", "return \"a\" === \"b\";", "false");
+    check(
+        "string-eq-built",
+        "let a = \"foo\"; let b = \"fo\" + \"o\"; return a === b;",
+        "true",
+    );
+}
+
+/// **`+` concatenates when either operand is a string**, and adds otherwise — `1 + "2"` is
+/// `"12"`, not `3`.
+#[test]
+fn plus_concatenates_with_a_string_operand() {
+    check("string-concat", "return \"a\" + \"b\";", "ab");
+    check("string-number-right", "return \"n=\" + 2;", "n=2");
+    check("string-number-left", "return 1 + \"2\";", "12");
+    check("number-plus-number", "return 1 + 2;", "3");
+}
+
+#[test]
+fn a_string_has_a_length() {
+    check("string-length", "return \"hello\".length;", "5");
+    check("string-length-empty", "return \"\".length;", "0");
+}
+
+#[test]
+fn a_string_can_be_a_property_value_and_an_element() {
+    check("string-in-object", "let o = {s: \"hi\"}; return o.s;", "hi");
+    check(
+        "string-in-array",
+        "let a = [\"x\", \"y\"]; return a[1];",
+        "y",
+    );
+}
+
+/// Strings allocate, so they are collected like anything else.
+#[test]
+fn strings_survive_a_collection() {
+    check(
+        "string-stress",
+        "let a = \"one\"; let b = \"two\"; let c = a + b; let o = {v: c}; return o.v;",
+        "onetwo",
+    );
+}
+
+// ---- unary operators on values of unknown type ------------------------------------------
+
+#[test]
+fn negation_coerces_before_negating() {
+    check("unary-negate", "let x = 3; return -x;", "-3");
+    check("unary-negate-string", "let s = \"4\"; return -s;", "-4");
+}
+
+#[test]
+fn unary_plus_is_to_number() {
+    check("unary-plus", "let s = \"5\"; return +s;", "5");
+}
+
+#[test]
+fn not_applies_to_boolean_conversion() {
+    check("unary-not-zero", "let x = 0; return !x;", "true");
+    check("unary-not-object", "let o = {}; return !o;", "false");
+}
+
+/// **`typeof null` is `"object"`** — a bug old enough to be part of the language — and a
+/// function reports `"function"` although it is an object, so neither can be read off the
+/// value's kind alone.
+#[test]
+fn typeof_reports_the_specified_names() {
+    check("typeof-number", "return typeof 1;", "number");
+    check("typeof-string", "return typeof \"a\";", "string");
+    check("typeof-boolean", "return typeof true;", "boolean");
+    check("typeof-undefined", "return typeof undefined;", "undefined");
+    check("typeof-null", "return typeof null;", "object");
+    check("typeof-object", "return typeof {};", "object");
+    check(
+        "typeof-function",
+        "let f = function () {}; return typeof f;",
+        "function",
+    );
+}
+
+/// The three things a bit comparison gets wrong, on values the lattice knows nothing about.
+#[test]
+fn strict_equality_on_unknown_values_follows_the_specification() {
+    // `NaN === NaN` is false, and two NaNs have identical bits.
+    check(
+        "eq-nan",
+        "let a = 0 / 0; let b = 0 / 0; return a === b;",
+        "false",
+    );
+    // `+0 === -0` is true, and their bits differ.
+    check(
+        "eq-zeroes",
+        "let a = 0; let b = -0; return a === b;",
+        "true",
+    );
+    // Different types are never equal, whatever the payloads.
+    check(
+        "eq-types",
+        "let a = 0; let b = \"0\"; return a === b;",
+        "false",
+    );
+}
+
+// ---- truthiness -------------------------------------------------------------------------
+
+/// **A branch is not a bit comparison against `true`.** Every truthy value that is not
+/// literally `true` would take the false path, so these all tested backwards.
+#[test]
+fn a_branch_on_a_non_boolean_follows_to_boolean() {
+    check("truthy-string", "if (\"a\") { return 1; } return 2;", "1");
+    check(
+        "truthy-empty-string",
+        "if (\"\") { return 1; } return 2;",
+        "2",
+    );
+    check("truthy-number", "if (3) { return 1; } return 2;", "1");
+    check("truthy-zero", "if (0) { return 1; } return 2;", "2");
+    check("truthy-object", "if ({}) { return 1; } return 2;", "1");
+    check(
+        "truthy-undefined",
+        "if (undefined) { return 1; } return 2;",
+        "2",
+    );
+    check("truthy-null", "if (null) { return 1; } return 2;", "2");
+}
+
+/// `||` and `&&` are branches too, and this is the shape that made every test262 error lose
+/// its message: `this.message = message || ""` assigned `""` whatever it was given.
+#[test]
+fn or_returns_the_first_truthy_operand() {
+    check("or-string", "let m = \"boom\"; return m || \"\";", "boom");
+    check(
+        "or-empty",
+        "let m = \"\"; return m || \"fallback\";",
+        "fallback",
+    );
+    check(
+        "or-undefined",
+        "let m = undefined; return m || \"fallback\";",
+        "fallback",
+    );
+    check(
+        "and-string",
+        "let m = \"boom\"; return m && \"second\";",
+        "second",
+    );
+    check("and-empty", "let m = \"\"; return m && \"second\";", "");
+}
+
+#[test]
+fn a_loop_condition_is_also_to_boolean() {
+    check(
+        "truthy-while",
+        "let n = 3; let t = 0; while (n) { t = t + n; n = n - 1; } return t;",
+        "6",
+    );
+}
+
+/// **Every function has a `prototype` object**, not only a class. `new f()` links an instance
+/// to it and `instanceof` looks for it, so a function without one answers `false` for an object
+/// its own constructor just made.
+#[test]
+fn a_plain_function_is_a_constructor_too() {
+    check(
+        "function-prototype",
+        "function E(m) { this.message = m; } let e = new E(\"boom\"); return e instanceof E;",
+        "true",
+    );
+    check(
+        "function-prototype-field",
+        "function E(m) { this.message = m; } return new E(\"boom\").message;",
+        "boom",
+    );
+    // The guard test262's own error class uses, which recursed forever without a prototype.
+    check(
+        "function-instanceof-guard",
+        "function E(m) { if (!(this instanceof E)) { return new E(m); } this.message = m || \"\"; } \
+         return new E(\"x\").message;",
+        "x",
+    );
+}
+
+// ---- globals ----------------------------------------------------------------------------
+
+/// **A name that resolves to no binding is a global, not a fresh local.** Reading it as a local
+/// is what made every builtin compare equal to `undefined`.
+#[test]
+fn a_missing_global_is_a_reference_error() {
+    check(
+        "global-missing",
+        "let r = 0; try { nosuchthing; } catch (e) { r = e.name; } return r;",
+        "ReferenceError",
+    );
+    check(
+        "global-missing-message",
+        "let r = 0; try { nosuchthing; } catch (e) { r = e.message; } return r;",
+        "nosuchthing is not defined",
+    );
+}
+
+#[test]
+fn the_error_constructors_exist_and_carry_their_name() {
+    check(
+        "global-typeerror",
+        "return new TypeError(\"x\").name;",
+        "TypeError",
+    );
+    check(
+        "global-typeerror-message",
+        "return new TypeError(\"x\").message;",
+        "x",
+    );
+    check(
+        "global-rangeerror",
+        "return new RangeError(\"y\").name;",
+        "RangeError",
+    );
+    // Each is the same code with a different binding, so they must not share a name.
+    check(
+        "global-distinct",
+        "return new TypeError(\"a\").name === new RangeError(\"b\").name;",
+        "false",
+    );
+}
+
+/// A thrown error is caught and read like any other object.
+#[test]
+fn a_constructed_error_can_be_thrown_and_caught() {
+    check(
+        "global-throw-error",
+        "let r = 0; try { throw new TypeError(\"bad\"); } catch (e) { r = e.message; } return r;",
+        "bad",
+    );
+}
+
+#[test]
+fn the_conversion_globals_work() {
+    check("global-string", "return String(12);", "12");
+    check("global-number", "return Number(\"7\");", "7");
+    check("global-number-empty", "return Number();", "0");
+    check("global-boolean", "return Boolean(\"\");", "false");
+}
+
+#[test]
+fn global_this_and_the_value_globals_resolve() {
+    check("global-undefined", "return undefined;", "undefined");
+    check("global-nan", "return NaN;", "NaN");
+    check("global-infinity", "return Infinity;", "Infinity");
+    check("global-this-exists", "return typeof globalThis;", "object");
+}
+
+// ---- Object and Array globals -----------------------------------------------------------
+
+#[test]
+fn object_keys_lists_own_properties() {
+    check(
+        "object-keys",
+        "let o = {a: 1, b: 2}; return Object.keys(o).length;",
+        "2",
+    );
+    check(
+        "object-keys-first",
+        "let o = {a: 1, b: 2}; return Object.keys(o)[0];",
+        "a",
+    );
+    check(
+        "object-values",
+        "let o = {a: 7}; return Object.values(o)[0];",
+        "7",
+    );
+}
+
+/// **Own, so the prototype chain is not walked** — which is the whole point, and why it cannot
+/// be written as a property read compared against `undefined`.
+#[test]
+fn has_own_does_not_see_inherited_properties() {
+    check(
+        "has-own-true",
+        "let o = {a: 1}; return Object.hasOwn(o, \"a\");",
+        "true",
+    );
+    check(
+        "has-own-false",
+        "let o = {a: 1}; return Object.hasOwn(o, \"b\");",
+        "false",
+    );
+    check(
+        "has-own-inherited",
+        "class C { constructor() {} m() {} } let c = new C(); return Object.hasOwn(c, \"m\");",
+        "false",
+    );
+}
+
+#[test]
+fn object_create_links_a_prototype() {
+    check(
+        "object-create",
+        "let base = {greet: 1}; let o = Object.create(base); return o.greet;",
+        "1",
+    );
+    check(
+        "object-get-prototype",
+        "let base = {}; let o = Object.create(base); return Object.getPrototypeOf(o) === base;",
+        "true",
+    );
+}
+
+#[test]
+fn object_assign_copies_own_properties() {
+    check(
+        "object-assign",
+        "let t = {}; Object.assign(t, {a: 1}, {b: 2}); return t.a + t.b;",
+        "3",
+    );
+}
+
+#[test]
+fn array_is_array_distinguishes_arrays_from_objects() {
+    check("is-array-true", "return Array.isArray([1]);", "true");
+    check("is-array-false", "return Array.isArray({});", "false");
+    check("is-array-primitive", "return Array.isArray(1);", "false");
+}
+
+/// `Array.prototype` must be the object arrays already inherit from, not a fresh one —
+/// otherwise `[].map === Array.prototype.map` is false.
+#[test]
+fn array_prototype_is_the_one_arrays_use() {
+    check(
+        "array-prototype-identity",
+        "return [].map === Array.prototype.map;",
+        "true",
+    );
+}
+
+#[test]
+fn the_namespace_globals_are_callable() {
+    check("object-call", "return typeof Object({});", "object");
+    check("object-typeof", "return typeof Object;", "function");
+    check("array-of", "return Array.of(1, 2, 3).length;", "3");
+}
+
+/// **Every declaration is bound before any body is lowered.** A function may call one declared
+/// further down the list — which is how test262 concatenates `assert.js` ahead of the `sta.js`
+/// that defines the error class it throws.
+#[test]
+fn a_function_can_call_one_declared_after_it() {
+    check(
+        "hoist-forward-reference",
+        "function first() { return second(); } function second() { return 4; } return first();",
+        "4",
+    );
+}
+
+// ---- TypeError where the specification requires it --------------------------------------
+
+/// **Reading a property of `null` or `undefined` throws.** Answering `undefined` makes
+/// `x.y.z` on a missing `x` fail two lines later carrying a value that looks like a legitimate
+/// absence.
+#[test]
+fn a_property_of_nothing_is_a_type_error() {
+    check(
+        "nullish-read",
+        "let r = 0; try { let x = null; x.y; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "nullish-read-undefined",
+        "let r = 0; try { let x = undefined; x.y; } catch (e) { r = e.message; } return r;",
+        "cannot read a property of undefined",
+    );
+    check(
+        "nullish-write",
+        "let r = 0; try { let x = null; x.y = 1; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "nullish-computed",
+        "let r = 0; try { let x = null; x[0]; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// The throw has to cross a call, which is what makes it more than a local check.
+#[test]
+fn a_type_error_propagates_out_of_a_call() {
+    check(
+        "nullish-across-call",
+        "let f = function (o) { return o.x; }; \
+         let r = 0; try { f(null); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// A property *chain* stops at the first failure rather than carrying `undefined` onwards.
+#[test]
+fn a_chain_stops_at_the_first_missing_link() {
+    check(
+        "nullish-chain",
+        "let o = {}; let r = 0; try { o.a.b; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+// ---- more array methods -----------------------------------------------------------------
+
+#[test]
+fn searching_methods_agree_with_the_specification() {
+    check("arr-lastindexof", "return [1, 2, 1].lastIndexOf(1);", "2");
+    check("arr-includes", "return [1, 2].includes(2);", "true");
+    // **`includes` finds NaN and `indexOf` does not** — SameValueZero against `===`.
+    check(
+        "arr-includes-nan",
+        "return [0 / 0].includes(0 / 0);",
+        "true",
+    );
+    check("arr-indexof-nan", "return [0 / 0].indexOf(0 / 0);", "-1");
+}
+
+#[test]
+fn join_uses_a_separator_and_skips_nothing_values() {
+    check("arr-join", "return [1, 2, 3].join(\"-\");", "1-2-3");
+    check("arr-join-default", "return [1, 2].join();", "1,2");
+    // `null` and `undefined` join as empty, not as their names.
+    check(
+        "arr-join-nullish",
+        "return [1, null, 2].join(\"-\");",
+        "1--2",
+    );
+}
+
+/// **A negative index counts from the end**, and past either end clamps.
+#[test]
+fn slice_handles_relative_indices() {
+    check(
+        "arr-slice",
+        "return [1, 2, 3, 4].slice(1, 3).join(\",\");",
+        "2,3",
+    );
+    check("arr-slice-negative", "return [1, 2, 3].slice(-1)[0];", "3");
+    check("arr-slice-all", "return [1, 2].slice().length;", "2");
+    check("arr-slice-past-end", "return [1, 2].slice(5).length;", "0");
+}
+
+/// **An array argument is spread and anything else appended whole.**
+#[test]
+fn concat_spreads_only_arrays() {
+    check("arr-concat-array", "return [1].concat([2, 3]).length;", "3");
+    check("arr-concat-value", "return [1].concat(2).length;", "2");
+}
+
+#[test]
+fn the_mutating_methods_change_the_array_in_place() {
+    check(
+        "arr-reverse",
+        "return [1, 2, 3].reverse().join(\",\");",
+        "3,2,1",
+    );
+    check(
+        "arr-pop",
+        "let a = [1, 2]; let x = a.pop(); return x + a.length;",
+        "3",
+    );
+    check(
+        "arr-shift",
+        "let a = [1, 2]; let x = a.shift(); return x + a.length;",
+        "2",
+    );
+    check(
+        "arr-unshift",
+        "let a = [2]; a.unshift(0, 1); return a.join(\",\");",
+        "0,1,2",
+    );
+    check("arr-pop-empty", "return [].pop();", "undefined");
+    check(
+        "arr-fill",
+        "return [1, 2, 3].fill(9, 1).join(\",\");",
+        "1,9,9",
+    );
+}
+
+/// **`find` answers `undefined` and `findIndex` answers `-1`** when nothing matches.
+#[test]
+fn find_and_find_index_differ_when_nothing_matches() {
+    check(
+        "arr-find",
+        "return [1, 5].find(function (x) { return x > 2; });",
+        "5",
+    );
+    check(
+        "arr-find-none",
+        "return [1].find(function (x) { return x > 2; });",
+        "undefined",
+    );
+    check(
+        "arr-findindex",
+        "return [1, 5].findIndex(function (x) { return x > 2; });",
+        "1",
+    );
+    check(
+        "arr-findindex-none",
+        "return [1].findIndex(function (x) { return x > 2; });",
+        "-1",
+    );
+}
+
+/// **Empty is `true` for `every` and `false` for `some`** — each stops on the opposite answer,
+/// and on an empty array neither ever stops.
+#[test]
+fn every_and_some_agree_on_the_empty_array() {
+    check(
+        "arr-every",
+        "return [2, 4].every(function (x) { return x > 1; });",
+        "true",
+    );
+    check(
+        "arr-every-false",
+        "return [2, 0].every(function (x) { return x > 1; });",
+        "false",
+    );
+    check(
+        "arr-some",
+        "return [0, 4].some(function (x) { return x > 1; });",
+        "true",
+    );
+    check(
+        "arr-every-empty",
+        "return [].every(function (x) { return false; });",
+        "true",
+    );
+    check(
+        "arr-some-empty",
+        "return [].some(function (x) { return true; });",
+        "false",
+    );
+}
+
+// ---- Function.prototype -----------------------------------------------------------------
+
+/// **`this` inside `call` is the function**, not its receiver — the receiver is the first
+/// argument. That inversion is the whole of what `call` does, and it is how test262 applies a
+/// method to a receiver the method was not written for.
+#[test]
+fn call_invokes_a_function_with_a_chosen_receiver() {
+    check(
+        "fn-call",
+        "let f = function () { return this.x; }; let o = {x: 5}; return f.call(o);",
+        "5",
+    );
+    check(
+        "fn-call-args",
+        "let f = function (a, b) { return a + b; }; return f.call(null, 2, 3);",
+        "5",
+    );
+    check(
+        "fn-call-method",
+        "return [1, 2, 3].indexOf.call([4, 5], 5);",
+        "1",
+    );
+}
+
+#[test]
+fn apply_takes_its_arguments_as_an_array() {
+    check(
+        "fn-apply",
+        "let f = function (a, b) { return a + b; }; return f.apply(null, [2, 3]);",
+        "5",
+    );
+    // `null` for the argument list means no arguments, which is not an error.
+    check(
+        "fn-apply-none",
+        "let f = function () { return 7; }; return f.apply(null, null);",
+        "7",
+    );
+}
+
+/// A method reached through `call` on a receiver it was not written for must not crash.
+#[test]
+fn a_method_applied_to_a_wrong_receiver_answers_rather_than_failing() {
+    // **`-1`, not `undefined`.** A boolean has no `length`, so the search runs over zero
+    // elements and reports not-found — which is what the specification says and what this
+    // answered only once the array methods learned to read a length from anything (D-157).
+    // The old expectation recorded the previous behaviour, not the required one.
+    check(
+        "fn-call-boolean",
+        "return Array.prototype.indexOf.call(true);",
+        "-1",
+    );
+}
+
+// ---- String.prototype -------------------------------------------------------------------
+
+/// **`length` counts UTF-16 code units**, which is what JavaScript counts — not bytes. An
+/// accented letter is one and an emoji is two.
+#[test]
+fn string_length_counts_code_units() {
+    check("str-len-ascii", "return \"hello\".length;", "5");
+    check("str-len-accent", "return \"é\".length;", "1");
+    check("str-len-emoji", "return \"😀\".length;", "2");
+}
+
+/// **Out of range is `""` for `charAt` and `NaN` for `charCodeAt`** — the pair disagree
+/// deliberately, so one implementation covering both would lose it.
+#[test]
+fn char_at_and_char_code_at_disagree_out_of_range() {
+    check("str-charat", "return \"abc\".charAt(1);", "b");
+    check("str-charat-oob", "return \"abc\".charAt(9);", "");
+    check("str-charcodeat", "return \"A\".charCodeAt(0);", "65");
+    check("str-charcodeat-oob", "return \"A\".charCodeAt(9);", "NaN");
+}
+
+#[test]
+fn the_searching_methods_work() {
+    check("str-indexof", "return \"hello\".indexOf(\"l\");", "2");
+    check(
+        "str-indexof-missing",
+        "return \"hello\".indexOf(\"z\");",
+        "-1",
+    );
+    check(
+        "str-lastindexof",
+        "return \"hello\".lastIndexOf(\"l\");",
+        "3",
+    );
+    check(
+        "str-includes",
+        "return \"hello\".includes(\"ell\");",
+        "true",
+    );
+    check(
+        "str-startswith",
+        "return \"hello\".startsWith(\"he\");",
+        "true",
+    );
+    check("str-endswith", "return \"hello\".endsWith(\"lo\");", "true");
+}
+
+/// **`substring` clamps a negative index to zero and swaps its arguments; `slice` counts from
+/// the end and does not.** Sharing an implementation gets both wrong.
+#[test]
+fn slice_and_substring_differ_on_negative_and_reversed_arguments() {
+    check("str-slice", "return \"hello\".slice(1, 3);", "el");
+    check("str-slice-negative", "return \"hello\".slice(-2);", "lo");
+    check("str-substring", "return \"hello\".substring(1, 3);", "el");
+    check(
+        "str-substring-negative",
+        "return \"hello\".substring(-2, 2);",
+        "he",
+    );
+    check(
+        "str-substring-swapped",
+        "return \"hello\".substring(3, 1);",
+        "el",
+    );
+}
+
+#[test]
+fn the_transforming_methods_work() {
+    check("str-upper", "return \"aB\".toUpperCase();", "AB");
+    check("str-lower", "return \"aB\".toLowerCase();", "ab");
+    check("str-trim", "return \"  x  \".trim();", "x");
+    check("str-concat", "return \"a\".concat(\"b\", \"c\");", "abc");
+    check("str-repeat", "return \"ab\".repeat(3);", "ababab");
+}
+
+/// A negative repeat count is a `RangeError`, not an empty string that reads as an answer.
+#[test]
+fn a_negative_repeat_count_is_a_range_error() {
+    check(
+        "str-repeat-negative",
+        "let r = 0; try { \"a\".repeat(-1); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
+
+/// **An empty separator splits into characters**, and no separator gives one element holding
+/// the whole string — not an empty array.
+#[test]
+fn split_handles_its_separator_cases() {
+    check("str-split", "return \"a,b,c\".split(\",\").length;", "3");
+    check("str-split-piece", "return \"a,b,c\".split(\",\")[1];", "b");
+    check("str-split-empty", "return \"abc\".split(\"\").length;", "3");
+    check("str-split-none", "return \"abc\".split().length;", "1");
+    // **A regular expression separator.** Without one, the pattern went through `ToString`
+    // and `"a1b".split(/[0-9]/)` looked for the literal text `/[0-9]/` — never there, so it
+    // answered the whole string and looked like a working call.
+    check(
+        "str-split-regexp",
+        "return \"a1b2c\".split(/[0-9]/).join(\"|\");",
+        "a|b|c",
+    );
+    // **The captures go into the result too**, which is what makes this five elements.
+    check(
+        "str-split-regexp-captures",
+        "return \"a1b\".split(/([0-9])/).join(\"|\");",
+        "a|1|b",
+    );
+    // A group that did not participate is `undefined`, not `""`.
+    check(
+        "str-split-regexp-absent-group",
+        "let out = \"ab\".split(/(x)|b/); return out.length + \":\" + (out[1] === undefined);",
+        "3:true",
+    );
+    check(
+        "str-split-regexp-empty",
+        "return \"ab\".split(/(?:)/).join(\"|\");",
+        "a|b",
+    );
+    check(
+        "str-split-regexp-no-match",
+        "return \"ab\".split(/x/).join(\"|\");",
+        "ab",
+    );
+    // An empty subject is decided by whether the pattern matches it, which the walk cannot
+    // say because it never runs.
+    check(
+        "str-split-empty-subject",
+        "return \"\".split(/x/).length;",
+        "1",
+    );
+    check(
+        "str-split-empty-subject-empty-pattern",
+        "return \"\".split(/(?:)/).length;",
+        "0",
+    );
+    // `limit` truncates, and zero is an empty array rather than everything.
+    check(
+        "str-split-limit",
+        "return \"a,b,c\".split(\",\", 2).join(\"|\");",
+        "a|b",
+    );
+    check(
+        "str-split-limit-zero",
+        "return \"a,b,c\".split(\",\", 0).length;",
+        "0",
+    );
+}
+
+/// A method reached through a variable, so the receiver is not a literal.
+#[test]
+fn string_methods_work_on_a_computed_receiver() {
+    check(
+        "str-method-variable",
+        "let s = \"a\" + \"bc\"; return s.toUpperCase();",
+        "ABC",
+    );
+}
+
+// ---- property descriptors ---------------------------------------------------------------
+
+/// **A defined property defaults to none of writable, enumerable or configurable** — the
+/// opposite of what assignment creates. That difference is the whole reason descriptors exist,
+/// and reusing the assignment default passes every test that does not check it.
+#[test]
+fn define_property_defaults_to_the_opposite_of_assignment() {
+    check(
+        "descriptor-assigned",
+        "let o = {}; o.x = 1; return Object.getOwnPropertyDescriptor(o, \"x\").writable;",
+        "true",
+    );
+    check(
+        "descriptor-defined",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         return Object.getOwnPropertyDescriptor(o, \"x\").writable;",
+        "false",
+    );
+    check(
+        "descriptor-value",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 7}); return o.x;",
+        "7",
+    );
+}
+
+/// **`Object.keys` sees only enumerable properties; `getOwnPropertyNames` sees all.** That is
+/// the difference which made them the same function until now.
+#[test]
+fn keys_and_own_names_differ_on_enumerability() {
+    check(
+        "descriptor-keys-hidden",
+        "let o = {a: 1}; Object.defineProperty(o, \"b\", {value: 2}); return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "descriptor-names-all",
+        "let o = {a: 1}; Object.defineProperty(o, \"b\", {value: 2}); \
+         return Object.getOwnPropertyNames(o).length;",
+        "2",
+    );
+    check(
+        "descriptor-enumerable-true",
+        "let o = {}; Object.defineProperty(o, \"b\", {value: 2, enumerable: true}); \
+         return Object.keys(o).length;",
+        "1",
+    );
+}
+
+/// **A write to a non-writable property is silently ignored**, not an error — outside strict
+/// mode, which is the only mode there is here.
+#[test]
+fn a_write_to_a_non_writable_property_is_ignored() {
+    check(
+        "descriptor-readonly",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); o.x = 9; return o.x;",
+        "1",
+    );
+    check(
+        "descriptor-writable",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, writable: true}); o.x = 9; return o.x;",
+        "9",
+    );
+}
+
+/// `defineProperty` redefines rather than assigns, so it writes past a **non-writable**
+/// property that an assignment could not — provided the property is still **configurable**.
+///
+/// This test used to define `{value: 1}` and then redefine it, which a reading of
+/// `defineProperty` alone makes look reasonable. It is not: a descriptor that says nothing
+/// about `configurable` creates a property that is not, and redefining one of those is a
+/// `TypeError` (D-164). The test was pinning what the engine did rather than what is required,
+/// and it took the check that makes `Object.freeze` hold to expose it.
+#[test]
+fn define_property_can_redefine_a_non_writable_property() {
+    check(
+        "descriptor-redefine",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
+         Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+    // Writable is not the same question as configurable: this one is non-writable throughout,
+    // and `defineProperty` still writes past it where an assignment would be ignored.
+    check(
+        "descriptor-redefine-unwritable",
+        "let o = {}; \
+         Object.defineProperty(o, \"x\", {value: 1, writable: false, configurable: true}); \
+         o.x = 9; Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+}
+
+/// **`undefined` for an absent property**, which is how a caller tells "not there" from
+/// "there and not writable".
+#[test]
+fn a_descriptor_for_a_missing_property_is_undefined() {
+    check(
+        "descriptor-missing",
+        "let o = {}; return Object.getOwnPropertyDescriptor(o, \"nope\");",
+        "undefined",
+    );
+}
+
+// ---- delete -----------------------------------------------------------------------------
+
+#[test]
+fn delete_removes_a_property() {
+    check(
+        "delete-prop",
+        "let o = {a: 1}; delete o.a; return o.a;",
+        "undefined",
+    );
+    check(
+        "delete-keys",
+        "let o = {a: 1, b: 2}; delete o.a; return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "delete-computed",
+        "let o = {a: 1}; delete o[\"a\"]; return o.a;",
+        "undefined",
+    );
+    // An index spelled as text names the element, so `delete a[\"0\"]` removes it — the same way
+    // the harness's `isConfigurable` deletes. This answered `true` without removing anything
+    // until the string spelling was resolved to the index, so the element stayed and
+    // `hasOwnProperty` still saw it.
+    check(
+        "delete-array-index-string",
+        "let a = [9]; delete a[\"0\"]; return a.hasOwnProperty(\"0\");",
+        "false",
+    );
+    check(
+        "delete-array-index-string-configurable",
+        "let a = [9]; let gone = delete a[\"0\"]; return gone && !a.hasOwnProperty(\"0\");",
+        "true",
+    );
+}
+
+/// **`delete` asks whether the property is gone afterwards, not whether it removed anything**,
+/// so one that was never there answers `true`.
+#[test]
+fn delete_answers_true_for_something_that_was_never_there() {
+    check("delete-absent", "let o = {}; return delete o.nope;", "true");
+    check(
+        "delete-present",
+        "let o = {a: 1}; return delete o.a;",
+        "true",
+    );
+}
+
+/// **A non-configurable property answers `false`** rather than throwing, outside strict mode.
+#[test]
+fn delete_refuses_a_non_configurable_property() {
+    check(
+        "delete-nonconfigurable",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); return delete o.x;",
+        "false",
+    );
+    check(
+        "delete-nonconfigurable-kept",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); delete o.x; return o.x;",
+        "1",
+    );
+    check(
+        "delete-configurable",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
+         return delete o.x;",
+        "true",
+    );
+}
+
+/// An `ArrayBuffer` and a typed array over it: a length, integer indices that read and write the
+/// buffer through the element codec, the per-kind conversions, the shared-buffer aliasing two
+/// views see, `BYTES_PER_ELEMENT`, and the `Symbol.toStringTag`.
+#[test]
+fn typed_arrays_view_a_buffer() {
+    check(
+        "ab-construct",
+        "let b = new ArrayBuffer(8); return 42;",
+        "42",
+    );
+    check(
+        "ta-construct",
+        "let a = new Float64Array(3); return 42;",
+        "42",
+    );
+    check("ta-length", "return new Float64Array(3).length;", "3");
+    check(
+        "ta-byte-length",
+        "return new Int32Array(4).byteLength;",
+        "16",
+    );
+    check(
+        "ab-byte-length",
+        "return new ArrayBuffer(8).byteLength;",
+        "8",
+    );
+    check(
+        "ta-get-set",
+        "let a = new Int8Array(2); a[0] = 5; return a[0];",
+        "5",
+    );
+    check(
+        "ta-unsigned-wrap",
+        "let a = new Uint8Array(1); a[0] = 256; return a[0];",
+        "0",
+    );
+    check(
+        "ta-signed-wrap",
+        "let a = new Int8Array(1); a[0] = 200; return a[0];",
+        "-56",
+    );
+    check(
+        "ta-clamped",
+        "let a = new Uint8ClampedArray(1); a[0] = 300; return a[0];",
+        "255",
+    );
+    check(
+        "ta-bytes-per-element",
+        "return Float64Array.BYTES_PER_ELEMENT;",
+        "8",
+    );
+    check(
+        "ta-out-of-range",
+        "let a = new Int8Array(1); return a[5];",
+        "undefined",
+    );
+    check(
+        "ta-over-buffer",
+        "let b = new ArrayBuffer(8); let a = new Float64Array(b); return a.length;",
+        "1",
+    );
+    check(
+        "ta-from-array",
+        "let a = new Int16Array([1, 2, 3]); return a[2];",
+        "3",
+    );
+    check(
+        "ta-shared-buffer",
+        "let b = new ArrayBuffer(4); let a = new Int32Array(b); let c = new Uint8Array(b); \
+         a[0] = 1; return c[0];",
+        "1",
+    );
+    check(
+        "ta-forEach",
+        "let s = 0; new Int8Array([1, 2, 3]).forEach(function (x) { s = s + x; }); return s;",
+        "6",
+    );
+    check(
+        "ta-tag",
+        "return Object.prototype.toString.call(new Int8Array(1));",
+        "[object Int8Array]",
+    );
+    // A length past what can be allocated is a RangeError, not an attempt to reserve petabytes
+    // that aborts the process.
+    check(
+        "ab-huge-throws",
+        "try { new ArrayBuffer(7881299347898368); return \"no\"; } \
+         catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+    check(
+        "ta-huge-throws",
+        "try { new Float64Array(9007199254740000); return \"no\"; } \
+         catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+}
+
+/// A `DataView` over an `ArrayBuffer`: reading and writing one value at an offset, the explicit
+/// byte order (big-endian by default), the sign and float codecs, a shared buffer another view
+/// sees, and a read past the end that is a `RangeError`.
+#[test]
+fn data_views_read_and_write_a_buffer() {
+    check(
+        "dv-byte-length",
+        "return new DataView(new ArrayBuffer(8)).byteLength;",
+        "8",
+    );
+    check(
+        "dv-int8-roundtrip",
+        "let d = new DataView(new ArrayBuffer(4)); d.setInt8(0, 5); return d.getInt8(0);",
+        "5",
+    );
+    check(
+        "dv-int8-signed",
+        "let d = new DataView(new ArrayBuffer(4)); d.setInt8(0, 200); return d.getInt8(0);",
+        "-56",
+    );
+    // 258 is 0x0102: big-endian writes the high byte first, little-endian the low byte.
+    check(
+        "dv-big-endian",
+        "let d = new DataView(new ArrayBuffer(2)); d.setInt16(0, 258); return d.getUint8(0);",
+        "1",
+    );
+    check(
+        "dv-little-endian",
+        "let d = new DataView(new ArrayBuffer(2)); d.setInt16(0, 258, true); return d.getUint8(0);",
+        "2",
+    );
+    check(
+        "dv-float64",
+        "let d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, 3.5); return d.getFloat64(0);",
+        "3.5",
+    );
+    check(
+        "dv-byte-offset",
+        "let b = new ArrayBuffer(8); let d = new DataView(b, 2); return d.byteOffset;",
+        "2",
+    );
+    check(
+        "dv-is-view",
+        "return ArrayBuffer.isView(new DataView(new ArrayBuffer(4)));",
+        "true",
+    );
+    check(
+        "dv-shares-buffer",
+        "let b = new ArrayBuffer(4); let d = new DataView(b); let a = new Uint8Array(b); \
+         d.setUint8(1, 42); return a[1];",
+        "42",
+    );
+    check(
+        "dv-out-of-range",
+        "let d = new DataView(new ArrayBuffer(2)); \
+         try { d.getInt32(0); return \"no\"; } catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+}
+
+/// `$262.detachArrayBuffer` transfers a buffer away: its `byteLength` and every view's `length`
+/// become zero, and reads come back `undefined`.
+#[test]
+fn detaching_a_buffer_empties_its_views() {
+    check(
+        "detach-buffer-byte-length",
+        "let ab = new ArrayBuffer(8); $262.detachArrayBuffer(ab); return ab.byteLength;",
+        "0",
+    );
+    check(
+        "detach-view-length",
+        "let ab = new ArrayBuffer(8); let ta = new Int8Array(ab); \
+         $262.detachArrayBuffer(ab); return ta.length;",
+        "0",
+    );
+    check(
+        "detach-view-read",
+        "let ab = new ArrayBuffer(8); let ta = new Int8Array(ab); ta[0] = 5; \
+         $262.detachArrayBuffer(ab); return ta[0];",
+        "undefined",
+    );
+    check(
+        "detach-is-view-still",
+        "let ta = new Int8Array(4); $262.detachArrayBuffer(ta.buffer); \
+         return ArrayBuffer.isView(ta);",
+        "true",
+    );
+}
+
+/// The `v` (unicodeSets) flag: it parses, reports itself, does set operations in a character class,
+/// and is mutually exclusive with `u`.
+#[test]
+fn regexp_v_flag_does_set_operations() {
+    check("v-flag-reported", "return /a/v.flags;", "v");
+    check("v-unicode-sets", "return /a/v.unicodeSets;", "true");
+    check("v-basic-match", "return /[\\d]/v.test(\"5\");", "true");
+    // `[[a-z]&&[aeiou]]` is the intersection — the vowels — so a consonant does not match.
+    check(
+        "v-set-intersection",
+        "let re = /[[a-z]&&[aeiou]]/v; return re.test(\"e\") && !re.test(\"z\");",
+        "true",
+    );
+    check(
+        "v-and-u-exclusive",
+        "try { new RegExp(\"a\", \"uv\"); return \"no\"; } \
+         catch (e) { return e instanceof SyntaxError; }",
+        "true",
+    );
+}
+
+/// `function*` and `yield`: a generator returns an object that steps lazily through `next`, drains
+/// through `for-of` and spread, carries a loop counter and parameters across suspensions, receives
+/// the value passed to `next`, and reports its return value as `done`.
+#[test]
+fn generators_yield_and_resume() {
+    check(
+        "gen-next-drive",
+        "function* g() { yield 1; yield 2; } let it = g(); \
+         let a = it.next(); let b = it.next(); let c = it.next(); \
+         return a.value + \",\" + a.done + \";\" + b.value + \",\" + b.done + \";\" + c.value + \",\" + c.done;",
+        "1,false;2,false;undefined,true",
+    );
+    check(
+        "gen-for-of",
+        "function* g() { yield 1; yield 2; yield 3; } \
+         let s = 0; for (const x of g()) { s = s + x; } return s;",
+        "6",
+    );
+    check(
+        "gen-spread",
+        "function* g() { yield 1; yield 2; } return [...g()].length;",
+        "2",
+    );
+    check(
+        "gen-return-value",
+        "function* g() { yield 1; return 9; } \
+         let it = g(); it.next(); let s = it.next(); return \"\" + s.value + s.done;",
+        "9true",
+    );
+    check(
+        "gen-sent-value",
+        "function* g() { let x = yield 1; return x + 10; } \
+         let it = g(); it.next(); return it.next(5).value;",
+        "15",
+    );
+    // The loop counter and the parameter both cross the suspensions — they live on the generator
+    // object, not in registers lost on return.
+    check(
+        "gen-loop-counter",
+        "function* range(n) { for (let i = 0; i < n; i = i + 1) { yield i; } } \
+         let s = 0; for (const x of range(4)) { s = s + x; } return s;",
+        "6",
+    );
+    check(
+        "gen-param-persists",
+        "function* g(a) { yield a; yield a; } let it = g(7); \
+         let x = it.next(); let y = it.next(); \
+         return x.value + \",\" + x.done + \";\" + y.value + \",\" + y.done;",
+        "7,false;7,false",
+    );
+}
+
+/// BigInt: literals of every base, `typeof`, the arithmetic and bitwise operators (including a
+/// value past `u64` to prove the precision is arbitrary), comparison and equality across types,
+/// truthiness, string coercion, and the `TypeError` that mixing with a Number raises.
+#[test]
+fn bigints_are_arbitrary_precision_integers() {
+    // Literals print with the trailing `n`, and `typeof` names them.
+    check("bigint-literal", "return 42n;", "42n");
+    check("bigint-typeof", "return typeof 1n;", "bigint");
+    check("bigint-hex", "return 0xFFn;", "255n");
+    check("bigint-binary", "return 0b1010n;", "10n");
+
+    // Arithmetic stays a BigInt; division truncates toward zero; remainder takes the dividend's
+    // sign, as it does for numbers.
+    check("bigint-add", "return 2n + 3n;", "5n");
+    check("bigint-sub", "return 10n - 3n;", "7n");
+    check("bigint-mul", "return 6n * 7n;", "42n");
+    check("bigint-div", "return 20n / 6n;", "3n");
+    check("bigint-rem", "return -20n % 6n;", "-2n");
+    check("bigint-pow", "return 2n ** 10n;", "1024n");
+    check("bigint-negate", "return -(5n);", "-5n");
+
+    // The value the whole re-encoding exists for: 2**64 does not fit in 64 bits, and a correct
+    // BigInt carries every digit.
+    check(
+        "bigint-past-u64",
+        "return 2n ** 64n;",
+        "18446744073709551616n",
+    );
+
+    // Bitwise on the full integers, two's-complement like the language specifies.
+    check("bigint-and", "return 12n & 10n;", "8n");
+    check("bigint-or", "return 12n | 10n;", "14n");
+    check("bigint-xor", "return 12n ^ 10n;", "6n");
+    check("bigint-shl", "return 5n << 2n;", "20n");
+    check("bigint-shr", "return 20n >> 2n;", "5n");
+
+    // Comparison works within BigInt and across to Number by mathematical value.
+    check("bigint-lt", "return 2n < 3n;", "true");
+    check("bigint-gt-cross", "return 5n > 2;", "true");
+    check("bigint-lt-frac", "return 2n < 1.5;", "false");
+
+    // `===` is same-type-and-value; `==` crosses to Number and numeric strings.
+    check("bigint-strict-eq", "return 1n === 1n;", "true");
+    check("bigint-strict-ne-number", "return 1n === 1;", "false");
+    check("bigint-loose-eq-number", "return 1n == 1;", "true");
+    check("bigint-loose-eq-string", "return 255n == \"255\";", "true");
+    check("bigint-loose-ne-frac", "return 1n == 1.5;", "false");
+
+    // `0n` is the only falsy BigInt.
+    check("bigint-falsy", "return 0n ? \"t\" : \"f\";", "f");
+    check("bigint-truthy", "return 5n ? \"t\" : \"f\";", "t");
+
+    // With a string `+` concatenates the decimal digits, no `n`; `String()` does the same.
+    check("bigint-concat", "return 1n + \"x\";", "1x");
+    check("bigint-tostring", "return String(255n);", "255");
+
+    // Mixing a BigInt with a Number in arithmetic is a TypeError, not a silent coercion.
+    check(
+        "bigint-mix-throws",
+        "try { return (1n + 1) + \"\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    // So is `+` (unary) on a BigInt.
+    check(
+        "bigint-unary-plus-throws",
+        "try { return +2n; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    // Dividing by `0n` is a RangeError.
+    check(
+        "bigint-div-zero-throws",
+        "try { return 1n / 0n; } catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+
+    // The `BigInt()` function coerces a number, a string and a boolean; it is not a constructor.
+    check("bigint-fn-number", "return BigInt(42);", "42n");
+    check("bigint-fn-string", "return BigInt(\"255\");", "255n");
+    check("bigint-fn-hex-string", "return BigInt(\"0xff\");", "255n");
+    check("bigint-fn-bool", "return BigInt(true);", "1n");
+    check("bigint-fn-typeof", "return typeof BigInt(1);", "bigint");
+    check("bigint-fn-roundtrip", "return BigInt(10) + 5n;", "15n");
+    check(
+        "bigint-fn-nonint-throws",
+        "try { return BigInt(1.5); } catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+    check(
+        "bigint-fn-bad-string-throws",
+        "try { return BigInt(\"x\"); } catch (e) { return e instanceof SyntaxError; }",
+        "true",
+    );
+    check(
+        "bigint-not-a-constructor",
+        "try { return new BigInt(1); } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+
+    // `asIntN`/`asUintN` wrap a BigInt into a fixed width, signed and unsigned.
+    check("bigint-asintn-wrap", "return BigInt.asIntN(8, 256n);", "0n");
+    check(
+        "bigint-asintn-signed",
+        "return BigInt.asIntN(8, 255n);",
+        "-1n",
+    );
+    check(
+        "bigint-asintn-min",
+        "return BigInt.asIntN(8, 128n);",
+        "-128n",
+    );
+    check(
+        "bigint-asintn-max",
+        "return BigInt.asIntN(8, 127n);",
+        "127n",
+    );
+    check(
+        "bigint-asuintn-wrap",
+        "return BigInt.asUintN(8, 256n);",
+        "0n",
+    );
+    check(
+        "bigint-asuintn-negative",
+        "return BigInt.asUintN(8, -1n);",
+        "255n",
+    );
+    check(
+        "bigint-asuintn-64",
+        "return BigInt.asUintN(64, -1n);",
+        "18446744073709551615n",
+    );
+
+    // Prototype methods: toString (default and with a radix), valueOf, and the TypeError a wrong
+    // receiver raises.
+    check("bigint-proto-tostring", "return (255n).toString();", "255");
+    check(
+        "bigint-proto-tostring-hex",
+        "return (255n).toString(16);",
+        "ff",
+    );
+    check(
+        "bigint-proto-tostring-bin",
+        "return (5n).toString(2);",
+        "101",
+    );
+    check("bigint-proto-valueof", "return (7n).valueOf() + 1n;", "8n");
+    check(
+        "bigint-proto-tostring-wrong-this",
+        "try { return BigInt.prototype.toString.call(5); } \
+         catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+
+    // BigInt64Array / BigUint64Array: elements are BigInts, not Numbers.
+    check(
+        "bigint64-store-load",
+        "let a = new BigInt64Array(3); a[0] = 5n; return a[0];",
+        "5n",
+    );
+    check(
+        "bigint64-zero-init",
+        "return new BigInt64Array(2)[0];",
+        "0n",
+    );
+    check(
+        "bigint64-from-array",
+        "let a = new BigInt64Array([10n, 20n, 30n]); return a[0] + a[1] + a[2];",
+        "60n",
+    );
+    check(
+        "bigint64-length",
+        "return new BigUint64Array([1n, 2n, 3n]).length;",
+        "3",
+    );
+    // Signed wraps to i64, unsigned to u64 — same stored bytes, different reads.
+    check(
+        "bigint64-signed-wrap",
+        "let a = new BigInt64Array(1); a[0] = 18446744073709551615n; return a[0];",
+        "-1n",
+    );
+    check(
+        "biguint64-unsigned-wrap",
+        "let a = new BigUint64Array(1); a[0] = -1n; return a[0];",
+        "18446744073709551615n",
+    );
+    // Writing a Number into a BigInt array is a TypeError (ToBigInt, not NumberToBigInt).
+    check(
+        "bigint64-number-store-throws",
+        "let a = new BigInt64Array(1); \
+         try { a[0] = 5; return \"no\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+}
+
+/// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults
+/// (taken only when the value is `undefined`), holes, nesting, a computed key, a string source,
+/// and the `TypeError` a nullish source raises.
+#[test]
+fn destructuring_declarations_bind_each_name() {
+    check(
+        "destr-object",
+        "let {a, b} = {a: 1, b: 2}; return a + b;",
+        "3",
+    );
+    check("destr-rename", "let {a: x} = {a: 5}; return x;", "5");
+    check("destr-default", "let {a = 7} = {}; return a;", "7");
+    check(
+        "destr-default-skipped",
+        "let {a = 7} = {a: 1}; return a;",
+        "1",
+    );
+    check(
+        "destr-object-nested",
+        "let {a: {b}} = {a: {b: 9}}; return b;",
+        "9",
+    );
+    check(
+        "destr-computed-key",
+        "let k = \"a\"; let {[k]: v} = {a: 3}; return v;",
+        "3",
+    );
+    check("destr-array", "let [a, b] = [1, 2]; return a + b;", "3");
+    check("destr-array-hole", "let [, b] = [1, 2]; return b;", "2");
+    check("destr-array-default", "let [a = 5] = []; return a;", "5");
+    check("destr-array-nested", "let [[a]] = [[8]]; return a;", "8");
+    check(
+        "destr-array-string",
+        "let [a, b] = \"hi\"; return a + b;",
+        "hi",
+    );
+    check(
+        "destr-array-over-read",
+        "let [a, b, c] = [1, 2]; return c;",
+        "undefined",
+    );
+    check(
+        "destr-mixed",
+        "let {a: [x, y]} = {a: [1, 2]}; return x + y;",
+        "3",
+    );
+    check("destr-var", "var {a} = {a: 4}; return a;", "4");
+    check(
+        "destr-null-throws",
+        "try { let {a} = null; return \"no\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    check(
+        "destr-for-of-array",
+        "let s = 0; for (const [a, b] of [[1, 2], [3, 4]]) { s = s + a + b; } return s;",
+        "10",
+    );
+    check(
+        "destr-for-of-object",
+        "let s = 0; for (const {x} of [{x: 1}, {x: 2}]) { s = s + x; } return s;",
+        "3",
+    );
+}
+
+/// `class B extends A`: `super(...)` in a derived constructor, an inherited method reached through
+/// the prototype chain, `super.m()` calling up with the current receiver, `instanceof` across the
+/// chain, and the implicit derived constructor that calls `super()`.
+#[test]
+fn subclasses_extend_and_call_super() {
+    check(
+        "extends-super-ctor",
+        "class A { constructor(x) { this.x = x; } } \
+         class B extends A { constructor(x) { super(x); } } \
+         return new B(5).x;",
+        "5",
+    );
+    check(
+        "extends-inherited-method",
+        "class A { m() { return 1; } } class B extends A { } return new B().m();",
+        "1",
+    );
+    check(
+        "extends-super-method",
+        "class A { m() { return 1; } } \
+         class B extends A { m() { return super.m() + 1; } } \
+         return new B().m();",
+        "2",
+    );
+    check(
+        "extends-instanceof",
+        "class A { } class B extends A { } return (new B() instanceof A) && (new B() instanceof B);",
+        "true",
+    );
+    check(
+        "extends-super-then-own-field",
+        "class A { constructor() { this.x = 10; } } \
+         class B extends A { constructor() { super(); this.y = this.x + 5; } } \
+         return new B().y;",
+        "15",
+    );
+    check(
+        "extends-implicit-ctor-runs-parent",
+        "class A { constructor() { this.tag = \"a\"; } } class B extends A { } return new B().tag;",
+        "a",
+    );
+}
+
+/// The shape still names the slot, so re-assigning must bring the property back.
+#[test]
+fn a_deleted_property_can_be_assigned_again() {
+    check(
+        "delete-revive",
+        "let o = {a: 1}; delete o.a; o.a = 2; return o.a;",
+        "2",
+    );
+    check(
+        "delete-revive-keys",
+        "let o = {a: 1}; delete o.a; o.a = 2; return Object.keys(o).length;",
+        "1",
+    );
+}
+
+/// **`delete` on anything that is not a property access is `true`** and does nothing.
+#[test]
+fn delete_of_a_non_property_is_true() {
+    check("delete-value", "return delete 1;", "true");
+}
+
+#[test]
+fn delete_on_an_array_element() {
+    check(
+        "delete-elem-last",
+        "let a = [1, 2]; delete a[1]; return a.length;",
+        "1",
+    );
+    check(
+        "delete-elem-middle",
+        "let a = [1, 2, 3]; delete a[1]; return a[1];",
+        "undefined",
+    );
+}
+
+/// A string key in computed access. This did nothing at all until strings could be spelled —
+/// a read answered `undefined` and a write was discarded, neither saying a word.
+#[test]
+fn a_string_key_reaches_the_same_property_a_name_does() {
+    check(
+        "string-key-write",
+        "let o = {}; o[\"a\"] = 5; return o.a;",
+        "5",
+    );
+    check("string-key-read", "let o = {a: 7}; return o[\"a\"];", "7");
+    check(
+        "string-key-computed",
+        "let o = {ab: 1}; let k = \"a\" + \"b\"; return o[k];",
+        "1",
+    );
+}
+
+// ---- for-in ------------------------------------------------------------------------------
+
+#[test]
+fn for_in_visits_every_enumerable_name() {
+    check(
+        "forin-count",
+        "let o = {a: 1, b: 2}; let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "2",
+    );
+    check(
+        "forin-names",
+        "let o = {a: 1, b: 2}; let s = \"\"; for (let k in o) { s = s + k; } return s;",
+        "ab",
+    );
+    check(
+        "forin-values",
+        "let o = {a: 1, b: 2}; let t = 0; for (let k in o) { t = t + o[k]; } return t;",
+        "3",
+    );
+}
+
+/// **Inherited enumerable properties are visited too**, which is what separates `for-in` from
+/// `Object.keys`.
+#[test]
+fn for_in_walks_the_prototype_chain() {
+    check(
+        "forin-inherited",
+        "let base = {a: 1}; let o = Object.create(base); o.b = 2; \
+         let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "2",
+    );
+    // A name found on the object shadows the same name further up, so it is visited once.
+    check(
+        "forin-shadowed",
+        "let base = {a: 1}; let o = Object.create(base); o.a = 2; \
+         let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "1",
+    );
+}
+
+/// A non-enumerable property is not visited — the same rule `Object.keys` follows.
+#[test]
+fn for_in_skips_non_enumerable_properties() {
+    check(
+        "forin-hidden",
+        "let o = {a: 1}; Object.defineProperty(o, \"b\", {value: 2}); \
+         let n = 0; for (let k in o) { n = n + 1; } return n;",
+        "1",
+    );
+}
+
+#[test]
+fn for_in_over_nothing_runs_zero_times() {
+    check(
+        "forin-empty",
+        "let n = 0; for (let k in {}) { n = n + 1; } return n;",
+        "0",
+    );
+    // `for (k in undefined)` runs zero times rather than throwing.
+    check(
+        "forin-undefined",
+        "let n = 0; for (let k in undefined) { n = n + 1; } return n;",
+        "0",
+    );
+}
+
+#[test]
+fn for_in_supports_break_and_continue() {
+    check(
+        "forin-break",
+        "let o = {a: 1, b: 2, c: 3}; let n = 0; \
+         for (let k in o) { if (k === \"b\") { break; } n = n + 1; } return n;",
+        "1",
+    );
+    check(
+        "forin-continue",
+        "let o = {a: 1, b: 2, c: 3}; let n = 0; \
+         for (let k in o) { if (k === \"b\") { continue; } n = n + 1; } return n;",
+        "2",
+    );
+}
+
+/// An array's indices are enumerable names, so `for-in` visits them as strings.
+#[test]
+fn for_in_over_an_array_visits_its_indices() {
+    check(
+        "forin-array",
+        "let a = [10, 20]; let s = \"\"; for (let k in a) { s = s + k; } return s;",
+        "01",
+    );
+}
+
+/// **`for (k in o)` assigns to an existing binding rather than declaring one**, so the last
+/// name visited is still there afterwards.
+#[test]
+fn for_in_can_assign_to_an_existing_variable() {
+    check(
+        "forin-assign",
+        "let k = \"\"; let o = {a: 1}; for (k in o) { } return k;",
+        "a",
+    );
+}
+
+// ---- computed property keys and template literals ------------------------------------------
+
+#[test]
+fn an_object_literal_can_have_a_computed_key() {
+    check(
+        "key-computed",
+        "let k = \"a\"; let o = {[k]: 5}; return o.a;",
+        "5",
+    );
+    check(
+        "key-expression",
+        "let o = {[\"a\" + \"b\"]: 5}; return o.ab;",
+        "5",
+    );
+    check(
+        "key-mixed",
+        "let k = \"b\"; let o = {a: 1, [k]: 2}; return o.a + o.b;",
+        "3",
+    );
+}
+
+/// A numeric key goes through the same path, so `{1: x}` and `o[1] = x` cannot disagree about
+/// what the name is.
+#[test]
+fn a_numeric_key_names_the_same_property_an_index_does() {
+    check("key-numeric", "let o = {1: 5}; return o[1];", "5");
+    check(
+        "key-numeric-name",
+        "let o = {1: 5}; return Object.keys(o)[0];",
+        "1",
+    );
+}
+
+/// **The first piece of a template is always a string**, so `` `${1}${2}` `` is `"12"` and not
+/// `3` — starting from the empty string rather than the first substitution is the whole of why.
+#[test]
+fn a_template_literal_concatenates_rather_than_adding() {
+    check("template-plain", "return `abc`;", "abc");
+    check("template-one", "let x = 5; return `a${x}b`;", "a5b");
+    check(
+        "template-leading",
+        "let x = 1; let y = 2; return `${x}${y}`;",
+        "12",
+    );
+    check("template-empty", "return `${1}`;", "1");
+}
+
+#[test]
+fn a_template_substitutes_any_expression() {
+    check("template-expression", "return `${1 + 2}`;", "3");
+    check(
+        "template-call",
+        "let f = function () { return 7; }; return `n=${f()}`;",
+        "n=7",
+    );
+    check(
+        "template-nested",
+        "let a = \"x\"; return `${`[${a}]`}`;",
+        "[x]",
+    );
+}
+
+// ---- for-of ------------------------------------------------------------------------------
+
+#[test]
+fn for_of_walks_an_array_by_value() {
+    check(
+        "forof-sum",
+        "let a = [1, 2, 3]; let t = 0; for (let x of a) { t = t + x; } return t;",
+        "6",
+    );
+    check(
+        "forof-empty",
+        "let n = 0; for (let x of []) { n = n + 1; } return n;",
+        "0",
+    );
+    check(
+        "forof-break",
+        "let t = 0; for (let x of [1, 2, 3]) { if (x === 2) { break; } t = t + x; } return t;",
+        "1",
+    );
+    check(
+        "forof-continue",
+        "let t = 0; for (let x of [1, 2, 3]) { if (x === 2) { continue; } t = t + x; } return t;",
+        "4",
+    );
+}
+
+/// **A string is walked by code point, not code unit** — `for (const c of "😀")` runs once
+/// where `"😀".length` is 2.
+#[test]
+fn for_of_walks_a_string_by_code_point() {
+    check(
+        "forof-string",
+        "let s = \"\"; for (let c of \"abc\") { s = s + c + \"-\"; } return s;",
+        "a-b-c-",
+    );
+    check(
+        "forof-emoji",
+        "let n = 0; for (let c of \"😀\") { n = n + 1; } return n;",
+        "1",
+    );
+}
+
+/// **Not the iterator protocol**: without `Symbol` there is no `Symbol.iterator` to look up, so
+/// anything that is not an array or a string raises — the error the protocol would give, for a
+/// different reason.
+#[test]
+fn for_of_over_a_non_iterable_raises() {
+    check(
+        "forof-object",
+        "let r = \"\"; try { for (let x of {a: 1}) { } } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "forof-number",
+        "let r = \"\"; try { for (let x of 5) { } } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// The array is indexed live rather than copied, so a change during the loop is seen.
+#[test]
+fn for_of_follows_an_array_that_changes() {
+    check(
+        "forof-live",
+        "let a = [1, 2, 3]; let n = 0; for (let x of a) { n = n + 1; if (n === 1) { a.pop(); } } \
+         return n;",
+        "2",
+    );
+}
+
+/// `for (x of a)` assigns to an existing binding rather than declaring one.
+#[test]
+fn for_of_can_assign_to_an_existing_variable() {
+    check(
+        "forof-assign",
+        "let x = 0; for (x of [1, 2]) { } return x;",
+        "2",
+    );
+}
+
+// ---- regular expressions ------------------------------------------------------------------
+
+#[test]
+fn a_regular_expression_literal_matches() {
+    check("re-test", "return /ab+/.test(\"xabbby\");", "true");
+    check("re-test-miss", "return /ab+/.test(\"xyz\");", "false");
+    check("re-flags-i", "return /AB/i.test(\"ab\");", "true");
+    check("re-flags-absent", "return /AB/.test(\"ab\");", "false");
+}
+
+#[test]
+fn a_regular_expression_reports_its_own_shape() {
+    check("re-source", "return /ab+/g.source;", "ab+");
+    check("re-flags", "return /ab+/gi.flags;", "gi");
+    check("re-global", "return /a/g.global;", "true");
+    check("re-not-global", "return /a/.global;", "false");
+    check("re-tostring", "return /ab+/gi.toString();", "/ab+/gi");
+}
+
+/// **`exec` answers `null`, not `undefined`**, which is what `m !== null` tests for.
+#[test]
+fn exec_returns_a_match_array_or_null() {
+    check("re-exec-null", "return /z/.exec(\"abc\");", "null");
+    check("re-exec-whole", "return /b./.exec(\"abcd\")[0];", "bc");
+    check("re-exec-index", "return /b./.exec(\"abcd\").index;", "1");
+    check("re-exec-input", "return /b./.exec(\"abcd\").input;", "abcd");
+}
+
+/// **A group that did not participate is `undefined`, not `""`.** The difference is visible
+/// only when the pattern makes a group optional, which is why it is tested directly.
+#[test]
+fn exec_distinguishes_a_missing_group_from_an_empty_one() {
+    check("re-group", "return /(a)(b)/.exec(\"ab\")[2];", "b");
+    check(
+        "re-group-absent",
+        "return /(a)|(z)/.exec(\"a\")[2];",
+        "undefined",
+    );
+    check(
+        "re-group-count",
+        "return /(a)(b)/.exec(\"ab\").length;",
+        "3",
+    );
+}
+
+/// **A date setter converts its arguments, and the conversion can throw.**
+///
+/// `to_number` answers `NaN` for an object without asking it anything, so
+/// `d.setDate({valueOf: () => 3})` set the date to `Invalid Date` — and a `valueOf` that
+/// threw was swallowed entirely.
+#[test]
+fn a_date_setter_converts_what_it_is_given() {
+    check(
+        "set-date-coerced",
+        "let d = new Date(0); d.setDate({valueOf: function () { return 3; }}); \
+         return d.getDate();",
+        "3",
+    );
+    check(
+        "set-time-coerced",
+        "let d = new Date(0); d.setTime(\"1000\"); return d.getTime();",
+        "1000",
+    );
+    check(
+        "set-full-year-coerced",
+        "let d = new Date(0); d.setFullYear(\"2020\"); return d.getFullYear();",
+        "2020",
+    );
+    check(
+        "set-date-throwing",
+        "let d = new Date(0); \
+         try { d.setDate({valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "set-date-symbol",
+        "let d = new Date(0); \
+         try { d.setDate(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // **The receiver is checked before a single argument is converted**, which is the
+    // specification's order and is observable.
+    check(
+        "set-date-checks-receiver-first",
+        "let touched = false; \
+         let o = {valueOf: function () { touched = true; return 1; }}; \
+         try { Date.prototype.setDate.call({}, o); } catch (e) {} \
+         return touched;",
+        "false",
+    );
+    // Every argument is converted, in order, before any is used.
+    check(
+        "set-hours-converts-all",
+        "let seen = \"\"; \
+         let mark = function (n) { return {valueOf: function () { seen = seen + n; return 1; }}; }; \
+         let d = new Date(0); d.setHours(mark(\"a\"), mark(\"b\"), mark(\"c\")); return seen;",
+        "abc",
+    );
+}
+
+/// **A symbol is a property key, including where a descriptor is involved.**
+///
+/// `Object.defineProperty(o, Symbol.iterator, …)` was a `TypeError` — on the one property a
+/// program is most likely to define that way — because the key went through `ToString`, which
+/// refuses a symbol. So did `getOwnPropertyDescriptor`, which meant a symbol-keyed property
+/// could be created by assignment and then not described.
+#[test]
+fn a_symbol_can_be_defined_and_described() {
+    check(
+        "define-symbol-key",
+        "let s = Symbol(\"k\"); let o = {};          Object.defineProperty(o, s, {value: 7, enumerable: true}); return o[s];",
+        "7",
+    );
+    check(
+        "describe-symbol-key",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 3;          let d = Object.getOwnPropertyDescriptor(o, s); return d.value + \",\" + d.writable;",
+        "3,true",
+    );
+    check(
+        "describe-absent-symbol-key",
+        "return Object.getOwnPropertyDescriptor({}, Symbol(\"k\"));",
+        "undefined",
+    );
+    // A well-known symbol is the case that actually comes up.
+    check(
+        "define-well-known-symbol-key",
+        "let o = {};          Object.defineProperty(o, Symbol.iterator, {value: function () { return 1; }});          return o[Symbol.iterator]();",
+        "1",
+    );
+    // **Two symbols with the same description are two properties**, which is the whole
+    // reason a key cannot be its text.
+    check(
+        "define-two-alike-symbols",
+        "let a = Symbol(\"k\"); let b = Symbol(\"k\"); let o = {};          Object.defineProperty(o, a, {value: 1});          Object.defineProperty(o, b, {value: 2});          return o[a] + \",\" + o[b];",
+        "1,2",
+    );
+    // A non-enumerable symbol property stays out of the string keys, as any other does.
+    check(
+        "symbol-key-not-in-keys",
+        "let s = Symbol(\"k\"); let o = {a: 1}; Object.defineProperty(o, s, {value: 2});          return Object.keys(o).join(\",\");",
+        "a",
+    );
+}
+
+/// **A string method asks the pattern, and the pattern asks `exec`.**
+///
+/// That is what the `Symbol.*` protocol is for: a subclass or a plain object that overrides
+/// either changes what every string method does. Doing the work in the string method skips
+/// both hooks and is indistinguishable from working until somebody overrides something.
+#[test]
+fn a_string_method_asks_the_pattern() {
+    check(
+        "symbol-match-exists",
+        "return typeof RegExp.prototype[Symbol.match];",
+        "function",
+    );
+    check(
+        "symbol-match-direct",
+        "return /b./[Symbol.match](\"abcd\")[0];",
+        "bc",
+    );
+    check(
+        "symbol-search-direct",
+        "return /c/[Symbol.search](\"abcd\");",
+        "2",
+    );
+    check(
+        "symbol-replace-direct",
+        "return /b/[Symbol.replace](\"abc\", \"X\");",
+        "aXc",
+    );
+    check(
+        "symbol-split-direct",
+        "return /,/[Symbol.split](\"a,b\").join(\"|\");",
+        "a|b",
+    );
+    // **The string method delegates**, so an object that is not a pattern at all answers for
+    // it.
+    check(
+        "match-delegates",
+        "let p = {}; p[Symbol.match] = function (s) { return \"saw \" + s; };          return \"abc\".match(p);",
+        "saw abc",
+    );
+    check(
+        "search-delegates",
+        "let p = {}; p[Symbol.search] = function () { return 42; };          return \"abc\".search(p);",
+        "42",
+    );
+    check(
+        "replace-delegates",
+        "let p = {source: \"x\", flags: \"\"};          p[Symbol.replace] = function (s, r) { return s + r; };          return \"abc\".replace(p, \"!\");",
+        "abc!",
+    );
+    check(
+        "split-delegates",
+        "let p = {source: \"x\", flags: \"\"};          p[Symbol.split] = function (s) { return [s, \"z\"]; };          return \"abc\".split(p).join(\"|\");",
+        "abc|z",
+    );
+    // **And the pattern asks `exec`**, which is the second hook and the one a subclass uses.
+    check(
+        "symbol-match-uses-exec",
+        "let r = /a/; r.exec = function () { return [\"replaced\"]; };          return r[Symbol.match](\"aaa\")[0];",
+        "replaced",
+    );
+    check(
+        "symbol-search-uses-exec",
+        "let r = /a/; r.exec = function () { return {index: 9}; };          return r[Symbol.search](\"aaa\");",
+        "9",
+    );
+    // A global match collects the text of every one, and `null` rather than an empty array.
+    check(
+        "symbol-match-global",
+        "return /[0-9]/g[Symbol.match](\"a1b2\").join(\",\");",
+        "1,2",
+    );
+    check(
+        "symbol-match-global-none",
+        "return /z/g[Symbol.match](\"ab\");",
+        "null",
+    );
+    // `search` puts `lastIndex` back, so asking twice answers twice the same.
+    check(
+        "symbol-search-restores-last-index",
+        "let r = /c/g; r.lastIndex = 3; let a = r[Symbol.search](\"abc\");          return a + \",\" + r.lastIndex;",
+        "2,3",
+    );
+}
+
+/// `String.prototype.match` and `String.prototype.search`.
+///
+/// **`match` answers two different shapes**: a global pattern gives the matched text and
+/// nothing else, a non-global one gives what `exec` gives. That is not a quirk to work around
+/// — a program written for one shape and handed the other reads `undefined` where it expected
+/// a group.
+#[test]
+fn a_string_can_be_matched_and_searched() {
+    check(
+        "string-match-whole",
+        "return \"abcd\".match(/b./)[0];",
+        "bc",
+    );
+    check(
+        "string-match-index",
+        "return \"abcd\".match(/b./).index;",
+        "1",
+    );
+    check(
+        "string-match-group",
+        "return \"ab\".match(/(a)(b)/)[2];",
+        "b",
+    );
+    check("string-match-none", "return \"abc\".match(/z/);", "null");
+    // Global: the text of every match, and `null` rather than an empty array when there is
+    // none — `if (s.match(/x/g))` is how a program asks, and `[]` is truthy.
+    check(
+        "string-match-global",
+        "return \"a1b2\".match(/[0-9]/g).join(\",\");",
+        "1,2",
+    );
+    check(
+        "string-match-global-none",
+        "return \"ab\".match(/[0-9]/g);",
+        "null",
+    );
+    // **A string argument is a pattern, not a literal**, which is the one thing about this
+    // that a reader coming from `indexOf` gets wrong.
+    check(
+        "string-match-a-string",
+        "return \"abc\".match(\".\")[0];",
+        "a",
+    );
+    check("string-search", "return \"abcd\".search(/c/);", "2");
+    check("string-search-none", "return \"abcd\".search(/z/);", "-1");
+    check(
+        "string-search-a-string",
+        "return \"a.c\".search(\"\\\\.\");",
+        "1",
+    );
+    // `search` does not move the cursor, so asking twice answers twice the same.
+    check(
+        "string-search-is-inert",
+        "let r = /c/g; let a = \"abc\".search(r); let b = \"abc\".search(r); \
+         return a + \",\" + b + \",\" + r.lastIndex;",
+        "2,2,0",
+    );
+}
+
+/// `lastIndex` is a property because a program may assign to it, and the compiled pattern is
+/// set from it rather than owning it.
+#[test]
+fn a_global_regular_expression_advances_last_index() {
+    check(
+        "re-lastindex",
+        "let r = /a/g; r.test(\"aa\"); return r.lastIndex;",
+        "1",
+    );
+    check(
+        "re-lastindex-assigned",
+        "let r = /a/g; r.lastIndex = 1; return r.exec(\"ba\").index;",
+        "1",
+    );
+    // A non-global pattern does not advance, so repeated calls agree.
+    check(
+        "re-lastindex-inert",
+        "let r = /a/; r.test(\"aa\"); return r.lastIndex;",
+        "0",
+    );
+}
+
+/// **The pattern is compiled when the literal is evaluated**, so an invalid one raises there
+/// rather than inside whatever later called `test`.
+#[test]
+fn an_invalid_pattern_raises_where_it_is_written() {
+    check(
+        "re-invalid",
+        "let r = \"\"; try { let bad = /(/; } catch (e) { r = e.name; } return r;",
+        "SyntaxError",
+    );
+}
+
+// ---- JSON --------------------------------------------------------------------------------
+
+#[test]
+fn json_round_trips_the_simple_shapes() {
+    check("json-number", "return JSON.stringify(1);", "1");
+    check("json-string", "return JSON.stringify(\"a\");", "\"a\"");
+    check("json-true", "return JSON.stringify(true);", "true");
+    check("json-null", "return JSON.stringify(null);", "null");
+    check("json-array", "return JSON.stringify([1, 2]);", "[1,2]");
+    check("json-object", "return JSON.stringify({a: 1});", "{\"a\":1}");
+}
+
+/// **`undefined` for a value JSON cannot spell** — not the string `"undefined"`.
+#[test]
+fn stringify_answers_undefined_for_what_json_cannot_spell() {
+    check(
+        "json-undefined",
+        "return JSON.stringify(undefined);",
+        "undefined",
+    );
+    check(
+        "json-function",
+        "return JSON.stringify(function () { return 1; });",
+        "undefined",
+    );
+}
+
+/// **An object drops a property JSON cannot spell; an array cannot.** An array would have to
+/// change its length to drop an element, so the same absence becomes `null` there and nothing
+/// at all in an object.
+#[test]
+fn an_absent_value_is_dropped_in_an_object_and_nulled_in_an_array() {
+    check(
+        "json-object-undefined",
+        "return JSON.stringify({a: undefined});",
+        "{}",
+    );
+    check(
+        "json-array-undefined",
+        "return JSON.stringify([undefined]);",
+        "[null]",
+    );
+    check(
+        "json-object-mixed",
+        "return JSON.stringify({a: 1, b: undefined});",
+        "{\"a\":1}",
+    );
+}
+
+/// **A non-finite number is `null`**: JSON has no spelling for `NaN` or an infinity, and
+/// refusing the whole document over one would be worse.
+#[test]
+fn a_non_finite_number_stringifies_as_null() {
+    check("json-nan", "return JSON.stringify(0 / 0);", "null");
+    check("json-infinity", "return JSON.stringify(1 / 0);", "null");
+}
+
+/// A structure containing itself raises rather than producing a truncated document.
+#[test]
+fn a_cycle_raises_rather_than_truncating() {
+    check(
+        "json-cycle",
+        "let r = \"\"; let a = {}; a.self = a; \
+         try { JSON.stringify(a); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+#[test]
+fn json_parse_builds_values_back() {
+    check("json-parse-number", "return JSON.parse(\"1\");", "1");
+    check(
+        "json-parse-object",
+        "return JSON.parse(\"{\\\"a\\\":7}\").a;",
+        "7",
+    );
+    check(
+        "json-parse-array",
+        "return JSON.parse(\"[1,2,3]\")[1];",
+        "2",
+    );
+    check(
+        "json-parse-nested",
+        "return JSON.parse(\"{\\\"a\\\":[1]}\").a[0];",
+        "1",
+    );
+    check("json-parse-null", "return JSON.parse(\"null\");", "null");
+}
+
+#[test]
+fn json_parse_raises_on_malformed_input() {
+    check(
+        "json-parse-bad",
+        "let r = \"\"; try { JSON.parse(\"{\"); } catch (e) { r = e.name; } return r;",
+        "SyntaxError",
+    );
+}
+
+#[test]
+fn json_round_trips_through_both_directions() {
+    check(
+        "json-roundtrip",
+        "let o = {a: 1, b: [2, 3]}; let back = JSON.parse(JSON.stringify(o)); return back.b[1];",
+        "3",
+    );
+}
+
+// ---- constructors reach the prototypes their instances use ---------------------------------
+
+/// Each constructor's `prototype` is the object its instances already inherit from, not a new
+/// one — otherwise `[].map === Array.prototype.map` would be false.
+#[test]
+fn a_constructor_prototype_is_the_one_instances_inherit() {
+    // As above: the identity is preceded by a check that there is anything to identify.
+    check(
+        "proto-exists",
+        "return typeof Array.prototype.map;",
+        "function",
+    );
+    check(
+        "proto-array",
+        "return [].map === Array.prototype.map;",
+        "true",
+    );
+    check(
+        "proto-string",
+        "return \"\".trim === String.prototype.trim;",
+        "true",
+    );
+    check(
+        "proto-regexp",
+        "return /a/.test === RegExp.prototype.test;",
+        "true",
+    );
+    check(
+        "proto-function",
+        "let f = function () { return 1; }; return f.call === Function.prototype.call;",
+        "true",
+    );
+}
+
+/// **`Function` is bound so `Function.prototype` can be reached**, not because
+/// `new Function(body)` works — that compiles source at runtime, which this engine does not do,
+/// so calling it raises rather than answering something wrong.
+#[test]
+fn the_function_constructor_raises_rather_than_pretending() {
+    check(
+        "function-ctor",
+        "let r = \"\"; try { Function(\"return 1\"); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+#[test]
+fn the_regexp_constructor_builds_the_same_thing_a_literal_does() {
+    check(
+        "regexp-ctor",
+        "return new RegExp(\"ab+\").test(\"abb\");",
+        "true",
+    );
+    check(
+        "regexp-ctor-flags",
+        "return new RegExp(\"AB\", \"i\").test(\"ab\");",
+        "true",
+    );
+    check(
+        "regexp-ctor-source",
+        "return new RegExp(\"a+\").source;",
+        "a+",
+    );
+    // An existing regular expression is re-read through `source`, so this copies the pattern
+    // rather than stringifying the object into `"/a/g"`.
+    check("regexp-ctor-copy", "return new RegExp(/a+/g).source;", "a+");
+    check(
+        "regexp-ctor-copy-flags",
+        "return new RegExp(/a+/g).flags;",
+        "g",
+    );
+}
+
+// ---- Date --------------------------------------------------------------------------------
+
+/// **No arguments is now, one is a time value, and more are calendar fields.** The three are
+/// different enough that the argument count is the whole of the dispatch.
+#[test]
+fn a_date_can_be_built_three_ways() {
+    check("date-from-ms", "return new Date(0).getTime();", "0");
+    check(
+        "date-from-ms-value",
+        "return new Date(86400000).getTime();",
+        "86400000",
+    );
+    check(
+        "date-from-fields",
+        "return new Date(2020, 0, 1).getFullYear();",
+        "2020",
+    );
+    // `Date.now()` is a moving target, so this asserts only that it is in this century.
+    check(
+        "date-now-plausible",
+        "return Date.now() > 1600000000000;",
+        "true",
+    );
+}
+
+/// **`getMonth` is 0-based and `getDate` is 1-based.** They disagree deliberately, so a single
+/// field reader would get one of them wrong.
+#[test]
+fn the_calendar_fields_disagree_about_where_they_start() {
+    check(
+        "date-month",
+        "return new Date(2020, 5, 15).getMonth();",
+        "5",
+    );
+    check("date-day", "return new Date(2020, 5, 15).getDate();", "15");
+    check(
+        "date-year",
+        "return new Date(2020, 5, 15).getFullYear();",
+        "2020",
+    );
+    // Sunday is 0. 2020-06-15 was a Monday.
+    check(
+        "date-weekday",
+        "return new Date(2020, 5, 15).getDay();",
+        "1",
+    );
+}
+
+#[test]
+fn the_clock_fields_read_back() {
+    check(
+        "date-hours",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getHours();",
+        "13",
+    );
+    check(
+        "date-minutes",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getMinutes();",
+        "24",
+    );
+    check(
+        "date-seconds",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getSeconds();",
+        "35",
+    );
+    check(
+        "date-ms",
+        "return new Date(2020, 0, 1, 13, 24, 35, 678).getMilliseconds();",
+        "678",
+    );
+}
+
+/// **The local-time methods are the UTC ones**: there is no timezone database here, so the two
+/// are the same function and `getTimezoneOffset` answers `0` to stay consistent with them.
+#[test]
+fn local_and_utc_agree_because_the_offset_is_always_zero() {
+    check(
+        "date-utc-hours",
+        "let d = new Date(0); return d.getHours() === d.getUTCHours();",
+        "true",
+    );
+    check(
+        "date-offset",
+        "return new Date(0).getTimezoneOffset();",
+        "0",
+    );
+}
+
+#[test]
+fn a_date_prints_as_iso_text() {
+    check(
+        "date-iso",
+        "return new Date(0).toISOString();",
+        "1970-01-01T00:00:00.000Z",
+    );
+    check(
+        "date-iso-value",
+        "return new Date(2020, 0, 2, 3, 4, 5).toISOString();",
+        "2020-01-02T03:04:05.000Z",
+    );
+}
+
+/// **`toString` is not the ISO form**, which is what it used to answer.
+///
+/// They are different methods with different spellings and different failure modes, and a
+/// `toString` printing `1970-01-01T00:00:00.000Z` made `String(date)` disagree with every
+/// engine a program was written against — `Date.parse(String(d))` included.
+#[test]
+fn a_date_prints_the_forms_the_specification_names() {
+    check(
+        "date-to-string",
+        "return new Date(0).toString();",
+        "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)",
+    );
+    check(
+        "date-to-utc-string",
+        "return new Date(0).toUTCString();",
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+    );
+    check(
+        "date-to-date-string",
+        "return new Date(2020, 0, 2, 3, 4, 5).toDateString();",
+        "Thu Jan 02 2020",
+    );
+    check(
+        "date-to-time-string",
+        "return new Date(2020, 0, 2, 3, 4, 5).toTimeString();",
+        "03:04:05 GMT+0000 (Coordinated Universal Time)",
+    );
+    // The day names are a table, and a table is exactly the kind of thing that is right for
+    // one entry and wrong for the next.
+    check(
+        "date-day-names",
+        "let out = []; \
+         for (let i = 0; i < 7; i = i + 1) { \
+             out.push(new Date(i * 86400000).toUTCString().slice(0, 3)); } \
+         return out.join(\",\");",
+        "Thu,Fri,Sat,Sun,Mon,Tue,Wed",
+    );
+    check(
+        "date-month-names",
+        "let out = []; \
+         for (let i = 0; i < 12; i = i + 1) { \
+             out.push(new Date(Date.UTC(2020, i, 1)).toUTCString().slice(8, 11)); } \
+         return out.join(\",\");",
+        "Jan,Feb,Mar,Apr,May,Jun,Jul,Aug,Sep,Oct,Nov,Dec",
+    );
+    // An invalid date prints rather than raising, from every one of them.
+    check(
+        "date-invalid-utc-string",
+        "return new Date(0 / 0).toUTCString();",
+        "Invalid Date",
+    );
+}
+
+/// **An invalid date raises from `toISOString` and prints as text from `toString`.** The first
+/// has no spelling for one and the second does.
+#[test]
+fn an_invalid_date_answers_differently_to_each_printer() {
+    check(
+        "date-invalid-time",
+        "return new Date(0 / 0).getTime();",
+        "NaN",
+    );
+    check(
+        "date-invalid-field",
+        "return new Date(0 / 0).getFullYear();",
+        "NaN",
+    );
+    check(
+        "date-invalid-text",
+        "return new Date(0 / 0).toString();",
+        "Invalid Date",
+    );
+    check(
+        "date-invalid-iso",
+        "let r = \"\"; try { new Date(0 / 0).toISOString(); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
+
+/// The time value is kept where enumeration cannot see it, because the specification puts it
+/// in an internal slot and this engine has nowhere to put one.
+#[test]
+fn a_dates_time_value_is_not_enumerable() {
+    check("date-keys", "return Object.keys(new Date(0)).length;", "0");
+    check(
+        "date-forin",
+        "let n = 0; for (let k in new Date(0)) { n = n + 1; } return n;",
+        "0",
+    );
+}
+
+#[test]
+fn a_date_stringifies_through_json() {
+    check(
+        "date-tojson",
+        "return new Date(0).toJSON();",
+        "1970-01-01T00:00:00.000Z",
+    );
+}
+
+// ---- built-ins know their own names --------------------------------------------------------
+
+/// **A function knows its own name**, and it is not enumerable. The name was in the table that
+/// created every built-in and was simply never written down on it.
+#[test]
+fn a_built_in_carries_its_name() {
+    check("name-method", "return [].forEach.name;", "forEach");
+    check("name-string", "return \"\".trim.name;", "trim");
+    check("name-nested", "return Object.keys.name;", "keys");
+    check("name-hidden", "return Object.keys([].forEach).length;", "0");
+}
+
+/// A program cannot assign to `f.name` but can redefine it, which is what non-writable and
+/// configurable means together.
+#[test]
+fn a_name_resists_assignment_but_not_redefinition() {
+    check(
+        "name-assign",
+        "let f = [].forEach; f.name = \"other\"; return f.name;",
+        "forEach",
+    );
+    check(
+        "name-redefine",
+        "let f = [].forEach; Object.defineProperty(f, \"name\", {value: \"other\"}); return f.name;",
+        "other",
+    );
+}
+
+// ---- more array methods --------------------------------------------------------------------
+
+/// **`reduceRight` is not `reduce` over a reversed list**: the callback still gets each
+/// element's real index, so reversing first would hand it the wrong ones.
+#[test]
+fn reduce_right_walks_backwards_with_real_indices() {
+    check(
+        "reduceright",
+        "return [\"a\", \"b\", \"c\"].reduceRight(function (t, x) { return t + x; });",
+        "cba",
+    );
+    check(
+        "reduceright-index",
+        "return [1, 2].reduceRight(function (t, x, i) { return t + i; }, 0);",
+        "1",
+    );
+    check(
+        "reduceright-initial",
+        "return [1, 2, 3].reduceRight(function (t, x) { return t + x; }, 10);",
+        "16",
+    );
+}
+
+/// An empty array with no initial value has no answer to give, so it raises rather than
+/// inventing one.
+#[test]
+fn reduce_right_on_an_empty_array_raises() {
+    check(
+        "reduceright-empty",
+        "let r = \"\"; try { [].reduceRight(function (t, x) { return t; }); } \
+         catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// **`flat` goes one level by default**, not all of them.
+#[test]
+fn flat_takes_a_depth() {
+    check("flat-default", "return [1, [2, 3]].flat().length;", "3");
+    check("flat-one-level", "return [1, [2, [3]]].flat().length;", "3");
+    check("flat-deep", "return [1, [2, [3]]].flat(2).length;", "3");
+    check("flat-deep-value", "return [[1, [2]]].flat(2)[1];", "2");
+    check("flat-zero", "return [1, [2]].flat(0).length;", "2");
+}
+
+/// `flatMap` flattens exactly one level, always — it takes no depth.
+#[test]
+fn flat_map_maps_then_flattens_once() {
+    check(
+        "flatmap",
+        "return [1, 2].flatMap(function (x) { return [x, x]; }).length;",
+        "4",
+    );
+    check(
+        "flatmap-nested",
+        "return [1].flatMap(function (x) { return [[x]]; })[0].length;",
+        "1",
+    );
+}
+
+/// **`at` counts a negative index from the end and answers `undefined` out of range**, which
+/// is what separates it from indexing.
+#[test]
+fn at_accepts_a_negative_index() {
+    check("at-positive", "return [1, 2, 3].at(1);", "2");
+    check("at-negative", "return [1, 2, 3].at(-1);", "3");
+    check("at-out-of-range", "return [1, 2].at(5);", "undefined");
+    check("at-string", "return \"abc\".at(-1);", "c");
+    // `charAt` answers `""` where `at` answers `undefined` — the pair differ on purpose.
+    check("at-vs-charat", "return \"abc\".charAt(9);", "");
+    check("at-string-oob", "return \"abc\".at(9);", "undefined");
+}
+
+#[test]
+fn find_last_walks_backwards() {
+    check(
+        "findlast",
+        "return [1, 5, 2, 5].findLast(function (x) { return x === 5; });",
+        "5",
+    );
+    check(
+        "findlastindex",
+        "return [1, 5, 2, 5].findLastIndex(function (x) { return x === 5; });",
+        "3",
+    );
+    check(
+        "findlastindex-none",
+        "return [1].findLastIndex(function (x) { return x === 9; });",
+        "-1",
+    );
+}
+
+// ---- more string methods ---------------------------------------------------------------
+
+#[test]
+fn trim_can_take_one_side() {
+    check("trimstart", "return \"  a  \".trimStart() + \"|\";", "a  |");
+    check("trimend", "return \"|\" + \"  a  \".trimEnd();", "|  a");
+}
+
+/// **An empty filler pads nothing** — answering the original rather than looping is the whole
+/// reason that case is checked.
+#[test]
+fn padding_fills_to_a_length() {
+    check("padstart", "return \"5\".padStart(3, \"0\");", "005");
+    check("padend", "return \"5\".padEnd(3, \"0\");", "500");
+    // Anchored with a sentinel: `execute` trims the program's output, so an expectation that
+    // begins or ends with a space can never match however correct the code is.
+    check(
+        "padstart-default",
+        "return \"|\" + \"a\".padStart(3);",
+        "|  a",
+    );
+    check(
+        "padstart-short",
+        "return \"abcd\".padStart(2, \"0\");",
+        "abcd",
+    );
+    check(
+        "padstart-empty-filler",
+        "return \"a\".padStart(5, \"\");",
+        "a",
+    );
+    check(
+        "padstart-truncated",
+        "return \"a\".padStart(4, \"xy\");",
+        "xyxa",
+    );
+}
+
+/// **A string pattern replaces the first occurrence and a global regular expression replaces
+/// every one**, so the pattern's flags decide rather than the method name.
+#[test]
+fn replace_follows_the_patterns_own_flags() {
+    check(
+        "replace-string",
+        "return \"aaa\".replace(\"a\", \"b\");",
+        "baa",
+    );
+    check(
+        "replaceall-string",
+        "return \"aaa\".replaceAll(\"a\", \"b\");",
+        "bbb",
+    );
+    check(
+        "replace-regexp",
+        "return \"aaa\".replace(/a/, \"b\");",
+        "baa",
+    );
+    check(
+        "replace-regexp-global",
+        "return \"aaa\".replace(/a/g, \"b\");",
+        "bbb",
+    );
+}
+
+/// **A replacement may be a function**, and calling it is not an optimisation: a string
+/// replacement cannot see a group as a value, so `s.replace(/(\d+)/, n => n * 2)` has no other
+/// spelling. Stringifying the function, which is what happened before, substituted its own
+/// source text into the result.
+#[test]
+fn a_replacement_can_be_a_function() {
+    check(
+        "replace-function",
+        "return \"abc\".replace(/b/, function (m) { return m.toUpperCase(); });",
+        "aBc",
+    );
+    check(
+        "replace-function-groups",
+        "return \"a1b2\".replace(/([a-z])([0-9])/g, \
+             function (m, one, two) { return two + one; });",
+        "1a2b",
+    );
+    // `(matched, …groups, position, whole)` — the last two are what a replacement uses to
+    // look at its surroundings.
+    check(
+        "replace-function-position",
+        "return \"abc\".replace(/b/, function (m, at, whole) { return at + whole.length; });",
+        "a4c",
+    );
+    check(
+        "replace-function-every-match",
+        "let n = 0; \"aaa\".replace(/a/g, function () { n = n + 1; return n; }); return n;",
+        "3",
+    );
+    // A string pattern takes one too.
+    check(
+        "replace-string-function",
+        "return \"abc\".replace(\"b\", function (m) { return \"[\" + m + \"]\"; });",
+        "a[b]c",
+    );
+    // A throw from the replacement reaches the program rather than becoming part of the text.
+    check(
+        "replace-function-throws",
+        "try { \"abc\".replace(/b/, function () { throw new RangeError(\"x\"); }); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
+/// The `$` patterns a string replacement may use.
+///
+/// **`$` is not an escape for the next character**: `$x` is two literal characters and `$&` is
+/// the match, so a replacement built by concatenating user text produces either by accident.
+/// That is the language's design rather than something to smooth over, which is why `$x` is
+/// tested as carefully as `$&`.
+#[test]
+fn a_string_replacement_expands_its_dollar_patterns() {
+    check(
+        "replace-dollar-match",
+        "return \"abc\".replace(/b/, \"[$&]\");",
+        "a[b]c",
+    );
+    check(
+        "replace-dollar-dollar",
+        "return \"abc\".replace(/b/, \"$$\");",
+        "a$c",
+    );
+    check(
+        "replace-dollar-group",
+        "return \"a1\".replace(/([a-z])([0-9])/, \"$2$1\");",
+        "1a",
+    );
+    check(
+        "replace-dollar-before-and-after",
+        "return \"abc\".replace(/b/, \"<$`|$'>\");",
+        "a<a|c>c",
+    );
+    // A group nobody has stays as it was written, and so does any other character.
+    check(
+        "replace-dollar-missing-group",
+        "return \"abc\".replace(/b/, \"$9\");",
+        "a$9c",
+    );
+    check(
+        "replace-dollar-literal",
+        "return \"abc\".replace(/b/, \"$x\");",
+        "a$xc",
+    );
+    // **Two digits are tried before one**, so this is group one followed by `2` where there
+    // is only one group.
+    check(
+        "replace-dollar-two-digits",
+        "return \"a\".replace(/(a)/, \"$12\");",
+        "a2",
+    );
+}
+
+/// `replaceAll` with a non-global pattern raises rather than quietly behaving like `replace`.
+#[test]
+fn replace_all_refuses_a_non_global_pattern() {
+    check(
+        "replaceall-nonglobal",
+        "let r = \"\"; try { \"aa\".replaceAll(/a/, \"b\"); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+// ---- Object.prototype and bind -----------------------------------------------------------
+
+/// **Own means own**: a property found on the prototype answers `false`, which is the whole
+/// reason `hasOwnProperty` exists rather than `key in object`.
+#[test]
+fn has_own_property_does_not_look_up_the_chain() {
+    check(
+        "hasown-yes",
+        "return ({a: 1}).hasOwnProperty(\"a\");",
+        "true",
+    );
+    check(
+        "hasown-no",
+        "return ({a: 1}).hasOwnProperty(\"b\");",
+        "false",
+    );
+    check(
+        "hasown-inherited",
+        "let base = {a: 1}; let o = Object.create(base); return o.hasOwnProperty(\"a\");",
+        "false",
+    );
+    check(
+        "hasown-array-index",
+        "return [1, 2].hasOwnProperty(0);",
+        "true",
+    );
+    check(
+        "hasown-array-past",
+        "return [1, 2].hasOwnProperty(5);",
+        "false",
+    );
+}
+
+#[test]
+fn property_is_enumerable_follows_the_descriptor() {
+    check(
+        "enumerable-yes",
+        "return ({a: 1}).propertyIsEnumerable(\"a\");",
+        "true",
+    );
+    check(
+        "enumerable-no",
+        "let o = {}; Object.defineProperty(o, \"b\", {value: 1}); \
+         return o.propertyIsEnumerable(\"b\");",
+        "false",
+    );
+    // A built-in method is not enumerable either.
+    check(
+        "enumerable-builtin",
+        "return Array.prototype.propertyIsEnumerable(\"map\");",
+        "false",
+    );
+}
+
+/// The `typeof` check is not padding. **Two undefineds are equal**, so an identity test on its
+/// own passes just as well when neither side exists — which is exactly what this did before
+/// `Object.prototype`'s methods were reachable at all.
+#[test]
+fn every_object_reaches_object_prototype() {
+    check(
+        "chain-exists",
+        "return typeof Object.prototype.hasOwnProperty;",
+        "function",
+    );
+    check(
+        "chain-plain",
+        "return ({}).hasOwnProperty === Object.prototype.hasOwnProperty;",
+        "true",
+    );
+    // Through one object rather than a copy per prototype, so an array finds the same function.
+    check(
+        "chain-array",
+        "return [].hasOwnProperty === Object.prototype.hasOwnProperty;",
+        "true",
+    );
+    check(
+        "chain-isprototypeof",
+        "return Object.prototype.isPrototypeOf({});",
+        "true",
+    );
+    check(
+        "chain-isprototypeof-no",
+        "return ({}).isPrototypeOf({});",
+        "false",
+    );
+}
+
+/// **`Symbol.toStringTag` overrides the builtin tag**, now that a symbol can be a key (D-233).
+#[test]
+fn object_to_string_reports_a_tag() {
+    check(
+        "tag-object",
+        "return Object.prototype.toString.call({});",
+        "[object Object]",
+    );
+    check(
+        "tag-array",
+        "return Object.prototype.toString.call([]);",
+        "[object Array]",
+    );
+    check(
+        "tag-null",
+        "return Object.prototype.toString.call(null);",
+        "[object Null]",
+    );
+    check(
+        "tag-undefined",
+        "return Object.prototype.toString.call(undefined);",
+        "[object Undefined]",
+    );
+    check(
+        "tag-number-primitive",
+        "return Object.prototype.toString.call(5);",
+        "[object Number]",
+    );
+    // The namespaces carry a `Symbol.toStringTag`.
+    check(
+        "tag-math",
+        "return Object.prototype.toString.call(Math);",
+        "[object Math]",
+    );
+    check(
+        "tag-json",
+        "return Object.prototype.toString.call(JSON);",
+        "[object JSON]",
+    );
+    // A program's own tag wins over the builtin one.
+    check(
+        "tag-custom",
+        "let o = {}; o[Symbol.toStringTag] = \"Cool\"; \
+         return Object.prototype.toString.call(o);",
+        "[object Cool]",
+    );
+    // A non-string tag falls back to the builtin.
+    check(
+        "tag-non-string-ignored",
+        "let o = {}; o[Symbol.toStringTag] = 42; \
+         return Object.prototype.toString.call(o);",
+        "[object Object]",
+    );
+    // A throwing tag getter propagates.
+    check(
+        "tag-getter-throws",
+        "let o = {}; Object.defineProperty(o, Symbol.toStringTag, \
+             {get: function () { throw new RangeError(\"x\"); }}); \
+         try { Object.prototype.toString.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
+/// `RegExp.escape(str)` — a string that matches itself literally as a pattern.
+#[test]
+fn regexp_escape_makes_a_literal_pattern() {
+    // A syntax character takes a backslash; an ordinary one does not.
+    check("regexp-escape-dot", "return RegExp.escape(\".\");", "\\.");
+    check(
+        "regexp-escape-underscore",
+        "return RegExp.escape(\"_\");",
+        "_",
+    );
+    check(
+        "regexp-escape-syntax",
+        "return RegExp.escape(\"(a)\");",
+        "\\(a\\)",
+    );
+    // A leading letter or digit is hex-escaped so the result cannot begin a quantifier.
+    check(
+        "regexp-escape-leading-digit",
+        "return RegExp.escape(\"1\");",
+        "\\x31",
+    );
+    // Round-trip: the escaped string, as a pattern, matches the original and not a near miss.
+    check(
+        "regexp-escape-roundtrip",
+        "let r = new RegExp(RegExp.escape(\"$.^\")); \
+         return r.test(\"$.^\") + \",\" + r.test(\"x\");",
+        "true,false",
+    );
+    // A non-string argument is a TypeError, not coerced.
+    check(
+        "regexp-escape-non-string",
+        "try { RegExp.escape(1); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// `String.prototype[Symbol.iterator]` — a code-point iterator reachable as a method.
+#[test]
+fn a_string_answers_symbol_iterator() {
+    check(
+        "string-symbol-iterator-exists",
+        "return typeof \"a\"[Symbol.iterator];",
+        "function",
+    );
+    check(
+        "string-iterator-next",
+        "let it = \"ab\"[Symbol.iterator](); return it.next().value + it.next().value;",
+        "ab",
+    );
+    // By code point: an astral character is a single step.
+    check(
+        "string-iterator-astral",
+        "let it = \"\\u{1f4a9}x\"[Symbol.iterator](); \
+         return (it.next().value === \"\\u{1f4a9}\") + \",\" + it.next().value;",
+        "true,x",
+    );
+    // The iterator is itself iterable, so Array.from drains it.
+    check(
+        "string-iterator-array-from",
+        "return Array.from(\"ab\"[Symbol.iterator]()).join(\",\");",
+        "a,b",
+    );
+    // Exhaustion.
+    check(
+        "string-iterator-done",
+        "let it = \"a\"[Symbol.iterator](); it.next(); return it.next().done;",
+        "true",
+    );
+}
+
+/// **The bound arguments come first and the call's own follow**, which is what makes
+/// `f.bind(null, 1)(2)` the same as `f(1, 2)`.
+#[test]
+fn bind_fixes_a_receiver_and_leading_arguments() {
+    check(
+        "bind-this",
+        "let f = function () { return this.x; }; return f.bind({x: 5})();",
+        "5",
+    );
+    check(
+        "bind-args",
+        "let f = function (a, b) { return a + b; }; return f.bind(null, 1)(2);",
+        "3",
+    );
+    check(
+        "bind-all-args",
+        "let f = function (a, b) { return a + b; }; return f.bind(null, 1, 2)();",
+        "3",
+    );
+    check(
+        "bind-no-args",
+        "let f = function (a) { return a; }; return f.bind(null)(7);",
+        "7",
+    );
+}
+
+/// The pattern test262's own property helper is built on, and the reason so much of the suite
+/// depended on `bind` existing at all.
+#[test]
+fn bind_can_turn_a_method_into_a_free_function() {
+    check(
+        "bind-uncurry",
+        "let has = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+         return has({a: 1}, \"a\");",
+        "true",
+    );
+    check(
+        "bind-uncurry-join",
+        "let join = Function.prototype.call.bind(Array.prototype.join); \
+         return join([1, 2], \"-\");",
+        "1-2",
+    );
+}
+
+// ---- loose equality and `in` ---------------------------------------------------------------
+
+/// `===` was always here. These pin the behaviour that makes it worth preferring, so a later
+/// change to `==` cannot quietly loosen it.
+#[test]
+fn strict_equality_does_not_coerce() {
+    check("strict-same", "return 1 === 1;", "true");
+    check("strict-number-string", "return 1 === \"1\";", "false");
+    check("strict-zero-false", "return 0 === false;", "false");
+    check(
+        "strict-null-undefined",
+        "return null === undefined;",
+        "false",
+    );
+    // Strings compare by their characters, not by identity, however many cells they came from.
+    check("strict-strings", "return \"a\" + \"b\" === \"ab\";", "true");
+    check("strict-nan", "return 0 / 0 === 0 / 0;", "false");
+    check("strict-zeroes", "return 0 === -0;", "true");
+    check("strict-not", "return 1 !== 2;", "true");
+}
+
+/// **`null` and `undefined` equal each other and nothing else** — not `0`, not `""`, not
+/// `false`. That is the rule behind `x == null` as the idiomatic "is it either".
+#[test]
+fn nullish_values_equal_only_each_other() {
+    check("loose-null-undefined", "return null == undefined;", "true");
+    check("loose-null-zero", "return null == 0;", "false");
+    check("loose-null-empty", "return null == \"\";", "false");
+    check("loose-null-false", "return null == false;", "false");
+    check("loose-undefined-zero", "return undefined == 0;", "false");
+    check("loose-null-null", "return null == null;", "true");
+}
+
+/// **A string meeting a number becomes a number**, never the reverse.
+#[test]
+fn a_string_meeting_a_number_is_read_as_one() {
+    check("loose-string-number", "return \"10\" == 10;", "true");
+    check("loose-string-number-no", "return \"11\" == 10;", "false");
+    check("loose-empty-zero", "return \"\" == 0;", "true");
+    check("loose-space-zero", "return \" \" == 0;", "true");
+}
+
+/// **A boolean becomes a number first**, on whichever side it is.
+#[test]
+fn a_boolean_is_read_as_a_number_before_anything_else() {
+    check("loose-true-one", "return true == 1;", "true");
+    check("loose-false-zero", "return false == 0;", "true");
+    check("loose-true-string", "return true == \"1\";", "true");
+    check("loose-false-empty", "return false == \"\";", "true");
+    check("loose-true-two", "return true == 2;", "false");
+}
+
+/// **`==` is not transitive**, and this is the example worth keeping in view: the first two
+/// coerce and the third does not.
+#[test]
+fn loose_equality_is_not_transitive() {
+    check("loose-empty-zero-again", "return \"\" == 0;", "true");
+    check("loose-zero-string-zero", "return \"0\" == 0;", "true");
+    check("loose-empty-zero-string", "return \"\" == \"0\";", "false");
+}
+
+/// An object becomes a primitive through `valueOf` and then `toString`.
+#[test]
+fn an_object_is_read_as_a_primitive() {
+    check(
+        "loose-valueof",
+        "let o = {valueOf: function () { return 5; }}; return o == 5;",
+        "true",
+    );
+    check(
+        "loose-tostring",
+        "let o = {toString: function () { return \"x\"; }}; return o == \"x\";",
+        "true",
+    );
+    // `valueOf` is tried first, so it wins when both are there.
+    check(
+        "loose-valueof-first",
+        "let o = {valueOf: function () { return 1; }, toString: function () { return \"2\"; }}; \
+         return o == 1;",
+        "true",
+    );
+}
+
+/// `NaN` is equal to nothing, including itself, under either operator.
+#[test]
+fn nan_is_equal_to_nothing() {
+    check("loose-nan", "return 0 / 0 == 0 / 0;", "false");
+    check("loose-nan-zero", "return 0 / 0 == 0;", "false");
+    check("loose-not-equal", "return 1 != 2;", "true");
+    check("loose-not-equal-coerced", "return 1 != \"1\";", "false");
+}
+
+/// **Inherited counts**, which is the whole difference between `in` and `hasOwnProperty`.
+#[test]
+fn the_in_operator_looks_up_the_chain() {
+    check("in-own", "return \"a\" in {a: 1};", "true");
+    check("in-absent", "return \"b\" in {a: 1};", "false");
+    check(
+        "in-inherited",
+        "let base = {a: 1}; let o = Object.create(base); return \"a\" in o;",
+        "true",
+    );
+    check(
+        "in-vs-hasown",
+        "let base = {a: 1}; let o = Object.create(base); return o.hasOwnProperty(\"a\");",
+        "false",
+    );
+    check("in-array-index", "return 1 in [1, 2];", "true");
+    check("in-array-past", "return 5 in [1, 2];", "false");
+    check("in-method", "return \"map\" in [];", "true");
+}
+
+/// The right side of `in` has to be an object.
+#[test]
+fn in_refuses_a_primitive_on_the_right() {
+    check(
+        "in-primitive",
+        "let r = \"\"; try { \"a\" in 5; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// `instanceof` answers a boolean and was typed `number` in the IR from the day it was added —
+/// `is_always_numeric` was written as "everything except `+`". These pin the answer in both a
+/// value position and a condition, which is where a wrong type would show.
+#[test]
+fn instanceof_answers_a_boolean() {
+    check("instanceof-value", "return [] instanceof Array;", "true");
+    check("instanceof-false", "return ({}) instanceof Array;", "false");
+    check(
+        "instanceof-condition",
+        "let r = 0; if ([] instanceof Array) { r = 1; } return r;",
+        "1",
+    );
+    check(
+        "instanceof-typeof",
+        "return typeof ([] instanceof Array);",
+        "boolean",
+    );
+    check("loose-equal-typeof", "return typeof (1 == 1);", "boolean");
+    check("in-typeof", "return typeof (\"a\" in {a: 1});", "boolean");
+}
+
+// ---- array spread --------------------------------------------------------------------------
+
+/// **`spread` is the whole difference between `[...a]` and `[a]`.**
+#[test]
+fn spread_appends_the_elements_and_not_the_array() {
+    check("spread-alone", "return [...[1, 2]].length;", "2");
+    check("spread-nested", "return [[1, 2]].length;", "1");
+    check("spread-values", "return [...[1, 2]].join(\",\");", "1,2");
+}
+
+/// An array with no spread is still one `CreateArray`; only what follows a spread is appended
+/// piece by piece.
+#[test]
+fn spread_composes_with_ordinary_elements() {
+    check(
+        "spread-leading",
+        "return [0, ...[1, 2]].join(\",\");",
+        "0,1,2",
+    );
+    check(
+        "spread-trailing",
+        "return [...[1, 2], 3].join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "spread-middle",
+        "return [0, ...[1], 2].join(\",\");",
+        "0,1,2",
+    );
+    check(
+        "spread-twice",
+        "return [...[1], ...[2, 3]].join(\",\");",
+        "1,2,3",
+    );
+    check("spread-empty", "return [...[]].length;", "0");
+    check("spread-only-plain", "return [1, 2, 3].length;", "3");
+}
+
+/// A copy, not an alias — the point of `[...a]`.
+#[test]
+fn spread_copies_rather_than_aliases() {
+    check(
+        "spread-copy",
+        "let a = [1, 2]; let b = [...a]; b.push(3); return a.length;",
+        "2",
+    );
+}
+
+/// A string spreads into its code points, by the same rule `for-of` follows.
+#[test]
+fn spread_of_a_string_gives_its_code_points() {
+    check("spread-string", "return [...\"abc\"].length;", "3");
+    check(
+        "spread-string-join",
+        "return [...\"abc\"].join(\"-\");",
+        "a-b-c",
+    );
+    check("spread-emoji", "return [...\"😀\"].length;", "1");
+}
+
+/// **Spreading a non-iterable fails the way `for-of` does**, rather than quietly producing a
+/// one-element array.
+#[test]
+fn spreading_a_non_iterable_raises() {
+    check(
+        "spread-number",
+        "let r = \"\"; try { let a = [...5]; } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+// ---- Math ----------------------------------------------------------------------------------
+
+#[test]
+fn the_rounding_functions_agree_with_the_specification() {
+    check("math-floor", "return Math.floor(1.7);", "1");
+    check("math-ceil", "return Math.ceil(1.2);", "2");
+    check("math-trunc", "return Math.trunc(-1.7);", "-1");
+    check("math-floor-negative", "return Math.floor(-1.2);", "-2");
+    check("math-abs", "return Math.abs(-3);", "3");
+}
+
+/// **`Math.round` is not Rust's `round`.** JavaScript rounds a half *upward*, toward positive
+/// infinity; Rust rounds it *away from zero*. They agree on `0.5` and disagree on `-0.5`.
+#[test]
+fn round_leans_upward_rather_than_away_from_zero() {
+    check("math-round-half", "return Math.round(0.5);", "1");
+    check("math-round-up", "return Math.round(1.5);", "2");
+    check("math-round-negative-half", "return Math.round(-0.5);", "0");
+    check("math-round-negative", "return Math.round(-1.5);", "-1");
+    check("math-round-down", "return Math.round(1.4);", "1");
+}
+
+/// **`Math.sign` is not `signum`**, which answers `1` for a zero and never `NaN`. All three of
+/// `0`, `-0` and `NaN` come back as themselves.
+#[test]
+fn sign_preserves_zero_and_propagates_nan() {
+    check("math-sign-positive", "return Math.sign(5);", "1");
+    check("math-sign-negative", "return Math.sign(-5);", "-1");
+    check("math-sign-zero", "return Math.sign(0);", "0");
+    check("math-sign-nan", "return Math.sign(0 / 0);", "NaN");
+}
+
+/// **No arguments gives the opposite infinity each time**, because each has to lose to the
+/// first real argument. **One `NaN` anywhere wins**, which `f64::min` does not do.
+#[test]
+fn min_and_max_lean_opposite_ways_when_empty() {
+    check("math-min", "return Math.min(3, 1, 2);", "1");
+    check("math-max", "return Math.max(3, 1, 2);", "3");
+    check("math-min-empty", "return Math.min();", "Infinity");
+    check("math-max-empty", "return Math.max();", "-Infinity");
+    check("math-min-nan", "return Math.min(1, 0 / 0);", "NaN");
+    check("math-max-nan", "return Math.max(1, 0 / 0);", "NaN");
+}
+
+#[test]
+fn the_power_and_root_functions_work() {
+    check("math-sqrt", "return Math.sqrt(9);", "3");
+    check("math-cbrt", "return Math.cbrt(27);", "3");
+    check("math-pow", "return Math.pow(2, 10);", "1024");
+    check("math-hypot", "return Math.hypot(3, 4);", "5");
+    check("math-exp-zero", "return Math.exp(0);", "1");
+    check("math-log-one", "return Math.log(1);", "0");
+    check("math-log2", "return Math.log2(8);", "3");
+    check("math-log10", "return Math.log10(1000);", "3");
+}
+
+#[test]
+fn the_trigonometric_functions_work() {
+    check("math-sin-zero", "return Math.sin(0);", "0");
+    check("math-cos-zero", "return Math.cos(0);", "1");
+    check("math-atan2", "return Math.atan2(0, 1);", "0");
+    check("math-asin-zero", "return Math.asin(0);", "0");
+}
+
+#[test]
+fn the_constants_are_there() {
+    check(
+        "math-pi",
+        "return Math.PI > 3.14 && Math.PI < 3.15;",
+        "true",
+    );
+    check("math-e", "return Math.E > 2.71 && Math.E < 2.72;", "true");
+    check(
+        "math-sqrt2",
+        "return Math.SQRT2 > 1.41 && Math.SQRT2 < 1.42;",
+        "true",
+    );
+    check(
+        "math-ln2",
+        "return Math.LN2 > 0.69 && Math.LN2 < 0.70;",
+        "true",
+    );
+}
+
+/// **Not suitable for anything needing unpredictability** — the specification asks only for an
+/// implementation-dependent value in `[0, 1)`, which is all this checks.
+#[test]
+fn random_stays_in_its_range() {
+    check(
+        "math-random-range",
+        "let r = Math.random(); return r >= 0 && r < 1;",
+        "true",
+    );
+    check(
+        "math-random-varies",
+        "return Math.random() !== Math.random() || true;",
+        "true",
+    );
+}
+
+// ---- arguments ------------------------------------------------------------------------------
+
+#[test]
+fn arguments_holds_what_the_caller_passed() {
+    check(
+        "arguments-length",
+        "let f = function () { return arguments.length; }; return f(1, 2, 3);",
+        "3",
+    );
+    check(
+        "arguments-index",
+        "let f = function () { return arguments[1]; }; return f(\"a\", \"b\");",
+        "b",
+    );
+    check(
+        "arguments-none",
+        "let f = function () { return arguments.length; }; return f();",
+        "0",
+    );
+    // More arguments than parameters is exactly the case `arguments` exists for.
+    check(
+        "arguments-extra",
+        "let f = function (a) { return arguments.length; }; return f(1, 2, 3);",
+        "3",
+    );
+}
+
+/// **An array, not the specification's array-*like*.** That buys everything array-shaped
+/// working at once, and costs the aliasing and the `Array.isArray` answer.
+#[test]
+fn arguments_behaves_as_an_array_here() {
+    check(
+        "arguments-join",
+        "let f = function () { return arguments.join(\"-\"); }; return f(1, 2);",
+        "1-2",
+    );
+    check(
+        "arguments-spread",
+        "let f = function () { return [...arguments].length; }; return f(1, 2);",
+        "2",
+    );
+    check(
+        "arguments-forof",
+        "let f = function () { let t = 0; for (let x of arguments) { t = t + x; } return t; }; \
+         return f(1, 2, 3);",
+        "6",
+    );
+}
+
+/// A copy, so writing to `arguments` does not reach the named parameter. A real engine aliases
+/// them outside strict mode; this does not, and the difference is asserted rather than assumed.
+#[test]
+fn arguments_does_not_alias_its_parameters() {
+    check(
+        "arguments-no-alias",
+        "let f = function (a) { arguments[0] = 9; return a; }; return f(1);",
+        "1",
+    );
+}
+
+/// **An arrow has no `arguments` of its own** and sees the enclosing function's, which is the
+/// same rule `this` follows — and falls out of resolving the name through the ordinary capture
+/// machinery rather than being special-cased.
+#[test]
+fn an_arrow_sees_the_enclosing_arguments() {
+    check(
+        "arguments-arrow",
+        "let f = function () { let g = () => arguments.length; return g(); }; return f(1, 2);",
+        "2",
+    );
+}
+
+/// A function that never names `arguments` must not pay for it. Nothing observable proves the
+/// prologue is empty, so this only pins that the name stays unbound at the top level.
+#[test]
+fn arguments_is_not_a_global() {
+    check(
+        "arguments-not-global",
+        "let r = \"\"; try { let n = arguments.length; } catch (e) { r = e.name; } return r;",
+        "ReferenceError",
+    );
+}
+
+// ---- var hoisting ---------------------------------------------------------------------------
+
+/// **A `var` is function-scoped and hoisted**, so its name exists from the top of the function
+/// whatever line declares it. This is the shape test262's own `propertyHelper.js` has — a `var`
+/// at the top of the file read by a hoisted function — and lowering the declaration where it
+/// appeared left every hoisted function above it unable to see the name.
+#[test]
+fn a_hoisted_function_sees_a_var_declared_below_it() {
+    check(
+        "var-hoist-function",
+        "function read() { return later; } var later = 7; return read();",
+        "7",
+    );
+    check(
+        "var-hoist-alias",
+        "function get() { return alias(1, 2); } var alias = Math.max; return get();",
+        "2",
+    );
+}
+
+/// **Hoisted means declared, not assigned.** Reading before the declaring statement runs gives
+/// `undefined`, which is exactly what separates `var` from `let`.
+#[test]
+fn a_var_read_before_its_declaration_is_undefined() {
+    check("var-before", "let r = x; var x = 1; return r;", "undefined");
+    check("var-after", "var x = 1; return x;", "1");
+}
+
+/// A `var` inside a block belongs to the function around it, not the block.
+#[test]
+fn a_var_inside_a_block_escapes_the_block() {
+    check("var-in-block", "{ var x = 1; } return x;", "1");
+    check("var-in-if", "if (true) { var y = 2; } return y;", "2");
+    check(
+        "var-in-loop",
+        "for (let i = 0; i < 1; i = i + 1) { var z = 3; } return z;",
+        "3",
+    );
+    check(
+        "var-in-try",
+        "try { var t = 4; } catch (e) { } return t;",
+        "4",
+    );
+}
+
+/// **`var x;` after an assignment must not clobber it.** The hoist already set the binding to
+/// `undefined`; a declaration with no initialiser has nothing left to do.
+#[test]
+fn a_var_declaration_without_an_initialiser_does_not_reset_it() {
+    check("var-redeclare", "x = 5; var x; return x;", "5");
+    check("var-twice", "var x = 1; var x; return x;", "1");
+}
+
+/// A nested function's own `var`s belong to it, not to the function around it.
+#[test]
+fn a_nested_functions_vars_stay_inside_it() {
+    check(
+        "var-nested-scope",
+        "let f = function () { var inner = 1; return inner; }; \
+         let r = f(); let outer = typeof inner; return outer;",
+        "undefined",
+    );
+}
+
+/// **`typeof` is the one operator that does not throw on an undeclared name.** The comment in
+/// the lowering said so long before the code did — the operand went through the ordinary global
+/// load, which raises, so this was a `ReferenceError` instead of a string.
+#[test]
+fn typeof_an_undeclared_name_is_a_string() {
+    check(
+        "typeof-undeclared",
+        "return typeof nothingHere;",
+        "undefined",
+    );
+    check("typeof-declared", "let x = 1; return typeof x;", "number");
+    check("typeof-global", "return typeof Object;", "function");
+    // Every *other* read of a missing global is still a `ReferenceError`.
+    check(
+        "undeclared-read-still-throws",
+        "let r = \"\"; try { let v = nothingHere; } catch (e) { r = e.name; } return r;",
+        "ReferenceError",
+    );
+}
+
+// ---- sort and splice --------------------------------------------------------------------
+
+/// **The default sort order is by text, not by number.** `[10, 9].sort()` is `[10, 9]`, because
+/// `"10"` sorts before `"9"`. That surprises everyone once, and it is the specification's rule.
+#[test]
+fn sort_compares_as_text_unless_told_otherwise() {
+    check(
+        "sort-text",
+        "return [\"c\", \"a\", \"b\"].sort().join(\"\");",
+        "abc",
+    );
+    check(
+        "sort-numbers-as-text",
+        "return [10, 9, 1].sort().join(\",\");",
+        "1,10,9",
+    );
+    check(
+        "sort-comparator",
+        "return [10, 9, 1].sort(function (a, b) { return a - b; }).join(\",\");",
+        "1,9,10",
+    );
+    check(
+        "sort-descending",
+        "return [1, 3, 2].sort(function (a, b) { return b - a; }).join(\",\");",
+        "3,2,1",
+    );
+}
+
+/// **`undefined` sorts to the end and never reaches the comparator.**
+#[test]
+fn undefined_sorts_last() {
+    check(
+        "sort-undefined-last",
+        "let a = [3, undefined, 1]; a.sort(); return a[2] === undefined;",
+        "true",
+    );
+    check(
+        "sort-undefined-not-compared",
+        "let seen = 0; [1, undefined, 2].sort(function (a, b) { seen = seen + 1; return 0; }); \
+         return seen;",
+        "1",
+    );
+}
+
+/// Stable since ES2019: equal elements keep the order they were in.
+#[test]
+fn sort_is_stable() {
+    check(
+        "sort-stable",
+        "let a = [\"b1\", \"a1\", \"b2\", \"a2\"]; \
+         a.sort(function (x, y) { return x.charAt(0) < y.charAt(0) ? -1 : (x.charAt(0) > y.charAt(0) ? 1 : 0); }); \
+         return a.join(\",\");",
+        "a1,a2,b1,b2",
+    );
+}
+
+/// **`splice` answers the removed elements and mutates in place** — the pair of jobs that makes
+/// it the odd one out among the array methods.
+#[test]
+fn splice_removes_and_answers_what_it_removed() {
+    check(
+        "splice-removed",
+        "return [1, 2, 3].splice(1, 1).join(\",\");",
+        "2",
+    );
+    check(
+        "splice-remaining",
+        "let a = [1, 2, 3]; a.splice(1, 1); return a.join(\",\");",
+        "1,3",
+    );
+    check(
+        "splice-insert",
+        "let a = [1, 4]; a.splice(1, 0, 2, 3); return a.join(\",\");",
+        "1,2,3,4",
+    );
+    check(
+        "splice-replace",
+        "let a = [1, 9, 3]; a.splice(1, 1, 2); return a.join(\",\");",
+        "1,2,3",
+    );
+}
+
+/// **No second argument removes everything from `start` on**, which is different from passing
+/// a count of zero — so the argument *count* decides, not the value.
+#[test]
+fn splice_without_a_count_removes_the_rest() {
+    check(
+        "splice-to-end",
+        "let a = [1, 2, 3]; a.splice(1); return a.join(\",\");",
+        "1",
+    );
+    check(
+        "splice-count-zero",
+        "let a = [1, 2, 3]; a.splice(1, 0); return a.join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "splice-negative",
+        "let a = [1, 2, 3]; a.splice(-1); return a.join(\",\");",
+        "1,2",
+    );
+}
+
+#[test]
+fn an_array_prints_as_its_elements() {
+    check("array-tostring", "return [1, 2, 3].toString();", "1,2,3");
+    check(
+        "array-tostring-nested",
+        "return String([1, [2, 3]]);",
+        "1,2,3",
+    );
+    check(
+        "array-tostring-nullish",
+        "return [1, null, 2].toString();",
+        "1,,2",
+    );
+}
+
+/// **Two strings compare lexicographically; everything else numerically.** Coercing both sides
+/// to a number made every string comparison a `NaN` comparison — false in *both* directions, so
+/// a sort comparator written the ordinary way answered `0` for every pair and sorted nothing.
+#[test]
+fn relational_operators_compare_strings_as_text() {
+    check("less-strings", "return \"a\" < \"b\";", "true");
+    check("less-strings-reverse", "return \"b\" < \"a\";", "false");
+    check("greater-strings", "return \"b\" > \"a\";", "true");
+    check("less-equal-strings", "return \"a\" <= \"a\";", "true");
+    // As text `"10"` precedes `"9"`; as numbers it does not. Both are right, for their types.
+    check("less-numeric-strings", "return \"10\" < \"9\";", "true");
+    check("less-numbers", "return 10 < 9;", "false");
+    // A string against a number is numeric, so this reads `"10"` as ten.
+    check("less-mixed", "return \"10\" < 9;", "false");
+}
+
+/// `NaN` makes all four false, which is not the same as the negation of the opposite operator.
+#[test]
+fn nan_is_not_ordered() {
+    check("less-nan", "return 0 / 0 < 1;", "false");
+    check("greater-nan", "return 0 / 0 > 1;", "false");
+    check("less-equal-nan", "return 0 / 0 <= 0 / 0;", "false");
+}
+
+/// **An object is asked for its text**, through `toString` and then `valueOf`. Reading
+/// `[object Object]` off every object made `String([1, 2])` that string instead of `"1,2"` —
+/// the array had a perfectly good `toString` that nothing called.
+#[test]
+fn an_object_is_asked_how_it_reads_as_text() {
+    check("text-array", "return String([1, 2]);", "1,2");
+    check("text-array-concat", "return \"\" + [1, 2];", "1,2");
+    check(
+        "text-custom",
+        "let o = {toString: function () { return \"x\"; }}; return String(o);",
+        "x",
+    );
+    // A plain object still reads as `[object Object]`, through the inherited `toString`.
+    check("text-plain-object", "return String({});", "[object Object]");
+}
+
+/// An uncaught error has to say what it was. **`describe_error` runs before `to_text`**,
+/// because `name` and `message` are what an error carries and `toString` is something most
+/// errors inherit rather than define — once `to_text` learned to ask an object (D-137), every
+/// uncaught error started describing itself as `[object Object]`.
+#[test]
+fn an_uncaught_error_reports_its_name_and_message() {
+    let Some(runtime) = runtime() else { return };
+    let directory = std::env::temp_dir().join("crisol-acceptance-uncaught-text");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, "throw new TypeError(\"bad thing\");").expect("write");
+    let binary = directory.join("main");
+    crisol::build::build(&file, &binary, &runtime).expect("should build");
+
+    let output = Command::new(&binary).output().expect("run the binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("TypeError") && stderr.contains("bad thing"),
+        "an uncaught error should name itself, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("[object Object]"),
+        "an uncaught error should not describe itself as a plain object, got: {stderr}"
+    );
+}
+
+/// **A `String` wrapper carries its own text.** Without it, a method reached through the
+/// wrapper asks the object for text, which calls `String.prototype.toString`, which asks
+/// again — `new String("x").slice(0, 1)` overflowed the stack rather than answering, and
+/// twelve test262 cases crashed on exactly that.
+#[test]
+fn a_string_wrapper_answers_its_methods() {
+    check(
+        "wrapper-slice",
+        "return new String(\"undefined\").slice(0, 3);",
+        "und",
+    );
+    check("wrapper-length", "return new String(\"abc\").length;", "3");
+    check(
+        "wrapper-indexof",
+        "return new String(\"hello\").indexOf(\"l\");",
+        "2",
+    );
+    check(
+        "wrapper-upper",
+        "return new String(\"ab\").toUpperCase();",
+        "AB",
+    );
+    check(
+        "wrapper-tostring",
+        "return new String(\"ab\").toString();",
+        "ab",
+    );
+    check(
+        "wrapper-charat",
+        "return new String(\"abc\").charAt(1);",
+        "b",
+    );
+    // A plain call is not a wrapper and still answers a primitive.
+    check(
+        "wrapper-plain-call",
+        "return typeof String(\"a\");",
+        "string",
+    );
+    check(
+        "wrapper-is-object",
+        "return typeof new String(\"a\");",
+        "object",
+    );
+}
+
+/// The wrapped text is not enumerable, for the same reason a date's time value is not.
+///
+/// **Asserted by name, not by a total.** The first version of this counted the wrapper's keys
+/// and expected none, which encoded a second wrong belief while testing the first thing
+/// correctly: a string wrapper owns one enumerable property per character. A count is a bad
+/// assertion for "X is absent" — it passes for the wrong reason whenever the total is wrong
+/// for another one.
+#[test]
+fn a_string_wrappers_value_is_hidden() {
+    check(
+        "wrapper-keys",
+        "return Object.keys(new String(\"ab\")).indexOf(\"__primitive\");",
+        "-1",
+    );
+    check(
+        "wrapper-own-names-hide-the-primitive",
+        "return Object.getOwnPropertyNames(new String(\"ab\")).indexOf(\"__primitive\");",
+        "-1",
+    );
+}
+
+// ---- Map and Set ---------------------------------------------------------------------------
+
+#[test]
+fn a_map_stores_and_retrieves_by_key() {
+    check(
+        "map-set-get",
+        "let m = new Map(); m.set(\"a\", 1); return m.get(\"a\");",
+        "1",
+    );
+    check(
+        "map-size",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); return m.size;",
+        "2",
+    );
+    check(
+        "map-has",
+        "let m = new Map(); m.set(\"a\", 1); return m.has(\"a\");",
+        "true",
+    );
+    check(
+        "map-has-not",
+        "let m = new Map(); return m.has(\"a\");",
+        "false",
+    );
+    check("map-empty-size", "return new Map().size;", "0");
+    // Answers the map, so calls chain.
+    check(
+        "map-chains",
+        "let m = new Map(); m.set(\"a\", 1).set(\"b\", 2); return m.size;",
+        "2",
+    );
+}
+
+/// **`undefined` for a missing key is indistinguishable from a stored `undefined`** — which is
+/// what `has` is for, and why both exist.
+#[test]
+fn a_map_distinguishes_absent_from_undefined_only_through_has() {
+    check("map-missing", "return new Map().get(\"a\");", "undefined");
+    check(
+        "map-stored-undefined",
+        "let m = new Map(); m.set(\"a\", undefined); return m.get(\"a\");",
+        "undefined",
+    );
+    check(
+        "map-stored-undefined-has",
+        "let m = new Map(); m.set(\"a\", undefined); return m.has(\"a\");",
+        "true",
+    );
+}
+
+/// **An existing key keeps its position.** Insertion order is observable through `forEach`, and
+/// re-setting a key does not move it to the end.
+#[test]
+fn a_map_keeps_insertion_order_through_a_reassignment() {
+    check(
+        "map-order",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); m.set(\"a\", 3); \
+         let s = \"\"; m.forEach(function (v, k) { s = s + k; }); return s;",
+        "ab",
+    );
+    check(
+        "map-reassign-size",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"a\", 2); return m.size;",
+        "1",
+    );
+}
+
+/// **`forEach` passes value first, then key** — the opposite of how the pair is stored.
+#[test]
+fn map_for_each_passes_the_value_before_the_key() {
+    check(
+        "map-foreach-order",
+        "let m = new Map(); m.set(\"k\", \"v\"); \
+         let s = \"\"; m.forEach(function (value, key) { s = value + key; }); return s;",
+        "vk",
+    );
+}
+
+#[test]
+fn a_map_can_delete_and_clear() {
+    check(
+        "map-delete",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); m.delete(\"a\"); return m.size;",
+        "1",
+    );
+    check(
+        "map-delete-answer",
+        "let m = new Map(); m.set(\"a\", 1); return m.delete(\"a\");",
+        "true",
+    );
+    // **`false` for a key that was not there**, where `delete` on an object answers `true`.
+    check(
+        "map-delete-absent",
+        "return new Map().delete(\"a\");",
+        "false",
+    );
+    check(
+        "map-delete-keeps-order",
+        "let m = new Map(); m.set(\"a\", 1); m.set(\"b\", 2); m.set(\"c\", 3); m.delete(\"b\"); \
+         let s = \"\"; m.forEach(function (v, k) { s = s + k; }); return s;",
+        "ac",
+    );
+    check(
+        "map-clear",
+        "let m = new Map(); m.set(\"a\", 1); m.clear(); return m.size;",
+        "0",
+    );
+}
+
+#[test]
+fn a_set_holds_each_value_once() {
+    check(
+        "set-add",
+        "let s = new Set(); s.add(1); s.add(2); return s.size;",
+        "2",
+    );
+    check(
+        "set-duplicate",
+        "let s = new Set(); s.add(1); s.add(1); return s.size;",
+        "1",
+    );
+    check(
+        "set-has",
+        "let s = new Set(); s.add(1); return s.has(1);",
+        "true",
+    );
+    check(
+        "set-delete",
+        "let s = new Set(); s.add(1); s.delete(1); return s.size;",
+        "0",
+    );
+    check("set-delete-absent", "return new Set().delete(1);", "false");
+    check(
+        "set-clear",
+        "let s = new Set(); s.add(1); s.clear(); return s.size;",
+        "0",
+    );
+}
+
+/// **`NaN` equals itself here**, which `===` does not do — without SameValueZero every
+/// `add(NaN)` would add another.
+#[test]
+fn a_collection_keys_on_same_value_zero() {
+    check(
+        "set-nan",
+        "let s = new Set(); s.add(0 / 0); s.add(0 / 0); return s.size;",
+        "1",
+    );
+    check(
+        "set-nan-has",
+        "let s = new Set(); s.add(0 / 0); return s.has(0 / 0);",
+        "true",
+    );
+    // `+0` and `-0` are the same key.
+    check(
+        "set-zeroes",
+        "let s = new Set(); s.add(0); s.add(-0); return s.size;",
+        "1",
+    );
+    check(
+        "map-nan-key",
+        "let m = new Map(); m.set(0 / 0, \"x\"); return m.get(0 / 0);",
+        "x",
+    );
+}
+
+/// **`Set.prototype.forEach` passes the value twice**, so a callback written for a map works
+/// unchanged on a set.
+#[test]
+fn set_for_each_passes_the_value_twice() {
+    check(
+        "set-foreach",
+        "let s = new Set(); s.add(\"a\"); s.add(\"b\"); \
+         let out = \"\"; s.forEach(function (v) { out = out + v; }); return out;",
+        "ab",
+    );
+    check(
+        "set-foreach-twice",
+        "let s = new Set(); s.add(\"x\"); \
+         let out = \"\"; s.forEach(function (v, k) { out = v + k; }); return out;",
+        "xx",
+    );
+}
+
+/// An object key is compared by identity, not by contents.
+#[test]
+fn an_object_key_is_its_own_key() {
+    check(
+        "map-object-key",
+        "let a = {}; let b = {}; let m = new Map(); m.set(a, 1); m.set(b, 2); return m.size;",
+        "2",
+    );
+    check(
+        "map-object-key-get",
+        "let a = {}; let m = new Map(); m.set(a, 7); return m.get(a);",
+        "7",
+    );
+}
+
+// ---- Symbol --------------------------------------------------------------------------------
+
+/// **Every symbol is unique**, which falls out of a symbol being a heap cell rather than being
+/// arranged: two `Symbol("x")` are different symbols however alike they read.
+#[test]
+fn a_symbol_is_unique_and_reports_its_type() {
+    check("symbol-typeof", "return typeof Symbol();", "symbol");
+    check(
+        "symbol-unique",
+        "return Symbol(\"x\") === Symbol(\"x\");",
+        "false",
+    );
+    check(
+        "symbol-self",
+        "let s = Symbol(\"x\"); return s === s;",
+        "true",
+    );
+    check(
+        "symbol-typeof-described",
+        "return typeof Symbol(\"x\");",
+        "symbol",
+    );
+}
+
+#[test]
+fn a_symbol_carries_its_description() {
+    check(
+        "symbol-description",
+        "return Symbol(\"hello\").description;",
+        "hello",
+    );
+    check(
+        "symbol-tostring",
+        "return Symbol(\"hello\").toString();",
+        "Symbol(hello)",
+    );
+    check(
+        "symbol-no-description",
+        "return Symbol().toString();",
+        "Symbol()",
+    );
+    check(
+        "symbol-valueof",
+        "let s = Symbol(\"x\"); return s.valueOf() === s;",
+        "true",
+    );
+}
+
+/// **`Symbol.for` is a registry and `Symbol()` is not.** The same key gives the same symbol
+/// back, which is the whole point of it.
+#[test]
+fn the_symbol_registry_returns_the_same_symbol() {
+    check(
+        "symbol-for",
+        "return Symbol.for(\"k\") === Symbol.for(\"k\");",
+        "true",
+    );
+    check(
+        "symbol-for-differs",
+        "return Symbol.for(\"a\") === Symbol.for(\"b\");",
+        "false",
+    );
+    check(
+        "symbol-for-vs-plain",
+        "return Symbol.for(\"k\") === Symbol(\"k\");",
+        "false",
+    );
+    check(
+        "symbol-keyfor",
+        "return Symbol.keyFor(Symbol.for(\"k\"));",
+        "k",
+    );
+}
+
+/// **Only a registered symbol has a key.** One made by `Symbol("x")` answers `undefined` even
+/// though its description is `"x"` — the description is not the key.
+#[test]
+fn key_for_distinguishes_registered_from_described() {
+    check(
+        "symbol-keyfor-plain",
+        "return Symbol.keyFor(Symbol(\"x\"));",
+        "undefined",
+    );
+    check(
+        "symbol-description-still",
+        "return Symbol(\"x\").description;",
+        "x",
+    );
+}
+
+/// The well-known symbols exist as values. **They are not yet usable as property keys** — a
+/// `PropertyKey` is a string — so this checks they are symbols, not that they index anything.
+#[test]
+fn the_well_known_symbols_are_symbols() {
+    check(
+        "symbol-iterator",
+        "return typeof Symbol.iterator;",
+        "symbol",
+    );
+    check(
+        "symbol-async-iterator",
+        "return typeof Symbol.asyncIterator;",
+        "symbol",
+    );
+    check(
+        "symbol-has-instance",
+        "return typeof Symbol.hasInstance;",
+        "symbol",
+    );
+    check(
+        "symbol-to-primitive",
+        "return typeof Symbol.toPrimitive;",
+        "symbol",
+    );
+    check(
+        "symbol-to-string-tag",
+        "return typeof Symbol.toStringTag;",
+        "symbol",
+    );
+    // Stable across reads, rather than freshly made each time.
+    check(
+        "symbol-iterator-stable",
+        "return Symbol.iterator === Symbol.iterator;",
+        "true",
+    );
+    // The rest of them. **A program branches on whether these exist far more often than it
+    // uses them** — that is what a feature test is — and one that reads `undefined` takes the
+    // path written for an engine from before the symbol existed.
+    check(
+        "the-rest-of-the-well-known-symbols",
+        "let names = [\"species\", \"match\", \"matchAll\", \"replace\", \"search\", \"split\", \
+                      \"isConcatSpreadable\", \"unscopables\"]; \
+         let count = 0; \
+         for (let i = 0; i < names.length; i = i + 1) { \
+             if (typeof Symbol[names[i]] === \"symbol\") { count = count + 1; } } \
+         return count;",
+        "8",
+    );
+    // Each is its own symbol, which is the whole of what makes them usable as distinct keys.
+    check(
+        "well-known-symbols-are-distinct",
+        "return Symbol.match === Symbol.replace;",
+        "false",
+    );
+    // Neither writable nor configurable, which is what the specification says.
+    check(
+        "symbol-iterator-is-frozen",
+        "let d = Object.getOwnPropertyDescriptor(Symbol, \"iterator\"); \
+         return d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "false,false,false",
+    );
+}
+
+/// A symbol survives a collection, which is the reason it is a heap cell rather than a bare
+/// payload — every path that turns a value into a reference would otherwise have traced a
+/// number as though it addressed one.
+#[test]
+fn a_symbol_survives_collection() {
+    check(
+        "symbol-survives",
+        "let s = Symbol(\"keep\"); let junk = []; \
+         for (let i = 0; i < 50; i = i + 1) { junk.push({n: i}); } return s.description;",
+        "keep",
+    );
+    check(
+        "symbol-registry-survives",
+        "let s = Symbol.for(\"reg\"); let junk = []; \
+         for (let i = 0; i < 50; i = i + 1) { junk.push({n: i}); } \
+         return Symbol.for(\"reg\") === s;",
+        "true",
+    );
+}
+
+// ---- more array methods ----------------------------------------------------------------
+
+/// **The copying counterparts leave the original alone**, which is the whole reason they exist
+/// alongside `reverse`, `sort` and `splice`.
+#[test]
+fn the_copying_array_methods_do_not_mutate() {
+    check(
+        "to-reversed",
+        "return [1, 2, 3].toReversed().join(\",\");",
+        "3,2,1",
+    );
+    check(
+        "to-reversed-original",
+        "let a = [1, 2, 3]; a.toReversed(); return a.join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "to-sorted",
+        "return [3, 1, 2].toSorted().join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "to-sorted-original",
+        "let a = [3, 1, 2]; a.toSorted(); return a.join(\",\");",
+        "3,1,2",
+    );
+    check(
+        "to-sorted-comparator",
+        "return [10, 9].toSorted(function (x, y) { return x - y; }).join(\",\");",
+        "9,10",
+    );
+    check(
+        "to-spliced",
+        "return [1, 2, 3].toSpliced(1, 1).join(\",\");",
+        "1,3",
+    );
+    check(
+        "to-spliced-insert",
+        "return [1, 4].toSpliced(1, 0, 2, 3).join(\",\");",
+        "1,2,3,4",
+    );
+    check(
+        "to-spliced-original",
+        "let a = [1, 2, 3]; a.toSpliced(1, 1); return a.length;",
+        "3",
+    );
+    check(
+        "array-with",
+        "return [1, 2, 3].with(1, 9).join(\",\");",
+        "1,9,3",
+    );
+    check(
+        "array-with-negative",
+        "return [1, 2, 3].with(-1, 9).join(\",\");",
+        "1,2,9",
+    );
+    check(
+        "array-with-original",
+        "let a = [1, 2, 3]; a.with(1, 9); return a.join(\",\");",
+        "1,2,3",
+    );
+}
+
+/// **`with` raises out of range where `at` answers `undefined`** — it builds an array, and
+/// there is no array to build for an index that does not exist.
+#[test]
+fn with_refuses_an_index_that_is_not_there() {
+    check(
+        "with-out-of-range",
+        "let r = \"\"; try { [1, 2].with(5, 0); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check("at-out-of-range-still", "return [1, 2].at(5);", "undefined");
+}
+
+/// **`copyWithin` never changes the length** — a run copied past the end is truncated rather
+/// than growing the array.
+#[test]
+fn copy_within_moves_a_run_without_resizing() {
+    check(
+        "copy-within",
+        "return [1, 2, 3, 4, 5].copyWithin(0, 3).join(\",\");",
+        "4,5,3,4,5",
+    );
+    check(
+        "copy-within-length",
+        "return [1, 2, 3].copyWithin(0, 1).length;",
+        "3",
+    );
+    check(
+        "copy-within-end",
+        "return [1, 2, 3, 4].copyWithin(0, 1, 3).join(\",\");",
+        "2,3,3,4",
+    );
+    // Overlapping runs read before they write.
+    check(
+        "copy-within-overlap",
+        "return [1, 2, 3, 4].copyWithin(1, 0).join(\",\");",
+        "1,1,2,3",
+    );
+}
+
+#[test]
+fn array_from_takes_an_array_like_or_a_string() {
+    check("from-array", "return Array.from([1, 2]).length;", "2");
+    check(
+        "from-string",
+        "return Array.from(\"abc\").join(\",\");",
+        "a,b,c",
+    );
+    check(
+        "from-array-like",
+        "return Array.from({length: 2, 0: \"a\", 1: \"b\"}).join(\",\");",
+        "a,b",
+    );
+    check(
+        "from-mapper",
+        "return Array.from([1, 2], function (x) { return x * 2; }).join(\",\");",
+        "2,4",
+    );
+    check("from-empty", "return Array.from({length: 0}).length;", "0");
+    // A copy, not the same array.
+    check(
+        "from-copies",
+        "let a = [1]; let b = Array.from(a); b.push(2); return a.length;",
+        "1",
+    );
+}
+
+/// **`Array.of` is not `Array`** — `Array(3)` is three elements and `Array.of(3)` is one.
+#[test]
+fn array_of_takes_its_arguments_as_elements() {
+    check("of-one", "return Array.of(3).length;", "1");
+    check("of-many", "return Array.of(1, 2, 3).join(\",\");", "1,2,3");
+    check("of-none", "return Array.of().length;", "0");
+}
+
+/// **`{value, done}` every time, and `done` stays `true` once reached** — an exhausted iterator
+/// does not restart, which is what lets a caller loop on `done` without counting.
+#[test]
+fn an_array_iterator_walks_and_then_stops() {
+    check("values-first", "return [7, 8].values().next().value;", "7");
+    check(
+        "values-not-done",
+        "return [7].values().next().done;",
+        "false",
+    );
+    check(
+        "values-second",
+        "let it = [7, 8].values(); it.next(); return it.next().value;",
+        "8",
+    );
+    check(
+        "values-exhausted",
+        "let it = [7].values(); it.next(); return it.next().done;",
+        "true",
+    );
+    check(
+        "values-stays-done",
+        "let it = [].values(); it.next(); return it.next().done;",
+        "true",
+    );
+    check(
+        "values-exhausted-value",
+        "let it = [7].values(); it.next(); return it.next().value;",
+        "undefined",
+    );
+}
+
+#[test]
+fn keys_and_entries_walk_positions_and_pairs() {
+    check("keys-first", "return [7, 8].keys().next().value;", "0");
+    check(
+        "entries-index",
+        "return [7, 8].entries().next().value[0];",
+        "0",
+    );
+    check(
+        "entries-value",
+        "return [7, 8].entries().next().value[1];",
+        "7",
+    );
+    check(
+        "keys-second",
+        "let it = [7, 8].keys(); it.next(); return it.next().value;",
+        "1",
+    );
+}
+
+// ---- Object statics, Number, Boolean and the globals ---------------------------------------
+
+/// **Freezing keeps enumerability** — a frozen object still lists its properties; it is the
+/// writing and the deleting that stop.
+#[test]
+fn freeze_stops_writing_and_extending() {
+    check(
+        "freeze-write",
+        "let o = {a: 1}; Object.freeze(o); o.a = 2; return o.a;",
+        "1",
+    );
+    check(
+        "freeze-extend",
+        "let o = {}; Object.freeze(o); o.b = 1; return o.b;",
+        "undefined",
+    );
+    check(
+        "freeze-is",
+        "let o = {}; Object.freeze(o); return Object.isFrozen(o);",
+        "true",
+    );
+    check("freeze-not", "return Object.isFrozen({a: 1});", "false");
+    check(
+        "freeze-keys",
+        "let o = {a: 1}; Object.freeze(o); return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "freeze-answers",
+        "let o = {}; return Object.freeze(o) === o;",
+        "true",
+    );
+    check(
+        "freeze-delete",
+        "let o = {a: 1}; Object.freeze(o); delete o.a; return o.a;",
+        "1",
+    );
+}
+
+/// **Sealing leaves the values writable** — that is the whole difference from freezing.
+#[test]
+fn seal_stops_extending_but_not_writing() {
+    check(
+        "seal-write",
+        "let o = {a: 1}; Object.seal(o); o.a = 2; return o.a;",
+        "2",
+    );
+    check(
+        "seal-extend",
+        "let o = {}; Object.seal(o); o.b = 1; return o.b;",
+        "undefined",
+    );
+    check(
+        "seal-is",
+        "let o = {}; Object.seal(o); return Object.isSealed(o);",
+        "true",
+    );
+    check(
+        "seal-not-frozen",
+        "let o = {a: 1}; Object.seal(o); return Object.isFrozen(o);",
+        "false",
+    );
+    check(
+        "prevent-extensions",
+        "let o = {}; Object.preventExtensions(o); o.a = 1; return o.a;",
+        "undefined",
+    );
+    check("is-extensible", "return Object.isExtensible({});", "true");
+    check(
+        "is-extensible-after",
+        "let o = {}; Object.preventExtensions(o); return Object.isExtensible(o);",
+        "false",
+    );
+}
+
+#[test]
+fn entries_and_from_entries_are_inverses() {
+    check(
+        "entries-length",
+        "return Object.entries({a: 1, b: 2}).length;",
+        "2",
+    );
+    check("entries-pair", "return Object.entries({a: 1})[0][0];", "a");
+    check("entries-value", "return Object.entries({a: 1})[0][1];", "1");
+    check(
+        "from-entries",
+        "return Object.fromEntries([[\"a\", 1], [\"b\", 2]]).b;",
+        "2",
+    );
+    check(
+        "entries-round-trip",
+        "let o = {a: 1, b: 2}; return Object.fromEntries(Object.entries(o)).a;",
+        "1",
+    );
+}
+
+/// **`Object.is` is neither `===` nor SameValueZero.** It is the only one of the three that
+/// separates the zeroes, and unlike `===` it says `NaN` is itself.
+#[test]
+fn object_is_separates_the_zeroes() {
+    check("is-nan", "return Object.is(0 / 0, 0 / 0);", "true");
+    check("is-zeroes", "return Object.is(0, -0);", "false");
+    check("is-strict-zeroes", "return 0 === -0;", "true");
+    check("is-same", "return Object.is(1, 1);", "true");
+    check("is-different", "return Object.is(1, 2);", "false");
+}
+
+/// **The `Number` predicates do no coercion; the globals do.** That is the whole difference,
+/// and it is why `isNaN("x")` is true while `Number.isNaN("x")` is false.
+#[test]
+fn the_number_predicates_do_not_coerce() {
+    check(
+        "number-isnan-string",
+        "return Number.isNaN(\"x\");",
+        "false",
+    );
+    check("global-isnan-string", "return isNaN(\"x\");", "true");
+    check("number-isnan", "return Number.isNaN(0 / 0);", "true");
+    check(
+        "number-isfinite-string",
+        "return Number.isFinite(\"1\");",
+        "false",
+    );
+    check("global-isfinite-string", "return isFinite(\"1\");", "true");
+    check("number-isinteger", "return Number.isInteger(1);", "true");
+    check(
+        "number-isinteger-fraction",
+        "return Number.isInteger(1.5);",
+        "false",
+    );
+    check(
+        "number-isinteger-string",
+        "return Number.isInteger(\"1\");",
+        "false",
+    );
+    check("number-issafe", "return Number.isSafeInteger(1);", "true");
+}
+
+/// **`parseInt` reads a prefix and stops**, where `Number` demands the whole string.
+#[test]
+fn parse_int_and_parse_float_read_a_prefix() {
+    check("parseint", "return parseInt(\"12\");", "12");
+    check("parseint-trailing", "return parseInt(\"12abc\");", "12");
+    check("number-whole", "return Number(\"12abc\");", "NaN");
+    check("parseint-radix", "return parseInt(\"ff\", 16);", "255");
+    check("parseint-hex-prefix", "return parseInt(\"0x10\");", "16");
+    check(
+        "parseint-hex-decimal",
+        "return parseInt(\"0x10\", 10);",
+        "0",
+    );
+    check("parseint-negative", "return parseInt(\"-42\");", "-42");
+    check("parseint-none", "return parseInt(\"abc\");", "NaN");
+    check("parsefloat", "return parseFloat(\"1.5rest\");", "1.5");
+    check("parsefloat-none", "return parseFloat(\"abc\");", "NaN");
+}
+
+#[test]
+fn number_constants_and_methods() {
+    check(
+        "number-max-safe",
+        "return Number.MAX_SAFE_INTEGER > 9007199254740990;",
+        "true",
+    );
+    check("number-epsilon", "return Number.EPSILON > 0;", "true");
+    check(
+        "number-infinity",
+        "return Number.POSITIVE_INFINITY;",
+        "Infinity",
+    );
+    check("number-tostring", "return (255).toString(16);", "ff");
+    check("number-tostring-binary", "return (5).toString(2);", "101");
+    check("number-tostring-default", "return (12).toString();", "12");
+    check("number-tofixed", "return (1.005).toFixed(2);", "1.00");
+    check("number-tofixed-zero", "return (1.5).toFixed(0);", "2");
+    check("number-valueof", "return (5).valueOf();", "5");
+    check("number-wrapper", "return new Number(7).valueOf();", "7");
+    check(
+        "number-wrapper-tostring",
+        "return new Number(7).toString();",
+        "7",
+    );
+}
+
+#[test]
+fn boolean_methods_and_wrappers() {
+    check("boolean-tostring", "return true.toString();", "true");
+    check("boolean-valueof", "return false.valueOf();", "false");
+    check(
+        "boolean-wrapper",
+        "return new Boolean(true).valueOf();",
+        "true",
+    );
+    check(
+        "boolean-wrapper-false",
+        "return new Boolean(false).toString();",
+        "false",
+    );
+    // A wrapper object is truthy whatever it wraps, which catches everyone once.
+    check(
+        "boolean-wrapper-truthy",
+        "return new Boolean(false) ? 1 : 0;",
+        "1",
+    );
+}
+
+#[test]
+fn string_statics_build_from_code_units_and_points() {
+    check(
+        "from-char-code",
+        "return String.fromCharCode(65, 66);",
+        "AB",
+    );
+    check("from-code-point", "return String.fromCodePoint(65);", "A");
+    // A code point beyond the basic plane is one argument here and two to `fromCharCode`.
+    check(
+        "from-code-point-astral",
+        "return String.fromCodePoint(128512).length;",
+        "2",
+    );
+}
+
+/// **`Date.UTC` answers a time value, not a date** — and a lone argument is a year.
+#[test]
+fn date_utc_and_parse() {
+    check("date-utc", "return Date.UTC(1970, 0, 1);", "0");
+    check("date-utc-day", "return Date.UTC(1970, 0, 2);", "86400000");
+    check(
+        "date-parse-iso",
+        "return Date.parse(\"1970-01-01T00:00:00.000Z\");",
+        "0",
+    );
+    check(
+        "date-parse-date-only",
+        "return Date.parse(\"1970-01-02\");",
+        "86400000",
+    );
+    check(
+        "date-parse-bad",
+        "return Date.parse(\"not a date\");",
+        "NaN",
+    );
+    check(
+        "date-parse-round-trip",
+        "return Date.parse(new Date(86400000).toISOString());",
+        "86400000",
+    );
+}
+
+/// **A number and a boolean are not heap cells**, so property access on them has to find their
+/// prototypes without an object to walk from. A string does not need this because a string *is*
+/// a cell — which is why the gap only appeared once the other two grew methods worth reaching.
+#[test]
+fn a_primitive_number_or_boolean_reaches_its_prototype() {
+    // Ordered to separate two causes that look identical from outside: if the prototype itself
+    // is empty the first fails, and if only the primitive cannot reach a prototype that is
+    // fine, the second does.
+    check(
+        "proto-has-tostring",
+        "return typeof Number.prototype.toString;",
+        "function",
+    );
+    // The decisive one: `call` hands the primitive to the method directly and never asks the
+    // primitive for a property. If this works, the method and the prototype are both fine and
+    // only the lookup from a primitive receiver is broken.
+    check(
+        "primitive-via-call",
+        "return Number.prototype.toString.call(255, 16);",
+        "ff",
+    );
+    check(
+        "primitive-var-tostring",
+        "let n = 255; return typeof n.toString;",
+        "function",
+    );
+    check(
+        "primitive-computed",
+        "let n = 255; return typeof n[\"toString\"];",
+        "function",
+    );
+    check(
+        "primitive-finds-tostring",
+        "return typeof (255).toString;",
+        "function",
+    );
+    check(
+        "primitive-number-method",
+        "return (255).toString(16);",
+        "ff",
+    );
+    check(
+        "primitive-boolean-method",
+        "return true.toString();",
+        "true",
+    );
+    check("primitive-number-valueof", "return (5).valueOf();", "5");
+    check(
+        "primitive-in-variable",
+        "let n = 7; return n.toString();",
+        "7",
+    );
+    // The receiver stays the primitive, so the method sees the value it was called on.
+    check(
+        "primitive-receiver",
+        "let b = false; return b.toString();",
+        "false",
+    );
+}
+
+/// **The engine's stand-ins for internal slots are not the program's properties.** Each one was
+/// visible to `getOwnPropertyNames` and, worse, to `isFrozen` — which asks whether every own
+/// property is non-writable and found this bookkeeping among them.
+#[test]
+fn internal_bookkeeping_is_not_a_property() {
+    check(
+        "internal-frozen",
+        "let o = {}; Object.freeze(o); return Object.isFrozen(o);",
+        "true",
+    );
+    check(
+        "internal-names",
+        "let o = {}; Object.freeze(o); return Object.getOwnPropertyNames(o).length;",
+        "0",
+    );
+    check(
+        "internal-date",
+        "return Object.getOwnPropertyNames(new Date(0)).length;",
+        "0",
+    );
+    check(
+        "internal-map",
+        "return Object.getOwnPropertyNames(new Map()).length;",
+        "1",
+    );
+    // By name rather than by a total: a wrapper owns its characters and its `length`, so the
+    // total is three and says nothing about whether the flag is among them.
+    check(
+        "internal-string-wrapper",
+        "return Object.getOwnPropertyNames(new String(\"ab\")).indexOf(\"__primitive\");",
+        "-1",
+    );
+}
+
+/// **`length` is not stored anywhere — it *is* the element count**, so assigning to it has to
+/// resize the array rather than add a property. Without this `a.length = 0` silently did
+/// nothing, and test262's `buildString` helper, which empties a scratch array that way on every
+/// chunk, re-sent everything it had accumulated instead: quadratic growth, and the process
+/// killed on memory rather than any error a test could report.
+#[test]
+fn assigning_to_length_resizes_an_array() {
+    check(
+        "length-truncate",
+        "let a = [1, 2, 3]; a.length = 1; return a.length;",
+        "1",
+    );
+    check(
+        "length-truncate-value",
+        "let a = [1, 2, 3]; a.length = 1; return a[0];",
+        "1",
+    );
+    check(
+        "length-empty",
+        "let a = [1, 2, 3]; a.length = 0; return a.length;",
+        "0",
+    );
+    check(
+        "length-grow",
+        "let a = [1]; a.length = 3; return a.length;",
+        "3",
+    );
+    check(
+        "length-grow-hole",
+        "let a = [1]; a.length = 3; return a[2];",
+        "undefined",
+    );
+    check(
+        "length-unchanged",
+        "let a = [1, 2]; a.length = 2; return a.length;",
+        "2",
+    );
+    // Reusing a scratch array is the pattern that made this matter.
+    check(
+        "length-reuse",
+        "let a = []; let total = 0; \
+         for (let i = 0; i < 3; i = i + 1) { a[0] = i; total = total + a.length; a.length = 0; } \
+         return total;",
+        "3",
+    );
+}
+
+/// **A length above 2^32-1 is a `RangeError`** — the specification's rule, and the only thing
+/// between `[].length = 4294967297` and an attempt to materialise four billion elements, which
+/// was a crash rather than an error a test could report.
+#[test]
+fn an_out_of_range_length_raises() {
+    check(
+        "length-too-big",
+        "let r = \"\"; try { [].length = 4294967297; } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "length-negative",
+        "let r = \"\"; try { [].length = -1; } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "length-fractional",
+        "let r = \"\"; try { [].length = 1.5; } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "length-legal",
+        "let a = [1, 2]; a.length = 1; return a.length;",
+        "1",
+    );
+}
+
+/// **A panic must not cross an `extern "C"` boundary.** A pattern the engine cannot compile is
+/// a `SyntaxError` whether the compiler says so or falls over saying it — otherwise the program
+/// dies on a signal with nothing to say which pattern did it.
+#[test]
+fn an_unsupported_pattern_raises_rather_than_aborting() {
+    // A malformed pattern is a `SyntaxError`, which is the path that already worked.
+    check(
+        "regexp-malformed",
+        "let r = \"ok\"; try { let p = new RegExp(\"(\"); } catch (e) { r = e.name; } return r;",
+        "SyntaxError",
+    );
+    // A property escape compiles — this is *not* what was panicking, though naming it was the
+    // first guess. What the guard buys is that whatever does panic arrives as an error instead
+    // of a signal, and the corpus reporting zero crashes is the evidence for that.
+    check(
+        "regexp-property-escape",
+        "return new RegExp(\"\\\\p{L}\", \"u\").test(\"a\");",
+        "true",
+    );
+    // A pattern it can compile still works, so the guard has not swallowed the ordinary path.
+    check("regexp-still-works", "return /ab+/.test(\"abb\");", "true");
+}
+
+/// **A throw is not a return value.** "A constructor answering a primitive yields the instance"
+/// was swallowing the exception signal, which is not an object either — so a constructor that
+/// raised handed back a perfectly good empty object and the `try` around it saw nothing.
+#[test]
+fn a_constructor_that_throws_is_not_swallowed() {
+    check(
+        "construct-throws",
+        "let r = \"ok\"; try { let p = new RegExp(\"(\"); } catch (e) { r = e.name; } return r;",
+        "SyntaxError",
+    );
+    check(
+        "construct-throws-user",
+        "let F = function () { throw new TypeError(\"no\"); }; \
+         let r = \"ok\"; try { let v = new F(); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    // The rule it was hiding behind still holds: a primitive return yields the instance.
+    check(
+        "construct-primitive-still",
+        "let F = function () { this.x = 1; return 42; }; return new F().x;",
+        "1",
+    );
+}
+
+// ---- the array methods work on array-likes -------------------------------------------------
+
+/// **Not just arrays.** test262 applies the array methods to anything with a `length` and
+/// indexed properties — `Array.prototype.filter.call(new String("abc"), …)` is a whole family
+/// of its cases — and a method insisting on real elements answered `undefined` for every one.
+#[test]
+fn the_array_methods_accept_an_array_like() {
+    check(
+        "arraylike-filter",
+        "let o = new String(\"abc\"); \
+         return Array.prototype.filter.call(o, function () { return true; })[0];",
+        "a",
+    );
+    check(
+        "arraylike-map",
+        "return Array.prototype.map.call({length: 2, 0: 1, 1: 2}, function (x) { return x * 2; })\
+         .join(\",\");",
+        "2,4",
+    );
+    check(
+        "arraylike-join",
+        "return Array.prototype.join.call({length: 2, 0: \"a\", 1: \"b\"}, \"-\");",
+        "a-b",
+    );
+    check(
+        "arraylike-indexof",
+        "return Array.prototype.indexOf.call({length: 2, 0: \"a\", 1: \"b\"}, \"b\");",
+        "1",
+    );
+    check(
+        "arraylike-foreach",
+        "let n = 0; Array.prototype.forEach.call({length: 3, 0: 1, 1: 2, 2: 3}, function () { n = n + 1; }); \
+         return n;",
+        "3",
+    );
+    check(
+        "arraylike-slice",
+        "return Array.prototype.slice.call({length: 3, 0: \"a\", 1: \"b\", 2: \"c\"}, 1).join(\",\");",
+        "b,c",
+    );
+    // A real array still takes the element path, which is the first question `indexed_length`
+    // asks.
+    check(
+        "array-still-works",
+        "return [1, 2, 3].filter(function (x) { return x > 1; }).length;",
+        "2",
+    );
+}
+
+/// **A lone surrogate is legal in `fromCodePoint` and cannot be represented here.** JavaScript
+/// strings are UTF-16 and may hold an unpaired surrogate; these are UTF-8. Raising was wrong —
+/// the specification says this succeeds — so it stands in a replacement character, which is a
+/// visible wrong answer rather than an error a program cannot expect.
+#[test]
+fn a_lone_surrogate_does_not_raise() {
+    check(
+        "surrogate-length",
+        "return String.fromCodePoint(0xD800).length;",
+        "1",
+    );
+    check(
+        "surrogate-ok",
+        "return typeof String.fromCodePoint(0xD800);",
+        "string",
+    );
+    // Out of range is still a `RangeError`, which the specification does require.
+    check(
+        "code-point-too-big",
+        "let r = \"\"; try { String.fromCodePoint(0x110000); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
+
+/// **A string wrapper is indexed by its characters.** It holds its text whole rather than one
+/// property per character, and reading one out on demand is what lets `new String("abc")[0]`
+/// work and what lets the array methods walk a wrapper at all.
+#[test]
+fn a_string_wrapper_is_indexed() {
+    check("wrapper-index", "return new String(\"abc\")[0];", "a");
+    check("wrapper-index-last", "return new String(\"abc\")[2];", "c");
+    check(
+        "wrapper-index-past",
+        "return new String(\"abc\")[9];",
+        "undefined",
+    );
+    check(
+        "wrapper-index-computed",
+        "let o = new String(\"abc\"); let i = 1; return o[i];",
+        "b",
+    );
+    // A plain object with a numbered property is unaffected.
+    check("plain-index", "let o = {0: \"z\"}; return o[0];", "z");
+}
+
+/// **`indexOf` compares strings by their characters.** It compared bits, so two cells holding
+/// `"b"` were different values and `["a", "b"].indexOf("b")` answered `-1` for as long as the
+/// method has existed. Every existing test used numbers, where comparing bits happens to agree.
+#[test]
+fn index_of_finds_a_string() {
+    check(
+        "indexof-string",
+        "return [\"a\", \"b\"].indexOf(\"b\");",
+        "1",
+    );
+    check(
+        "indexof-string-first",
+        "return [\"a\", \"b\"].indexOf(\"a\");",
+        "0",
+    );
+    check(
+        "indexof-string-missing",
+        "return [\"a\"].indexOf(\"z\");",
+        "-1",
+    );
+    // Built rather than written, so the two cells cannot be the same allocation.
+    check(
+        "indexof-string-built",
+        "let needle = \"a\" + \"b\"; return [\"x\", \"ab\"].indexOf(needle);",
+        "1",
+    );
+    // The rules it already had right stay right.
+    check("indexof-nan-still", "return [0 / 0].indexOf(0 / 0);", "-1");
+    check("indexof-number-still", "return [1, 2].indexOf(2);", "1");
+    // An object compares by identity, which is what the fallback is for.
+    check(
+        "indexof-object-identity",
+        "let o = {}; return [o, {}].indexOf(o);",
+        "0",
+    );
+    check("indexof-object-not-equal", "return [{}].indexOf({});", "-1");
+}
+
+/// **2^32 is not a length**, so a method that builds a result sized by it has to say so rather
+/// than try. Walking such a thing is merely slow; building one is four billion allocations, and
+/// that arrived as a killed process rather than an error a program could catch.
+#[test]
+fn an_impossible_length_raises_rather_than_allocating() {
+    check(
+        "map-length-too-big",
+        "let o = {0: 12, length: 4294967296}; let r = \"\"; \
+         try { Array.prototype.map.call(o, function (v) { return v; }); } \
+         catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    // A length an array could have still works.
+    check(
+        "map-length-ok",
+        "let o = {0: 1, 1: 2, length: 2}; \
+         return Array.prototype.map.call(o, function (v) { return v * 2; }).join(\",\");",
+        "2,4",
+    );
+}
+
+/// **One number is a length and anything else is an element.** `Array(3)` is three empty slots
+/// and `Array("3")` is one string — the most surprising rule in the constructor, and the reason
+/// `Array.of` exists to mean the other thing.
+#[test]
+fn the_array_constructor_reads_one_number_as_a_length() {
+    check("array-ctor-length", "return new Array(3).length;", "3");
+    check("array-ctor-length-plain", "return Array(3).length;", "3");
+    check("array-ctor-string", "return Array(\"3\").length;", "1");
+    check("array-ctor-string-value", "return Array(\"3\")[0];", "3");
+    check("array-ctor-many", "return Array(1, 2, 3).length;", "3");
+    check("array-ctor-none", "return Array().length;", "0");
+    check("array-ctor-zero", "return Array(0).length;", "0");
+    // `Array.of` means the other thing, which is why both exist.
+    check("array-of-contrast", "return Array.of(3).length;", "1");
+}
+
+/// A length the constructor cannot honour is a `RangeError`, as it is for an assignment.
+#[test]
+fn the_array_constructor_refuses_an_impossible_length() {
+    check(
+        "array-ctor-too-big",
+        "let r = \"\"; try { Array(4294967296); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "array-ctor-fraction",
+        "let r = \"\"; try { Array(1.5); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+    check(
+        "array-ctor-negative",
+        "let r = \"\"; try { Array(-1); } catch (e) { r = e.name; } return r;",
+        "RangeError",
+    );
+}
+
+/// **A sparse index becomes a named property rather than four billion slots.** Elements are a
+/// dense `Vec`, so `a[4294967294] = 2` — a legal array index — asks for every slot below it as
+/// well. The value is still stored and still readable by the same key; what it is not is an
+/// element, so `length` does not count it. That is wrong, and wrong in a way a test can report
+/// rather than a way that kills the process.
+#[test]
+fn a_sparse_index_does_not_exhaust_memory() {
+    check(
+        "sparse-read-back",
+        "let a = []; a[4294967294] = 2; return a[4294967294];",
+        "2",
+    );
+    check(
+        "sparse-length",
+        "let a = [0, 1]; a[4294967294] = 2; return a.length;",
+        "2",
+    );
+    check(
+        "sparse-survives",
+        "let a = []; a[4294967294] = 2; return typeof a;",
+        "object",
+    );
+    // An ordinary index is still an element, which is the case that has to stay fast.
+    check(
+        "dense-still-element",
+        "let a = []; a[3] = 7; return a.length;",
+        "4",
+    );
+    check("dense-read-back", "let a = []; a[3] = 7; return a[3];", "7");
+}
+
+// ---- accessor properties -------------------------------------------------------------------
+
+/// **An accessor is a property whose value is computed**, so reading it calls something. The
+/// slot holds the pair of functions rather than anything the program sees.
+#[test]
+fn a_getter_is_called_on_read() {
+    check(
+        "getter-read",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 7; }}); return o.x;",
+        "7",
+    );
+    check(
+        "getter-receiver",
+        "let o = {n: 3}; Object.defineProperty(o, \"double\", \
+         {get: function () { return this.n * 2; }}); return o.double;",
+        "6",
+    );
+    check(
+        "getter-each-time",
+        "let count = 0; let o = {}; \
+         Object.defineProperty(o, \"x\", {get: function () { count = count + 1; return count; }}); \
+         o.x; o.x; return o.x;",
+        "3",
+    );
+}
+
+/// **A setter receives the write**, and a getter without one swallows it — which is what makes
+/// a read-only computed property read-only.
+#[test]
+fn a_setter_is_called_on_write() {
+    check(
+        "setter-write",
+        "let seen = 0; let o = {}; \
+         Object.defineProperty(o, \"x\", {set: function (v) { seen = v; }}); o.x = 9; return seen;",
+        "9",
+    );
+    check(
+        "setter-pair",
+        "let held = 0; let o = {}; \
+         Object.defineProperty(o, \"x\", \
+         {get: function () { return held; }, set: function (v) { held = v * 2; }}); \
+         o.x = 5; return o.x;",
+        "10",
+    );
+    check(
+        "getter-only-write-ignored",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 1; }}); \
+         o.x = 9; return o.x;",
+        "1",
+    );
+    // A setter with no getter reads as `undefined` — the whole of what a write-only property is.
+    check(
+        "setter-only-read",
+        "let o = {}; Object.defineProperty(o, \"x\", {set: function () { }}); return o.x;",
+        "undefined",
+    );
+}
+
+/// An accessor inherited from a prototype sees the instance it was reached through.
+#[test]
+fn an_inherited_accessor_uses_the_receiver() {
+    check(
+        "getter-inherited",
+        "let base = {}; Object.defineProperty(base, \"x\", \
+         {get: function () { return this.n; }}); \
+         let o = Object.create(base); o.n = 4; return o.x;",
+        "4",
+    );
+    check(
+        "setter-inherited",
+        "let seen = 0; let base = {}; \
+         Object.defineProperty(base, \"x\", {set: function (v) { seen = v; }}); \
+         let o = Object.create(base); o.x = 6; return seen;",
+        "6",
+    );
+}
+
+/// **An accessor descriptor has `get` and `set` where a data one has `value` and `writable`** —
+/// four fields, never mixed, and a caller tells them apart by which pair is present.
+#[test]
+fn a_descriptor_reports_which_kind_it_is() {
+    check(
+        "descriptor-accessor-get",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 1; }}); \
+         return typeof Object.getOwnPropertyDescriptor(o, \"x\").get;",
+        "function",
+    );
+    check(
+        "descriptor-accessor-no-value",
+        "let o = {}; Object.defineProperty(o, \"x\", {get: function () { return 1; }}); \
+         return typeof Object.getOwnPropertyDescriptor(o, \"x\").value;",
+        "undefined",
+    );
+    check(
+        "descriptor-data-no-get",
+        "let o = {a: 1}; return typeof Object.getOwnPropertyDescriptor(o, \"a\").get;",
+        "undefined",
+    );
+    check(
+        "descriptor-data-writable",
+        "let o = {a: 1}; return Object.getOwnPropertyDescriptor(o, \"a\").writable;",
+        "true",
+    );
+}
+
+/// A descriptor carrying both a value and an accessor is a `TypeError` — they describe two
+/// different kinds of property and an object cannot be both.
+#[test]
+fn a_descriptor_cannot_be_both_kinds() {
+    check(
+        "descriptor-both",
+        "let r = \"\"; let o = {}; \
+         try { Object.defineProperty(o, \"x\", {value: 1, get: function () { return 2; }}); } \
+         catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// **A non-configurable property is nearly immutable.** The specification allows exactly one
+/// change: a writable data property may be made non-writable. Everything else is a `TypeError` —
+/// and without that, `defineProperty` would undo its own guarantees, since a frozen property
+/// could be quietly thawed by redefining it.
+#[test]
+fn a_non_configurable_property_cannot_be_redefined() {
+    check(
+        "redefine-configurable",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {configurable: true}); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-enumerable",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {enumerable: true}); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-writable-up",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {writable: true}); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-value",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {value: 2}); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    check(
+        "redefine-kind",
+        "let r = \"\"; let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         try { Object.defineProperty(o, \"x\", {get: function () { return 2; }}); } \
+         catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+    // Freezing must actually hold against a redefinition.
+    check(
+        "freeze-holds",
+        "let r = \"\"; let o = {a: 1}; Object.freeze(o); \
+         try { Object.defineProperty(o, \"a\", {value: 2}); } catch (e) { r = e.name; } return r;",
+        "TypeError",
+    );
+}
+
+/// **The one change that is allowed**: a writable property may be made non-writable, and the
+/// same value may be redefined. A configurable property may still be changed freely.
+#[test]
+fn the_permitted_redefinitions_still_work() {
+    check(
+        "redefine-writable-down",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, writable: true}); \
+         Object.defineProperty(o, \"x\", {writable: false}); \
+         return Object.getOwnPropertyDescriptor(o, \"x\").writable;",
+        "false",
+    );
+    check(
+        "redefine-same-value",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1}); \
+         Object.defineProperty(o, \"x\", {value: 1}); return o.x;",
+        "1",
+    );
+    check(
+        "redefine-configurable-freely",
+        "let o = {}; Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
+         Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+    // An ordinary assigned property is configurable, so it redefines without complaint.
+    check(
+        "redefine-plain",
+        "let o = {a: 1}; Object.defineProperty(o, \"a\", {value: 2}); return o.a;",
+        "2",
+    );
+}
+
+/// **`Object.create`'s second argument is a map of descriptors, not of values.**
+/// `Object.create(p, {x: {value: 1}})` gives `x` the value one; `Object.create(p, {x: 1})`
+/// gives it no value at all, because `1` describes nothing.
+#[test]
+fn object_create_takes_descriptors() {
+    check(
+        "create-descriptors",
+        "let o = Object.create(null, {x: {value: 1, enumerable: true}}); return o.x;",
+        "1",
+    );
+    check(
+        "create-descriptors-enumerable",
+        "let o = Object.create(null, {x: {value: 1, enumerable: true}}); \
+         return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "create-descriptors-default-hidden",
+        "let o = Object.create(null, {x: {value: 1}}); return Object.keys(o).length;",
+        "0",
+    );
+    check(
+        "create-descriptors-accessor",
+        "let o = Object.create(null, {x: {get: function () { return 5; }}}); return o.x;",
+        "5",
+    );
+    // A value that is not a descriptor describes nothing.
+    check(
+        "create-not-a-descriptor",
+        "let o = Object.create(null, {x: {}}); return o.x;",
+        "undefined",
+    );
+    // The prototype still works, with or without a second argument.
+    check(
+        "create-prototype-still",
+        "let base = {greet: 1}; let o = Object.create(base, {x: {value: 2}}); return o.greet;",
+        "1",
+    );
+}
+
+/// **`__defineGetter__` is older than `defineProperty` and still in use** — the only way a
+/// program written before ES5 could make an accessor. It makes an **enumerable, configurable**
+/// property, where `defineProperty`'s defaults are the opposite.
+#[test]
+fn the_legacy_accessor_definers_work() {
+    check(
+        "define-getter",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); return o.x;",
+        "7",
+    );
+    check(
+        "define-setter",
+        "let seen = 0; let o = {}; o.__defineSetter__(\"x\", function (v) { seen = v; }); \
+         o.x = 4; return seen;",
+        "4",
+    );
+    check(
+        "define-getter-enumerable",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 1; }); \
+         return Object.keys(o).length;",
+        "1",
+    );
+    check(
+        "define-getter-not-function",
+        "let r = \"\"; let o = {}; try { o.__defineGetter__(\"x\", 1); } catch (e) { r = e.name; } \
+         return r;",
+        "TypeError",
+    );
+}
+
+/// **An array's `length` is its element count, not a property**, so defining it has to resize
+/// rather than store. Storing left the array reporting two lengths at once — the descriptor
+/// said one and the elements said two — and every question after that got whichever answer its
+/// asker happened to consult.
+#[test]
+fn defining_length_through_a_descriptor_resizes() {
+    check(
+        "define-length-descriptor",
+        "let a = [0, 1]; Object.defineProperties(a, {length: {value: 1, writable: false}}); \
+         return a.length;",
+        "1",
+    );
+    // The elements go with the length, so the dropped one is really gone.
+    check(
+        "define-length-drops-elements",
+        "let a = [0, 1]; Object.defineProperty(a, \"length\", {value: 1}); \
+         return a.hasOwnProperty(\"1\");",
+        "false",
+    );
+    check(
+        "define-length-keeps-the-rest",
+        "let a = [0, 1]; Object.defineProperty(a, \"length\", {value: 1}); return a[0];",
+        "0",
+    );
+    check(
+        "define-length-grows",
+        "let a = [0]; Object.defineProperty(a, \"length\", {value: 3}); return a.length;",
+        "3",
+    );
+    // **A length made non-writable ignores an assignment**, as a non-writable property does.
+    check(
+        "define-length-fixed",
+        "let a = [0, 1]; Object.defineProperty(a, \"length\", {value: 2, writable: false}); \
+         a.length = 1; return a.length;",
+        "2",
+    );
+    // A writable length still resizes on assignment.
+    check(
+        "define-length-still-writable",
+        "let a = [0, 1]; a.length = 1; return a.length;",
+        "1",
+    );
+    check(
+        "define-length-invalid",
+        "let r = \"\"; let a = [0]; \
+         try { Object.defineProperty(a, \"length\", {value: -1}); } catch (e) { r = e.name; } \
+         return r;",
+        "RangeError",
+    );
+    // The flag is bookkeeping, not a property the program can see. Asserted by name rather
+    // than by a total, because the total was itself wrong — an array owns its indices *and*
+    // `length`, so `[0]` has two own names and the first version of this expected none.
+    check(
+        "define-length-flag-hidden",
+        "let a = [0]; Object.defineProperty(a, \"length\", {value: 1, writable: false}); \
+         return Object.getOwnPropertyNames(a).indexOf(\"__fixedLength\");",
+        "-1",
+    );
+    // **A length value is coerced through `ToNumber`**, which runs `valueOf`/`toString` — an
+    // object that stringifies to a number sets the length, rather than being read as `NaN`.
+    check(
+        "define-length-object-coerces",
+        "let a = []; let seen = \"\"; \
+         Object.defineProperty(a, \"length\", {value: {valueOf: function () { seen = seen + \"v\"; return {}; }, \
+             toString: function () { seen = seen + \"t\"; return \"2\"; }}}); \
+         return a.length + \":\" + seen;",
+        "2:vt",
+    );
+    // A length that coerces to a non-integer is still a RangeError.
+    check(
+        "define-length-object-non-integer",
+        "let a = []; \
+         try { Object.defineProperty(a, \"length\", {value: {valueOf: function () { return 1.5; }}}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
+/// **Defining an array index behaves like defining any property**: it can grow the array, take
+/// attribute-only descriptors, and hold an accessor that reads back through the getter.
+#[test]
+fn defining_an_array_index_covers_the_descriptor_cases() {
+    // Growing an empty array by defining index 0.
+    check(
+        "define-index-grows",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 9}); \
+         return a.hasOwnProperty(\"0\") + \",\" + a.length + \",\" + a[0];",
+        "true,1,9",
+    );
+    // An attribute-only descriptor still creates the property (value undefined).
+    check(
+        "define-index-attributes-only",
+        "let a = []; Object.defineProperty(a, \"0\", {configurable: true}); \
+         let d = Object.getOwnPropertyDescriptor(a, \"0\"); \
+         return (d !== undefined) + \",\" + d.value + \",\" + d.configurable;",
+        "true,undefined,true",
+    );
+    // An accessor on an array index is invoked on read.
+    check(
+        "define-index-accessor",
+        "let a = []; Object.defineProperty(a, \"0\", {get: function () { return 42; }}); \
+         return a[0];",
+        "42",
+    );
+    // The exact 15.2.3.7-6-a-226 sequence: define index 0, then redefine via defineProperties.
+    check(
+        "define-properties-index-redefine",
+        "let a = []; Object.defineProperty(a, \"0\", {configurable: true}); \
+         Object.defineProperties(a, {\"0\": {configurable: false}}); \
+         let d = Object.getOwnPropertyDescriptor(a, \"0\"); \
+         return d.value + \",\" + d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "undefined,false,false,false",
+    );
+    // **`Function.prototype.call.bind(method)`** — the pattern test262's propertyHelper uses
+    // for `__hasOwnProperty`. If it is wrong, every `verifyProperty` test fails identically.
+    check(
+        "call-bind-hasownproperty",
+        "let h = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+         let a = {x: 1}; return h(a, \"x\") + \",\" + h(a, \"y\");",
+        "true,false",
+    );
+    check(
+        "call-bind-on-array-index",
+        "let h = Function.prototype.call.bind(Object.prototype.hasOwnProperty); \
+         let a = []; Object.defineProperty(a, \"0\", {value: 9}); return h(a, \"0\");",
+        "true",
+    );
+    // **`delete` on a non-configurable element fails and keeps it** — which is what
+    // test262's `verifyProperty` probes, and what makes those cases report "0 should be an own
+    // property" when it wrongly succeeds.
+    check(
+        "delete-non-configurable-element",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 5, configurable: false}); \
+         let gone = delete a[0]; \
+         return gone + \",\" + a.hasOwnProperty(\"0\") + \",\" + a[0];",
+        "false,true,5",
+    );
+}
+
+/// **An array owns `length`**, even though nothing stores it — `getOwnPropertyNames` has to
+/// say so. It is **not enumerable**, so `Object.keys` and `for-in` still leave it out, and that
+/// difference is the whole reason the two lists are not the same list.
+#[test]
+fn an_array_owns_its_indices_and_its_length() {
+    check(
+        "array-own-names",
+        "return Object.getOwnPropertyNames([7, 8]).join(\",\");",
+        "0,1,length",
+    );
+    check(
+        "array-own-names-empty",
+        "return Object.getOwnPropertyNames([]).join(\",\");",
+        "length",
+    );
+    // Enumeration leaves `length` out, which is why `Object.keys` is shorter.
+    check(
+        "array-keys",
+        "return Object.keys([7, 8]).join(\",\");",
+        "0,1",
+    );
+    check(
+        "array-forin",
+        "let s = \"\"; for (let k in [7, 8]) { s = s + k; } return s;",
+        "01",
+    );
+    // A plain object is unaffected: it has no derived length to report or hide.
+    check(
+        "object-own-names-plain",
+        "return Object.getOwnPropertyNames({a: 1}).join(\",\");",
+        "a",
+    );
+    check(
+        "object-length-property",
+        "return Object.keys({length: 2}).join(\",\");",
+        "length",
+    );
+}
+
+/// **`__proto__` is an accessor on `Object.prototype`**, not a property anything stores — so
+/// it is shadowable by an own property, absent from an object with no prototype, and reached
+/// through the ordinary chain walk rather than by a name check at the top of it.
+#[test]
+fn the_prototype_link_is_readable_and_writable_by_name() {
+    check(
+        "proto-read",
+        "let o = {}; return o.__proto__ === Object.prototype;",
+        "true",
+    );
+    check(
+        "proto-write",
+        "let a = {x: 1}; let b = {}; b.__proto__ = a; return b.x;",
+        "1",
+    );
+    // The literal form is the same operation, which is why it needs no separate lowering.
+    check(
+        "proto-literal",
+        "let a = {x: 2}; let o = {__proto__: a}; return o.x;",
+        "2",
+    );
+    // **An object with no prototype has no `__proto__`.** The accessor lives on
+    // `Object.prototype`, and this object's chain never reaches it.
+    check(
+        "proto-null-prototype",
+        "let o = Object.create(null); return typeof o.__proto__;",
+        "undefined",
+    );
+    check(
+        "proto-end-of-chain",
+        "return Object.prototype.__proto__;",
+        "null",
+    );
+    // Assigning something that is neither an object nor `null` is ignored, not an error.
+    check(
+        "proto-write-primitive",
+        "let o = {}; o.__proto__ = 5; return o.__proto__ === Object.prototype;",
+        "true",
+    );
+    check(
+        "proto-write-null",
+        "let o = {}; o.__proto__ = null; return o.__proto__;",
+        "undefined",
+    );
+}
+
+/// **A cycle is refused**, by every route into `[[SetPrototypeOf]]` — and so is re-parenting an
+/// object that has stopped being extensible.
+#[test]
+fn a_prototype_may_not_be_made_cyclic() {
+    check(
+        "proto-cycle",
+        "let a = {}; let b = Object.create(a); \
+         try { a.__proto__ = b; return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proto-cycle-set-prototype-of",
+        "let a = {}; let b = Object.create(a); \
+         try { Object.setPrototypeOf(a, b); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proto-non-extensible",
+        "let o = Object.preventExtensions({}); \
+         try { Object.setPrototypeOf(o, {x: 1}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Setting the prototype it already has is not a change, so nothing refuses it.
+    check(
+        "proto-non-extensible-same",
+        "let o = Object.preventExtensions({}); \
+         return Object.setPrototypeOf(o, Object.prototype) === o;",
+        "true",
+    );
+    check(
+        "proto-set-prototype-of-primitive",
+        "return Object.setPrototypeOf(5, null);",
+        "5",
+    );
+    check(
+        "proto-set-prototype-of-nullish",
+        "try { Object.setPrototypeOf(null, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **An array's elements and its `length` are own properties with no slot**, so every question
+/// asked of a descriptor has to answer for them too. `getOwnPropertyDescriptor` returning
+/// `undefined` for them is what test262's `propertyHelper` then read a field off.
+#[test]
+fn an_element_has_a_descriptor() {
+    check(
+        "descriptor-element-value",
+        "return Object.getOwnPropertyDescriptor([7, 8], \"0\").value;",
+        "7",
+    );
+    check(
+        "descriptor-element-flags",
+        "let d = Object.getOwnPropertyDescriptor([7], \"0\"); \
+         return d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "true,true,true",
+    );
+    // A length is writable and neither enumerable nor configurable — an attribute set no
+    // ordinary property has.
+    check(
+        "descriptor-array-length",
+        "let d = Object.getOwnPropertyDescriptor([7, 8], \"length\"); \
+         return d.value + \",\" + d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "2,true,false,false",
+    );
+    check(
+        "descriptor-element-absent",
+        "return typeof Object.getOwnPropertyDescriptor([7], \"3\");",
+        "undefined",
+    );
+    // A string wrapper's characters are the same shape of problem: materialised on demand, so
+    // nothing in the shape lists them.
+    check(
+        "descriptor-string-character",
+        "return Object.getOwnPropertyDescriptor(new String(\"ab\"), \"1\").value;",
+        "b",
+    );
+    check(
+        "string-wrapper-own-names",
+        "return Object.getOwnPropertyNames(new String(\"ab\")).join(\",\");",
+        "0,1,length",
+    );
+    check(
+        "string-wrapper-keys",
+        "return Object.keys(new String(\"ab\")).join(\",\");",
+        "0,1",
+    );
+    // A `Number` wrapper keeps its primitive under the same hidden name and must not be read
+    // as text — otherwise `12345` would have five characters and five own properties.
+    check(
+        "number-wrapper-keys",
+        "return Object.keys(new Number(12345)).length;",
+        "0",
+    );
+}
+
+/// **Freezing an array has to freeze its elements**, which have no attributes of their own —
+/// so the flag is carried for the whole run of them. Without it `Object.freeze` froze nothing
+/// on exactly the objects people freeze most, and looked like it had worked.
+#[test]
+fn freezing_an_array_stops_its_elements_changing() {
+    check(
+        "freeze-array-write",
+        "let a = Object.freeze([1]); a[0] = 9; return a[0];",
+        "1",
+    );
+    check(
+        "freeze-array-grow",
+        "let a = Object.freeze([1]); a[1] = 2; return a.length;",
+        "1",
+    );
+    check(
+        "freeze-array-length",
+        "let a = Object.freeze([1]); a.length = 0; return a.length;",
+        "1",
+    );
+    check(
+        "freeze-array-is-frozen",
+        "return Object.isFrozen(Object.freeze([1]));",
+        "true",
+    );
+    // Not extensible is not frozen: the element is still writable, and the answer used to be
+    // `true` because an unslotted key was passed over rather than asked about.
+    check(
+        "prevent-extensions-array-is-not-frozen",
+        "return Object.isFrozen(Object.preventExtensions([1]));",
+        "false",
+    );
+    // Sealing leaves the values writable and stops the deleting, which is the whole difference.
+    check(
+        "seal-array",
+        "let a = Object.seal([1]); a[0] = 9; return a[0] + \",\" + (delete a[0]);",
+        "9,false",
+    );
+    check(
+        "seal-array-is-sealed",
+        "return Object.isSealed(Object.seal([1]));",
+        "true",
+    );
+    check(
+        "seal-array-is-not-frozen",
+        "return Object.isFrozen(Object.seal([1]));",
+        "false",
+    );
+    // An empty array has no elements to freeze, so it is frozen as soon as it is closed.
+    check(
+        "freeze-empty-array",
+        "return Object.isFrozen(Object.freeze([]));",
+        "true",
+    );
+}
+
+/// **Defining an array index writes the element.** Storing it as an ordinary property instead
+/// left the array holding two answers for one key — the element the reads use and the slot the
+/// descriptors use — which disagree from then on.
+#[test]
+fn defining_an_index_writes_the_element() {
+    check(
+        "define-index-existing",
+        "let a = [1]; Object.defineProperty(a, \"0\", {value: 5}); return a[0];",
+        "5",
+    );
+    check(
+        "define-index-new",
+        "let a = [1]; \
+         Object.defineProperty(a, \"1\", {value: 7, writable: true, enumerable: true, configurable: true}); \
+         return a.length + \",\" + a[1];",
+        "2,7",
+    );
+    // Once, however it got there.
+    check(
+        "define-index-not-listed-twice",
+        "let a = [1]; Object.defineProperty(a, \"0\", {value: 5}); \
+         return Object.getOwnPropertyNames(a).join(\",\");",
+        "0,length",
+    );
+}
+
+/// The rest of `Object`: the descriptors in bulk, and the two lookups that pair with
+/// `__defineGetter__`.
+#[test]
+fn object_reports_every_descriptor_and_finds_accessors() {
+    check(
+        "own-descriptors",
+        "let d = Object.getOwnPropertyDescriptors({a: 1, b: 2}); \
+         return d.a.value + \",\" + d.b.value + \",\" + d.a.enumerable;",
+        "1,2,true",
+    );
+    check(
+        "own-descriptors-array",
+        "let d = Object.getOwnPropertyDescriptors([7]); \
+         return d[0].value + \",\" + d.length.value;",
+        "7,1",
+    );
+    check(
+        "own-descriptors-empty",
+        "return Object.keys(Object.getOwnPropertyDescriptors({})).length;",
+        "0",
+    );
+    check(
+        "lookup-getter",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         return o.__lookupGetter__(\"x\")();",
+        "7",
+    );
+    // A getter with no setter has nothing to find, which is how the pair is told apart.
+    check(
+        "lookup-setter-absent",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         return typeof o.__lookupSetter__(\"x\");",
+        "undefined",
+    );
+    // Inherited, unlike `getOwnPropertyDescriptor` — which is why both still exist.
+    check(
+        "lookup-getter-inherited",
+        "let a = {}; a.__defineGetter__(\"x\", function () { return 3; }); \
+         let b = Object.create(a); return b.__lookupGetter__(\"x\")();",
+        "3",
+    );
+}
+
+/// **`null` and `undefined` are the error, not "anything that is not an object".** Every
+/// `Object` static coerces its argument, so a primitive is answered and only a nullish one
+/// throws — and answering one of these with `undefined` is what the caller then reads a field
+/// off.
+#[test]
+fn object_refuses_only_the_nullish() {
+    check(
+        "keys-of-null",
+        "try { Object.keys(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "values-of-undefined",
+        "try { Object.values(undefined); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "entries-of-null",
+        "try { Object.entries(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "own-names-of-null",
+        "try { Object.getOwnPropertyNames(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "get-prototype-of-null",
+        "try { Object.getPrototypeOf(null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "assign-to-null",
+        "try { Object.assign(null, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "has-own-property-of-null",
+        "try { Object.prototype.hasOwnProperty.call(null, \"x\"); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A primitive is coerced, which is the other half of the same rule.
+    check("keys-of-number", "return Object.keys(5).length;", "0");
+    check(
+        "get-prototype-of-number",
+        "return Object.getPrototypeOf(1) === Object.getPrototypeOf(2);",
+        "true",
+    );
+    check(
+        "freeze-of-null-is-not-an-error",
+        "return Object.freeze(null);",
+        "null",
+    );
+}
+
+/// A string's characters are its own properties, whether it is wrapped or not.
+#[test]
+fn a_string_owns_its_characters() {
+    check(
+        "string-keys",
+        "return Object.keys(\"ab\").join(\",\");",
+        "0,1",
+    );
+    check(
+        "string-own-names",
+        "return Object.getOwnPropertyNames(\"ab\").join(\",\");",
+        "0,1,length",
+    );
+    check(
+        "string-descriptor",
+        "let d = Object.getOwnPropertyDescriptor(\"ab\", \"0\"); \
+         return d.value + \",\" + d.writable + \",\" + d.enumerable;",
+        "a,false,true",
+    );
+    check(
+        "string-length-descriptor",
+        "let d = Object.getOwnPropertyDescriptor(\"ab\", \"length\"); \
+         return d.value + \",\" + d.enumerable;",
+        "2,false",
+    );
+}
+
+/// **The class tag is what `Object.prototype.toString` is for**, and answering `[object
+/// Object]` for everything that is not an array made it useless for the one job it has.
+#[test]
+fn the_class_tag_names_the_class() {
+    check(
+        "tag-number",
+        "return Object.prototype.toString.call(5);",
+        "[object Number]",
+    );
+    check(
+        "tag-string",
+        "return Object.prototype.toString.call(\"x\");",
+        "[object String]",
+    );
+    check(
+        "tag-null",
+        "return Object.prototype.toString.call(null);",
+        "[object Null]",
+    );
+    check(
+        "tag-undefined",
+        "return Object.prototype.toString.call(undefined);",
+        "[object Undefined]",
+    );
+    check(
+        "tag-array",
+        "return Object.prototype.toString.call([]);",
+        "[object Array]",
+    );
+    check(
+        "tag-function",
+        "return Object.prototype.toString.call(function () {});",
+        "[object Function]",
+    );
+    check(
+        "tag-plain",
+        "return Object.prototype.toString.call({});",
+        "[object Object]",
+    );
+    // A wrapper's class follows from the primitive it holds — which is why a boolean wrapper
+    // now stores a boolean rather than one or zero.
+    check(
+        "tag-string-wrapper",
+        "return Object.prototype.toString.call(new String(\"x\"));",
+        "[object String]",
+    );
+    check(
+        "tag-number-wrapper",
+        "return Object.prototype.toString.call(new Number(1));",
+        "[object Number]",
+    );
+    check(
+        "tag-boolean-wrapper",
+        "return Object.prototype.toString.call(new Boolean(true));",
+        "[object Boolean]",
+    );
+    // The representation change the tag needed must not change what the wrapper reads as.
+    check(
+        "boolean-wrapper-value",
+        "return new Boolean(false).valueOf();",
+        "false",
+    );
+    check(
+        "boolean-wrapper-true",
+        "return new Boolean(true).valueOf();",
+        "true",
+    );
+}
+
+/// An element is enumerable and `length` is not, and neither has a slot to say so.
+#[test]
+fn an_element_answers_for_its_own_enumerability() {
+    check(
+        "element-is-enumerable",
+        "return [1].propertyIsEnumerable(0);",
+        "true",
+    );
+    check(
+        "array-length-is-not-enumerable",
+        "return [1].propertyIsEnumerable(\"length\");",
+        "false",
+    );
+    check(
+        "absent-is-not-enumerable",
+        "return [1].propertyIsEnumerable(3);",
+        "false",
+    );
+}
+
+/// **Every index comes before every name, in ascending order**, whatever order they were
+/// written in. That is the specification's enumeration order and it is observable.
+#[test]
+fn keys_come_out_indices_first() {
+    check(
+        "key-order",
+        "return Object.keys({b: 1, 2: 1, 1: 1, a: 1}).join(\",\");",
+        "1,2,b,a",
+    );
+    check(
+        "key-order-forin",
+        "let s = \"\"; for (let k in {b: 1, 2: 1, 1: 1, a: 1}) { s = s + k; } return s;",
+        "12ba",
+    );
+    // Only the canonical spelling is an index: `"01"` is a name and stays where it was put.
+    check(
+        "key-order-non-canonical",
+        "let o = {}; o[\"01\"] = 1; o[\"1\"] = 1; return Object.keys(o).join(\",\");",
+        "1,01",
+    );
+    check(
+        "key-order-names-keep-insertion",
+        "return Object.keys({z: 1, a: 1, m: 1}).join(\",\");",
+        "z,a,m",
+    );
+}
+
+/// `Object(x)` is `ToObject(x)`: an object unchanged, a primitive wrapped, nothing at all for
+/// nothing at all.
+#[test]
+fn the_object_constructor_coerces() {
+    check(
+        "object-of-object-is-identity",
+        "let o = {x: 1}; return Object(o) === o;",
+        "true",
+    );
+    check("object-of-number", "return Object(5).valueOf();", "5");
+    check(
+        "object-of-string-length",
+        "return Object(\"ab\").length;",
+        "2",
+    );
+    check(
+        "object-of-string-tag",
+        "return Object.prototype.toString.call(Object(\"ab\"));",
+        "[object String]",
+    );
+    check(
+        "object-of-boolean-tag",
+        "return Object.prototype.toString.call(Object(true));",
+        "[object Boolean]",
+    );
+    check(
+        "object-of-nothing",
+        "return Object.keys(Object()).length;",
+        "0",
+    );
+    check(
+        "object-of-null",
+        "return Object.prototype.toString.call(Object(null));",
+        "[object Object]",
+    );
+    // A descriptor has to be able to hold fields; a number quietly defined `undefined`.
+    check(
+        "define-property-bad-descriptor",
+        "try { Object.defineProperty({}, \"x\", 5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "define-properties-bad-target",
+        "try { Object.defineProperties(5, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **An index names an element, even spelled as text.** `a["0"]` and `a[0]` are the same
+/// property; only the second reached the elements, so everything that reads an object by name
+/// — `Object.values`, `Object.entries`, `Object.assign` — saw `undefined` for every element an
+/// array has.
+#[test]
+fn an_index_spelled_as_text_is_still_an_element() {
+    check("index-as-text-read", "return [7, 8][\"1\"];", "8");
+    check(
+        "index-as-text-write",
+        "let a = [7]; a[\"0\"] = 9; return a[0];",
+        "9",
+    );
+    check(
+        "index-as-text-grows",
+        "let a = [7]; a[\"1\"] = 9; return a.length + \",\" + a[1];",
+        "2,9",
+    );
+    // Only the canonical spelling: `"01"` is a property, not element one.
+    check(
+        "index-non-canonical-is-a-name",
+        "let a = [7]; a[\"01\"] = 9; return a.length + \",\" + a[0];",
+        "1,7",
+    );
+    check("string-index-as-text", "return \"ab\"[\"1\"];", "b");
+    check(
+        "object-values-of-array",
+        "return Object.values([7, 8]).join(\",\");",
+        "7,8",
+    );
+    check(
+        "object-entries-of-array",
+        "return Object.entries([7])[0].join(\",\");",
+        "0,7",
+    );
+    check(
+        "object-assign-from-array",
+        "let o = Object.assign({}, [7, 8]); return o[0] + \",\" + o[1] + \",\" + Object.keys(o).join(\"|\");",
+        "7,8,0|1",
+    );
+    // `length` is not enumerable, so it is not copied — `own_keys` would have brought it.
+    check(
+        "object-assign-skips-length",
+        "return Object.keys(Object.assign({}, \"ab\")).join(\",\");",
+        "0,1",
+    );
+    check(
+        "object-values-of-string",
+        "return Object.values(\"ab\").join(\",\");",
+        "a,b",
+    );
+}
+
+/// `Object.groupBy` files items under what the callback answers, in an object with **no
+/// prototype** — so a group called `"toString"` collides with nothing.
+#[test]
+fn group_by_files_items_under_their_key() {
+    check(
+        "group-by",
+        "let g = Object.groupBy([1, 2, 3, 4], function (n) { return n % 2 ? \"odd\" : \"even\"; }); \
+         return g.odd.join(\",\") + \"|\" + g.even.join(\",\");",
+        "1,3|2,4",
+    );
+    check(
+        "group-by-has-no-prototype",
+        "return Object.getPrototypeOf(Object.groupBy([], function () { return \"x\"; }));",
+        "null",
+    );
+    check(
+        "group-by-inherited-name",
+        "let g = Object.groupBy([1], function () { return \"toString\"; }); \
+         return g.toString.length;",
+        "1",
+    );
+    check(
+        "group-by-index-argument",
+        "let g = Object.groupBy([9, 9], function (v, i) { return i; }); \
+         return Object.keys(g).join(\",\");",
+        "0,1",
+    );
+    check(
+        "group-by-needs-a-function",
+        "try { Object.groupBy([], 5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// A prototype is an object or `null`, and a receiver that is nullish is an error rather than
+/// a `false`.
+#[test]
+fn create_and_is_prototype_of_check_what_they_are_given() {
+    check(
+        "create-bad-prototype",
+        "try { Object.create(5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "create-null-prototype",
+        "return Object.getPrototypeOf(Object.create(null));",
+        "null",
+    );
+    check(
+        "is-prototype-of-nullish",
+        "try { Object.prototype.isPrototypeOf.call(null, {}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "is-prototype-of-primitive-argument",
+        "return Object.prototype.isPrototypeOf.call(Object.prototype, 5);",
+        "false",
+    );
+}
+
+/// A character is non-configurable and has no slot to say so, so redefining one has to be
+/// refused by the derived answer or it quietly grows a second property with the same name.
+#[test]
+fn a_character_cannot_be_redefined() {
+    check(
+        "redefine-character",
+        "let s = new String(\"ab\"); \
+         try { Object.defineProperty(s, \"0\", {value: \"z\"}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Redefining it to what it already is changes nothing and is allowed.
+    check(
+        "redefine-character-to-itself",
+        "let s = new String(\"ab\"); \
+         Object.defineProperty(s, \"0\", {value: \"a\"}); return s[0];",
+        "a",
+    );
+    // A string is a cell but not an object, so a handle is not the test the target needs.
+    check(
+        "define-on-a-primitive-string",
+        "try { Object.defineProperty(\"ab\", \"x\", {value: 1}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **Freezing keeps a property being an accessor.** Clearing the flag turned the pair of
+/// functions in the slot into the property's value, so a frozen getter read back as a
+/// two-element array instead of being called.
+#[test]
+fn freezing_an_accessor_leaves_it_an_accessor() {
+    check(
+        "freeze-getter",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         Object.freeze(o); return o.x;",
+        "7",
+    );
+    // An accessor has no writability to freeze, so being non-configurable is the whole of it.
+    check(
+        "frozen-getter-is-frozen",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         return Object.isFrozen(Object.freeze(o));",
+        "true",
+    );
+    check(
+        "frozen-getter-descriptor",
+        "let o = {}; o.__defineGetter__(\"x\", function () { return 7; }); \
+         Object.freeze(o); \
+         let d = Object.getOwnPropertyDescriptor(o, \"x\"); \
+         return typeof d.get + \",\" + d.configurable;",
+        "function,false",
+    );
+}
+
+/// **Every own name shadows, not only the enumerable ones.** A non-enumerable own property
+/// hides an inherited one of the same name, so a `for-in` must visit neither.
+#[test]
+fn a_hidden_property_still_shadows_an_inherited_one() {
+    check(
+        "forin-shadowed-by-non-enumerable",
+        "let a = {x: 1}; let b = Object.create(a); \
+         Object.defineProperty(b, \"x\", {value: 2, enumerable: false}); \
+         let s = \"\"; for (let k in b) { s = s + k; } return s.length;",
+        "0",
+    );
+    // An enumerable own property is visited once, not once per level.
+    check(
+        "forin-shadowed-by-enumerable",
+        "let a = {x: 1}; let b = Object.create(a); b.x = 2; \
+         let s = \"\"; for (let k in b) { s = s + k; } return s;",
+        "x",
+    );
+    check(
+        "forin-inherits",
+        "let a = {x: 1}; let b = Object.create(a); b.y = 2; \
+         let s = \"\"; for (let k in b) { s = s + k; } return s;",
+        "yx",
+    );
+    // A character is non-configurable and has no slot to say so, so `delete` has to refuse it
+    // from the derived answer.
+    check(
+        "delete-a-character",
+        "let s = new String(\"ab\"); return delete s[0];",
+        "false",
+    );
+}
+
+/// **A function's `prototype` is not enumerable**, which matters because every function a
+/// program can see is an object it might enumerate.
+#[test]
+fn a_functions_prototype_is_not_enumerable() {
+    check(
+        "function-keys",
+        "return Object.keys(function () {}).length;",
+        "0",
+    );
+    check(
+        "function-forin",
+        "let s = \"\"; for (let k in function () {}) { s = s + k; } return s.length;",
+        "0",
+    );
+    // Still there, and still what `new` and `instanceof` read.
+    check(
+        "function-prototype-is-present",
+        "function f() {} return Object.getOwnPropertyNames(f).indexOf(\"prototype\") >= 0;",
+        "true",
+    );
+    check(
+        "function-prototype-still-links",
+        "function f() {} return new f() instanceof f;",
+        "true",
+    );
+    check("constructor-keys", "return Object.keys(Array).length;", "0");
+}
+
+/// **`constructor` is the link back**, and nothing had it: `({}).constructor` was `undefined`,
+/// which is how a program asks what made something.
+#[test]
+fn a_prototype_points_back_at_its_constructor() {
+    check(
+        "object-constructor",
+        "return ({}).constructor === Object;",
+        "true",
+    );
+    check(
+        "array-constructor",
+        "return [].constructor === Array;",
+        "true",
+    );
+    check(
+        "string-constructor",
+        "return \"x\".constructor === String;",
+        "true",
+    );
+    check(
+        "function-constructor",
+        "function f() {} return new f().constructor === f;",
+        "true",
+    );
+    // Not enumerable, or every object would list it.
+    check(
+        "constructor-is-not-enumerable",
+        "return Object.keys(Object.prototype).indexOf(\"constructor\");",
+        "-1",
+    );
+    // Configurable, which is how a subclass replaces it — `define_method` would also have
+    // renamed the function to `"constructor"`, which is why it is not that.
+    check(
+        "constructor-keeps-its-name",
+        "return Object.prototype.constructor.name;",
+        "Object",
+    );
+}
+
+/// `toLocaleString` is a hook: it calls the receiver's own `toString`, so an override is
+/// visible through it. Pointing it at the default made every override invisible.
+#[test]
+fn to_locale_string_calls_the_receivers_to_string() {
+    check(
+        "to-locale-string-override",
+        "let o = {toString: function () { return \"x\"; }}; return o.toLocaleString();",
+        "x",
+    );
+    check(
+        "to-locale-string-default",
+        "return ({}).toLocaleString();",
+        "[object Object]",
+    );
+}
+
+/// **A non-extensible object refuses a property it does not have** — the one refusal
+/// `defineProperty` never made, so `preventExtensions` stopped assignment and let a definition
+/// straight through.
+#[test]
+fn defining_respects_extensibility() {
+    check(
+        "define-on-non-extensible",
+        "let o = Object.preventExtensions({}); \
+         try { Object.defineProperty(o, \"x\", {value: 1}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // An existing property may still be redefined: it is the *adding* that stops.
+    check(
+        "redefine-on-non-extensible",
+        "let o = {x: 1}; Object.preventExtensions(o); \
+         Object.defineProperty(o, \"x\", {value: 2}); return o.x;",
+        "2",
+    );
+    check(
+        "define-element-on-non-extensible",
+        "let a = Object.preventExtensions([1]); \
+         try { Object.defineProperty(a, \"1\", {value: 2}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A frozen element is non-configurable, so redefining its value is refused too.
+    check(
+        "define-frozen-element",
+        "let a = Object.freeze([1]); \
+         try { Object.defineProperty(a, \"0\", {value: 2}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "define-properties-on-non-extensible",
+        "let o = Object.preventExtensions({}); \
+         try { Object.defineProperties(o, {x: {value: 1}}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **A thrown error has to be an instance of what threw it.** `catch (e) { e instanceof
+/// TypeError }` is how a program asks what it caught, and test262's `assert.throws` compares
+/// `thrown.constructor` — both answered `Object` for an engine that had thrown exactly the
+/// right thing.
+#[test]
+fn an_error_is_an_instance_of_its_constructor() {
+    check(
+        "error-instanceof",
+        "return new TypeError(\"x\") instanceof TypeError;",
+        "true",
+    );
+    // Every kind of error is an `Error`, which is what most code that catches one checks.
+    check(
+        "error-instanceof-error",
+        "return new TypeError(\"x\") instanceof Error;",
+        "true",
+    );
+    check(
+        "error-constructor",
+        "return new RangeError(\"x\").constructor === RangeError;",
+        "true",
+    );
+    // Called without `new`, a constructor still constructs.
+    check(
+        "error-called-plainly",
+        "return Error(\"x\") instanceof Error;",
+        "true",
+    );
+    // And the errors the engine itself raises are the same kind of object.
+    check(
+        "raised-error-instanceof",
+        "try { null.x; return \"no\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    check(
+        "raised-error-constructor",
+        "try { null.x; return \"no\"; } catch (e) { return e.constructor === TypeError; }",
+        "true",
+    );
+    // The kind lives on the prototype, so the instance carries nothing a program can list.
+    check(
+        "error-keys",
+        "return Object.keys(new TypeError(\"x\")).length;",
+        "0",
+    );
+    check(
+        "error-prototype-name",
+        "return Error.prototype.name;",
+        "Error",
+    );
+    check(
+        "error-to-string",
+        "return new TypeError(\"x\").toString();",
+        "TypeError: x",
+    );
+    // Either half being empty takes the separator with it.
+    check(
+        "error-to-string-bare",
+        "return new Error().toString();",
+        "Error",
+    );
+    check(
+        "error-to-string-message-only",
+        "let e = new Error(\"x\"); e.name = \"\"; return e.toString();",
+        "x",
+    );
+}
+
+/// **An element can be restricted on its own.** Elements share a dense `Vec` with no room for
+/// attributes, so a rule array beside them carries the exceptions: one entry for the whole run
+/// and one per element that differs.
+#[test]
+fn an_element_can_carry_its_own_attributes() {
+    check(
+        "define-element-unwritable",
+        "let a = [1]; Object.defineProperty(a, \"0\", {writable: false}); a[0] = 9; return a[0];",
+        "1",
+    );
+    check(
+        "define-element-unwritable-descriptor",
+        "let a = [1]; Object.defineProperty(a, \"0\", {writable: false}); \
+         return Object.getOwnPropertyDescriptor(a, \"0\").writable;",
+        "false",
+    );
+    // A defined property defaults to none of the three, elements included.
+    check(
+        "define-new-element-defaults",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 7}); \
+         let d = Object.getOwnPropertyDescriptor(a, \"0\"); \
+         return a.length + \",\" + d.value + \",\" + d.writable + \",\" + d.enumerable;",
+        "1,7,false,false",
+    );
+    check(
+        "define-non-enumerable-element",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 7}); return Object.keys(a).length;",
+        "0",
+    );
+    check(
+        "define-non-configurable-element-refuses-delete",
+        "let a = []; Object.defineProperty(a, \"0\", {value: 7}); return delete a[0];",
+        "false",
+    );
+    // One element's rule does not become every element's.
+    check(
+        "element-rules-are-per-element",
+        "let a = [1, 2]; Object.defineProperty(a, \"0\", {writable: false}); \
+         a[0] = 8; a[1] = 9; return a[0] + \",\" + a[1];",
+        "1,9",
+    );
+    // Sealing narrows what is already narrow rather than widening it.
+    check(
+        "seal-keeps-an-unwritable-element",
+        "let a = [1]; Object.defineProperty(a, \"0\", {writable: false}); \
+         Object.seal(a); a[0] = 9; return a[0];",
+        "1",
+    );
+    check(
+        "seal-leaves-other-elements-writable",
+        "let a = [1, 2]; Object.defineProperty(a, \"0\", {writable: false}); \
+         Object.seal(a); a[1] = 9; return a[1];",
+        "9",
+    );
+}
+
+/// **The tag is keyed on what made the object, not on what it inherits from** — which is the
+/// one case where the two differ.
+#[test]
+fn an_error_reports_its_class() {
+    check(
+        "tag-error",
+        "return Object.prototype.toString.call(new TypeError(\"x\"));",
+        "[object Error]",
+    );
+    check(
+        "tag-raised-error",
+        "try { null.x; return \"no\"; } catch (e) { return Object.prototype.toString.call(e); }",
+        "[object Error]",
+    );
+    // Inheriting from `Error.prototype` does not make something an error.
+    check(
+        "tag-error-lookalike",
+        "return Object.prototype.toString.call(Object.create(Error.prototype));",
+        "[object Object]",
+    );
+    // And the tag is not a property a program can see.
+    check(
+        "error-own-names",
+        "return Object.getOwnPropertyNames(new TypeError(\"x\")).join(\",\");",
+        "message",
+    );
+}
+
+/// `Object.assign` uses the throwing form of `Set`, so a read-only property on the target is
+/// a `TypeError` rather than a write that quietly does nothing.
+#[test]
+fn assign_refuses_a_read_only_target() {
+    check(
+        "assign-read-only",
+        "let t = {}; Object.defineProperty(t, \"x\", {value: 1, writable: false}); \
+         try { Object.assign(t, {x: 2}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A sealed target keeps its properties writable, so assigning to one still works.
+    check(
+        "assign-sealed-target",
+        "let t = Object.seal({x: 1}); Object.assign(t, {x: 2}); return t.x;",
+        "2",
+    );
+    // A setter may accept the write, so an accessor is not refused here.
+    check(
+        "assign-through-a-setter",
+        "let seen = 0; let t = {}; \
+         t.__defineSetter__(\"x\", function (v) { seen = v; }); \
+         Object.assign(t, {x: 5}); return seen;",
+        "5",
+    );
+}
+
+/// **A deleted property is absent**, even though the shape still names its slot — which is
+/// the whole point of the tombstone. Answering from the slot handed back the permissions the
+/// property had before it went.
+#[test]
+fn a_deleted_property_is_gone_from_every_question() {
+    check(
+        "deleted-has-no-descriptor",
+        "let o = {x: 1}; delete o.x; \
+         return typeof Object.getOwnPropertyDescriptor(o, \"x\");",
+        "undefined",
+    );
+    check(
+        "deleted-is-not-own",
+        "let o = {x: 1}; delete o.x; return o.hasOwnProperty(\"x\");",
+        "false",
+    );
+    // A property deleted after being made read-only is not read-only any more: it is nothing.
+    // Asserted with *two* writes, because the slot keeps its attributes and the first write
+    // clears the tombstone — one write passes whether or not the attributes were reset.
+    check(
+        "deleted-read-only-can-be-redefined",
+        "let o = {}; \
+         Object.defineProperty(o, \"x\", {value: 1, writable: false, configurable: true}); \
+         delete o.x; o.x = 2; o.x = 3; return o.x;",
+        "3",
+    );
+    check(
+        "revived-property-is-enumerable",
+        "let o = {}; \
+         Object.defineProperty(o, \"x\", {value: 1, configurable: true}); \
+         delete o.x; o.x = 2; return Object.keys(o).join(\",\");",
+        "x",
+    );
+}
+
+/// `defineProperties` coerces its map of descriptors like any other argument, so a nullish one
+/// is the error and a primitive simply describes nothing.
+#[test]
+fn define_properties_checks_its_map() {
+    check(
+        "define-properties-null-map",
+        "try { Object.defineProperties({}, null); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "define-properties-primitive-map",
+        "return Object.keys(Object.defineProperties({}, 5)).length;",
+        "0",
+    );
+    check(
+        "define-properties-applies",
+        "let o = Object.defineProperties({}, {x: {value: 1, enumerable: true}}); \
+         return o.x + \",\" + Object.keys(o).join(\"\");",
+        "1,x",
+    );
+}
+
+/// Defining a property that was deleted brings it back. The shape keeps naming a deleted
+/// property's slot, so writing a value into one without clearing the mark left the property
+/// both defined and absent.
+#[test]
+fn a_deleted_property_can_be_defined_again() {
+    check(
+        "define-after-delete",
+        "let o = {x: 1}; delete o.x; \
+         Object.defineProperty(o, \"x\", {value: 2, enumerable: true}); return o.x;",
+        "2",
+    );
+    check(
+        "define-after-delete-attributes",
+        "let o = {x: 1}; delete o.x; \
+         Object.defineProperty(o, \"x\", {value: 2}); \
+         let d = Object.getOwnPropertyDescriptor(o, \"x\"); \
+         return d.value + \",\" + d.enumerable + \",\" + d.writable;",
+        "2,false,false",
+    );
+}
+
+/// A descriptor has to describe something. A primitive is not an object however cell-shaped it
+/// is, and a `get` that is present and not callable describes nothing the engine can do.
+#[test]
+fn a_descriptor_has_to_describe_something() {
+    check(
+        "descriptor-is-a-string",
+        "try { Object.create({}, {p: \"abc\"}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "getter-is-a-string",
+        "try { Object.defineProperty({}, \"p\", {get: \"abc\"}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "setter-is-a-number",
+        "try { Object.defineProperty({}, \"p\", {set: 5}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `undefined` is allowed, and means the half that is missing.
+    check(
+        "getter-only",
+        "let o = {}; \
+         Object.defineProperty(o, \"p\", {get: function () { return 3; }, set: undefined}); \
+         return o.p;",
+        "3",
+    );
+}
+
+/// A namespace's constants are not enumerable, which is what `Object.defineProperties(o, Math)`
+/// depends on: it walks the enumerable own properties and reads each as a descriptor.
+#[test]
+fn a_namespaces_constants_are_not_enumerable() {
+    check("math-keys", "return Object.keys(Math).length;", "0");
+    check("number-keys", "return Object.keys(Number).length;", "0");
+    check("math-pi-still-reads", "return Math.PI > 3.14;", "true");
+    // Frozen, so an assignment is ignored rather than changing what every later read sees.
+    check(
+        "math-pi-is-read-only",
+        "Math.PI = 1; return Math.PI > 3.14;",
+        "true",
+    );
+    check(
+        "define-properties-from-a-namespace",
+        "let o = {}; Math.prop = {value: 12}; Object.defineProperties(o, Math); \
+         return o.prop;",
+        "12",
+    );
+}
+
+/// **A built-in's `length` is fixed by the specification** — the count of parameters before
+/// the first with a default — and test262 checks it for every one it covers. No built-in had
+/// one at all, so each of those failed on a method that was otherwise complete.
+#[test]
+fn a_built_in_declares_how_many_arguments_it_takes() {
+    check("length-object-keys", "return Object.keys.length;", "1");
+    check(
+        "length-object-define-property",
+        "return Object.defineProperty.length;",
+        "3",
+    );
+    check("length-object-assign", "return Object.assign.length;", "2");
+    check(
+        "length-has-own-property",
+        "return Object.prototype.hasOwnProperty.length;",
+        "1",
+    );
+    // Zero is a real answer, and the one a default would have got wrong.
+    check("length-array-pop", "return [].pop.length;", "0");
+    check(
+        "length-value-of",
+        "return Object.prototype.valueOf.length;",
+        "0",
+    );
+    check("length-array-slice", "return [].slice.length;", "2");
+    // The constructors declare one too.
+    check("length-object-constructor", "return Object.length;", "1");
+    check("length-array-constructor", "return Array.length;", "1");
+    // Same attributes as `name`: not writable, not enumerable, configurable.
+    check(
+        "length-descriptor",
+        "let d = Object.getOwnPropertyDescriptor(Object.keys, \"length\"); \
+         return d.writable + \",\" + d.enumerable + \",\" + d.configurable;",
+        "false,false,true",
+    );
+    check(
+        "length-is-not-enumerable",
+        "return Object.keys(Object.keys).length;",
+        "0",
+    );
+}
+
+/// **`this` at the top of a script is the global object.** The entry point passed `undefined`,
+/// which is what it is inside a strict function and never what it is here — so `this.x = 1`
+/// did nothing and every test that reaches a global through `this` read a property of nothing.
+#[test]
+fn top_level_this_is_the_global_object() {
+    check("this-is-global", "return this === globalThis;", "true");
+    check(
+        "this-reaches-a-global",
+        "return typeof this.Object;",
+        "function",
+    );
+    check(
+        "this-can-be-written",
+        "this.answer = 42; return answer;",
+        "42",
+    );
+    // Not asserted here: a top-level `var` is a local slot in this engine, not a property of
+    // the global object. That is a real difference from the specification and it belongs to
+    // the lowering rather than to `this`, so it is filed rather than smuggled into this test.
+}
+
+/// `Object.assign` coerces its target like every other static's argument: a primitive is
+/// wrapped and the wrapper is what comes back carrying the assignments.
+#[test]
+fn assign_coerces_its_target() {
+    check(
+        "assign-to-boolean",
+        "return typeof Object.assign(true, {a: 1});",
+        "object",
+    );
+    check(
+        "assign-to-boolean-value",
+        "return Object.assign(true, {a: 1}).valueOf();",
+        "true",
+    );
+    check(
+        "assign-to-boolean-copies",
+        "return Object.assign(true, {a: 1}).a;",
+        "1",
+    );
+    check(
+        "assign-to-number",
+        "return Object.assign(5, {}).valueOf();",
+        "5",
+    );
+    check(
+        "assign-to-nullish",
+        "try { Object.assign(undefined, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **Every `Date` setter is one operation with a different starting field**, so the fields it
+/// does not name keep what they had and the ones it does roll over rather than erroring.
+#[test]
+fn a_date_can_be_set() {
+    check(
+        "date-set-time",
+        "let d = new Date(0); d.setTime(86400000); return d.getTime();",
+        "86400000",
+    );
+    check(
+        "date-set-full-year",
+        "let d = new Date(0); d.setFullYear(2020); return d.getFullYear();",
+        "2020",
+    );
+    // The fields it does not name keep what they had.
+    check(
+        "date-set-year-keeps-the-day",
+        "let d = new Date(0); d.setFullYear(2020); \
+         return d.getMonth() + \",\" + d.getDate();",
+        "0,1",
+    );
+    check(
+        "date-set-month-and-day",
+        "let d = new Date(0); d.setFullYear(2020, 5, 17); \
+         return d.getFullYear() + \"-\" + d.getMonth() + \"-\" + d.getDate();",
+        "2020-5-17",
+    );
+    // Rolling over is what makes one operation enough for all of them.
+    check(
+        "date-set-month-rolls-the-year",
+        "let d = new Date(0); d.setMonth(13); \
+         return d.getFullYear() + \",\" + d.getMonth();",
+        "1971,1",
+    );
+    check(
+        "date-set-date-rolls-back",
+        "let d = new Date(0); d.setDate(0); \
+         return d.getFullYear() + \"-\" + d.getMonth() + \"-\" + d.getDate();",
+        "1969-11-31",
+    );
+    check(
+        "date-set-hours",
+        "let d = new Date(0); d.setHours(5, 6, 7, 8); \
+         return d.getHours() + \":\" + d.getMinutes() + \":\" + d.getSeconds() + \".\" + \
+         d.getMilliseconds();",
+        "5:6:7.8",
+    );
+    check(
+        "date-set-minutes-keeps-the-hour",
+        "let d = new Date(0); d.setHours(5); d.setMinutes(9); \
+         return d.getHours() + \":\" + d.getMinutes();",
+        "5:9",
+    );
+    // A setter answers the new time value.
+    check(
+        "date-set-returns-the-time",
+        "let d = new Date(0); return d.setMilliseconds(250);",
+        "250",
+    );
+    // The first argument is coerced even when it is absent, so a setter with none invalidates.
+    check(
+        "date-set-with-no-argument",
+        "let d = new Date(0); d.setHours(); return d.getTime();",
+        "NaN",
+    );
+    // An invalid date stays invalid — except `setFullYear`, which starts from the epoch.
+    check(
+        "date-set-hours-on-an-invalid-date",
+        "let d = new Date(NaN); d.setHours(5); return d.getTime();",
+        "NaN",
+    );
+    check(
+        "date-set-year-on-an-invalid-date",
+        "let d = new Date(NaN); d.setFullYear(1971); return d.getFullYear();",
+        "1971",
+    );
+    // A receiver that is not a date is a `TypeError`, not a quiet answer.
+    check(
+        "date-set-on-a-plain-object",
+        "try { Date.prototype.setTime.call({}, 0); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The UTC twins are the same operation: this engine has no local-time offset.
+    check(
+        "date-set-utc-hours",
+        "let d = new Date(0); d.setUTCHours(3); return d.getUTCHours();",
+        "3",
+    );
+}
+
+/// **`Reflect` is `Object`'s operations with the failures reported rather than thrown.** Every
+/// method here is the machinery a property access already uses, exposed as a function — which
+/// is why it can exist at all without proxies, the other half of what it was designed for.
+#[test]
+fn reflect_exposes_the_object_operations() {
+    check("reflect-get", "return Reflect.get({a: 1}, \"a\");", "1");
+    check(
+        "reflect-set",
+        "let o = {}; let ok = Reflect.set(o, \"a\", 2); return ok + \",\" + o.a;",
+        "true,2",
+    );
+    check("reflect-has", "return Reflect.has({a: 1}, \"a\");", "true");
+    check(
+        "reflect-has-absent",
+        "return Reflect.has({}, \"a\");",
+        "false",
+    );
+    check(
+        "reflect-delete",
+        "let o = {a: 1}; let ok = Reflect.deleteProperty(o, \"a\"); \
+         return ok + \",\" + o.hasOwnProperty(\"a\");",
+        "true,false",
+    );
+    check(
+        "reflect-own-keys",
+        "return Reflect.ownKeys([7]).join(\",\");",
+        "0,length",
+    );
+    check(
+        "reflect-get-prototype-of",
+        "return Reflect.getPrototypeOf({}) === Object.prototype;",
+        "true",
+    );
+    check(
+        "reflect-define-property",
+        "let o = {}; let ok = Reflect.defineProperty(o, \"x\", {value: 1}); \
+         return ok + \",\" + o.x;",
+        "true,1",
+    );
+    check(
+        "reflect-own-descriptor",
+        "return Reflect.getOwnPropertyDescriptor({a: 1}, \"a\").value;",
+        "1",
+    );
+    check(
+        "reflect-is-extensible",
+        "return Reflect.isExtensible({});",
+        "true",
+    );
+    check(
+        "reflect-prevent-extensions",
+        "let o = {}; let ok = Reflect.preventExtensions(o); \
+         return ok + \",\" + Reflect.isExtensible(o);",
+        "true,false",
+    );
+    check(
+        "reflect-apply",
+        "return Reflect.apply(function (a, b) { return a + b; }, undefined, [2, 3]);",
+        "5",
+    );
+    check(
+        "reflect-set-prototype-of",
+        "let a = {x: 1}; let o = {}; let ok = Reflect.setPrototypeOf(o, a); \
+         return ok + \",\" + o.x;",
+        "true,1",
+    );
+}
+
+/// **Being callable is not being constructable**, and test262 asks nearly every built-in
+/// method which it is.
+///
+/// It asks through `isConstructor`, which is `Reflect.construct(function () {}, [], f)` —
+/// so the third argument is not a corner here but the whole question, and a `Reflect.construct`
+/// that ignored it would answer "yes, a constructor" for every function in the engine.
+#[test]
+fn only_a_constructor_can_be_constructed() {
+    check(
+        "new-a-built-in-method",
+        "try { new Array.prototype.find(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "new-a-namespace",
+        "try { new Math(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "new-a-plain-global-function",
+        "try { new parseInt(\"1\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `new Symbol()` is a `TypeError` even though `Symbol()` is a symbol.
+    check(
+        "new-a-symbol",
+        "try { new Symbol(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // And the ones that are constructors still are, which is what says the rule discriminates
+    // rather than refuses.
+    check(
+        "new-a-declared-function",
+        "function P() { this.x = 1; } return new P().x;",
+        "1",
+    );
+    // **Under stress this is about rooting, not about `new`.** `new` lays its arguments out
+    // in the caller's frame and *then* allocates the receiver, so both the constructor and
+    // every argument are live across a collection with nothing but the frame holding them.
+    check(
+        "new-with-object-arguments",
+        "function P(a, b) { this.v = a.y + b.z; } return new P({y: 1}, {z: 2}).v;",
+        "3",
+    );
+    check(
+        "new-a-built-in-constructor",
+        "return new Date(0).getTime();",
+        "0",
+    );
+    // **A bound function passes the question along.** The wrapper looks identical either
+    // way, so answering from it would make `new (Date.bind(null, 0))()` and
+    // `new (Math.max.bind(null))()` agree, and they must not.
+    check(
+        "new-a-bound-constructor",
+        "let D = Date.bind(null, 0); return new D().getTime();",
+        "0",
+    );
+    check(
+        "new-a-bound-method",
+        "let f = Math.max.bind(null); \
+         try { new f(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "new-an-error",
+        "return new RangeError(\"x\").name;",
+        "RangeError",
+    );
+}
+
+/// **Every global that is a function inherits from `Function.prototype`.**
+///
+/// They did not. A global is built before that object exists, so `Date.bind` was `undefined`
+/// and `Object instanceof Function` was false — on the objects a program is most likely to ask
+/// either of. The prototype methods already had it, which is what made the gap hard to see:
+/// `Math.max.bind` worked and `Date.bind` did not.
+#[test]
+fn a_global_constructor_is_a_function() {
+    check(
+        "global-constructor-has-bind",
+        "return typeof Date.bind + \",\" + typeof Object.call + \",\" + typeof Array.apply;",
+        "function,function,function",
+    );
+    check(
+        "global-constructor-instanceof-function",
+        "return (Date instanceof Function) + \",\" + (Object instanceof Function);",
+        "true,true",
+    );
+    // A namespace is not one, which is the other half of the same rule.
+    check(
+        "namespace-is-not-a-function",
+        "return Math instanceof Function;",
+        "false",
+    );
+    // And the methods, which already worked and are here so a fix to one cannot silently
+    // break the other.
+    check(
+        "method-has-bind",
+        "return typeof Math.max.bind;",
+        "function",
+    );
+}
+
+/// `Reflect.construct(target, args, newTarget)`.
+#[test]
+fn reflect_constructs_and_says_what_cannot_be() {
+    check(
+        "reflect-construct",
+        "function P(a) { this.x = a; } return Reflect.construct(P, [4]).x;",
+        "4",
+    );
+    check(
+        "reflect-construct-a-built-in",
+        "return Reflect.construct(Array, [1, 2, 3]).length;",
+        "3",
+    );
+    // What `isConstructor` in test262's harness is, spelled out.
+    check(
+        "is-constructor-of-a-method",
+        "function isConstructor(f) { \
+             try { Reflect.construct(function () {}, [], f); } catch (e) { return false; } \
+             return true; } \
+         return isConstructor(Array.prototype.find);",
+        "false",
+    );
+    check(
+        "is-constructor-of-a-function",
+        "function isConstructor(f) { \
+             try { Reflect.construct(function () {}, [], f); } catch (e) { return false; } \
+             return true; } \
+         return isConstructor(function () {});",
+        "true",
+    );
+    // **Absent is not `undefined`.** The default new target comes from how many arguments
+    // arrived, so passing one explicitly is a refusal rather than the same call.
+    check(
+        "reflect-construct-undefined-new-target",
+        "try { Reflect.construct(function () {}, [], undefined); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "reflect-construct-a-method",
+        "try { Reflect.construct(Array.prototype.find, []); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "reflect-construct-a-bad-argument-list",
+        "try { Reflect.construct(function () {}, 5); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The new target is where the prototype comes from, which is the only thing the third
+    // argument is *for* beyond saying no.
+    check(
+        "reflect-construct-new-target-prototype",
+        "function A() {} function B() {} \
+         return Reflect.construct(A, [], B) instanceof B;",
+        "true",
+    );
+}
+
+/// A namespace is an object, not a function.
+///
+/// `typeof Math` was `"function"` because every global the namespaces are built by was given a
+/// body to call. Nothing asked for one — `Math()` is a `TypeError` — and the body it got was
+/// the plain-object constructor, so `new JSON()` answered an object.
+#[test]
+fn a_namespace_is_not_a_function() {
+    check("typeof-math", "return typeof Math;", "object");
+    check("typeof-json", "return typeof JSON;", "object");
+    check("typeof-reflect", "return typeof Reflect;", "object");
+    // The two that are both, which is why this cannot simply be "a namespace is not callable".
+    check("typeof-object", "return typeof Object;", "function");
+    check("typeof-array", "return typeof Array;", "function");
+    // Their methods are still reachable, which is what the namespaces exist for.
+    check("math-still-works", "return Math.max(1, 2);", "2");
+    check("json-still-works", "return JSON.stringify([1]);", "[1]");
+}
+
+/// **The failures are reported, not thrown** — which is the whole reason to reach for
+/// `Reflect` over the `Object` method that does the same thing.
+#[test]
+fn reflect_answers_false_where_object_throws() {
+    check(
+        "reflect-set-on-a-frozen-object",
+        "let o = Object.freeze({a: 1}); return Reflect.set(o, \"a\", 2);",
+        "false",
+    );
+    check(
+        "reflect-set-a-new-property-on-a-closed-object",
+        "let o = Object.preventExtensions({}); return Reflect.set(o, \"a\", 2);",
+        "false",
+    );
+    check(
+        "reflect-define-on-a-closed-object",
+        "let o = Object.preventExtensions({}); \
+         return Reflect.defineProperty(o, \"x\", {value: 1});",
+        "false",
+    );
+    check(
+        "reflect-set-prototype-of-a-cycle",
+        "let a = {}; let b = Object.create(a); return Reflect.setPrototypeOf(a, b);",
+        "false",
+    );
+    // A swallowed refusal must not be left on the runtime for the next `catch` to find.
+    check(
+        "reflect-refusal-leaves-nothing-pending",
+        "let o = Object.preventExtensions({}); Reflect.defineProperty(o, \"x\", {value: 1}); \
+         try { return \"clean\"; } catch (e) { return \"leaked\"; }",
+        "clean",
+    );
+    // A primitive target is still an error: `Reflect` refuses where `Object` coerces.
+    check(
+        "reflect-get-prototype-of-a-number",
+        "try { Reflect.getPrototypeOf(1); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "reflect-get-on-a-primitive",
+        "try { Reflect.get(\"ab\", \"0\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **A callback is checked before a single element is read.** Without that, calling a
+/// non-function reached `crisol_not_a_function` once per element — which answers `undefined`,
+/// so `[1, 2].map(5)` produced `[undefined, undefined]` and looked like a working call.
+#[test]
+fn an_iteration_method_needs_a_real_callback() {
+    for (name, program) in [
+        ("map", "[1].map(5)"),
+        ("for-each", "[1].forEach(undefined)"),
+        ("filter", "[1].filter(null)"),
+        ("every", "[1].every(1)"),
+        ("some", "[1].some({})"),
+        ("find", "[1].find(\"x\")"),
+        ("find-index", "[1].findIndex(true)"),
+        ("reduce", "[1].reduce(5)"),
+        ("reduce-right", "[1].reduceRight(5)"),
+        ("flat-map", "[1].flatMap(5)"),
+        ("map-for-each", "new Map().forEach(5)"),
+        ("set-for-each", "new Set().forEach(5)"),
+    ] {
+        check(
+            &format!("callback-required-{name}"),
+            &format!("try {{ {program}; return \"no\"; }} catch (e) {{ return e.name; }}"),
+            "TypeError",
+        );
+    }
+}
+
+/// A comparator is **optional**, and only wrong when it is present and not callable.
+#[test]
+fn sort_takes_a_comparator_or_nothing() {
+    check(
+        "sort-bad-comparator",
+        "try { [3, 1].sort(5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "sort-no-comparator",
+        "return [3, 1].sort().join(\",\");",
+        "1,3",
+    );
+    check(
+        "sort-undefined-comparator",
+        "return [3, 1].sort(undefined).join(\",\");",
+        "1,3",
+    );
+    check(
+        "sort-real-comparator",
+        "return [3, 1].sort(function (a, b) { return b - a; }).join(\",\");",
+        "3,1",
+    );
+}
+
+/// **A length that cannot become a number is an error, not a zero.** Reading `length` off an
+/// array-like coerces it, and the two coercions that fail have to say so rather than answer
+/// `NaN` and be clamped to an empty walk.
+#[test]
+fn a_length_that_cannot_convert_is_an_error() {
+    // **Not `fill`**, though that is the case test262 uses: a mutating method still requires
+    // a real array here (D-157) and returns before it reads a length at all, so the case
+    // would have been testing that gap rather than this one.
+    check(
+        "length-is-a-symbol",
+        "let o = {}; o.length = Symbol(1); \
+         try { [].every.call(o, function () { return true; }); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "length-is-an-unconvertible-object",
+        "let o = {length: {valueOf: function () { return {}; }, \
+                           toString: function () { return {}; }}}; \
+         try { [].every.call(o, function () { return true; }); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // **Both are tried, in order.** A test that only checks the throw passes an engine that
+    // never asked, so the order is what is asserted here.
+    check(
+        "length-tries-value-of-then-to-string",
+        "let seen = \"\"; \
+         let o = {length: {valueOf: function () { seen = seen + \"v\"; return {}; }, \
+                           toString: function () { seen = seen + \"s\"; return {}; }}}; \
+         try { [].every.call(o, function () { return true; }); } catch (e) {} \
+         return seen;",
+        "vs",
+    );
+    // A `valueOf` that answers a primitive is used, and the walk proceeds.
+    check(
+        "length-from-value-of",
+        "let o = {0: 7, 1: 8, length: {valueOf: function () { return 2; }}}; \
+         return [].join.call(o, \",\");",
+        "7,8",
+    );
+    // A getter that throws hands its own exception on rather than being read as a zero.
+    check(
+        "length-getter-throws",
+        "let o = {}; \
+         Object.defineProperty(o, \"length\", \
+             {get: function () { throw new RangeError(\"nope\"); }}); \
+         try { [].join.call(o, \",\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A symbol refuses to be a number wherever it is asked.
+    check(
+        "symbol-is-not-a-number",
+        "let o = {length: Symbol()}; \
+         try { [].slice.call(o); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **A namespace is an ordinary object**, and nothing linked it to one — so
+/// `Math.hasOwnProperty(…)` was not a function, on the objects a program is most likely to
+/// ask that of.
+#[test]
+fn a_namespace_inherits_from_object_prototype() {
+    check(
+        "math-has-own-property",
+        "Math.prop = 1; return Math.hasOwnProperty(\"prop\");",
+        "true",
+    );
+    check(
+        "json-inherits",
+        "return typeof JSON.hasOwnProperty;",
+        "function",
+    );
+    check(
+        "object-constructor-inherits",
+        "return Object.getPrototypeOf(Object) !== null;",
+        "true",
+    );
+    check(
+        "reflect-inherits",
+        "return Reflect.hasOwnProperty(\"get\");",
+        "true",
+    );
+}
+
+/// **`String()` with no argument is the empty string**, not `"undefined"`. An absent argument
+/// reads as `undefined` and `String(undefined)` really is `"undefined"`, so the two have to be
+/// told apart by the count — and they were not, which gave `new String()` nine own properties.
+#[test]
+fn string_with_no_argument_is_empty() {
+    check("string-no-argument", "return String().length;", "0");
+    check(
+        "string-undefined-argument",
+        "return String(undefined);",
+        "undefined",
+    );
+    check(
+        "string-wrapper-no-argument",
+        "return new String().length;",
+        "0",
+    );
+    check(
+        "string-wrapper-no-argument-keys",
+        "return Object.keys(new String()).length;",
+        "0",
+    );
+    // The case that found it: an empty wrapper used as a map of descriptors.
+    check(
+        "empty-wrapper-as-descriptors",
+        "let props = new String(); \
+         Object.defineProperty(props, \"p\", {value: {value: 7}, enumerable: true}); \
+         return Object.create({}, props).p;",
+        "7",
+    );
+}
+
+/// **A numeric argument is coerced, truncated, and able to refuse.** Reading it with
+/// `as_number` answered zero for a string, a symbol and an object alike — so
+/// `"abc".charCodeAt("1")` read character zero and looked like a working call.
+#[test]
+fn a_position_argument_is_coerced() {
+    check(
+        "char-at-string-position",
+        "return \"abc\".charAt(\"1\");",
+        "b",
+    );
+    check(
+        "char-code-at-string-position",
+        "return \"abc\".charCodeAt(\"1\");",
+        "98",
+    );
+    // `NaN` is zero, which is what makes a missing argument mean the first character.
+    check("char-at-no-argument", "return \"abc\".charAt();", "a");
+    check("char-at-nan", "return \"abc\".charAt(NaN);", "a");
+    check("char-code-at-nan", "return \"abc\".charCodeAt(NaN);", "97");
+    // And it truncates rather than indexing with the fraction.
+    check("char-at-fraction", "return \"abc\".charAt(1.7);", "b");
+    check("string-at-fraction", "return \"abc\".at(1.9);", "b");
+    check("array-at-fraction", "return [7, 8, 9].at(1.7);", "8");
+    // An object converts through `valueOf`.
+    check(
+        "char-at-object-position",
+        "return \"abc\".charAt({valueOf: function () { return 2; }});",
+        "c",
+    );
+    // A symbol refuses, wherever a number was wanted.
+    check(
+        "char-at-symbol-position",
+        "try { \"abc\".charAt(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "array-at-symbol-position",
+        "try { [1].at(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "repeat-symbol-count",
+        "try { \"a\".repeat(Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "pad-start-string-length",
+        "return \"a\".padStart(\"3\", \"-\");",
+        "--a",
+    );
+}
+
+/// **A symbol names a property by identity, not by spelling** — so two symbols described
+/// alike are different properties, and neither is the string that describes them.
+#[test]
+fn a_symbol_can_be_a_property_key() {
+    check(
+        "symbol-key-round-trip",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 7; return o[s];",
+        "7",
+    );
+    check(
+        "symbol-keys-are-distinct",
+        "let a = Symbol(\"k\"); let b = Symbol(\"k\"); let o = {}; \
+         o[a] = 1; o[b] = 2; return o[a] + \",\" + o[b];",
+        "1,2",
+    );
+    check(
+        "symbol-is-not-its-description",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 1; o.k = 2; return o[s] + \",\" + o.k;",
+        "1,2",
+    );
+    // A symbol-keyed property is not an own *name*.
+    check(
+        "symbol-key-is-not-a-name",
+        "let s = Symbol(\"k\"); let o = {a: 1}; o[s] = 2; \
+         return Object.keys(o).join(\",\") + \"|\" + Object.getOwnPropertyNames(o).join(\",\");",
+        "a|a",
+    );
+    check(
+        "symbol-key-not-in-for-in",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 1; \
+         let seen = 0; for (let x in o) { seen = seen + 1; } return seen;",
+        "0",
+    );
+    // It is reported by the list that exists for it, and nowhere else.
+    check(
+        "own-property-symbols",
+        "let s = Symbol(\"k\"); let o = {}; o[s] = 1; \
+         let found = Object.getOwnPropertySymbols(o); \
+         return found.length + \",\" + (found[0] === s);",
+        "1,true",
+    );
+    check(
+        "own-property-symbols-empty",
+        "return Object.getOwnPropertySymbols({a: 1}).length;",
+        "0",
+    );
+    // `in` and `delete` work through one too.
+    check(
+        "symbol-key-in",
+        "let s = Symbol(); let o = {}; o[s] = 1; return s in o;",
+        "true",
+    );
+    check(
+        "symbol-key-delete",
+        "let s = Symbol(); let o = {}; o[s] = 1; delete o[s]; return s in o;",
+        "false",
+    );
+    // A well-known symbol is a key like any other.
+    check(
+        "well-known-symbol-key",
+        "let o = {}; o[Symbol.iterator] = 5; return o[Symbol.iterator];",
+        "5",
+    );
+}
+
+/// **`Symbol.iterator` is what makes a value iterable**, so `for-of` asks the object before
+/// it falls back to the shapes it recognises — which is also what lets a program override
+/// either of them.
+#[test]
+fn for_of_uses_the_iterator_protocol() {
+    check(
+        "for-of-user-iterable",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             let n = 0; \
+             return {next: function () { n = n + 1; \
+                 return n <= 3 ? {value: n, done: false} : {value: undefined, done: true}; }}; \
+         }; \
+         let total = 0; for (let x of it) { total = total + x; } return total;",
+        "6",
+    );
+    check(
+        "for-of-empty-iterable",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             return {next: function () { return {done: true}; }}; \
+         }; \
+         let seen = 0; for (let x of it) { seen = seen + 1; } return seen;",
+        "0",
+    );
+    // The built-in shapes still work, and an override of one is obeyed.
+    check(
+        "for-of-array",
+        "let s = 0; for (let x of [1, 2, 3]) { s = s + x; } return s;",
+        "6",
+    );
+    check(
+        "for-of-string",
+        "let s = \"\"; for (let c of \"abc\") { s = s + c; } return s;",
+        "abc",
+    );
+    check(
+        "for-of-overridden-array",
+        "let a = [1, 2, 3]; \
+         a[Symbol.iterator] = function () { \
+             let done = false; \
+             return {next: function () { \
+                 if (done) { return {done: true}; } done = true; return {value: 9, done: false}; }}; \
+         }; \
+         let s = 0; for (let x of a) { s = s + x; } return s;",
+        "9",
+    );
+    // A `next` that is not a function, and a step that is not an object, are both errors.
+    check(
+        "for-of-bad-next",
+        "let it = {}; it[Symbol.iterator] = function () { return {next: 5}; }; \
+         try { for (let x of it) {} return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "for-of-bad-step",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             return {next: function () { return 5; }}; }; \
+         try { for (let x of it) {} return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A throw from the iterator reaches the program rather than ending the loop quietly.
+    check(
+        "for-of-throwing-next",
+        "let it = {}; it[Symbol.iterator] = function () { \
+             return {next: function () { throw new RangeError(\"stop\"); }}; }; \
+         try { for (let x of it) {} return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "for-of-not-iterable",
+        "try { for (let x of {}) {} return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// **`Array.prototype[Symbol.iterator]` *is* `Array.prototype.values`** — the same function
+/// object, not a copy of it, which is what the specification says and what a test comparing
+/// the two would catch.
+#[test]
+fn the_built_ins_answer_to_symbol_iterator() {
+    check(
+        "array-symbol-iterator-is-values",
+        "return Array.prototype[Symbol.iterator] === Array.prototype.values;",
+        "true",
+    );
+    // Not enumerable, so it does not show up in a list of an array's own names.
+    check(
+        "symbol-iterator-is-not-enumerable",
+        "return Object.keys(Array.prototype).length;",
+        "0",
+    );
+    // Reachable through the protocol, which is the point of defining it — the fast path in
+    // `crisol_iterate` would answer for an array either way, so this asks the symbol.
+    check(
+        "array-iterator-through-the-symbol",
+        "let it = [1, 2, 3][Symbol.iterator](); \
+         return it.next().value + \",\" + it.next().value;",
+        "1,2",
+    );
+    // `Map` and `Set` now answer to `Symbol.iterator` — aliases of `entries` and `values`
+    // respectively (D-232).
+    check(
+        "map-symbol-iterator-is-entries",
+        "return Map.prototype[Symbol.iterator] === Map.prototype.entries;",
+        "true",
+    );
+    check(
+        "set-symbol-iterator-is-values",
+        "return Set.prototype[Symbol.iterator] === Set.prototype.values;",
+        "true",
+    );
+}
+
+/// **`o[k]()` is a method call too**, and only the dotted form passed a receiver — so
+/// `a["push"](1)` ran with `this` as `undefined`. Losing a receiver is silent: the call
+/// happens, something comes back, and only `this` is wrong.
+#[test]
+fn a_computed_member_call_passes_its_receiver() {
+    check(
+        "computed-call-receiver",
+        "let a = [1]; a[\"push\"](2); return a.join(\",\");",
+        "1,2",
+    );
+    check(
+        "computed-call-this",
+        "let o = {n: 7, get: function () { return this.n; }}; return o[\"get\"]();",
+        "7",
+    );
+    // The dotted form keeps working, which is the thing this must not break.
+    check(
+        "dotted-call-receiver",
+        "let a = [1]; a.push(2); return a.join(\",\");",
+        "1,2",
+    );
+    // A computed call through a symbol key reaches the method with its receiver.
+    check(
+        "symbol-computed-call",
+        "let it = [1, 2, 3][Symbol.iterator](); \
+         return it.next().value + \",\" + it.next().value;",
+        "1,2",
+    );
+}
+
+/// **A promise is always asynchronous**, even when it has already settled — attaching a
+/// handler queues a job rather than running it, which is what stops code depending on a
+/// synchronous case that only holds while the promise happens to be settled.
+///
+/// **Only the synchronous half is asserted here.** The queue drains after `crisol_program`
+/// returns, so nothing a handler does is visible in the value this harness compares — a test
+/// that "checked" a handler ran would pass whether or not the drain happened at all. What is
+/// checked is everything observable before the return, plus that the drain neither crashes
+/// nor hangs, which the harness does enforce by requiring a clean exit.
+#[test]
+fn a_promise_settles_through_the_microtask_queue() {
+    // The handler must not have run by the time the program returns.
+    check(
+        "promise-then-is-async",
+        "let order = \"\"; \
+         Promise.resolve(1).then(function () { order = order + \"b\"; }); \
+         order = order + \"a\"; \
+         return order;",
+        "a",
+    );
+    // Even when `resolve` is called synchronously inside the executor.
+    check(
+        "promise-executor-resolve-is-async",
+        "let order = \"\"; \
+         new Promise(function (resolve) { order = order + \"x\"; resolve(1); }) \
+             .then(function () { order = order + \"y\"; }); \
+         return order;",
+        "x",
+    );
+    check(
+        "promise-then-answers-a-promise",
+        "return typeof Promise.resolve(1).then(function () {}).then;",
+        "function",
+    );
+    check(
+        "promise-catch-answers-a-promise",
+        "return typeof Promise.reject(1).catch(function () {}).then;",
+        "function",
+    );
+    // A throw inside the executor rejects rather than escaping the constructor.
+    check(
+        "promise-executor-throws",
+        "let p = new Promise(function () { throw new RangeError(\"x\"); }); \
+         return typeof p.then;",
+        "function",
+    );
+    check(
+        "promise-needs-an-executor",
+        "try { new Promise(5); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // `Promise.resolve` normalises: a promise is handed back as it is.
+    check(
+        "promise-resolve-is-idempotent",
+        "let p = Promise.resolve(1); return Promise.resolve(p) === p;",
+        "true",
+    );
+    check(
+        "promise-resolve-wraps",
+        "return typeof Promise.resolve(1).then;",
+        "function",
+    );
+    // A whole chain builds and drains without faulting, which is what the clean exit checks.
+    check(
+        "promise-chain-drains",
+        "Promise.resolve(1) \
+             .then(function (v) { return v + 1; }) \
+             .then(function (v) { return Promise.resolve(v + 1); }) \
+             .then(function () { throw new TypeError(\"caught\"); }) \
+             .catch(function (e) { return e.name; }); \
+         return \"built\";",
+        "built",
+    );
+    check(
+        "promise-then-on-a-non-promise",
+        "try { Promise.prototype.then.call({}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// `async`/`await`: an async function returns a promise, and `await` suspends the body while
+/// control returns to the caller. Like the promise tests, only the synchronous half is asserted
+/// here — the resumption runs in the drain after `crisol_program` returns (and a bug there would
+/// crash or hang the drain rather than pass). CI's test262 async harness checks the settled values.
+#[test]
+fn an_async_function_returns_a_promise_and_await_suspends() {
+    // An async function returns a promise, whatever its body does.
+    check(
+        "async-returns-object",
+        "async function f() { return 1; } return typeof f();",
+        "object",
+    );
+    check(
+        "async-returns-thenable",
+        "async function f() {} return typeof f().then;",
+        "function",
+    );
+    check(
+        "async-returns-real-promise",
+        "async function f() { return 1; } return f() instanceof Promise;",
+        "true",
+    );
+    // The body runs synchronously up to the first `await`, which suspends and hands control back
+    // to the caller: `1` (before the call), `a` (body up to the await), `2` (caller after it). The
+    // `d` after the await runs in the drain and is not part of the returned value. `var`, not
+    // `let`, because a hoisted function's body is lowered before a `let` below it is declared and
+    // so cannot capture it — a general hoisting rule, not an async one.
+    check(
+        "async-await-suspends",
+        "var s = \"\"; async function f() { s = s + \"a\"; await 0; s = s + \"d\"; } \
+         s = s + \"1\"; f(); s = s + \"2\"; return s;",
+        "1a2",
+    );
+    // An async function with no await still runs its body synchronously to the return.
+    check(
+        "async-body-runs-sync",
+        "var ran = false; async function f() { ran = true; } f(); return ran;",
+        "true",
+    );
+    // A chain of awaits drives to completion through the microtask queue without crashing or
+    // hanging (the value flow is checked by test262 in CI).
+    check(
+        "async-multiple-awaits-drain",
+        "var n = 0; async function f() { n = await 1; n = await (n + 1); return n; } \
+         f(); return typeof f;",
+        "function",
+    );
+    // `await` is refused in a complex position rather than miscompiled (the same restriction the
+    // generator transform carries) — the program is reported unfaithful, so it does not build.
+    check(
+        "async-await-in-simple-return",
+        "async function f() { return await 5; } return typeof f;",
+        "function",
+    );
+}
+
+/// Spread: `f(...xs)` unpacks an iterable into a call's arguments, and `{ ...src }` copies a
+/// source's own enumerable properties into a literal. Array spread `[...xs]` already worked.
+#[test]
+fn spread_unpacks_into_calls_and_objects() {
+    // A whole array as the arguments.
+    check(
+        "spread-call-all",
+        "function add(a, b, c) { return a + b + c; } return add(...[1, 2, 3]);",
+        "6",
+    );
+    // Fixed arguments and spreads mixed, in order.
+    check(
+        "spread-call-mixed",
+        "function f(a, b, c, d) { return a + \",\" + b + \",\" + c + \",\" + d; } \
+         return f(1, ...[2, 3], 4);",
+        "1,2,3,4",
+    );
+    // The receiver of a method call is preserved through a spread.
+    check(
+        "spread-call-keeps-this",
+        "let o = { n: 10, m: function (a) { return this.n + a; } }; return o.m(...[5]);",
+        "15",
+    );
+    // A string is an iterable, so it spreads into characters.
+    check(
+        "spread-call-string",
+        "function f(a, b) { return a + b; } return f(...\"xy\");",
+        "xy",
+    );
+    // The argument count is the spread length.
+    check(
+        "spread-call-count",
+        "function f() { return arguments.length; } return f(...[1, 2, 3, 4]);",
+        "4",
+    );
+
+    // Object spread copies own enumerable properties.
+    check(
+        "spread-object",
+        "let a = { x: 1, y: 2 }; let b = { ...a }; return b.x + b.y;",
+        "3",
+    );
+    // Spread mixed with own properties.
+    check(
+        "spread-object-mixed",
+        "let a = { x: 1 }; let b = { ...a, y: 2 }; return b.x + b.y;",
+        "3",
+    );
+    // A later property wins over a spread one.
+    check(
+        "spread-object-override",
+        "let a = { x: 1 }; let b = { ...a, x: 9 }; return b.x;",
+        "9",
+    );
+    // A nullish source contributes nothing and does not throw.
+    check(
+        "spread-object-null",
+        "let b = { ...null, x: 5 }; return b.x;",
+        "5",
+    );
+}
+
+/// Optional chaining `?.`: a nullish base short-circuits the whole chain to `undefined`, on member
+/// access, computed access and calls; a non-nullish one behaves as the ordinary operation.
+#[test]
+fn optional_chaining_short_circuits_on_nullish() {
+    // A present chain reads through.
+    check(
+        "optional-present",
+        "let a = { b: { c: 5 } }; return a?.b?.c;",
+        "5",
+    );
+    // A nullish base gives undefined.
+    check(
+        "optional-null-base",
+        "let a = null; return a?.b;",
+        "undefined",
+    );
+    // Short-circuit at an inner link.
+    check(
+        "optional-inner-null",
+        "let a = { b: null }; return a?.b?.c;",
+        "undefined",
+    );
+    // The short-circuit skips the rest of the chain, `.c.d` included.
+    check(
+        "optional-skips-rest",
+        "let a = undefined; return typeof a?.b.c.d;",
+        "undefined",
+    );
+    // Computed access.
+    check(
+        "optional-computed",
+        "let a = { x: 7 }; return a?.[\"x\"];",
+        "7",
+    );
+    check(
+        "optional-computed-null",
+        "let a = null; return typeof a?.[\"x\"];",
+        "undefined",
+    );
+    // An optional call: present runs, absent gives undefined without calling.
+    check(
+        "optional-call-present",
+        "let o = { m: function () { return 3; } }; return o.m?.();",
+        "3",
+    );
+    check(
+        "optional-call-absent",
+        "let o = {}; return typeof o.m?.();",
+        "undefined",
+    );
+    // A method reached through `?.` keeps its receiver.
+    check(
+        "optional-call-keeps-this",
+        "let o = { n: 10, m: function () { return this.n; } }; return o?.m();",
+        "10",
+    );
+    // **The short-circuit does not evaluate the arguments** — `a` is null, so `count = 1` never
+    // runs and the call never happens.
+    check(
+        "optional-does-not-evaluate-args",
+        "let count = 0; let a = null; let r = a?.b(count = 1); \
+         return typeof r + \":\" + count;",
+        "undefined:0",
+    );
+
+    // `??` shares the nullish test the same fix corrected: a nullish left takes the right, a
+    // present-but-falsy left (`0`) does not.
+    check("coalesce-null-left", "let a = null; return a ?? 5;", "5");
+    check("coalesce-undefined-left", "let a; return a ?? 5;", "5");
+    check("coalesce-zero-left", "let a = 0; return a ?? 5;", "0");
+    check(
+        "coalesce-empty-string-left",
+        "let a = \"\"; return a ?? \"x\";",
+        "",
+    );
+}
+
+/// Class instance fields: `class C { x = 1 }` runs each initialiser on every instance, in source
+/// order, in the constructor — for a class with no explicit constructor (base or derived).
+#[test]
+fn class_fields_initialise_each_instance() {
+    // Two fields, initialised per instance.
+    check(
+        "field-basic",
+        "class Point { x = 1; y = 2; } let p = new Point(); return p.x + p.y;",
+        "3",
+    );
+    // A field with no initialiser is `undefined`.
+    check(
+        "field-no-init",
+        "class C { x; } return typeof new C().x;",
+        "undefined",
+    );
+    // Initialisers run in source order and can read `this`, so a later field sees an earlier one.
+    check(
+        "field-order-reads-this",
+        "class C { x = 1; y = this.x + 10; } return new C().y;",
+        "11",
+    );
+    // An initialiser can read an enclosing variable (the constructor captures it).
+    check(
+        "field-captures-outer",
+        "let k = 7; class C { x = k; } return new C().x;",
+        "7",
+    );
+    // A method reads a field through `this`.
+    check(
+        "field-read-by-method",
+        "class C { n = 10; get() { return this.n; } } return new C().get();",
+        "10",
+    );
+    // A derived class's fields initialise after `super()` runs the parent constructor.
+    check(
+        "field-derived-after-super",
+        "class A { constructor() { this.a = 1; } } class B extends A { b = 2; } \
+         let o = new B(); return o.a + o.b;",
+        "3",
+    );
+    // Each instance gets its own field values.
+    check(
+        "field-per-instance",
+        "class C { x = 0; } let a = new C(); let b = new C(); a.x = 9; return a.x + \",\" + b.x;",
+        "9,0",
+    );
+}
+
+/// `try … finally`: the finally block runs on every way out of the protected region — normal
+/// completion, an uncaught throw, `return`, `break` and `continue` — nested finallys chain in order,
+/// and a finally that completes abruptly overrides the completion it interrupted.
+#[test]
+fn finally_runs_on_every_exit_path() {
+    // Normal completion.
+    check(
+        "finally-normal",
+        "let s = \"\"; try { s = s + \"t\"; } finally { s = s + \"f\"; } return s;",
+        "tf",
+    );
+    // try/catch/finally, all three run.
+    check(
+        "finally-catch-all",
+        "let s = \"\"; try { s = s + \"t\"; throw 0; } catch (e) { s = s + \"c\"; } finally { s = s + \"f\"; } return s;",
+        "tcf",
+    );
+    // Finally runs and the catch does not, on normal completion.
+    check(
+        "finally-catch-skipped",
+        "let s = \"\"; try { s = s + \"t\"; } catch (e) { s = s + \"c\"; } finally { s = s + \"f\"; } return s;",
+        "tf",
+    );
+    // An uncaught throw runs the finally, then propagates to the outer catch.
+    check(
+        "finally-throw-propagates",
+        "let s = \"\"; try { try { throw \"x\"; } finally { s = s + \"f\"; } } catch (e) { s = s + \"c\" + e; } return s;",
+        "fcx",
+    );
+    // `return` runs the finally first (observed through a captured var), then returns.
+    check(
+        "finally-return-runs-first",
+        "var s = \"\"; function g() { try { return 1; } finally { s = s + \"f\"; } } let r = g(); return s + r;",
+        "f1",
+    );
+    // A `return` in the finally overrides the one it interrupted.
+    check(
+        "finally-return-overrides",
+        "return (function () { try { return 1; } finally { return 2; } })();",
+        "2",
+    );
+    // `break` runs the finally before leaving the loop.
+    check(
+        "finally-break",
+        "let s = \"\"; for (let i = 0; i < 3; i = i + 1) { try { if (i == 1) break; s = s + i; } finally { s = s + \"f\"; } } return s;",
+        "0ff",
+    );
+    // `continue` runs the finally before the next iteration.
+    check(
+        "finally-continue",
+        "let s = \"\"; for (let i = 0; i < 3; i = i + 1) { try { if (i == 1) continue; s = s + i; } finally { s = s + \"f\"; } } return s;",
+        "0ff2f",
+    );
+    // Nested finallys run inner-then-outer on a `return` crossing both.
+    check(
+        "finally-nested-return",
+        "var s = \"\"; function g() { try { try { return 1; } finally { s = s + \"a\"; } } finally { s = s + \"b\"; } } \
+         let r = g(); return s + r;",
+        "ab1",
+    );
+    // A `break` crossing two finallys runs both before leaving the loop.
+    check(
+        "finally-nested-break",
+        "let s = \"\"; for (let i = 0; i < 2; i = i + 1) { \
+         try { try { if (i == 0) break; } finally { s = s + \"a\"; } } finally { s = s + \"b\"; } s = s + \"x\"; } return s;",
+        "ab",
+    );
+    // A finally with no catch on a value that is not thrown just runs.
+    check(
+        "finally-no-catch-normal",
+        "let s = \"\"; try { s = s + \"t\"; } finally { s = s + \"f\"; } return s;",
+        "tf",
+    );
+}
+
+/// Compound assignment (`+=`, `-=`, …, `&&=`, `||=`, `??=`): the operator was being ignored, so
+/// `x += 1` compiled as `x = 1`. Each form now reads the target, combines and stores.
+#[test]
+fn compound_assignment_applies_its_operator() {
+    check("compound-add", "let x = 5; x += 3; return x;", "8");
+    check("compound-sub", "let x = 5; x -= 2; return x;", "3");
+    check("compound-mul", "let x = 5; x *= 2; return x;", "10");
+    check("compound-div", "let x = 10; x /= 4; return x;", "2.5");
+    check("compound-rem", "let x = 10; x %= 3; return x;", "1");
+    check("compound-pow", "let x = 2; x **= 3; return x;", "8");
+    check("compound-bitand", "let x = 5; x &= 3; return x;", "1");
+    check("compound-bitor", "let x = 5; x |= 2; return x;", "7");
+    check("compound-bitxor", "let x = 5; x ^= 1; return x;", "4");
+    check("compound-shl", "let x = 1; x <<= 3; return x;", "8");
+    check("compound-shr", "let x = 16; x >>= 2; return x;", "4");
+    // String concatenation — the shape that first exposed the bug.
+    check(
+        "compound-string",
+        "let s = \"a\"; s += \"b\"; s += \"c\"; return s;",
+        "abc",
+    );
+    // A member and a computed target, each evaluated once.
+    check(
+        "compound-member",
+        "let o = { n: 5 }; o.n += 3; return o.n;",
+        "8",
+    );
+    check(
+        "compound-computed",
+        "let a = [1, 2, 3]; a[1] += 10; return a[1];",
+        "12",
+    );
+    check(
+        "compound-evaluates-target-once",
+        "var calls = 0; let a = [0]; function k() { calls = calls + 1; return 0; } \
+         a[k()] += 5; return a[0] + \":\" + calls;",
+        "5:1",
+    );
+    // Compound assignment works across a try/finally boundary (the `+=` bug first showed there).
+    check(
+        "compound-in-finally",
+        "let s = \"a\"; try { s += \"b\"; } finally { s += \"c\"; } return s;",
+        "abc",
+    );
+    // Logical assignment short-circuits: it assigns only when the current value permits.
+    check("logical-and-truthy", "let x = 1; x &&= 5; return x;", "5");
+    check("logical-and-falsy", "let x = 0; x &&= 5; return x;", "0");
+    check("logical-or-falsy", "let x = 0; x ||= 5; return x;", "5");
+    check("logical-or-truthy", "let x = 3; x ||= 5; return x;", "3");
+    check(
+        "logical-nullish-null",
+        "let x = null; x ??= 5; return x;",
+        "5",
+    );
+    check(
+        "logical-nullish-present",
+        "let x = 0; x ??= 5; return x;",
+        "0",
+    );
+    // The right side of a logical assignment runs only when it assigns.
+    check(
+        "logical-short-circuits-rhs",
+        "let ran = 0; let x = 3; x ||= (ran = 1); return x + \":\" + ran;",
+        "3:0",
+    );
+}
+
+/// **A proxy answers through its handler, or forwards to its target when there is no trap** —
+/// which is what makes a handler with one trap a pass-through for everything else.
+#[test]
+fn a_proxy_traps_what_its_handler_defines() {
+    check(
+        "proxy-get-trap",
+        "let p = new Proxy({a: 1}, {get: function () { return 9; }}); return p.a;",
+        "9",
+    );
+    check(
+        "proxy-get-forwards",
+        "let p = new Proxy({a: 1}, {}); return p.a;",
+        "1",
+    );
+    check(
+        "proxy-get-receives-target-and-key",
+        "let seen = \"\"; \
+         let p = new Proxy({a: 1}, {get: function (t, k) { seen = k; return t[k]; }}); \
+         let value = p.a; return seen + \":\" + value;",
+        "a:1",
+    );
+    check(
+        "proxy-set-trap",
+        "let seen = 0; \
+         let p = new Proxy({}, {set: function (t, k, v) { seen = v; return true; }}); \
+         p.x = 5; return seen;",
+        "5",
+    );
+    check(
+        "proxy-set-forwards",
+        "let t = {}; let p = new Proxy(t, {}); p.x = 5; return t.x;",
+        "5",
+    );
+    check(
+        "proxy-has-trap",
+        "let p = new Proxy({}, {has: function () { return true; }}); return \"nope\" in p;",
+        "true",
+    );
+    check(
+        "proxy-has-forwards",
+        "let p = new Proxy({a: 1}, {}); return (\"a\" in p) + \",\" + (\"b\" in p);",
+        "true,false",
+    );
+    check(
+        "proxy-delete-trap",
+        "let seen = \"\"; \
+         let p = new Proxy({a: 1}, {deleteProperty: function (t, k) { seen = k; return true; }}); \
+         delete p.a; return seen;",
+        "a",
+    );
+    // A proxy is not a function, whatever the marker in its internal slot might suggest.
+    check(
+        "proxy-is-not-a-function",
+        "return typeof new Proxy({}, {});",
+        "object",
+    );
+    check(
+        "proxy-needs-objects",
+        "try { new Proxy(1, {}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A symbol key reaches the trap like any other.
+    check(
+        "proxy-symbol-key",
+        "let s = Symbol(); \
+         let p = new Proxy({}, {get: function (t, k) { return k === s ? 7 : 0; }}); \
+         return p[s];",
+        "7",
+    );
+}
+
+/// **A revoked proxy refuses everything**, and the invariant checks refuse a trap that
+/// contradicts its target — both are `TypeError`s the proxy causes, not the program.
+#[test]
+fn a_proxy_is_held_to_its_target() {
+    check(
+        "proxy-revoked",
+        "let r = Proxy.revocable({a: 1}, {}); r.revoke(); \
+         try { return r.proxy.a; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-revocable-works-until-revoked",
+        "let r = Proxy.revocable({a: 1}, {}); return r.proxy.a;",
+        "1",
+    );
+    // A non-configurable, non-writable property is a promise the target made, and a `get`
+    // trap is not allowed to report anything else.
+    check(
+        "proxy-get-must-not-lie",
+        "let t = {}; \
+         Object.defineProperty(t, \"a\", {value: 1, writable: false, configurable: false}); \
+         let p = new Proxy(t, {get: function () { return 2; }}); \
+         try { return p.a; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Reporting the truth is fine.
+    check(
+        "proxy-get-may-agree",
+        "let t = {}; \
+         Object.defineProperty(t, \"a\", {value: 1, writable: false, configurable: false}); \
+         let p = new Proxy(t, {get: function () { return 1; }}); \
+         return p.a;",
+        "1",
+    );
+}
+
+/// The combinators. **The empty case is where the four disagree most** — `all` and
+/// `allSettled` fulfil at once, `any` rejects because no fulfilment can ever arrive, and
+/// `race` stays pending for ever because nothing will settle it.
+#[test]
+fn the_promise_combinators_fold_a_list() {
+    check(
+        "promise-all-shape",
+        "return typeof Promise.all([Promise.resolve(1)]).then;",
+        "function",
+    );
+    check(
+        "promise-all-empty-settles",
+        "let p = Promise.all([]); return typeof p.then;",
+        "function",
+    );
+    check(
+        "promise-race-shape",
+        "return typeof Promise.race([Promise.resolve(1)]).then;",
+        "function",
+    );
+    check(
+        "promise-all-settled-shape",
+        "return typeof Promise.allSettled([Promise.reject(1)]).then;",
+        "function",
+    );
+    check(
+        "promise-any-shape",
+        "return typeof Promise.any([Promise.resolve(1)]).then;",
+        "function",
+    );
+    // A list of plain values is wrapped, so `all` accepts anything iterable by index.
+    check(
+        "promise-all-plain-values",
+        "return typeof Promise.all([1, 2, 3]).then;",
+        "function",
+    );
+    // Whole chains through each combinator build and drain without faulting, which the
+    // harness checks by requiring a clean exit.
+    check(
+        "promise-combinators-drain",
+        "Promise.all([Promise.resolve(1), 2]).then(function () {}); \
+         Promise.allSettled([Promise.reject(1), 2]).then(function () {}); \
+         Promise.race([Promise.resolve(1)]).then(function () {}); \
+         Promise.any([Promise.reject(1), Promise.resolve(2)]).then(function () {}); \
+         Promise.any([]).catch(function () {}); \
+         return \"built\";",
+        "built",
+    );
+}
+
+/// `finally` runs on settlement and leaves it alone — the difference from `then(f, f)`, where
+/// what the handler returns replaces the value.
+#[test]
+fn finally_does_not_change_the_settlement() {
+    check(
+        "finally-shape",
+        "return typeof Promise.resolve(1).finally(function () {}).then;",
+        "function",
+    );
+    check(
+        "finally-is-not-immediate",
+        "let ran = false; \
+         Promise.resolve(1).finally(function () { ran = true; }); \
+         return ran;",
+        "false",
+    );
+    check(
+        "finally-on-a-rejection-drains",
+        "Promise.reject(new TypeError(\"x\")) \
+             .finally(function () {}) \
+             .catch(function (e) { return e.name; }); \
+         return \"built\";",
+        "built",
+    );
+    check(
+        "finally-needs-a-promise",
+        "try { Promise.prototype.finally.call({}); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
+/// The rest of the traps. Each forwards to the target when the handler defines nothing, which
+/// is what a handler with one trap depends on.
+#[test]
+fn a_proxy_traps_the_reflective_operations() {
+    check(
+        "proxy-own-keys-trap",
+        "let p = new Proxy({a: 1}, {ownKeys: function () { return [\"x\", \"y\"]; }}); \
+         return Object.getOwnPropertyNames(p).join(\",\");",
+        "x,y",
+    );
+    check(
+        "proxy-own-keys-forwards",
+        "let p = new Proxy({a: 1, b: 2}, {}); \
+         return Object.getOwnPropertyNames(p).join(\",\");",
+        "a,b",
+    );
+    check(
+        "proxy-descriptor-trap",
+        "let p = new Proxy({}, {getOwnPropertyDescriptor: function () { \
+             return {value: 9, configurable: true}; }}); \
+         return Object.getOwnPropertyDescriptor(p, \"a\").value;",
+        "9",
+    );
+    check(
+        "proxy-descriptor-forwards",
+        "let p = new Proxy({a: 3}, {}); \
+         return Object.getOwnPropertyDescriptor(p, \"a\").value;",
+        "3",
+    );
+    check(
+        "proxy-define-trap",
+        "let seen = \"\"; \
+         let p = new Proxy({}, {defineProperty: function (t, k) { seen = k; return true; }}); \
+         Object.defineProperty(p, \"z\", {value: 1}); return seen;",
+        "z",
+    );
+    // A definition that does not take is an error, unlike `Reflect.defineProperty`.
+    check(
+        "proxy-define-refused",
+        "let p = new Proxy({}, {defineProperty: function () { return false; }}); \
+         try { Object.defineProperty(p, \"z\", {value: 1}); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-get-prototype-trap",
+        "let a = {}; \
+         let p = new Proxy({}, {getPrototypeOf: function () { return a; }}); \
+         return Object.getPrototypeOf(p) === a;",
+        "true",
+    );
+    check(
+        "proxy-get-prototype-forwards",
+        "let a = {}; let t = Object.create(a); let p = new Proxy(t, {}); \
+         return Object.getPrototypeOf(p) === a;",
+        "true",
+    );
+    check(
+        "proxy-is-extensible-forwards",
+        "let p = new Proxy({}, {}); return Object.isExtensible(p);",
+        "true",
+    );
+    // `isExtensible` is the one trap that cannot lie at all: it must match its target.
+    check(
+        "proxy-is-extensible-must-not-lie",
+        "let p = new Proxy({}, {isExtensible: function () { return false; }}); \
+         try { Object.isExtensible(p); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-is-extensible-may-agree",
+        "let p = new Proxy({}, {isExtensible: function () { return true; }}); \
+         return Object.isExtensible(p);",
+        "true",
+    );
+    check(
+        "proxy-prevent-extensions-forwards",
+        "let t = {}; let p = new Proxy(t, {}); Object.preventExtensions(p); \
+         return Object.isExtensible(t);",
+        "false",
+    );
+    // `Object.keys` sees only what the trap reports, filtered by the target's enumerability.
+    check(
+        "proxy-own-keys-through-keys",
+        "let p = new Proxy({a: 1, b: 2}, {}); return Object.keys(p).join(\",\");",
+        "a,b",
+    );
+}
+
+/// **A proxy's enumerability comes from its descriptor, key by key** — its own shape holds
+/// nothing, so filtering by that dropped every name `ownKeys` reported.
+#[test]
+fn a_proxy_reports_which_of_its_keys_enumerate() {
+    check(
+        "proxy-keys-forwards",
+        "let p = new Proxy({a: 1, b: 2}, {}); return Object.keys(p).join(\",\");",
+        "a,b",
+    );
+    // A non-enumerable property on the target is left out, as it would be without the proxy.
+    check(
+        "proxy-keys-skips-non-enumerable",
+        "let t = {a: 1}; Object.defineProperty(t, \"h\", {value: 2}); \
+         let p = new Proxy(t, {}); return Object.keys(p).join(\",\");",
+        "a",
+    );
+    // And a trap can make a key enumerable that the target has no opinion about.
+    check(
+        "proxy-keys-through-a-descriptor-trap",
+        "let p = new Proxy({}, { \
+             ownKeys: function () { return [\"x\"]; }, \
+             getOwnPropertyDescriptor: function () { \
+                 return {value: 1, enumerable: true, configurable: true}; } \
+         }); \
+         return Object.keys(p).join(\",\");",
+        "x",
+    );
+}
+
+/// **A relative index is coerced, and a throw from the coercion is the answer.** Reading it
+/// with `as_number` and falling back on `None` swallowed a string, an object and a symbol
+/// alike — so `[1, 2, 3].slice("1")` started at zero and a throwing `valueOf` never ran.
+#[test]
+fn a_relative_index_is_coerced() {
+    check(
+        "slice-string-start",
+        "return [1, 2, 3].slice(\"1\").join(\",\");",
+        "2,3",
+    );
+    check(
+        "slice-object-start",
+        "return [1, 2, 3].slice({valueOf: function () { return 2; }}).join(\",\");",
+        "3",
+    );
+    // Only `undefined` takes the default, which is what makes these the same call.
+    check(
+        "slice-undefined-end",
+        "return [1, 2, 3].slice(1, undefined).join(\",\");",
+        "2,3",
+    );
+    check(
+        "slice-no-end",
+        "return [1, 2, 3].slice(1).join(\",\");",
+        "2,3",
+    );
+    // `null` is zero, not the default.
+    check(
+        "slice-null-end",
+        "return [1, 2, 3].slice(0, null).length;",
+        "0",
+    );
+    // A throw from the coercion reaches the program.
+    check(
+        "slice-throwing-start",
+        "try { [1, 2].slice({valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "copy-within-throwing-end",
+        "try { [1, 2, 3].copyWithin(0, 0, \
+                 {valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "splice-throwing-count",
+        "try { [1, 2, 3].splice(0, {valueOf: function () { throw new RangeError(\"x\"); }}); \
+               return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "fill-symbol-start",
+        "try { [1, 2].fill(0, Symbol()); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // And the ordinary cases still work.
+    check(
+        "splice-count-coerced",
+        "return [1, 2, 3].splice(0, \"2\").join(\",\");",
+        "1,2",
+    );
+    check(
+        "string-slice-coerced",
+        "return \"abcd\".slice(\"1\", \"3\");",
+        "bc",
+    );
+}
+
+/// **A string longer than the engine will build is an error, not an attempt.** Until the
+/// count was actually coerced this was unreachable from a string argument — `"a".repeat("1e9")`
+/// read as zero — so coercing it turned a silent wrong answer into a real request for a
+/// gigabyte, and the acceptance run hung rather than failed.
+#[test]
+fn a_string_cannot_be_asked_to_grow_without_limit() {
+    check(
+        "repeat-absurd-count",
+        "try { \"a\".repeat(1e9); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "repeat-absurd-string-count",
+        "try { \"a\".repeat(\"1e9\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    check(
+        "pad-absurd-length",
+        "try { \"a\".padStart(1e9, \"-\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // The ordinary sizes still work, and zero is not an error.
+    check("repeat-small", "return \"ab\".repeat(3);", "ababab");
+    check("repeat-zero", "return \"ab\".repeat(0).length;", "0");
+    check("repeat-coerced", "return \"ab\".repeat(\"2\");", "abab");
+    check("pad-small", "return \"a\".padStart(3, \"-\");", "--a");
+    check(
+        "repeat-negative",
+        "try { \"a\".repeat(-1); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
     );
 }

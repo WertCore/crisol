@@ -168,25 +168,86 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
     })?;
     std::fs::write(
         &entry_path,
-        "extern unsigned long long crisol_program(void);\n\
-         extern void crisol_print(unsigned long long);\n\
-         int main(void) { crisol_print(crisol_program()); return 0; }\n",
+        // The program hands its stack map table to the runtime before running anything. The
+        // runtime cannot look the symbol up itself: an `extern` reference in `crisol-abi`
+        // would make that crate fail to link anywhere the symbol does not exist, including
+        // its own tests.
+        //
+        // Element 0 is the row count and the rows begin at element 1 — the layout the backend
+        // writes (D-90). Registering *before* `crisol_program` runs is the whole point: a
+        // collection can happen on the first allocation.
+        format!(
+            // `crisol_program` takes the five operands every compiled function takes
+            // (closure, this, new.target, argc, argv), because a call site cannot know which
+            // function it is reaching. The program itself is called with none: no closure, no
+            // `this` yet, no `new.target`, no arguments.
+            //
+            // `argv` still points at a real slot. A parameter is read under a select rather
+            // than a branch, so the load happens even for an argument that was not passed and
+            // has to be in bounds — `ARGV_MIN_SLOTS` is that guarantee, and this honours it.
+            //
+            // The `undefined` bit pattern is interpolated from the Rust constant rather than
+            // written out here, so the NaN-box layout stays in one place.
+            //
+            // **The result goes into the drain and comes back out.** It lives in a C local,
+            // which no stack map describes, and draining the microtask queue allocates — so
+            // a collection there freed the very value about to be printed. Handing it to the
+            // runtime is how it gets rooted for the one call that can collect after the
+            // program has returned.
+            "extern unsigned long long crisol_stack_maps[];\n\
+             extern unsigned long long crisol_functions[];\n\
+             extern void crisol_register_functions(const void *table, unsigned long long count);\n\
+             extern void crisol_register_stack_maps(const void *rows, unsigned long long count);\n\
+             extern unsigned long long crisol_program(unsigned long long closure,\n\
+                 unsigned long long this_value, unsigned long long new_target,\n\
+                 unsigned long long argc, unsigned long long *argv);\n\
+             extern void crisol_print(unsigned long long);\n\
+             extern void crisol_report_uncaught(void);\n\
+             extern unsigned long long crisol_global_object(void);\n\
+             extern unsigned long long crisol_run_microtasks(unsigned long long keep);\n\
+             int main(void) {{\n\
+                 unsigned long long argv[{slots}] = {{ {undefined}ULL }};\n\
+                 crisol_register_stack_maps(&crisol_stack_maps[1], crisol_stack_maps[0]);\n\
+                 crisol_register_functions(&crisol_functions[1], crisol_functions[0]);\n\
+                 unsigned long long result =\n\
+                     crisol_program(0ULL, crisol_global_object(), {undefined}ULL, 0ULL, argv);\n\
+                 result = crisol_run_microtasks(result);\n\
+                 if (result == {exception}ULL) {{\n\
+                     crisol_report_uncaught();\n\
+                     return 1;\n\
+                 }}\n\
+                 crisol_print(result);\n\
+                 return 0;\n\
+             }}\n",
+            undefined = crisol_value::Value::UNDEFINED.to_bits(),
+            slots = crisol_codegen::ARGV_MIN_SLOTS,
+            exception = crisol_value::Value::EXCEPTION.to_bits(),
+        ),
     )
     .map_err(|error| BuildError::Link {
         message: format!("cannot write the entry point: {error}"),
     })?;
 
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
-    let result = Command::new(&compiler)
+    let mut command = Command::new(&compiler);
+    command
         .arg(&entry_path)
         .arg(&object_path)
         .arg(runtime)
         .arg("-o")
-        .arg(output)
-        .output()
-        .map_err(|error| BuildError::Link {
-            message: format!("cannot run {compiler}: {error}"),
-        })?;
+        .arg(output);
+    // **The Rust runtime archive needs these named on Linux and not on macOS**, which is the
+    // whole reason this worked here and linked nothing in CI. A Rust `staticlib` leaves its
+    // dependencies on the system allocator, threads and `dlopen` for the final link to
+    // resolve; macOS's driver supplies them implicitly and GNU ld does not. Every test262
+    // case failed at the link step, and the failure was recorded as the word "link" with the
+    // message discarded — so the run reported twelve thousand refusals and no reason.
+    if cfg!(target_os = "linux") {
+        command.args(["-lpthread", "-ldl", "-lm"]);
+    }
+    let result = command.output().map_err(|error| BuildError::Link {
+        message: format!("cannot run {compiler}: {error}"),
+    })?;
 
     if !result.status.success() {
         return Err(BuildError::Link {

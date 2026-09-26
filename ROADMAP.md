@@ -88,6 +88,37 @@ product claim.
 **Rejected — reference counting:** pathological with closures and cycles. Would need a
 cycle collector anyway, which is most of a tracing GC with extra steps.
 
+**Deferred — concurrent marking with write barriers (the Go approach):** not rejected, but
+not next, and for a reason worth stating because the instinct to reach for it is a good one.
+
+Concurrent collection does not make collection *cheaper*. It makes it **later**: total work
+goes up — barriers on pointer stores, synchronisation, re-scanning what changed during the
+mark — in exchange for no single long pause. Go pays that willingly because Go targets
+servers where a tail-latency spike is a product problem.
+
+Three things make it the wrong first move here:
+
+- **The heap is small.** M8's acceptance is around 10 MiB of process footprint. A
+  stop-the-world mark-sweep over a few thousand objects is likely sub-millisecond, so
+  concurrency would be solving a problem that may not exist at this scale.
+- **A barrier on every pointer store fights the product claim.** The premise is AOT-compiled
+  specialised native code; adding a branch to every store to buy latency we have not shown we
+  lack is a bad trade for this engine.
+- **Mobile's binding constraint is footprint, not pause** (§3.6: memory pressure is a
+  termination risk, not a slowdown). Concurrent marking makes footprint slightly *worse*
+  through floating garbage.
+
+**Generational comes first** for the opposite reasons: UI work allocates per-frame temporaries
+that die young, so a nursery collection touches few live objects and gives short pauses. Note
+that generational needs a write barrier too — for old→young references — so this is not
+"barriers versus none", it is a narrower barrier buying a larger win.
+
+**And nothing has been measured.** No pause time has been recorded against compiled code,
+because the collector cannot yet see compiled frames at all. Choosing a concurrency design to
+fix an unmeasured cost is the kind of decision this project records *against*. If young-generation
+pauses later hurt frame times on a real workload, the order is generational first, then
+concurrent marking if pauses remain too long — and M20 is where that measurement belongs.
+
 **Consequences, accepted now:**
 
 - Every heap-allocated JS value lives behind a `GcRef` handle, never a raw pointer
@@ -529,6 +560,35 @@ Windows x86_64.
 to a standalone binary that runs and produces correct output on all four targets, with
 GC stress mode enabled.
 
+**Calling convention — uniform now, direct fast path next.** Every compiled function takes
+`(closure, this, new.target, argc, argv)`, so a call site never needs to know which function
+it is reaching. That is not a preference: a callback passed to `arr.map` has no statically
+known arity, so a convention with the arity baked in cannot express one at all. `argv` points
+into the **caller's stack frame** rather than a heap list — no allocation per call, and the
+collector already traces frame slots, so arguments are rooted for free. `new.target` is in the
+signature from the start even though nothing reads it until classes, because adding a
+parameter later rewrites every call site.
+
+**Unconditional — benchmark against QuickJS inside M13.** §7's kill criterion fires right
+after this milestone, so the number is needed here rather than in M20. This is the part that
+rots if left to "when it matters": the optimisations are obvious once there is a measurement
+and unorderable without one.
+
+**Conditional — which call optimisation, decided by that number.** Three are known, cheapest
+first, and the order is deliberate:
+
+1. **Remove the `crisol_closure_code` call.** Every call currently makes a full C call just to
+   read slot zero and index the function table, before the indirect call it actually wants.
+   Pure overhead on the hottest path in the language, and removing it needs no analysis.
+2. **Narrow the stack maps.** Every live variable is spilled to the frame at every safepoint,
+   because the IR cannot say which slots can hold references. Calls are safepoints, so this is
+   a per-call cost proportional to how much is live.
+3. **The direct fast path.** When the callee is known, arguments can go in registers and the
+   call can be direct. Listed last because it is the most expensive of the three: a callee
+   arrives as an SSA value from a slot load, so *proving* which function it is means
+   devirtualisation, not just a second code path — and two call paths are two chances to
+   miscompile in a way that shows up on only one of them.
+
 ---
 
 #### M14 — Differential testing
@@ -624,7 +684,8 @@ JS object graph unless the program asks for it.
 
 **Deliverable:** Inlining, constant folding, DCE, escape analysis, allocation elimination,
 type specialization on TS types, shape-based property access with per-site monomorphic
-caches, devirtualization, LTO.
+caches, devirtualization, LTO. Narrowing stack maps to reference-typed slots, so a call stops
+spilling every live variable. The direct-call fast path from M13, if it was not needed sooner.
 
 **Accept:** benchmark suite showing measured improvement over M13 baseline. Publish
 honest numbers per §2.7 — startup, memory, binary size — not throughput comparisons

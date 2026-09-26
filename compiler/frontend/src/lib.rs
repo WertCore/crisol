@@ -4,6 +4,7 @@
 
 #![doc(html_root_url = "https://docs.rs/crisol-frontend/0.0.0")]
 
+mod escape;
 mod graph;
 mod loader;
 mod lower;

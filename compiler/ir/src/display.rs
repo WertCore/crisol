@@ -98,12 +98,50 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
                 args.join(", ")
             )
         }
+        Op::CallSpread {
+            callee,
+            this_value,
+            arguments,
+        } => write!(f, "call {callee}(this={this_value}, ...{arguments})"),
         // Quoted, because a property name is an arbitrary string: `obj[""]` and
         // `obj["a b"]` are both legal, and an unquoted dump of either is ambiguous exactly
         // where someone is squinting at it to work out what went wrong.
         Op::PropertyLoad { object, key } => write!(f, "get {object}.{key:?}"),
         Op::PropertyStore { object, key, value } => write!(f, "set {object}.{key:?} = {value}"),
+        Op::DefineAccessor {
+            object,
+            key,
+            getter,
+            setter,
+        } => write!(f, "accessor {object}.{key:?} get {getter} set {setter}"),
+        Op::ComputedLoad { object, key } => write!(f, "get {object}[{key}]"),
+        Op::Delete { object, key } => write!(f, "delete {object}[{key}]"),
+        Op::Enumerate { object } => write!(f, "enumerate {object}"),
+        Op::Iterate { object } => write!(f, "iterate {object}"),
+        Op::ArrayExtend {
+            array,
+            value,
+            spread,
+        } => {
+            if *spread {
+                write!(f, "extend {array}, ...{value}")
+            } else {
+                write!(f, "extend {array}, {value}")
+            }
+        }
+        Op::ObjectExtend { object, source } => write!(f, "extend {object}, ...{source}"),
+        Op::CreateRegExp { source, flags } => write!(f, "regexp /{source}/{flags}"),
+        Op::ComputedStore { object, key, value } => write!(f, "set {object}[{key}] = {value}"),
+        Op::SetPrototype { object, prototype } => {
+            write!(f, "set-prototype {object} <- {prototype}")
+        }
+        Op::MakeGenerator { body, this_value } => {
+            write!(f, "make-generator {body} this={this_value}")
+        }
         Op::CreateObject { shape } => write!(f, "object #{}", shape.index()),
+        Op::CaughtValue => write!(f, "caught"),
+        Op::GlobalLoad { name } => write!(f, "global {name:?}"),
+        Op::GlobalLoadOptional { name } => write!(f, "global? {name:?}"),
         Op::Construct { callee, args } => {
             let args: Vec<String> = args.iter().map(ToString::to_string).collect();
             write!(f, "new {callee}({})", args.join(", "))
@@ -172,6 +210,7 @@ impl fmt::Display for Literal<'_> {
             // about.
             Constant::Number(value) => write!(f, "{value:?}"),
             Constant::String(value) => write!(f, "{value:?}"),
+            Constant::BigInt(digits) => write!(f, "{digits}n"),
         }
     }
 }

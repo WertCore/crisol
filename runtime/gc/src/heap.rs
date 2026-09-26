@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 
-use crisol_value::{ShapeId, Value};
+use crisol_value::{Attributes, ShapeId, Value};
 
 use crate::handle::GcRef;
 
@@ -29,11 +29,87 @@ pub struct Stats {
     pub swept: u64,
 }
 
-/// An object: its shape, and one value per slot the shape names.
+/// An object: its shape, one value per slot the shape names, and what it inherits from.
 #[derive(Debug)]
 struct Object {
     shape: ShapeId,
     slots: Vec<Value>,
+    /// Its `[[Prototype]]`, or `None` for an object at the end of the chain.
+    ///
+    /// A `GcRef` rather than a `Value` because a prototype is an object or nothing — there is
+    /// no boxed form to get wrong — and because the collector has to trace it, which is easier
+    /// to not forget when the type says it is a reference.
+    prototype: Option<GcRef>,
+    /// Engine-private state: a closure's function index and its captured values.
+    ///
+    /// **Separate from `slots`, and that separation is the whole point.** Properties are
+    /// addressed by *shape*, and a shape assigns slot numbers from zero — so a closure keeping
+    /// its function index in slot zero lost it the moment anything stored a property on the
+    /// function. `class C {}` does exactly that: it stores `prototype` on the constructor,
+    /// which took slot zero and overwrote the index, and the constructor silently stopped
+    /// being callable.
+    ///
+    /// Traced like any other reference, because captures are values the program can still
+    /// reach.
+    internals: Vec<Value>,
+    /// Indexed elements, for an array. `None` for an ordinary object.
+    ///
+    /// Separate from `slots` because those are addressed by *shape*: every distinct property
+    /// name adds a shape. Storing `a[0]`, `a[1]`, … as named properties would give a thousand
+    /// element array a thousand shapes, and a dynamic index would have to format a number into
+    /// a string to look one up.
+    ///
+    /// `None` rather than an empty vector, so `[]` and `{}` stay distinguishable — the first
+    /// has a `length` and the second does not.
+    elements: Option<Vec<Value>>,
+    /// The characters, for a string. `None` for everything else.
+    ///
+    /// A string is a heap cell like an object because a `Value` carries 48 bits and text does
+    /// not fit in them. It is *not* an object in the language's sense — it has no properties
+    /// and no shape that matters — but it is collected the same way, which is what it needs
+    /// from here.
+    ///
+    /// Holds no references, so the collector traces nothing through it.
+    text: Option<Box<str>>,
+    /// The bytes, for an `ArrayBuffer`. `None` for everything else.
+    ///
+    /// A raw byte store, not a `Vec<Value>` of small numbers: an `ArrayBuffer` holds bytes, and
+    /// a `Value` per byte would cost eight times the memory it models and read each one through
+    /// the number-boxing path. Like `text` it holds no references, so the collector traces
+    /// nothing through it, and like `text` its length is fixed once set — every `ArrayBuffer`
+    /// but a resizable one, which is not implemented.
+    bytes: Option<Box<[u8]>>,
+    /// What each property permits, for the ones that are not the default.
+    ///
+    /// **Per object rather than in the shape**, which is not where a production engine puts
+    /// them. A shape would let every object sharing it answer without a lookup, and would mean
+    /// rebuilding the shape chain whenever `defineProperty` changes an existing property —
+    /// attributes do not affect *layout*, so the chain would be rebuilt for something it does
+    /// not describe.
+    ///
+    /// The cost is that attribute lookup is not shape-cached. The benefit is that an object
+    /// nobody calls `defineProperty` on carries **nothing** — the map is absent, not empty,
+    /// which is eight bytes against the forty-eight an empty `HashMap` occupies inline. Every
+    /// cell in the heap pays for this field, including the free ones.
+    #[expect(
+        clippy::box_collection,
+        reason = "the point is the *inline* size: every cell in the heap carries this field, \
+                  free ones included, and `Option<Box<_>>` is eight bytes against a `HashMap`'s \
+                  forty-eight. The extra allocation happens only for an object that actually \
+                  has attributes."
+    )]
+    attributes: Option<Box<std::collections::HashMap<u32, Attributes>>>,
+    /// Slots a `delete` has removed, though the shape still names them.
+    ///
+    /// **A tombstone rather than a new shape.** Removing a property from a shape means an
+    /// object whose layout no longer matches the chain that describes it, which a real engine
+    /// answers by leaving the shape world entirely for a dictionary. Marking the slot keeps one
+    /// representation, at the price of a lookup on every read of a property that *was* deleted
+    /// — and of the slot staying allocated.
+    ///
+    /// Absent rather than empty, for the same reason as `attributes`.
+    #[expect(clippy::box_collection, reason = "as for `attributes` above")]
+    deleted: Option<Box<std::collections::HashSet<u32>>>,
 }
 
 #[derive(Debug)]
@@ -46,6 +122,27 @@ enum State {
 struct Entry {
     generation: u16,
     state: State,
+}
+
+/// A source of roots the collector cannot find by itself.
+///
+/// A newtype purely because `dyn Fn` has no `Debug`, and a `Heap` that could not be printed
+/// would be harder to debug than one whose provider prints as a placeholder.
+#[derive(Default)]
+struct ExtraRoots(Option<Box<dyn Fn() -> Vec<GcRef>>>);
+
+impl std::fmt::Debug for ExtraRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Whether one is installed is the part worth seeing. A closure's address is not, and
+        // calling it to print the roots would collect-time work in a `Debug` impl.
+        f.debug_tuple("ExtraRoots")
+            .field(&if self.0.is_some() {
+                "installed"
+            } else {
+                "none"
+            })
+            .finish()
+    }
 }
 
 /// A garbage-collected heap.
@@ -80,6 +177,13 @@ struct Entry {
 /// nested scopes are the normal shape of a call stack.
 #[derive(Debug, Default)]
 pub struct Heap {
+    /// A source of roots the shadow stack does not hold — compiled frames, once a program has
+    /// registered its stack maps.
+    ///
+    /// `None` means there are none, which is the truth for an embedder running no compiled
+    /// code. It is *not* a default that silently loses roots: a compiled program installs one
+    /// before it runs anything, and `collect` refuses when compiled frames exist without it.
+    extra_roots: RefCell<ExtraRoots>,
     cells: RefCell<Vec<Entry>>,
     free: RefCell<Vec<u32>>,
     roots: RefCell<Vec<GcRef>>,
@@ -92,6 +196,25 @@ impl Heap {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs a source of roots the shadow stack cannot see.
+    ///
+    /// A compiled program calls this before running anything, passing something that walks its
+    /// native frames. Without it the collector sees only what Rust code has rooted, and every
+    /// value held by compiled code looks like garbage.
+    ///
+    /// Replacing an existing provider is allowed and takes effect on the next collection; there
+    /// is no way to *remove* one, because a program that stopped reporting its compiled roots
+    /// midway would be strictly worse than one that never reported them.
+    pub fn set_extra_roots(&self, provider: Box<dyn Fn() -> Vec<GcRef>>) {
+        self.extra_roots.borrow_mut().0 = Some(provider);
+    }
+
+    /// Whether a source of compiled roots has been installed.
+    #[must_use]
+    pub fn has_extra_roots(&self) -> bool {
+        self.extra_roots.borrow().0.is_some()
     }
 
     /// Collect on every allocation.
@@ -200,6 +323,465 @@ impl Heap {
         }
     }
 
+    /// Moves `handle` to `shape`, growing it to `slots` values.
+    ///
+    /// An object literal is lowered as an empty allocation followed by one `PropertyStore` per
+    /// property, and a shape names the properties an object has — so storing a *new* property
+    /// has to move the object to the shape that includes it. Without this, an object allocated
+    /// at the root shape could never gain a property, which is every object literal.
+    ///
+    /// Returns whether it happened. It refuses two things:
+    ///
+    /// - a stale handle, like every other accessor here;
+    /// - **any request that would shrink the object**, because the slots past the new end hold
+    ///   values, and dropping them would make the collector stop tracing references that the
+    ///   object still logically owns. A transition that removes a property has to be written as
+    ///   an explicit rebuild, so that the values being discarded are discarded *visibly*.
+    ///
+    /// New slots arrive as `undefined` rather than uninitialised: a slot holding a plausible
+    /// bit pattern is the worst case for a precise collector, which would read it as a
+    /// reference and follow it.
+    pub fn transition(&self, handle: GcRef, shape: ShapeId, slots: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                if slots < object.slots.len() {
+                    return false;
+                }
+                object.slots.resize(slots, Value::UNDEFINED);
+                object.shape = shape;
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// What the property in `slot` permits.
+    ///
+    /// Absent means the default an assignment creates: writable, enumerable and configurable.
+    #[must_use]
+    pub fn attributes_of(&self, handle: GcRef, slot: u32) -> Attributes {
+        let cells = self.cells.borrow();
+        let Some(cell) = cells.get(handle.slot() as usize) else {
+            return Attributes::DATA;
+        };
+        if cell.generation != handle.generation() {
+            return Attributes::DATA;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object
+                .attributes
+                .as_ref()
+                .and_then(|map| map.get(&slot).copied())
+                .unwrap_or(Attributes::DATA),
+            State::Free => Attributes::DATA,
+        }
+    }
+
+    /// Sets what the property in `slot` permits.
+    pub fn set_attributes(&self, handle: GcRef, slot: u32, attributes: Attributes) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                if attributes == Attributes::DATA {
+                    // The default is the absence of an entry, so an object returned to it stops
+                    // carrying one.
+                    if let Some(map) = object.attributes.as_mut() {
+                        map.remove(&slot);
+                    }
+                } else {
+                    object
+                        .attributes
+                        .get_or_insert_with(Box::default)
+                        .insert(slot, attributes);
+                }
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// Whether the property in `slot` has been deleted.
+    #[must_use]
+    pub fn is_deleted(&self, handle: GcRef, slot: u32) -> bool {
+        let cells = self.cells.borrow();
+        let Some(cell) = cells.get(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object
+                .deleted
+                .as_ref()
+                .is_some_and(|set| set.contains(&slot)),
+            State::Free => false,
+        }
+    }
+
+    /// Marks the property in `slot` deleted, or brings it back.
+    ///
+    /// Re-assigning a deleted property revives it: the shape still names the slot, so the
+    /// tombstone is the only thing that made it absent.
+    pub fn set_deleted(&self, handle: GcRef, slot: u32, deleted: bool) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                if deleted {
+                    object.deleted.get_or_insert_with(Box::default).insert(slot);
+                    // The value goes too, or the collector keeps whatever it pointed at alive
+                    // for as long as the object lives.
+                    if let Some(existing) = object.slots.get_mut(slot as usize) {
+                        *existing = Value::UNDEFINED;
+                    }
+                } else if let Some(set) = object.deleted.as_mut() {
+                    set.remove(&slot);
+                }
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// Turns `handle` into a string holding `text`.
+    ///
+    /// Separate from allocation for the same reason `make_array` is: the cell is allocated
+    /// first so it is rooted, and only then filled.
+    pub fn make_string(&self, handle: GcRef, text: &str) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.text = Some(text.into());
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// The characters of `handle`, if it is a string.
+    ///
+    /// Takes a closure rather than returning the text, so a caller cannot hold a borrow of the
+    /// heap across an allocation — which is how a collection would find the cells already
+    /// borrowed and panic.
+    pub fn with_text<R>(&self, handle: GcRef, body: impl FnOnce(&str) -> R) -> Option<R> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.text.as_deref().map(body),
+            State::Free => None,
+        }
+    }
+
+    /// The whole byte store of `handle`, if it has one, without copying it out.
+    ///
+    /// The counterpart of [`Heap::with_text`] for the byte store, and for the same reason: a
+    /// caller that only reads the bytes — a BigInt decoding its digits (D-248) is the motivating
+    /// case — would otherwise take a `Vec` copy through [`Heap::read_bytes`] on every access.
+    /// The closure keeps the borrow from outliving the call.
+    pub fn with_bytes<R>(&self, handle: GcRef, body: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.bytes.as_deref().map(body),
+            State::Free => None,
+        }
+    }
+
+    /// Turns `handle` into an array of `length` elements, all `undefined`.
+    ///
+    /// Separate from allocation so an array is still an object first — it has a shape, a
+    /// prototype and properties like anything else, and only additionally a run of elements.
+    pub fn make_array(&self, handle: GcRef, length: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.elements = Some(vec![Value::UNDEFINED; length]);
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// Shortens an array to `length`, keeping the elements that remain.
+    ///
+    /// Distinct from `make_array`, which *replaces* the elements — calling that to shorten a
+    /// filled array silently discards everything in it, which is exactly what a `filter` that
+    /// sized its result afterwards did.
+    ///
+    /// Growing is not this operation's job and is refused, so a caller that meant to extend
+    /// cannot quietly get a shorter array instead.
+    pub fn truncate_elements(&self, handle: GcRef, length: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                let Some(elements) = object.elements.as_mut() else {
+                    return false;
+                };
+                if length > elements.len() {
+                    return false;
+                }
+                elements.truncate(length);
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// How many elements `handle` has, or `None` if it is not an array.
+    #[must_use]
+    pub fn element_count(&self, handle: GcRef) -> Option<usize> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.elements.as_ref().map(Vec::len),
+            State::Free => None,
+        }
+    }
+
+    /// Reads an element, or `None` if this is not an array or the index is past the end.
+    #[must_use]
+    pub fn element(&self, handle: GcRef, index: usize) -> Option<Value> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.elements.as_ref()?.get(index).copied(),
+            State::Free => None,
+        }
+    }
+
+    /// Writes an element, growing the array if `index` is past the end.
+    ///
+    /// Growing is what `a[5] = 1` on a three-element array does, and the gap fills with
+    /// `undefined`. That is not quite the specification — the gap should be *holes*, which
+    /// `in` and `forEach` treat differently from `undefined` (D-64) — and it is recorded there
+    /// rather than pretended away here.
+    pub fn set_element(&self, handle: GcRef, index: usize, value: Value) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                let Some(elements) = object.elements.as_mut() else {
+                    return false;
+                };
+                if index >= elements.len() {
+                    elements.resize(index + 1, Value::UNDEFINED);
+                }
+                elements[index] = value;
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// Attaches a fixed-length, zeroed byte store of `length` bytes, replacing any it had.
+    ///
+    /// An `ArrayBuffer`'s backing store. Separate from `elements`, which are `Value`s.
+    pub fn attach_bytes(&self, handle: GcRef, length: usize) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.bytes = Some(vec![0u8; length].into_boxed_slice());
+                true
+            }
+            State::Free => false,
+        }
+    }
+
+    /// How many bytes `handle`'s store holds, or `None` if it has none.
+    #[must_use]
+    pub fn byte_len(&self, handle: GcRef) -> Option<usize> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.bytes.as_ref().map(|bytes| bytes.len()),
+            State::Free => None,
+        }
+    }
+
+    /// Reads `count` bytes at `offset`, or `None` if the store is absent or the range is past
+    /// its end.
+    #[must_use]
+    pub fn read_bytes(&self, handle: GcRef, offset: usize, count: usize) -> Option<Vec<u8>> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object
+                .bytes
+                .as_ref()?
+                .get(offset..offset.checked_add(count)?)
+                .map(<[u8]>::to_vec),
+            State::Free => None,
+        }
+    }
+
+    /// Writes `data` at `offset`, returning whether the range fit inside the store.
+    pub fn write_bytes(&self, handle: GcRef, offset: usize, data: &[u8]) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                let Some(end) = offset.checked_add(data.len()) else {
+                    return false;
+                };
+                match object
+                    .bytes
+                    .as_mut()
+                    .and_then(|bytes| bytes.get_mut(offset..end))
+                {
+                    Some(slice) => {
+                        slice.copy_from_slice(data);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            State::Free => false,
+        }
+    }
+
+    /// Reads engine-private state, which no property access can reach.
+    #[must_use]
+    pub fn internal(&self, handle: GcRef, index: u32) -> Option<Value> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.internals.get(index as usize).copied(),
+            State::Free => None,
+        }
+    }
+
+    /// Writes engine-private state, returning whether the index existed.
+    pub fn set_internal(&self, handle: GcRef, index: u32, value: Value) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => match object.internals.get_mut(index as usize) {
+                Some(existing) => {
+                    *existing = value;
+                    true
+                }
+                None => false,
+            },
+            State::Free => false,
+        }
+    }
+
+    /// What `handle` inherits from, if anything.
+    #[must_use]
+    pub fn prototype_of(&self, handle: GcRef) -> Option<GcRef> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.prototype,
+            State::Free => None,
+        }
+    }
+
+    /// Sets what `handle` inherits from, returning whether it happened.
+    ///
+    /// No cycle check. `a.__proto__ = b; b.__proto__ = a` would make a property lookup loop
+    /// forever, and the specification forbids it — but the check belongs where prototypes are
+    /// *assigned* from source, not here, because the constructor path cannot produce a cycle
+    /// and would pay for the walk on every `new`.
+    pub fn set_prototype(&self, handle: GcRef, prototype: Option<GcRef>) -> bool {
+        let mut cells = self.cells.borrow_mut();
+        let Some(cell) = cells.get_mut(handle.slot() as usize) else {
+            return false;
+        };
+        if cell.generation != handle.generation() {
+            return false;
+        }
+        match &mut cell.state {
+            State::Live { object, .. } => {
+                object.prototype = prototype;
+                true
+            }
+            State::Free => false,
+        }
+    }
+
     /// Runs a collection.
     ///
     /// Mark from the roots, sweep what was not reached. Precise rather than conservative: the
@@ -225,6 +807,16 @@ impl Heap {
     /// Marks everything reachable from the shadow stack, returning how many survived.
     fn mark(&self) -> usize {
         let mut worklist: Vec<GcRef> = self.roots.borrow().clone();
+        // Roots the shadow stack cannot see. Compiled machine code holds values in registers
+        // and frame slots and pushes nothing, so without this every one of them looks like
+        // garbage — and marking would free values a running program is still using (§3.1).
+        //
+        // A callback rather than a direct call into the runtime: the collector defines the
+        // hole and whoever knows how to walk a native stack fills it. Reversing that would
+        // make this crate depend on the ABI crate, which depends on this one to allocate.
+        if let Some(extra) = self.extra_roots.borrow().0.as_ref() {
+            worklist.extend(extra());
+        }
         let mut marked = 0;
 
         while let Some(handle) = worklist.pop() {
@@ -253,11 +845,28 @@ impl Heap {
             // Collected before releasing the borrow: the worklist cannot be extended while
             // `cells` is held, and re-borrowing per child would be a borrow error rather
             // than merely slow.
-            let children: Vec<GcRef> = object
+            // The prototype is traced like any slot. Missing it would free a class's shared
+            // prototype the moment nothing else referred to it — and every instance would go
+            // on pointing at a reclaimed object, which is the use-after-free §3.1 names.
+            let mut children: Vec<GcRef> = object
                 .slots
                 .iter()
                 .filter_map(|value| value.as_address().map(GcRef::from_address))
                 .collect();
+            children.extend(object.prototype);
+            children.extend(
+                object
+                    .internals
+                    .iter()
+                    .filter_map(|value| value.as_address().map(GcRef::from_address)),
+            );
+            children.extend(
+                object
+                    .elements
+                    .iter()
+                    .flatten()
+                    .filter_map(|value| value.as_address().map(GcRef::from_address)),
+            );
             drop(cells);
             worklist.extend(children);
         }
@@ -296,7 +905,7 @@ impl Heap {
         (swept, retired)
     }
 
-    fn allocate(&self, shape: ShapeId, slots: usize) -> GcRef {
+    fn allocate(&self, shape: ShapeId, slots: usize, internals: usize) -> GcRef {
         if self.stress.get() {
             self.collect();
         }
@@ -304,6 +913,13 @@ impl Heap {
         let object = Object {
             shape,
             slots: vec![Value::UNDEFINED; slots],
+            prototype: None,
+            internals: vec![Value::UNDEFINED; internals],
+            elements: None,
+            text: None,
+            bytes: None,
+            attributes: None,
+            deleted: None,
         };
 
         let handle = match self.free.borrow_mut().pop() {
@@ -351,7 +967,22 @@ pub struct Scope<'heap> {
 impl<'heap> Scope<'heap> {
     /// Allocates an object with `slots` slots, rooted for this scope.
     pub fn alloc(&self, shape: ShapeId, slots: usize) -> Rooted<'_> {
-        let handle = self.heap.allocate(shape, slots);
+        let handle = self.heap.allocate(shape, slots, 0);
+        self.root(handle)
+    }
+
+    /// Allocates with room for engine-private state as well.
+    ///
+    /// A closure needs this: its function index and captures must not live in the property
+    /// slots, because a shape assigns those from zero and would hand slot zero to the first
+    /// property stored on the function.
+    pub fn alloc_with_internals(
+        &self,
+        shape: ShapeId,
+        slots: usize,
+        internals: usize,
+    ) -> Rooted<'_> {
+        let handle = self.heap.allocate(shape, slots, internals);
         self.root(handle)
     }
 

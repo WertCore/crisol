@@ -8,10 +8,10 @@
 //! # The layout
 //!
 //! ```text
-//! 63          51                                              0
-//! ┌─┬───────────┬─┬─┬──┬──────────────────────────────────────┐
-//! │s│ exponent  │q│e│tg│              payload                 │
-//! └─┴───────────┴─┴─┴──┴──────────────────────────────────────┘
+//! 63          51                                            0
+//! ┌─┬───────────┬─┬─┬───┬──────────────────────────────────┐
+//! │s│ exponent  │q│e│tg │             payload               │
+//! └─┴───────────┴─┴─┴───┴──────────────────────────────────┘
 //! ```
 //!
 //! A value is a **number** unless its exponent is all ones *and* both `q` (bit 51, the quiet
@@ -20,10 +20,13 @@
 //! number side of the line, so arithmetic that overflows into NaN needs no special handling
 //! at the point it happens.
 //!
-//! `tg` is two bits saying what the remaining 48 hold, and 48 bits is not a guess: every
-//! platform this engine targets gives user space a 48-bit virtual address, so a heap pointer
-//! fits with nothing to spare and nothing wasted. [`Address`] is the type that refuses
-//! anything larger rather than truncating it.
+//! `tg` is three bits (bits 49–47) saying what the remaining 47 hold. It was two until BigInt
+//! (D-248) needed a fifth reference tag alongside object, string and symbol, and there was no
+//! spare bit above the payload: the tagged space below `e` is exactly fifty bits, so a third
+//! tag bit is one fewer payload bit. The payload is not a raw machine pointer but a garbage
+//! collector handle — a slot index and a generation (`crisol-gc`'s `GcRef`) — and 47 bits still
+//! carries two billion live slots, more than any reachable heap, so the narrowing costs
+//! nothing real. [`Address`] is the type that refuses anything wider rather than truncating it.
 //!
 //! # Why not tag numbers instead
 //!
@@ -40,21 +43,26 @@ use std::fmt;
 /// why the extra bit is there.
 const TAG_BASE: u64 = 0x7FFC_0000_0000_0000;
 
-/// Selects the two bits that say what a non-number value is.
-const TAG_MASK: u64 = 0x0003_0000_0000_0000;
+/// Selects the three bits that say what a non-number value is.
+const TAG_MASK: u64 = 0x0003_8000_0000_0000;
 
-/// The 48 bits a non-number value carries.
-const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+/// The 47 bits a non-number value carries.
+const PAYLOAD_MASK: u64 = 0x0000_7FFF_FFFF_FFFF;
 
 const TAG_SINGLETON: u64 = 0x0000_0000_0000_0000;
-const TAG_OBJECT: u64 = 0x0001_0000_0000_0000;
-const TAG_STRING: u64 = 0x0002_0000_0000_0000;
-const TAG_SYMBOL: u64 = 0x0003_0000_0000_0000;
+const TAG_OBJECT: u64 = 0x0000_8000_0000_0000;
+const TAG_STRING: u64 = 0x0001_0000_0000_0000;
+const TAG_SYMBOL: u64 = 0x0001_8000_0000_0000;
+/// A BigInt, by reference (D-248). Its magnitude lives in the heap cell's byte store, so a
+/// value carries only the handle, exactly as the other reference tags do.
+const TAG_BIGINT: u64 = 0x0002_0000_0000_0000;
 
 const SINGLETON_UNDEFINED: u64 = 0;
 const SINGLETON_NULL: u64 = 1;
 const SINGLETON_FALSE: u64 = 2;
 const SINGLETON_TRUE: u64 = 3;
+/// Not a JavaScript value: the signal that a call threw. See [`Value::EXCEPTION`].
+const SINGLETON_EXCEPTION: u64 = 4;
 
 /// The NaN every value that is not a number canonicalises to.
 ///
@@ -63,7 +71,7 @@ const SINGLETON_TRUE: u64 = 3;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
 /// How many bits of a pointer a [`Value`] can carry.
-pub const ADDRESS_BITS: u32 = 48;
+pub const ADDRESS_BITS: u32 = 47;
 
 /// A heap address small enough to live inside a [`Value`].
 ///
@@ -115,6 +123,8 @@ pub enum Kind {
     String,
     /// A symbol, by reference.
     Symbol,
+    /// A BigInt, by reference.
+    BigInt,
     /// An object, by reference.
     Object,
 }
@@ -137,6 +147,19 @@ impl Value {
     pub const TRUE: Self = Self::singleton(SINGLETON_TRUE);
     /// `false`.
     pub const FALSE: Self = Self::singleton(SINGLETON_FALSE);
+
+    /// **Not a JavaScript value.** The signal that a call threw.
+    ///
+    /// A call returns this instead of a result, and the thrown value waits in the runtime. It
+    /// lives in the value space rather than in a second return register so that adding
+    /// exceptions changes no function's signature — a call site that ignores it compiles
+    /// exactly as before.
+    ///
+    /// [`Value::kind`] deliberately reports this as `Undefined`. It should never reach a
+    /// program, and if a propagation is ever missed the value behaves as `undefined` rather
+    /// than aborting — a wrong answer in a corner is recoverable, and a crash inside a
+    /// half-unwound call is not.
+    pub const EXCEPTION: Self = Self::singleton(SINGLETON_EXCEPTION);
 
     const fn singleton(which: u64) -> Self {
         Self {
@@ -193,6 +216,12 @@ impl Value {
         Self::pointer(TAG_SYMBOL, address)
     }
 
+    /// A BigInt, by address.
+    #[must_use]
+    pub const fn bigint(address: Address) -> Self {
+        Self::pointer(TAG_BIGINT, address)
+    }
+
     /// Whether this is a number.
     ///
     /// The whole discrimination, and it is one mask and one compare. Every other predicate
@@ -212,6 +241,7 @@ impl Value {
             TAG_OBJECT => Kind::Object,
             TAG_STRING => Kind::String,
             TAG_SYMBOL => Kind::Symbol,
+            TAG_BIGINT => Kind::BigInt,
             // Singleton. The payload says which, and anything unrecognised is `undefined`
             // rather than a panic: this is reached from compiled code, and a value that
             // cannot be constructed through the safe API should not be able to abort a
@@ -222,6 +252,12 @@ impl Value {
                 _ => Kind::Undefined,
             },
         }
+    }
+
+    /// Whether this is the [`Value::EXCEPTION`] signal rather than a value.
+    #[must_use]
+    pub const fn is_exception(self) -> bool {
+        self.bits == Self::EXCEPTION.bits
     }
 
     /// The number, if this is one.
@@ -242,10 +278,16 @@ impl Value {
         }
     }
 
+    /// Whether this is a BigInt.
+    #[must_use]
+    pub const fn is_bigint(self) -> bool {
+        !self.is_number() && (self.bits & TAG_MASK) == TAG_BIGINT
+    }
+
     /// The address, if this value holds one.
     ///
-    /// Objects, strings and symbols all do; nothing else does. A collector walks these and
-    /// only these, which is why the question is asked once here rather than three times at
+    /// Objects, strings, symbols and BigInts all do; nothing else does. A collector walks these
+    /// and only these, which is why the question is asked once here rather than four times at
     /// every call site.
     #[must_use]
     pub const fn as_address(self) -> Option<Address> {
@@ -253,7 +295,9 @@ impl Value {
             return None;
         }
         match self.bits & TAG_MASK {
-            TAG_OBJECT | TAG_STRING | TAG_SYMBOL => Some(Address(self.bits & PAYLOAD_MASK)),
+            TAG_OBJECT | TAG_STRING | TAG_SYMBOL | TAG_BIGINT => {
+                Some(Address(self.bits & PAYLOAD_MASK))
+            }
             _ => None,
         }
     }
@@ -304,6 +348,7 @@ impl fmt::Debug for Value {
             Kind::Number => write!(f, "{}", self.as_number().unwrap_or(f64::NAN)),
             Kind::String => write!(f, "String({:?})", self.as_address()),
             Kind::Symbol => write!(f, "Symbol({:?})", self.as_address()),
+            Kind::BigInt => write!(f, "BigInt({:?})", self.as_address()),
             Kind::Object => write!(f, "Object({:?})", self.as_address()),
         }
     }
