@@ -338,7 +338,6 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // Recorded rather than left silently half-right.
         ("let [...a] = [1];", "array rest pattern"),
         ("let { ...r } = {};", "object rest pattern"),
-        ("let o = { ...{} };", "object spread"),
         // A hole is not `undefined` (D-64) and the IR cannot yet say so, so it is recorded
         // rather than filled in with a value that reads the same and answers `in` differently.
         // A hole is still refused; a spread is not. The two used to share a note, which made

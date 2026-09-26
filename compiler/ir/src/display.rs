@@ -98,6 +98,11 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
                 args.join(", ")
             )
         }
+        Op::CallSpread {
+            callee,
+            this_value,
+            arguments,
+        } => write!(f, "call {callee}(this={this_value}, ...{arguments})"),
         // Quoted, because a property name is an arbitrary string: `obj[""]` and
         // `obj["a b"]` are both legal, and an unquoted dump of either is ambiguous exactly
         // where someone is squinting at it to work out what went wrong.
@@ -124,6 +129,7 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
                 write!(f, "extend {array}, {value}")
             }
         }
+        Op::ObjectExtend { object, source } => write!(f, "extend {object}, ...{source}"),
         Op::CreateRegExp { source, flags } => write!(f, "regexp /{source}/{flags}"),
         Op::ComputedStore { object, key, value } => write!(f, "set {object}[{key}] = {value}"),
         Op::SetPrototype { object, prototype } => {

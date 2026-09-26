@@ -1777,25 +1777,65 @@ impl Lowering {
                         (callee, undefined)
                     }
                 };
-                let mut args = Vec::with_capacity(call.arguments.len());
-                for argument in &call.arguments {
-                    match argument.as_expression() {
-                        Some(expression) => args.push(self.expression(expression)),
-                        None => {
-                            self.note("spread argument", call.span.start);
-                            let placeholder = self.placeholder();
-                            args.push(placeholder);
+                // A spread argument (`f(...xs)`) makes the count dynamic, so the arguments are
+                // gathered into an array and the call goes through `crisol_apply` (D-250). A call
+                // with none stays a fixed-operand `Op::Call` and costs exactly what it did before.
+                let spread = call
+                    .arguments
+                    .iter()
+                    .any(|argument| matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)));
+                let result = if spread {
+                    let array = self.emit(
+                        Type::Object(None),
+                        Op::CreateArray {
+                            elements: Vec::new(),
+                        },
+                    );
+                    for argument in &call.arguments {
+                        if let oxc_ast::ast::Argument::SpreadElement(element) = argument {
+                            let value = self.expression(&element.argument);
+                            let extended = self.emit(
+                                Type::Undefined,
+                                Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: true,
+                                },
+                            );
+                            self.propagate(extended);
+                        } else if let Some(expression) = argument.as_expression() {
+                            let value = self.expression(expression);
+                            self.emit_effect(Op::ArrayExtend {
+                                array,
+                                value,
+                                spread: false,
+                            });
                         }
                     }
-                }
-                let result = self.emit(
-                    Type::Unknown,
-                    Op::Call {
-                        callee,
-                        this_value,
-                        args,
-                    },
-                );
+                    self.emit(
+                        Type::Unknown,
+                        Op::CallSpread {
+                            callee,
+                            this_value,
+                            arguments: array,
+                        },
+                    )
+                } else {
+                    let mut args = Vec::with_capacity(call.arguments.len());
+                    for argument in &call.arguments {
+                        if let Some(expression) = argument.as_expression() {
+                            args.push(self.expression(expression));
+                        }
+                    }
+                    self.emit(
+                        Type::Unknown,
+                        Op::Call {
+                            callee,
+                            this_value,
+                            args,
+                        },
+                    )
+                };
                 self.propagate(result)
             }
             Expression::ObjectExpression(object) => self.object(object),
@@ -3129,7 +3169,17 @@ impl Lowering {
                     }
                 }
                 ObjectPropertyKind::SpreadProperty(spread) => {
-                    self.note("object spread", spread.span.start);
+                    // `{ ...src }`: copy src's own enumerable properties onto the literal. A getter
+                    // on src can throw, so the copy's result is propagated.
+                    let source = self.expression(&spread.argument);
+                    let extended = self.emit(
+                        Type::Undefined,
+                        Op::ObjectExtend {
+                            object: result,
+                            source,
+                        },
+                    );
+                    self.propagate(extended);
                 }
             }
         }

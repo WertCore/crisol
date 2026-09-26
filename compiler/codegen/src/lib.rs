@@ -201,6 +201,8 @@ const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
 const ITERATE_SYMBOL: &str = "crisol_iterate";
 const CREATE_REGEXP_SYMBOL: &str = "crisol_create_regexp";
 const ARRAY_EXTEND_SYMBOL: &str = "crisol_array_extend";
+const OBJECT_SPREAD_SYMBOL: &str = "crisol_object_spread";
+const APPLY_SYMBOL: &str = "crisol_apply";
 const CREATE_ARGUMENTS_SYMBOL: &str = "crisol_create_arguments";
 const GLOBAL_LOAD_OPTIONAL_SYMBOL: &str = "crisol_global_load_optional";
 const RELATIONAL_SYMBOL: &str = "crisol_relational";
@@ -281,6 +283,10 @@ struct ObjectHelpers<T> {
     create_regexp: T,
     /// `crisol_array_extend(array, value, spread) -> exception or undefined`
     array_extend: T,
+    /// `crisol_object_spread(object, source) -> exception or undefined` — `{ ...source }`
+    object_spread: T,
+    /// `crisol_apply(callee, this, arguments) -> value` — a spread call `f(...xs)`
+    apply: T,
     /// `crisol_create_arguments(argc, argv) -> array`
     create_arguments: T,
     /// `crisol_global_load_optional(name, length) -> value or undefined`
@@ -449,6 +455,20 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     array_extend.params.push(AbiParam::new(types::I64));
     array_extend.returns.push(AbiParam::new(types::I64));
 
+    // `crisol_object_spread` takes the object under construction and a source; returns an
+    // exception or undefined.
+    let mut object_spread = module.make_signature();
+    object_spread.params.push(AbiParam::new(types::I64));
+    object_spread.params.push(AbiParam::new(types::I64));
+    object_spread.returns.push(AbiParam::new(types::I64));
+
+    // `crisol_apply` takes callee, `this` and an arguments array; returns the call's value.
+    let mut apply = module.make_signature();
+    apply.params.push(AbiParam::new(types::I64));
+    apply.params.push(AbiParam::new(types::I64));
+    apply.params.push(AbiParam::new(types::I64));
+    apply.returns.push(AbiParam::new(types::I64));
+
     let mut create_regexp = module.make_signature();
     create_regexp.params.push(AbiParam::new(pointer));
     create_regexp.params.push(AbiParam::new(types::I64));
@@ -507,6 +527,8 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         iterate: declare(ITERATE_SYMBOL, &iterate)?,
         create_regexp: declare(CREATE_REGEXP_SYMBOL, &create_regexp)?,
         array_extend: declare(ARRAY_EXTEND_SYMBOL, &array_extend)?,
+        object_spread: declare(OBJECT_SPREAD_SYMBOL, &object_spread)?,
+        apply: declare(APPLY_SYMBOL, &apply)?,
         create_arguments: declare(CREATE_ARGUMENTS_SYMBOL, &create_arguments)?,
         global_load_optional: declare(GLOBAL_LOAD_OPTIONAL_SYMBOL, &global_load_optional)?,
         relational: declare(RELATIONAL_SYMBOL, &relational)?,
@@ -1067,6 +1089,12 @@ impl Backend for Cranelift {
             array_extend: self
                 .module
                 .declare_func_in_func(self.objects.array_extend, &mut context.func),
+            object_spread: self
+                .module
+                .declare_func_in_func(self.objects.object_spread, &mut context.func),
+            apply: self
+                .module
+                .declare_func_in_func(self.objects.apply, &mut context.func),
             create_arguments: self
                 .module
                 .declare_func_in_func(self.objects.create_arguments, &mut context.func),
@@ -1801,6 +1829,29 @@ impl Lowering<'_> {
                     .call(self.objects.array_extend, &[array, value, spread]);
                 Some(self.builder.inst_results(call)[0])
             }
+            Op::ObjectExtend { object, source } => {
+                let object = self.value(*object);
+                let source = self.value(*source);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.object_spread, &[object, source]);
+                Some(self.builder.inst_results(call)[0])
+            }
+            Op::CallSpread {
+                callee,
+                this_value,
+                arguments,
+            } => {
+                let callee = self.value(*callee);
+                let this_value = self.value(*this_value);
+                let arguments = self.value(*arguments);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.apply, &[callee, this_value, arguments]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::Iterate { object } => {
                 let object = self.value(*object);
                 let call = self.builder.ins().call(self.objects.iterate, &[object]);
@@ -2321,6 +2372,12 @@ impl Jit {
             array_extend: self
                 .module
                 .declare_func_in_func(self.objects.array_extend, &mut context.func),
+            object_spread: self
+                .module
+                .declare_func_in_func(self.objects.object_spread, &mut context.func),
+            apply: self
+                .module
+                .declare_func_in_func(self.objects.apply, &mut context.func),
             create_arguments: self
                 .module
                 .declare_func_in_func(self.objects.create_arguments, &mut context.func),

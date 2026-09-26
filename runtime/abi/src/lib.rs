@@ -86,6 +86,8 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_loose_not_equal",
     "crisol_in",
     "crisol_array_extend",
+    "crisol_apply",
+    "crisol_object_spread",
     "crisol_create_arguments",
     "crisol_global_load_optional",
     "crisol_relational",
@@ -9379,6 +9381,57 @@ extern "C" fn function_apply(
             None => Vec::new(),
         };
         call_value(this_value, receiver, &rest)
+    })
+}
+
+/// A spread call `f(...xs)` (D-250): calls `callee` with `this_value` and the elements of the
+/// array `arguments`. The frontend has already spread each `...` operand into that array, so this
+/// is `Function.prototype.apply`'s core without the reroutable `apply` lookup — an internal call a
+/// program cannot intercept.
+///
+/// # Safety
+///
+/// Called from generated code with three NaN-boxed values.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_apply(callee: u64, this_value: u64, arguments: u64) -> u64 {
+    with_rooted(&[callee, this_value, arguments], || {
+        let args: Vec<u64> = match elements_of(arguments) {
+            Some((array, length)) => (0..length).map(|index| element_at(array, index)).collect(),
+            None => Vec::new(),
+        };
+        call_value(callee, this_value, &args)
+    })
+}
+
+/// `{ ...source }` (D-250): copies `source`'s own enumerable properties onto `object`, the fresh
+/// literal under construction. A nullish source contributes nothing and is not an error; a getter
+/// that throws stops the copy and propagates. `object` is a literal, so this defines rather than
+/// assigns — no read-only or setter concerns, unlike `Object.assign`.
+///
+/// # Safety
+///
+/// Called from generated code with two NaN-boxed values.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_object_spread(object: u64, source: u64) -> u64 {
+    if Value::from_bits(source).is_nullish() {
+        return Value::UNDEFINED.to_bits();
+    }
+    with_rooted(&[object, source], || {
+        for name in enumerable_keys(source) {
+            // SAFETY: `name` is a live Rust string.
+            let value = unsafe { crisol_property_load(source, name.as_ptr(), name.len() as u64) };
+            // A getter on the source may have thrown; stop and propagate rather than copying on.
+            if Value::from_bits(value).is_exception() {
+                return value;
+            }
+            // SAFETY: as above.
+            unsafe {
+                crisol_property_store(object, name.as_ptr(), name.len() as u64, value);
+            }
+        }
+        Value::UNDEFINED.to_bits()
     })
 }
 

@@ -9724,6 +9724,68 @@ fn an_async_function_returns_a_promise_and_await_suspends() {
     );
 }
 
+/// Spread: `f(...xs)` unpacks an iterable into a call's arguments, and `{ ...src }` copies a
+/// source's own enumerable properties into a literal. Array spread `[...xs]` already worked.
+#[test]
+fn spread_unpacks_into_calls_and_objects() {
+    // A whole array as the arguments.
+    check(
+        "spread-call-all",
+        "function add(a, b, c) { return a + b + c; } return add(...[1, 2, 3]);",
+        "6",
+    );
+    // Fixed arguments and spreads mixed, in order.
+    check(
+        "spread-call-mixed",
+        "function f(a, b, c, d) { return a + \",\" + b + \",\" + c + \",\" + d; } \
+         return f(1, ...[2, 3], 4);",
+        "1,2,3,4",
+    );
+    // The receiver of a method call is preserved through a spread.
+    check(
+        "spread-call-keeps-this",
+        "let o = { n: 10, m: function (a) { return this.n + a; } }; return o.m(...[5]);",
+        "15",
+    );
+    // A string is an iterable, so it spreads into characters.
+    check(
+        "spread-call-string",
+        "function f(a, b) { return a + b; } return f(...\"xy\");",
+        "xy",
+    );
+    // The argument count is the spread length.
+    check(
+        "spread-call-count",
+        "function f() { return arguments.length; } return f(...[1, 2, 3, 4]);",
+        "4",
+    );
+
+    // Object spread copies own enumerable properties.
+    check(
+        "spread-object",
+        "let a = { x: 1, y: 2 }; let b = { ...a }; return b.x + b.y;",
+        "3",
+    );
+    // Spread mixed with own properties.
+    check(
+        "spread-object-mixed",
+        "let a = { x: 1 }; let b = { ...a, y: 2 }; return b.x + b.y;",
+        "3",
+    );
+    // A later property wins over a spread one.
+    check(
+        "spread-object-override",
+        "let a = { x: 1 }; let b = { ...a, x: 9 }; return b.x;",
+        "9",
+    );
+    // A nullish source contributes nothing and does not throw.
+    check(
+        "spread-object-null",
+        "let b = { ...null, x: 5 }; return b.x;",
+        "5",
+    );
+}
+
 /// **A proxy answers through its handler, or forwards to its target when there is no trap** —
 /// which is what makes a handler with one trap a pass-through for everything else.
 #[test]

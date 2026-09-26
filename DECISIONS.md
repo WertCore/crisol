@@ -6956,3 +6956,30 @@ Deferred: **a rejected `await` rejects the result promise rather than resuming t
 need `Symbol.asyncIterator`); and `for await`. A hoisted async declaration cannot capture a `let`
 declared below it — a general hoisting-order property (its body lowers before the `let`), not an
 async one; a `var` or a function expression captures normally.
+
+## D-250
+
+**Spread into calls and object literals, over the array-spread machinery.**
+
+Status: Accepted
+
+`[...xs]` already lowered through `Op::ArrayExtend`, which drains an iterable into an array under
+construction. The two remaining spreads reuse that shape:
+
+- **`f(...xs)`** — a spread argument makes the count dynamic, so the arguments are gathered into a
+  fresh array (each `...` drained through `ArrayExtend`, each plain argument appended) and the call
+  goes through a new `Op::CallSpread` → `crisol_apply(callee, this, array)`. That is
+  `Function.prototype.apply`'s core — extract the array's elements, `call_value` — without the
+  reroutable `apply` lookup, so a program cannot intercept an internal call. A call with no spread
+  stays a fixed-operand `Op::Call` and costs exactly what it did before; only a spread call pays for
+  the array.
+- **`{ ...src }`** — a new `Op::ObjectExtend` → `crisol_object_spread(object, source)` copies src's
+  own enumerable properties onto the literal, the `Object.assign` copy loop over `enumerable_keys`.
+  Because the target is a fresh literal it *defines* rather than assigns — no read-only or setter
+  concerns — and a nullish source is a no-op, not an error. A getter on the source that throws stops
+  the copy and propagates.
+
+Both `CallSpread` and `ObjectExtend` `can_collect` and are exception-propagated at the site, since a
+drained iterator, a getter, or the call itself can throw. Deferred: **`new C(...xs)`** (construct
+spread needs the apply-construct path) and destructuring rest (`[...a]`/`{...r}` on the binding
+side, which gathers rather than spreads).

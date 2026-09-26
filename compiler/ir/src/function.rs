@@ -344,6 +344,18 @@ pub enum Op {
         /// Its arguments.
         args: Vec<ValueId>,
     },
+    /// Calls `callee` with `this_value` as the receiver and the elements of `arguments` (an
+    /// array) spread as its arguments — `f(...xs)`. Separate from [`Op::Call`] (D-250) because the
+    /// argument count is known only at runtime, so they arrive as one array the runtime unpacks
+    /// rather than as a fixed operand list.
+    CallSpread {
+        /// What is being called.
+        callee: ValueId,
+        /// The receiver.
+        this_value: ValueId,
+        /// An array whose elements are the arguments.
+        arguments: ValueId,
+    },
     /// Reads a property.
     PropertyLoad {
         /// The receiver.
@@ -391,6 +403,14 @@ pub enum Op {
         value: ValueId,
         /// Whether `value` is spread.
         spread: bool,
+    },
+    /// Copies `source`'s own enumerable properties onto `object` — the `...src` of an object
+    /// literal (D-250). The counterpart of [`Op::ArrayExtend`] for `{ ...src }`.
+    ObjectExtend {
+        /// The object literal under construction.
+        object: ValueId,
+        /// What to copy the own enumerable properties of.
+        source: ValueId,
     },
     /// `delete object[key]`.
     ///
@@ -577,6 +597,7 @@ impl Op {
         matches!(
             self,
             Self::Call { .. }
+                | Self::CallSpread { .. }
                 // `+` reaches `ToPrimitive`, which calls `valueOf` or `toString` — user code,
                 // which can allocate. The other operators coerce primitives that already exist.
                 | Self::Binary { op: BinaryOp::Add, .. }
@@ -590,6 +611,7 @@ impl Op {
                 | Self::Iterate { .. }
                 | Self::CreateRegExp { .. }
                 | Self::ArrayExtend { .. }
+                | Self::ObjectExtend { .. }
                 | Self::Construct { .. }
                 | Self::CreateObject { .. }
                 | Self::CreateArray { .. }
@@ -620,6 +642,11 @@ impl Op {
                 all.extend(args);
                 all
             }
+            Self::CallSpread {
+                callee,
+                this_value,
+                arguments,
+            } => vec![*callee, *this_value, *arguments],
             Self::PropertyLoad { object, .. }
             | Self::Enumerate { object }
             | Self::Iterate { object } => vec![*object],
@@ -636,6 +663,7 @@ impl Op {
                 vec![*object, *key]
             }
             Self::ArrayExtend { array, value, .. } => vec![*array, *value],
+            Self::ObjectExtend { object, source } => vec![*object, *source],
             Self::ComputedStore { object, key, value } => vec![*object, *key, *value],
             Self::CreateArray { elements } => elements.clone(),
             Self::Construct { callee, args } => {
