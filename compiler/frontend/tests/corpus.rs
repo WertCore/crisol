@@ -348,7 +348,12 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // operand, which is the only case anyone writes `==` for.
         // `extends`/`super` lower now (D-243); a class **field** does not — it initialises per
         // instance inside the constructor, which the class lowering does not synthesise yet.
-        ("class C { x = 1; }", "class member that is not a method"),
+        // An instance field lowers now (D-252) when the class has no explicit constructor; one that
+        // *does* still needs the field injected into that body, which is not synthesised yet.
+        (
+            "class C { x = 1; constructor() {} }",
+            "class field with an explicit constructor",
+        ),
         ("class C { static m() { } }", "static class member"),
     ];
 

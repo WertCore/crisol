@@ -9863,6 +9863,55 @@ fn optional_chaining_short_circuits_on_nullish() {
     );
 }
 
+/// Class instance fields: `class C { x = 1 }` runs each initialiser on every instance, in source
+/// order, in the constructor — for a class with no explicit constructor (base or derived).
+#[test]
+fn class_fields_initialise_each_instance() {
+    // Two fields, initialised per instance.
+    check(
+        "field-basic",
+        "class Point { x = 1; y = 2; } let p = new Point(); return p.x + p.y;",
+        "3",
+    );
+    // A field with no initialiser is `undefined`.
+    check(
+        "field-no-init",
+        "class C { x; } return typeof new C().x;",
+        "undefined",
+    );
+    // Initialisers run in source order and can read `this`, so a later field sees an earlier one.
+    check(
+        "field-order-reads-this",
+        "class C { x = 1; y = this.x + 10; } return new C().y;",
+        "11",
+    );
+    // An initialiser can read an enclosing variable (the constructor captures it).
+    check(
+        "field-captures-outer",
+        "let k = 7; class C { x = k; } return new C().x;",
+        "7",
+    );
+    // A method reads a field through `this`.
+    check(
+        "field-read-by-method",
+        "class C { n = 10; get() { return this.n; } } return new C().get();",
+        "10",
+    );
+    // A derived class's fields initialise after `super()` runs the parent constructor.
+    check(
+        "field-derived-after-super",
+        "class A { constructor() { this.a = 1; } } class B extends A { b = 2; } \
+         let o = new B(); return o.a + o.b;",
+        "3",
+    );
+    // Each instance gets its own field values.
+    check(
+        "field-per-instance",
+        "class C { x = 0; } let a = new C(); let b = new C(); a.x = 9; return a.x + \",\" + b.x;",
+        "9,0",
+    );
+}
+
 /// **A proxy answers through its handler, or forwards to its target when there is no trap** —
 /// which is what makes a handler with one trap a pass-through for everything else.
 #[test]

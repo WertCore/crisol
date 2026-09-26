@@ -7006,3 +7006,23 @@ the result was typed `Bool`. The branch that consumes a `Bool` condition bit-com
 operand took the wrong edge — `null ?? x` would have answered `null`. It went unseen because `??` had
 no nullish-left test. Replaced with `x == null` (loose), which is true for exactly `null` and
 `undefined` and answers a real boolean, and is one comparison rather than three.
+
+## D-252
+
+**Class instance fields, injected into the implicit constructor.**
+
+Status: Accepted
+
+`class C { x = 1 }` runs each field initialiser on every instance, in source order, in the
+constructor — after `super()` for a derived class, at the top for a base one. The frontend collects
+the non-static, non-computed `PropertyDefinition`s and, when the class has **no explicit
+constructor**, injects `this.field = <initialiser>` (or `undefined`) into the implicit constructor it
+already synthesises: `emit_field_inits` runs at the top for a base class and right after the `super()`
+call for a derived one, which is where the specification puts them. Because an initialiser can read an
+enclosing binding, the base implicit constructor now returns its real captures rather than an empty
+list, and records `this_slot` (it did not need to while its body was empty).
+
+Scope: a class with **both** fields and an explicit constructor is refused (noted) rather than
+silently dropping the fields — injecting into a user-written body, around a `super()` that may sit
+anywhere in it, is the harder half and is not done. Also deferred: static fields, computed-name
+fields, private fields (`#x`), and static blocks.

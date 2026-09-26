@@ -2982,11 +2982,27 @@ impl Lowering {
             });
         }
         let mut constructor = None;
+        // Instance fields, in source order, each with its initialiser. They are run in the
+        // constructor on every instance (D-252); collected here and injected below.
+        let mut fields: Vec<(String, Option<&Expression<'_>>)> = Vec::new();
 
         for element in &class.body.body {
-            let oxc_ast::ast::ClassElement::MethodDefinition(method) = element else {
-                self.note("class member that is not a method", class.span.start);
-                continue;
+            let method = match element {
+                oxc_ast::ast::ClassElement::MethodDefinition(method) => method,
+                // `x = 1;` — an instance field. Static and computed-name fields are not lowered.
+                oxc_ast::ast::ClassElement::PropertyDefinition(property)
+                    if !property.r#static && !property.computed =>
+                {
+                    match property.key.static_name() {
+                        Some(key) => fields.push((key.to_string(), property.value.as_ref())),
+                        None => self.note("computed class field", property.span.start),
+                    }
+                    continue;
+                }
+                _ => {
+                    self.note("class member that is not a method", class.span.start);
+                    continue;
+                }
             };
             if method.r#static {
                 self.note("static class member", method.span.start);
@@ -3045,15 +3061,23 @@ impl Lowering {
         }
 
         let constructor = match constructor {
-            Some(closure) => closure,
+            Some(closure) => {
+                // Fields need to run at the top of the constructor (after `super()` when derived);
+                // injecting them into a user-written constructor's body is not done yet, so a class
+                // with both is recorded rather than silently dropping the fields.
+                if !fields.is_empty() {
+                    self.note("class field with an explicit constructor", class.span.start);
+                }
+                closure
+            }
             None => {
                 // No explicit constructor: the class still needs one, because `new` has to call
-                // something. A base class's does nothing; a derived class's calls `super()` so the
-                // parent still runs.
+                // something. A base class's runs the field initialisers; a derived class's calls
+                // `super()` first so the parent runs before the fields (D-252).
                 let (id, captures) = if parent.is_some() {
-                    self.implicit_derived_constructor(name)
+                    self.implicit_derived_constructor(name, &fields)
                 } else {
-                    self.implicit_constructor(name)
+                    self.implicit_constructor(name, &fields)
                 };
                 self.close_over(id, &captures)
             }
@@ -3075,12 +3099,15 @@ impl Lowering {
     }
 
     /// The empty constructor a class without one still has.
-    fn implicit_constructor(&mut self, name: &str) -> (FunctionId, Vec<String>) {
+    fn implicit_constructor(
+        &mut self,
+        name: &str,
+        fields: &[(String, Option<&Expression<'_>>)],
+    ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
         function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
         let entry = function.entry;
-        function.captures = Vec::new();
         self.functions.push(function);
         self.scopes.push(Scope {
             function: index,
@@ -3096,20 +3123,54 @@ impl Lowering {
             generator: None,
             value_types: Vec::new(),
         });
-        self.declare("this");
+        // `this_slot` recorded so the backend binds the incoming receiver — the base constructor did
+        // not need it while its body was empty, but a field store writes through `this`.
+        let this_slot = self.declare("this");
+        self.functions[index].this_slot = Some(this_slot);
+        self.emit_field_inits(this_slot, fields);
         self.terminate(Terminator::Return(None));
-        self.scopes.pop();
+        // A field initialiser can read an enclosing variable — the class name, a captured local —
+        // so the constructor's real captures are returned, not an empty list.
+        let scope = self.scopes.pop().expect("just pushed");
+        let names: Vec<String> = scope
+            .captures
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let slots: Vec<u32> = scope.captures.iter().map(|(_, slot)| *slot).collect();
+        self.functions[index].captures = slots;
         (
             FunctionId(u32::try_from(index).expect("functions fit in u32")),
-            Vec::new(),
+            names,
         )
+    }
+
+    /// Emits `this.field = <initialiser>` for each instance field, `undefined` when a field has no
+    /// initialiser. Run at the top of a class's constructor (D-252).
+    fn emit_field_inits(&mut self, this_slot: u32, fields: &[(String, Option<&Expression<'_>>)]) {
+        for (field_name, initialiser) in fields {
+            let value = match initialiser {
+                Some(expression) => self.expression(expression),
+                None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+            };
+            let this = self.read(this_slot);
+            self.emit_effect(Op::PropertyStore {
+                object: this,
+                key: PropertyKey::new(field_name),
+                value,
+            });
+        }
     }
 
     /// The constructor a *derived* class without an explicit one still gets: `constructor(...) {
     /// super(...); }`. It forwards no arguments — this engine has no rest/spread to forward them
     /// with — so `new B()` runs the parent's constructor but `new B(x)` does not pass `x` on
     /// (D-243). It captures ` super` the same way any method that writes `super` does.
-    fn implicit_derived_constructor(&mut self, name: &str) -> (FunctionId, Vec<String>) {
+    fn implicit_derived_constructor(
+        &mut self,
+        name: &str,
+        fields: &[(String, Option<&Expression<'_>>)],
+    ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
         function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
@@ -3147,6 +3208,8 @@ impl Lowering {
             },
         );
         self.propagate(call);
+        // Fields initialise **after** `super()` returns, when `this` exists (D-252).
+        self.emit_field_inits(this_slot, fields);
         self.terminate(Terminator::Return(None));
         let scope = self.scopes.pop().expect("just pushed");
         let names: Vec<String> = scope
