@@ -78,6 +78,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_delete",
     "crisol_set_prototype",
     "crisol_make_generator",
+    "crisol_async_start",
     "crisol_enumerate",
     "crisol_iterate",
     "crisol_create_regexp",
@@ -3746,6 +3747,136 @@ extern "C" fn generator_throw(
     crisol_throw(value)
 }
 
+// ============================== async / await ==============================
+//
+// An async function is a generator whose suspension points are `await` rather than `yield`
+// (D-249): the frontend lowers the two through the same machinery, and the outer function calls
+// `crisol_async_start` instead of returning the generator. The driver steps the generator to each
+// `await`, wraps the awaited value in a promise, and resumes when it settles — the standard
+// "spawn" of an async function over a generator.
+
+/// The hidden keys an async resume callback carries: the generator it steps, the promise it
+/// settles, and whether it runs on the awaited value's rejection.
+const ASYNC_GEN: &str = "__asyncGen";
+const ASYNC_PROMISE: &str = "__asyncPromise";
+const ASYNC_REJECTS: &str = "__asyncRejects";
+
+/// `crisol_async_start(generator)` — the promise an async function returns.
+///
+/// Creates the promise the function settles, drives the body to its first `await` (or to
+/// completion for a body with none), and returns the promise.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_async_start(generator: u64) -> u64 {
+    with_rooted(&[generator], || {
+        let promise = new_promise_object();
+        with_rooted(&[promise, generator], || {
+            async_drive(generator, promise, Value::UNDEFINED.to_bits());
+        });
+        promise
+    })
+}
+
+/// Steps the async generator once with `sent` as the awaited result, then settles the promise (on
+/// return or an uncaught throw) or chains the next `await`.
+fn async_drive(generator: u64, promise: u64, sent: u64) {
+    // Hand the settled value to the body as the result of the `await` that suspended it.
+    if let Some(handle) = handle_of(generator) {
+        with_rooted(&[generator, sent], || {
+            with_runtime(|runtime| runtime.define_hidden(handle, GEN_SENT, Value::from_bits(sent)));
+        });
+    }
+    let result = with_rooted(&[generator, promise], || generator_resume(generator));
+    // The body threw and nothing in it caught it — reject with the thrown value.
+    if Value::from_bits(result).is_exception() {
+        let reason = crisol_pending_exception();
+        with_rooted(&[promise, reason], || settle_promise(promise, reason, true));
+        return;
+    }
+    let done = is_truthy(Value::from_bits(property_of(result, "done")));
+    let value = property_of(result, "value");
+    if done {
+        // The function returned `value`. (A bare `return aPromise` is fulfilled with the promise
+        // rather than adopting it; `return await aPromise` — the common form — resolves first.)
+        with_rooted(&[promise, value], || settle_promise(promise, value, false));
+        return;
+    }
+    // `await value`: normalise to a promise and resume the body when it settles.
+    with_rooted(&[generator, promise, value], || {
+        let awaited = if is_promise(value) {
+            value
+        } else {
+            let wrapper = with_rooted(&[value], new_promise_object);
+            with_rooted(&[wrapper, value], || settle_promise(wrapper, value, false));
+            wrapper
+        };
+        with_rooted(&[awaited, generator, promise], || {
+            let on_fulfilled = async_resume_function(generator, promise, false);
+            let on_rejected = with_rooted(&[on_fulfilled], || {
+                async_resume_function(generator, promise, true)
+            });
+            with_rooted(&[awaited, on_fulfilled, on_rejected], || {
+                promise_then(awaited, on_fulfilled, on_rejected, false);
+            });
+        });
+    });
+}
+
+/// One resume callback — a native carrying the generator, the result promise, and whether the
+/// awaited value rejected.
+fn async_resume_function(generator: u64, promise: u64, rejects: bool) -> u64 {
+    let function = with_rooted(&[generator, promise], || {
+        with_runtime(|runtime| {
+            runtime
+                .native_function(
+                    NATIVES.len()
+                        + GLOBAL_NATIVES.len()
+                        + NAMESPACE_NATIVES.len()
+                        + ASYNC_RESUME_CALL,
+                )
+                .to_value()
+                .to_bits()
+        })
+    });
+    with_rooted(&[function, generator, promise], || {
+        if let Some(handle) = handle_of(function) {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, ASYNC_GEN, Value::from_bits(generator));
+                runtime.define_hidden(handle, ASYNC_PROMISE, Value::from_bits(promise));
+                runtime.define_hidden(handle, ASYNC_REJECTS, boolean(rejects));
+            });
+        }
+    });
+    function
+}
+
+/// The body an async resume callback runs: resume the generator with the fulfilled value, or
+/// reject the result promise when the awaited value rejected.
+extern "C" fn async_resume_call(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let generator = property_of(closure, ASYNC_GEN);
+    let promise = property_of(closure, ASYNC_PROMISE);
+    let rejects = is_truthy(Value::from_bits(property_of(closure, ASYNC_REJECTS)));
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let settled = unsafe { argument(argc, argv, 0) };
+    with_rooted(&[generator, promise, settled], || {
+        if rejects {
+            // **A rejected await rejects the async result** rather than resuming the body's
+            // `try`/`catch` — resume-with-throw at the suspension point is deferred, the same
+            // limitation a generator's `throw` carries (it does not run an inner `catch`).
+            settle_promise(promise, settled, true);
+        } else {
+            async_drive(generator, promise, settled);
+        }
+    });
+    Value::UNDEFINED.to_bits()
+}
+
 /// `RegExp.escape(string)` — a string that, used as a pattern, matches itself literally.
 ///
 /// **A string is required, not coerced.** `RegExp.escape(1)` is a `TypeError`; escaping a number
@@ -4589,6 +4720,7 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     regexp_symbol_split,
     iterator_self,
     string_iterator,
+    async_resume_call,
 ];
 
 /// Where a `resolve`/`reject` function keeps the promise it settles.
@@ -4716,6 +4848,10 @@ const ITERATOR_SELF: usize = 11;
 
 /// The index within [`ANONYMOUS_NATIVES`] of `String.prototype[Symbol.iterator]`.
 const STRING_ITERATOR: usize = 12;
+
+/// The index within [`ANONYMOUS_NATIVES`] of the callback that resumes an async function when the
+/// value it awaited settles (D-249).
+const ASYNC_RESUME_CALL: usize = 13;
 
 /// Marks an array whose `length` has been made non-writable.
 ///

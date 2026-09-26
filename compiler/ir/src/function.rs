@@ -272,6 +272,9 @@ pub enum UnaryOp {
     /// unwinding is ordinary control flow the verifier already checks, rather than metadata a
     /// backend has to honour.
     IsException,
+    /// Starts an async function's body (a generator, D-249) and returns the promise it settles.
+    /// Not a JavaScript operator — an internal one-in, one-out call, like [`UnaryOp::Throw`].
+    AsyncStart,
 }
 
 impl UnaryOp {
@@ -287,6 +290,7 @@ impl UnaryOp {
             Self::Void => "void",
             Self::Throw => "throw",
             Self::IsException => "is-exception",
+            Self::AsyncStart => "async-start",
         }
     }
 }

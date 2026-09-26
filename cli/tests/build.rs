@@ -9668,6 +9668,62 @@ fn a_promise_settles_through_the_microtask_queue() {
     );
 }
 
+/// `async`/`await`: an async function returns a promise, and `await` suspends the body while
+/// control returns to the caller. Like the promise tests, only the synchronous half is asserted
+/// here — the resumption runs in the drain after `crisol_program` returns (and a bug there would
+/// crash or hang the drain rather than pass). CI's test262 async harness checks the settled values.
+#[test]
+fn an_async_function_returns_a_promise_and_await_suspends() {
+    // An async function returns a promise, whatever its body does.
+    check(
+        "async-returns-object",
+        "async function f() { return 1; } return typeof f();",
+        "object",
+    );
+    check(
+        "async-returns-thenable",
+        "async function f() {} return typeof f().then;",
+        "function",
+    );
+    check(
+        "async-returns-real-promise",
+        "async function f() { return 1; } return f() instanceof Promise;",
+        "true",
+    );
+    // The body runs synchronously up to the first `await`, which suspends and hands control back
+    // to the caller: `1` (before the call), `a` (body up to the await), `2` (caller after it). The
+    // `d` after the await runs in the drain and is not part of the returned value. `var`, not
+    // `let`, because a hoisted function's body is lowered before a `let` below it is declared and
+    // so cannot capture it — a general hoisting rule, not an async one.
+    check(
+        "async-await-suspends",
+        "var s = \"\"; async function f() { s = s + \"a\"; await 0; s = s + \"d\"; } \
+         s = s + \"1\"; f(); s = s + \"2\"; return s;",
+        "1a2",
+    );
+    // An async function with no await still runs its body synchronously to the return.
+    check(
+        "async-body-runs-sync",
+        "var ran = false; async function f() { ran = true; } f(); return ran;",
+        "true",
+    );
+    // A chain of awaits drives to completion through the microtask queue without crashing or
+    // hanging (the value flow is checked by test262 in CI).
+    check(
+        "async-multiple-awaits-drain",
+        "var n = 0; async function f() { n = await 1; n = await (n + 1); return n; } \
+         f(); return typeof f;",
+        "function",
+    );
+    // `await` is refused in a complex position rather than miscompiled (the same restriction the
+    // generator transform carries) — the program is reported unfaithful, so it does not build.
+    check(
+        "async-await-in-simple-return",
+        "async function f() { return await 5; } return typeof f;",
+        "function",
+    );
+}
+
 /// **A proxy answers through its handler, or forwards to its target when there is no trap** —
 /// which is what makes a handler with one trap a pass-through for everything else.
 #[test]

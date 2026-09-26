@@ -169,6 +169,11 @@ struct GenState {
     /// not — which is what lets a loop counter survive a `yield`. Captures are **not** in here:
     /// they are re-loaded from the closure at every resume, so they persist on their own.
     locals: HashMap<u32, String>,
+    /// Whether this is an async function's body rather than a generator's (D-249). An async body
+    /// suspends on `await` — lowered through the same `yield` machinery — and the outer drives it
+    /// with a promise instead of returning it. `yield` is refused here and `await` in a plain
+    /// generator.
+    is_async: bool,
 }
 
 // **The three jump-target stacks live here and not on `Lowering`, because a `BlockId` names a
@@ -1045,8 +1050,25 @@ impl Lowering {
         }
 
         for (name, declaration) in &named {
-            let (id, captures) = if declaration.generator {
-                self.lower_generator(name, &declaration.params, declaration.body.as_deref())
+            let (id, captures) = if declaration.r#async && declaration.generator {
+                // An async generator needs `Symbol.asyncIterator` and a queue of pending reads —
+                // a separate feature. Lowered as a plain function, which then refuses the `yield`
+                // and `await` inside rather than miscompiling them.
+                self.note("async generator", declaration.span.start);
+                self.lower_function(
+                    name,
+                    &declaration.params,
+                    declaration.body.as_deref(),
+                    None,
+                    true,
+                )
+            } else if declaration.generator || declaration.r#async {
+                self.lower_generator(
+                    name,
+                    &declaration.params,
+                    declaration.body.as_deref(),
+                    declaration.r#async,
+                )
             } else {
                 self.lower_function(
                     name,
@@ -1360,6 +1382,13 @@ impl Lowering {
                         unreachable!("is_plain_yield checked the shape")
                     };
                     self.lower_yield(yield_expression.argument.as_ref());
+                } else if self.is_plain_await(&statement.expression) {
+                    // `await e;` suspends and discards the settled value.
+                    let Expression::AwaitExpression(await_expression) = &statement.expression
+                    else {
+                        unreachable!("is_plain_await checked the shape")
+                    };
+                    self.lower_yield(Some(&await_expression.argument));
                 } else {
                     self.expression(&statement.expression);
                 }
@@ -1371,8 +1400,10 @@ impl Lowering {
                 // Inside a generator, `return e` is not the function's return — it finishes the
                 // generator with `e` as the result and hands the body's `DONE` signal back.
                 if self.scope().generator.is_some() {
+                    // `value_expression` so `return await p` / `return yield x` suspend first, then
+                    // finish with the settled value.
                     let value = match &statement.argument {
-                        Some(argument) => self.expression(argument),
+                        Some(argument) => self.value_expression(argument),
                         None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
                     };
                     let this_slot = self.slot("this");
@@ -1773,8 +1804,22 @@ impl Lowering {
                     .id
                     .as_ref()
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                let (id, names) = if function.generator {
-                    self.lower_generator(&name, &function.params, function.body.as_deref())
+                let (id, names) = if function.r#async && function.generator {
+                    self.note("async generator", function.span.start);
+                    self.lower_function(
+                        &name,
+                        &function.params,
+                        function.body.as_deref(),
+                        None,
+                        true,
+                    )
+                } else if function.generator || function.r#async {
+                    self.lower_generator(
+                        &name,
+                        &function.params,
+                        function.body.as_deref(),
+                        function.r#async,
+                    )
                 } else {
                     self.lower_function(
                         &name,
@@ -2249,8 +2294,9 @@ impl Lowering {
         name: &str,
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+        is_async: bool,
     ) -> (FunctionId, Vec<String>) {
-        let (body_id, body_captures) = self.lower_generator_body(name, params, body);
+        let (body_id, body_captures) = self.lower_generator_body(name, params, body, is_async);
 
         let index = self.functions.len();
         let mut outer = Function::new(name);
@@ -2305,7 +2351,20 @@ impl Lowering {
             }
         }
         self.functions[index].parameters = parameter_slots;
-        self.terminate(Terminator::Return(Some(generator)));
+        // A generator function returns the generator object; an async function returns the promise
+        // that `crisol_async_start` settles as it drives that generator to completion (D-249).
+        let result = if is_async {
+            self.emit(
+                Type::Object(None),
+                Op::Unary {
+                    op: UnaryOp::AsyncStart,
+                    operand: generator,
+                },
+            )
+        } else {
+            generator
+        };
+        self.terminate(Terminator::Return(Some(result)));
 
         let scope = self.scopes.pop().expect("just pushed");
         let names: Vec<String> = scope
@@ -2329,6 +2388,7 @@ impl Lowering {
         name: &str,
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+        is_async: bool,
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}~body"));
@@ -2350,6 +2410,7 @@ impl Lowering {
                 next_state: 1,
                 resumes: Vec::new(),
                 locals: HashMap::new(),
+                is_async,
             }),
             value_types: Vec::new(),
         });
@@ -2508,15 +2569,36 @@ impl Lowering {
             && self.scope().generator.is_some()
     }
 
-    /// A value expression that may itself be a `yield` — the right side of an initialiser or a
-    /// simple assignment, the positions where a `yield`'s sent value is bound with nothing else
-    /// live across the suspension.
+    /// Whether an expression is an `await` this position can suspend on (D-249) — inside an async
+    /// body, where `await` reuses the `yield` machinery. Like `yield`, only the simple positions
+    /// below take it; a complex one keeps no compiler temporary live across the suspension only
+    /// because it is refused.
+    fn is_plain_await(&self, expression: &Expression<'_>) -> bool {
+        matches!(expression, Expression::AwaitExpression(_))
+            && self
+                .scope()
+                .generator
+                .as_ref()
+                .is_some_and(|generator| generator.is_async)
+    }
+
+    /// A value expression that may itself be a `yield` or an `await` — the right side of an
+    /// initialiser or a simple assignment, the positions where the sent/awaited value is bound
+    /// with nothing else live across the suspension.
     fn value_expression(&mut self, expression: &Expression<'_>) -> ValueId {
         if self.is_plain_yield(expression) {
             let Expression::YieldExpression(yield_expression) = expression else {
                 unreachable!("is_plain_yield checked the shape")
             };
             return self.lower_yield(yield_expression.argument.as_ref());
+        }
+        if self.is_plain_await(expression) {
+            let Expression::AwaitExpression(await_expression) = expression else {
+                unreachable!("is_plain_await checked the shape")
+            };
+            // `await e` suspends exactly as `yield e` does; the driver resumes with the settled
+            // value, which becomes the expression's result.
+            return self.lower_yield(Some(&await_expression.argument));
         }
         self.expression(expression)
     }

@@ -214,6 +214,7 @@ const UNARY_SYMBOLS: &[(crisol_ir::UnaryOp, &str)] = &[
     (crisol_ir::UnaryOp::ToNumber, "crisol_to_number"),
     (crisol_ir::UnaryOp::Not, "crisol_not"),
     (crisol_ir::UnaryOp::TypeOf, "crisol_typeof"),
+    (crisol_ir::UnaryOp::AsyncStart, "crisol_async_start"),
 ];
 
 /// The symbol holding the addresses of the program's compiled functions.

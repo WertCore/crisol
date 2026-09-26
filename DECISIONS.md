@@ -6922,3 +6922,37 @@ a `TypeError` — *not* `NumberToBigInt`, which is the asymmetry that makes `big
 The stored bytes are `value mod 2**64`, identical for signed and unsigned; only the read distinguishes
 them. Still deferred: `DataView.prototype.getBigInt64`/`setBigInt64` (a separate method surface), and
 `~` on a BigInt (out of reach until `~` is supported for Numbers, which it is not).
+
+## D-249
+
+**async/await, as a generator driven by the promise queue.**
+
+Status: Accepted
+
+An async function is a generator whose suspension points are `await` rather than `yield` (D-246),
+and the two are lowered through the same machinery: the frontend routes an async function to
+`lower_generator` with `is_async` set, lowers each `await e` as `yield e`, and the outer function
+calls `crisol_async_start(generator)` — a new one-in/one-out `UnaryOp::AsyncStart` — instead of
+returning the generator. That reuses the whole state-machine transform for nothing but the driver
+on top, which is the standard "spawn" of async over generators.
+
+The driver (`crisol_async_start` + `async_drive`) creates the promise the function settles, steps
+the generator to its first `await`, wraps the awaited value with `Promise.resolve`, and attaches a
+resume callback through the existing `promise_then`. The callback is a native carrying the generator
+and the result promise as hidden properties — the same pattern `new_settling_function` uses for a
+promise's own `resolve`/`reject`. On fulfilment it resumes the generator with the value; on the
+generator returning it resolves the promise; on the body throwing (`generator_resume` answers the
+exception signal) it rejects. No new microtask machinery: `await` rides the promise queue that
+already exists, so ordering ("a" before the await runs synchronously, the caller's code next, the
+continuation in the drain) falls out for free.
+
+Scope kept deliberately at the generator transform's: `await` is taken in statement, simple-
+assignment, initialiser and `return` position — where nothing is live across the suspension — and
+refused in a complex one (`f(await x)`, `await a + await b`), the same restriction `yield` carries.
+Deferred: **a rejected `await` rejects the result promise rather than resuming the body's
+`try`/`catch`** (that needs resume-with-throw at the suspension point, the same gap a generator's
+`throw` has); a bare `return aPromise` is fulfilled with the promise rather than adopting it
+(`return await p` resolves first and is the common form); async generators (`async function*`, which
+need `Symbol.asyncIterator`); and `for await`. A hoisted async declaration cannot capture a `let`
+declared below it — a general hoisting-order property (its body lowers before the `let`), not an
+async one; a `var` or a function expression captures normally.
