@@ -1193,6 +1193,99 @@ fn typed_arrays_have_their_producing_methods() {
     );
 }
 
+/// The scattered built-in gaps (D-255…D-257): the `EvalError`/`URIError`/`AggregateError` error
+/// kinds, `Number.prototype.toExponential`/`toPrecision`, `DataView`'s BigInt accessors, and
+/// `String.prototype.matchAll`.
+#[test]
+fn the_remaining_built_in_methods_are_present() {
+    // Error kinds: name on the prototype, chained through Error, and AggregateError's `errors`.
+    check(
+        "eval-error",
+        "var e = new EvalError(\"x\"); return e.name + \",\" + e.message + \",\" + (e instanceof Error);",
+        "EvalError,x,true",
+    );
+    check(
+        "uri-error",
+        "return new URIError().name + \",\" + (new URIError() instanceof Error);",
+        "URIError,true",
+    );
+    check(
+        "aggregate-error",
+        "var a = new AggregateError([new Error(\"a\"), new TypeError(\"b\")], \"m\"); \
+         return a.name + \",\" + a.message + \",\" + a.errors.length + \",\" + a.errors[1].name;",
+        "AggregateError,m,2,TypeError",
+    );
+    // Number formatting.
+    check("to-precision", "return (123.456).toPrecision(4);", "123.5");
+    check(
+        "to-precision-exp",
+        "return (123.456).toPrecision(2);",
+        "1.2e+2",
+    );
+    check(
+        "to-precision-small",
+        "return (0.00001234).toPrecision(2);",
+        "0.000012",
+    );
+    check(
+        "to-precision-undef",
+        "return (12.34).toPrecision();",
+        "12.34",
+    );
+    check(
+        "to-exponential",
+        "return (12345).toExponential(2);",
+        "1.23e+4",
+    );
+    check(
+        "to-exponential-undef",
+        "return (12345).toExponential();",
+        "1.2345e+4",
+    );
+    check(
+        "to-exponential-neg",
+        "return (0.5).toExponential();",
+        "5e-1",
+    );
+    check(
+        "to-precision-range",
+        "try { (1).toPrecision(0); return 1; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // DataView BigInt accessors, including endianness.
+    check(
+        "dataview-bigint",
+        "var d = new DataView(new ArrayBuffer(16)); d.setBigInt64(0, -5n); \
+         d.setBigUint64(8, 18446744073709551615n); \
+         return d.getBigInt64(0) + \",\" + d.getBigUint64(8) + \",\" + typeof d.getBigInt64(0);",
+        "-5,18446744073709551615,bigint",
+    );
+    check(
+        "dataview-bigint-endian",
+        "var d = new DataView(new ArrayBuffer(8)); d.setBigInt64(0, 1n, true); \
+         return d.getBigInt64(0, true) + \",\" + (d.getBigInt64(0, false) === 1n);",
+        "1,false",
+    );
+    // matchAll: a real iterator over every match, with capture groups.
+    check(
+        "match-all",
+        "var out = []; \
+         for (var m of \"a1b2\".matchAll(/([a-z])(\\d)/g)) { out.push(m[1] + m[2]); } \
+         return out.join(\",\");",
+        "a1,b2",
+    );
+    check(
+        "match-all-spread",
+        "return [...\"xxx\".matchAll(/x/g)].length;",
+        "3",
+    );
+    check(
+        "match-all-non-global",
+        "try { \"a\".matchAll(/a/); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **A string method on `null`/`undefined` or a symbol is a `TypeError`.**
 ///
 /// `ToString(RequireObjectCoercible(this))`: nullish fails the first step, a symbol the second.

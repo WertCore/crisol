@@ -7131,3 +7131,35 @@ a comparator, a `with` value, and each element read by `sort` all had to be root
 buffer or the element snapshot was allocated. Reading a BigInt array's elements is itself a string of
 allocations — one BigInt per element — so `sort` stashes them in a rooted holder array as it reads,
 rather than into a bare `Vec` the collector cannot see (`typed_array_snapshot`).
+
+## D-257
+
+**The scattered built-in gaps: three error kinds, two Number formatters, DataView's BigInt, matchAll.**
+
+Status: Accepted
+
+An audit of what the runtime actually implements — dispatch tables, not the arity-only stubs — turned
+up a short list of genuinely-missing members, now filled:
+
+- `EvalError`, `URIError` and `AggregateError`. The first two are one table line each: `make_error`
+  already reads its name off the constructor's prototype, so they differ only in a binding.
+  `AggregateError` needed its own constructor for the `errors` array it drains from its first argument
+  (its message is the *second*); `make_error`'s body was extracted into `build_error_object` for the two
+  to share. All three chain through `Error.prototype`, so `instanceof Error` holds.
+- `Number.prototype.toExponential` and `toPrecision`. Rust's `{:e}`/`{:.*e}` do the rounding; the only
+  massaging is a `+` on a non-negative exponent (`jsify_exponent`), since Rust omits it and JS does not.
+  `toPrecision` reads the decimal exponent back out of the exponential form to choose between fixed and
+  exponential notation, the specification's own split (`e < -6 || e >= precision`).
+- `DataView.prototype.getBigInt64`/`setBigInt64`/`getBigUint64`/`setBigUint64`. These reuse the typed
+  array BigInt codecs (`ElementKind::I64`/`U64`), which are little-endian, and reverse the eight bytes
+  for a big-endian access. They are keyed by name rather than through `DATA_VIEW_KINDS`, whose kinds are
+  the Number ones.
+- `String.prototype.matchAll`. It collects every match up front and hands back an *array iterator* over
+  the results — a real iterator with `next` and `[Symbol.iterator]`, though not the distinct
+  `%RegExpStringIteratorPrototype%`. A non-global `RegExp` argument is the required `TypeError`.
+
+Two audit entries turned out to be **already implemented** and were left alone: `Symbol.prototype`'s
+`description` reads back through the hidden slot the symbol already stores it in, and every `RegExp`
+flag getter (`source`, `flags`, `global`, `ignoreCase`, …) already answers. One is **deferred**:
+`String.prototype.normalize` needs Unicode decomposition tables this build does not carry, and an
+identity stand-in would be a lie that fails every real case — so it stays absent, like full `Intl`.

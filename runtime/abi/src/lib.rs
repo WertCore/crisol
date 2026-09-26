@@ -1734,6 +1734,9 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("RangeError", make_error),
     ("ReferenceError", make_error),
     ("SyntaxError", make_error),
+    ("EvalError", make_error),
+    ("URIError", make_error),
+    ("AggregateError", make_aggregate_error),
     ("String", to_string_global),
     ("Number", to_number_global),
     ("Boolean", to_boolean_global),
@@ -1827,6 +1830,10 @@ const TYPED_NATIVES: &[Native] = &[
     typed_array_with,        // TA_WITH_METHOD
     typed_array_of,          // TA_OF_METHOD (static)
     typed_array_from,        // TA_FROM_METHOD (static)
+    dv_get_bigint64,         // DV_GET_BIGINT64
+    dv_get_biguint64,        // DV_GET_BIGUINT64
+    dv_set_bigint64,         // DV_SET_BIGINT64
+    dv_set_biguint64,        // DV_SET_BIGUINT64
 ];
 
 /// Indices into [`TYPED_NATIVES`].
@@ -1859,6 +1866,11 @@ const TA_WITH_METHOD: usize = 35;
 /// The two typed-array-producing *statics*, installed on each per-kind constructor.
 const TA_OF_METHOD: usize = 36;
 const TA_FROM_METHOD: usize = 37;
+/// The four `DataView` BigInt accessors, appended after the typed-array statics.
+const DV_GET_BIGINT64: usize = 38;
+const DV_GET_BIGUINT64: usize = 39;
+const DV_SET_BIGINT64: usize = 40;
+const DV_SET_BIGUINT64: usize = 41;
 
 /// The eight kinds a `DataView` reads and writes, in the order [`DV_GET_BASE`]/[`DV_SET_BASE`]
 /// lay them out — `Uint8Clamped` is absent, so this is not [`ELEMENT_KINDS`].
@@ -2079,6 +2091,8 @@ const NUMBER_NATIVES: &[(&str, Native)] = &[
     ("toLocaleString", number_to_text),
     ("valueOf", number_value_of),
     ("toFixed", number_to_fixed),
+    ("toExponential", number_to_exponential),
+    ("toPrecision", number_to_precision),
 ];
 
 /// Methods on `Boolean.prototype`.
@@ -2205,6 +2219,120 @@ extern "C" fn number_to_fixed(
         return new_string(&number_text(value));
     }
     new_string(&format!("{value:.places$}"))
+}
+
+/// Rewrites Rust's exponential form into JavaScript's: Rust writes `1.5e4` and `1.5e-4`, JS writes
+/// `1.5e+4` and `1.5e-4` — a `+` on a non-negative exponent is the only difference.
+fn jsify_exponent(rust_exponential: &str) -> String {
+    match rust_exponential.rfind('e') {
+        Some(at) => {
+            let mantissa = &rust_exponential[..at];
+            let exponent = &rust_exponential[at + 1..];
+            if exponent.starts_with('-') {
+                format!("{mantissa}e{exponent}")
+            } else {
+                format!("{mantissa}e+{exponent}")
+            }
+        }
+        None => rust_exponential.to_owned(),
+    }
+}
+
+/// `Number.prototype.toExponential(fractionDigits)`.
+extern "C" fn number_to_exponential(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = match require_number(this_value) {
+        Ok(value) => value,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let argument = unsafe { argument(argc, argv, 0) };
+    // `ToIntegerOrInfinity`: `NaN` becomes zero, an infinity stays one to fail the range check.
+    let digits = to_number(argument);
+    let digits = if digits.is_nan() { 0.0 } else { digits.trunc() };
+    // **A non-finite value answers its `toString` before the range is checked**, exactly as the
+    // specification orders the two steps.
+    if !value.is_finite() {
+        return new_string(&number_text(value));
+    }
+    if !(0.0..=100.0).contains(&digits) {
+        return raise("fraction digits must be between 0 and 100", "RangeError");
+    }
+    let raw = if Value::from_bits(argument).is_undefined() {
+        // As many digits as it takes to name the value, which Rust's default exponential gives.
+        format!("{value:e}")
+    } else {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "range-checked into 0..=100 just above"
+        )]
+        let places = digits as usize;
+        format!("{value:.places$e}")
+    };
+    new_string(&jsify_exponent(&raw))
+}
+
+/// `Number.prototype.toPrecision(precision)` — `precision` significant digits, in fixed notation
+/// when the exponent is small and exponential otherwise, as the specification chooses between them.
+extern "C" fn number_to_precision(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = match require_number(this_value) {
+        Ok(value) => value,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let argument = unsafe { argument(argc, argv, 0) };
+    // **`undefined` precision is plain `ToString`**, before anything else is looked at.
+    if Value::from_bits(argument).is_undefined() {
+        return new_string(&number_text(value));
+    }
+    let precision = to_number(argument);
+    let precision = if precision.is_nan() {
+        0.0
+    } else {
+        precision.trunc()
+    };
+    if !value.is_finite() {
+        return new_string(&number_text(value));
+    }
+    if !(1.0..=100.0).contains(&precision) {
+        return raise("precision must be between 1 and 100", "RangeError");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "range-checked into 1..=100 just above"
+    )]
+    let significant = precision as usize;
+    // Rounding to `significant` digits in exponential form also yields the decimal exponent `e`,
+    // which decides between the two notations: exponential when `e < -6` or `e >= significant`,
+    // fixed otherwise — the specification's own split.
+    let exponential = format!("{value:.*e}", significant - 1);
+    let exponent = exponential
+        .rfind('e')
+        .and_then(|at| exponential[at + 1..].parse::<i32>().ok())
+        .unwrap_or(0);
+    let significant_i32 = i32::try_from(significant).unwrap_or(i32::MAX);
+    if exponent < -6 || exponent >= significant_i32 {
+        return new_string(&jsify_exponent(&exponential));
+    }
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the difference is clamped to be non-negative just here"
+    )]
+    let fraction = (significant_i32 - 1 - exponent).max(0) as usize;
+    new_string(&format!("{value:.fraction$}"))
 }
 
 /// The boolean a receiver stands for.
@@ -4654,6 +4782,110 @@ data_view_accessor!(dv_set_uint32, ElementKind::U32, data_view_set);
 data_view_accessor!(dv_set_float32, ElementKind::F32, data_view_set);
 data_view_accessor!(dv_set_float64, ElementKind::F64, data_view_set);
 
+/// The shared body behind `DataView.prototype.getBigInt64`/`getBigUint64`. The eight bytes are read
+/// little-endian by [`ElementKind::read_bigint`], so a big-endian read reverses them first; `kind`
+/// (`I64` or `U64`) decides whether the result is signed.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values.
+unsafe fn data_view_get_bigint(
+    this_value: u64,
+    kind: ElementKind,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !is_data_view(this_value) {
+        return raise("this is not a DataView", "TypeError");
+    }
+    // SAFETY: the caller promises `argc` readable values at `argv`.
+    let byte_offset = match to_index(unsafe { argument(argc, argv, 0) }) {
+        Ok(offset) => offset,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: as above.
+    let little_endian = is_truthy(Value::from_bits(unsafe { argument(argc, argv, 1) }));
+    let Some((buffer, view_offset, byte_length)) = data_view_parts(this_value) else {
+        return raise("this is not a DataView", "TypeError");
+    };
+    if byte_offset + 8 > byte_length {
+        return raise("offset is outside the DataView", "RangeError");
+    }
+    let Some(handle) = handle_of(buffer) else {
+        return raise("the DataView's buffer is gone", "TypeError");
+    };
+    match with_runtime(|runtime| {
+        runtime
+            .heap
+            .read_bytes(handle, view_offset + byte_offset, 8)
+    }) {
+        Some(mut bytes) => {
+            if !little_endian {
+                bytes.reverse();
+            }
+            new_bigint(&kind.read_bigint(&bytes))
+        }
+        None => raise("offset is outside the DataView", "RangeError"),
+    }
+}
+
+/// The shared body behind `DataView.prototype.setBigInt64`/`setBigUint64`. `ToBigInt` runs before
+/// the range check, as it does for the Number setters, and the little-endian encoding is reversed
+/// for a big-endian write.
+///
+/// # Safety
+///
+/// `argv` must point to `argc` readable values.
+unsafe fn data_view_set_bigint(
+    this_value: u64,
+    kind: ElementKind,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !is_data_view(this_value) {
+        return raise("this is not a DataView", "TypeError");
+    }
+    // SAFETY: the caller promises `argc` readable values at `argv`.
+    let byte_offset = match to_index(unsafe { argument(argc, argv, 0) }) {
+        Ok(offset) => offset,
+        Err(thrown) => return thrown,
+    };
+    // **`ToBigInt` is observable and runs before the range is checked.** SAFETY: as above.
+    let coerced = to_bigint(unsafe { argument(argc, argv, 1) });
+    if Value::from_bits(coerced).is_exception() {
+        return coerced;
+    }
+    // SAFETY: as above.
+    let little_endian = is_truthy(Value::from_bits(unsafe { argument(argc, argv, 2) }));
+    let Some((buffer, view_offset, byte_length)) = data_view_parts(this_value) else {
+        return raise("this is not a DataView", "TypeError");
+    };
+    if byte_offset + 8 > byte_length {
+        return raise("offset is outside the DataView", "RangeError");
+    }
+    let Some(handle) = handle_of(buffer) else {
+        return raise("the DataView's buffer is gone", "TypeError");
+    };
+    let Some(magnitude) = bigint_of(coerced) else {
+        return raise("expected a BigInt", "TypeError");
+    };
+    let mut bytes = kind.bigint_to_bytes(&magnitude);
+    if !little_endian {
+        bytes.reverse();
+    }
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .write_bytes(handle, view_offset + byte_offset, &bytes)
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+data_view_accessor!(dv_get_bigint64, ElementKind::I64, data_view_get_bigint);
+data_view_accessor!(dv_get_biguint64, ElementKind::U64, data_view_get_bigint);
+data_view_accessor!(dv_set_bigint64, ElementKind::I64, data_view_set_bigint);
+data_view_accessor!(dv_set_biguint64, ElementKind::U64, data_view_set_bigint);
+
 // ============================== Generators ==============================
 //
 // A generator cannot be a suspended native stack — crisol is ahead-of-time, and locals are
@@ -5069,26 +5301,25 @@ extern "C" fn make_error(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let message = unsafe { argument(argc, argv, 0) };
-    // SAFETY: as above.
-    let live = unsafe { live_values(this_value, argc, argv) };
-    with_rooted(&live, || {
-        // `new Error(…)` gives a receiver to fill; a plain call gives `undefined`, so one is
-        // made here — **and it inherits from the constructor's own `prototype`**, because
-        // `Error("x") instanceof Error` is true: called without `new`, the constructor still
-        // constructs.
+    build_error_object(closure, this_value, message)
+}
+
+/// The shared body of every error constructor: makes or fills the receiver, brands it, links its
+/// prototype for a plain call, and stores a non-enumerable `message`.
+///
+/// **`new Error(…)` gives a receiver to fill; a plain call gives `undefined`**, so one is made here
+/// and inherits from the constructor's own `prototype` — `Error("x") instanceof Error` is true.
+/// `name` is not set: it belongs to the prototype, one string per kind. Everything is rooted before
+/// the next allocation, the discipline every one of these has needed under GC stress.
+fn build_error_object(closure: u64, this_value: u64, message: u64) -> u64 {
+    with_rooted(&[this_value, message], || {
         let plain = handle_of(this_value).is_none();
         let receiver = if plain {
             crisol_create_object()
         } else {
             this_value
         };
-        // **Rooted before anything else allocates.** The receiver a plain call makes is
-        // reachable from nothing until it is returned, and the message below allocates a
-        // string — under GC stress the error was collected between the two, and what came
-        // back was a stale handle whose prototype nothing had managed to set. The symptom
-        // was `Error("x") instanceof Error` answering `false` under stress and `true`
-        // without, which is the shape every one of these bugs has had.
-        with_rooted(&[receiver], || {
+        with_rooted(&[receiver, message], || {
             let Some(target) = handle_of(receiver) else {
                 return Value::UNDEFINED.to_bits();
             };
@@ -5112,9 +5343,8 @@ extern "C" fn make_error(
                     with_runtime(|runtime| runtime.heap.set_prototype(target, Some(prototype)));
                 }
             }
-            // **`message` is not enumerable**, which `Object.keys(new Error("x"))` reports
-            // and `JSON.stringify` copies. `name` is not set here at all: it belongs to the
-            // prototype, where one string serves every instance of the kind.
+            // **`message` is not enumerable**, which `Object.keys(new Error("x"))` reports and
+            // `JSON.stringify` copies.
             if Value::from_bits(message).kind() != crisol_value::Kind::Undefined {
                 let text = to_text(message).unwrap_or_default();
                 let held = new_string(&text);
@@ -5125,6 +5355,54 @@ extern "C" fn make_error(
                 });
             }
             receiver
+        })
+    })
+}
+
+/// `new AggregateError(errors, message?)` — an error that also carries an `errors` array drained
+/// from its *first* argument, an iterable; its `message` is the *second* argument.
+extern "C" fn make_aggregate_error(
+    closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let errors = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let message = unsafe { argument(argc, argv, 1) };
+    with_rooted(&[this_value, errors, message], || {
+        let error = build_error_object(closure, this_value, message);
+        with_rooted(&[error, errors], || {
+            let Some(target) = handle_of(error) else {
+                return error;
+            };
+            // The iterable is drained to an array; a non-iterable (including `undefined`, which
+            // `errors` defaults to) is the `TypeError` `crisol_iterate` answers.
+            let taken = if elements_of(errors).is_some() {
+                errors
+            } else {
+                crisol_iterate(errors)
+            };
+            if Value::from_bits(taken).is_exception() {
+                return taken;
+            }
+            with_rooted(&[taken], || {
+                let values: Vec<u64> = match elements_of(taken) {
+                    Some((array, length)) => {
+                        (0..length).map(|index| element_at(array, index)).collect()
+                    }
+                    None => Vec::new(),
+                };
+                let array = with_rooted(&values, || array_of_values(&values));
+                with_rooted(&[array], || {
+                    with_runtime(|runtime| {
+                        runtime.define_hidden(target, "errors", Value::from_bits(array));
+                    });
+                });
+                error
+            })
         })
     })
 }
@@ -5516,6 +5794,9 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("global", "Symbol", 0),
     ("global", "SyntaxError", 1),
     ("global", "TypeError", 1),
+    ("global", "EvalError", 1),
+    ("global", "URIError", 1),
+    ("global", "AggregateError", 2),
     ("global", "isFinite", 1),
     ("global", "isNaN", 1),
     ("global", "parseFloat", 1),
@@ -8724,6 +9005,7 @@ const STRING_NATIVES: &[(&str, Native)] = &[
     ("replace", string_replace),
     ("replaceAll", string_replace_all),
     ("match", string_match),
+    ("matchAll", string_match_all),
     ("search", string_search),
     ("codePointAt", string_code_point_at),
     ("localeCompare", string_locale_compare),
@@ -9616,6 +9898,62 @@ extern "C" fn string_match(
             });
         }
         array.to_value().to_bits()
+    })
+}
+
+/// `String.prototype.matchAll(regexp)` — an iterator over every match, each shaped as
+/// `RegExp.prototype.exec` produces it.
+///
+/// A `RegExp` argument that is not global is a `TypeError`, as the specification requires; a string
+/// argument is matched globally. The iterator is an array iterator over the results collected up
+/// front — a real iterator object with `next` and `[Symbol.iterator]`, though not the distinct
+/// `%RegExpStringIteratorPrototype%` (D-257).
+extern "C" fn string_match_all(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let text = match coercible_text(this_value) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let pattern = unsafe { argument(argc, argv, 0) };
+    // A pattern with its own `Symbol.matchAll` answers instead, exactly as `match` delegates.
+    let matcher = symbol_method(pattern, "matchAll");
+    if is_callable(matcher) {
+        let subject = with_rooted(&[pattern, matcher], || new_string(&text));
+        return with_rooted(&[pattern, matcher, subject], || {
+            call_value(matcher, pattern, &[subject])
+        });
+    }
+    // A RegExp is one with `flags`; anything else is a string pattern, matched globally.
+    let is_regexp = handle_of(pattern).is_some() && property_text(pattern, "flags").is_some();
+    let Some((mut compiled, flags)) = pattern_argument(pattern) else {
+        return new_array_iterator(array_of_values(&[]), 1.0);
+    };
+    if is_regexp && !flags.contains('g') {
+        return raise("matchAll must be called with a global RegExp", "TypeError");
+    }
+    let founds = compiled.all_matches(&text);
+    // The result arrays are stashed in a rooted holder as they are built, since each `match_result`
+    // allocates and would otherwise collect the ones before it under GC stress (D-255).
+    let holder = array_of_values(&[]);
+    with_rooted(&[holder], || {
+        let Some(handle) = handle_of(holder) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        for (index, found) in founds.iter().enumerate() {
+            let result = match_result(&text, found);
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(handle, index, Value::from_bits(result));
+            });
+        }
+        new_array_iterator(holder, 1.0)
     })
 }
 
@@ -13809,6 +14147,9 @@ impl Runtime {
             "RangeError",
             "ReferenceError",
             "SyntaxError",
+            "EvalError",
+            "URIError",
+            "AggregateError",
         ] {
             let Some(constructor) = self.global_object(globals.handle(), name) else {
                 continue;
@@ -14666,6 +15007,22 @@ impl Runtime {
                     "DataView.prototype",
                     &format!("set{name}"),
                     setter.to_value(),
+                );
+            }
+            // The four BigInt accessors, which are not in `DATA_VIEW_KINDS` (its kinds are the
+            // Number ones) and so are installed by name from their own constants.
+            for (name, offset) in [
+                ("getBigInt64", DV_GET_BIGINT64),
+                ("getBigUint64", DV_GET_BIGUINT64),
+                ("setBigInt64", DV_SET_BIGINT64),
+                ("setBigUint64", DV_SET_BIGUINT64),
+            ] {
+                let method = self.native_function(base + offset);
+                self.define_method(
+                    prototype.handle(),
+                    "DataView.prototype",
+                    name,
+                    method.to_value(),
                 );
             }
         }
