@@ -3333,6 +3333,62 @@ fn bigints_are_arbitrary_precision_integers() {
         "try { return 1n / 0n; } catch (e) { return e instanceof RangeError; }",
         "true",
     );
+
+    // The `BigInt()` function coerces a number, a string and a boolean; it is not a constructor.
+    check("bigint-fn-number", "return BigInt(42);", "42n");
+    check("bigint-fn-string", "return BigInt(\"255\");", "255n");
+    check("bigint-fn-hex-string", "return BigInt(\"0xff\");", "255n");
+    check("bigint-fn-bool", "return BigInt(true);", "1n");
+    check("bigint-fn-typeof", "return typeof BigInt(1);", "bigint");
+    check("bigint-fn-roundtrip", "return BigInt(10) + 5n;", "15n");
+    check(
+        "bigint-fn-nonint-throws",
+        "try { return BigInt(1.5); } catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+    check(
+        "bigint-fn-bad-string-throws",
+        "try { return BigInt(\"x\"); } catch (e) { return e instanceof SyntaxError; }",
+        "true",
+    );
+    check(
+        "bigint-not-a-constructor",
+        "try { return new BigInt(1); } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+
+    // `asIntN`/`asUintN` wrap a BigInt into a fixed width, signed and unsigned.
+    check("bigint-asintn-wrap", "return BigInt.asIntN(8, 256n);", "0n");
+    check(
+        "bigint-asintn-signed",
+        "return BigInt.asIntN(8, 255n);",
+        "-1n",
+    );
+    check(
+        "bigint-asintn-min",
+        "return BigInt.asIntN(8, 128n);",
+        "-128n",
+    );
+    check(
+        "bigint-asintn-max",
+        "return BigInt.asIntN(8, 127n);",
+        "127n",
+    );
+    check(
+        "bigint-asuintn-wrap",
+        "return BigInt.asUintN(8, 256n);",
+        "0n",
+    );
+    check(
+        "bigint-asuintn-negative",
+        "return BigInt.asUintN(8, -1n);",
+        "255n",
+    );
+    check(
+        "bigint-asuintn-64",
+        "return BigInt.asUintN(64, -1n);",
+        "18446744073709551615n",
+    );
 }
 
 /// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults

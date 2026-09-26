@@ -1741,6 +1741,7 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Float32Array", make_float32_array),
     ("Float64Array", make_float64_array),
     ("DataView", make_data_view),
+    ("BigInt", bigint_global),
 ];
 
 /// The nine typed-array constructor names, in [`ELEMENT_KINDS`] order.
@@ -3882,6 +3883,146 @@ extern "C" fn to_number_global(
     from_number(number)
 }
 
+/// `BigInt(value)` — the coercion function, not a constructor (`new BigInt()` is rejected before
+/// this runs because BigInt is not in the constructor set).
+extern "C" fn bigint_global(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`. `BigInt()` with no
+    // argument coerces `undefined`, which is a `TypeError`.
+    let value = unsafe { argument(argc, argv, 0) };
+    with_rooted(&[value], || to_bigint(value))
+}
+
+/// `ToBigInt` — what `BigInt(x)` and a few internal operations perform.
+///
+/// Stricter than `ToNumber`: a non-integer or non-finite Number is a `RangeError`, an
+/// unparseable string a `SyntaxError`, and `undefined`, `null` and a Symbol a `TypeError`. Only
+/// a Boolean, a String, a Number that is an integer, and a BigInt convert.
+fn to_bigint(value: u64) -> u64 {
+    let held = Value::from_bits(value);
+    match held.kind() {
+        crisol_value::Kind::BigInt => value,
+        crisol_value::Kind::Boolean => {
+            new_bigint(&BigInt::from(i32::from(held.as_boolean().unwrap_or(false))))
+        }
+        crisol_value::Kind::Number => {
+            let number = held.as_number().unwrap_or(f64::NAN);
+            if !number.is_finite() || number.fract() != 0.0 {
+                return raise(
+                    "The number is not a safe integer and cannot be converted to a BigInt",
+                    "RangeError",
+                );
+            }
+            // `{:.0}` prints the integer exactly, so no precision is lost above 2^53.
+            BigInt::parse_bytes(format!("{number:.0}").as_bytes(), 10).map_or_else(
+                || raise("cannot convert this number to a BigInt", "RangeError"),
+                |value| new_bigint(&value),
+            )
+        }
+        crisol_value::Kind::String => text_of(value)
+            .and_then(|text| string_to_bigint(&text))
+            .map_or_else(
+                || raise("Cannot convert this string to a BigInt", "SyntaxError"),
+                |value| new_bigint(&value),
+            ),
+        crisol_value::Kind::Object => {
+            // `ToPrimitive` with a number hint, then `ToBigInt` on the result. The primitive is
+            // rooted across the recursion because `valueOf` allocated it and nothing else holds it.
+            let primitive = to_primitive(value);
+            if Value::from_bits(primitive).kind() == crisol_value::Kind::Object {
+                return raise("Cannot convert this object to a BigInt", "TypeError");
+            }
+            with_rooted(&[primitive], || to_bigint(primitive))
+        }
+        // `undefined`, `null` and a Symbol have no BigInt.
+        _ => raise("Cannot convert this value to a BigInt", "TypeError"),
+    }
+}
+
+/// `BigInt.asIntN(bits, x)` — `x` as a signed integer that fits in `bits` bits, wrapping.
+extern "C" fn bigint_as_int_n(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (bits_arg, value_arg) = unsafe { (argument(argc, argv, 0), argument(argc, argv, 1)) };
+    with_rooted(&[value_arg], || {
+        let bits = match to_index(bits_arg) {
+            Ok(bits) => bits,
+            Err(exception) => return exception,
+        };
+        let value = to_bigint(value_arg);
+        if Value::from_bits(value).is_exception() {
+            return value;
+        }
+        let Some(x) = bigint_of(value) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        if bits == 0 {
+            return new_bigint(&BigInt::from(0));
+        }
+        let modulus = BigInt::from(1) << bits;
+        let reduced = x % &modulus;
+        let reduced = if reduced.is_negative() {
+            reduced + &modulus
+        } else {
+            reduced
+        };
+        // The top of the `bits`-wide range is negative in two's complement.
+        let half = BigInt::from(1) << (bits - 1);
+        let result = if reduced >= half {
+            reduced - modulus
+        } else {
+            reduced
+        };
+        new_bigint(&result)
+    })
+}
+
+/// `BigInt.asUintN(bits, x)` — `x` as an unsigned integer that fits in `bits` bits, wrapping.
+extern "C" fn bigint_as_uint_n(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let (bits_arg, value_arg) = unsafe { (argument(argc, argv, 0), argument(argc, argv, 1)) };
+    with_rooted(&[value_arg], || {
+        let bits = match to_index(bits_arg) {
+            Ok(bits) => bits,
+            Err(exception) => return exception,
+        };
+        let value = to_bigint(value_arg);
+        if Value::from_bits(value).is_exception() {
+            return value;
+        }
+        let Some(x) = bigint_of(value) else {
+            return Value::UNDEFINED.to_bits();
+        };
+        if bits == 0 {
+            return new_bigint(&BigInt::from(0));
+        }
+        let modulus = BigInt::from(1) << bits;
+        let reduced = x % &modulus;
+        let result = if reduced.is_negative() {
+            reduced + modulus
+        } else {
+            reduced
+        };
+        new_bigint(&result)
+    })
+}
+
 /// `Boolean(value)`.
 extern "C" fn to_boolean_global(
     _closure: u64,
@@ -3925,6 +4066,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     // The constructors themselves, owned by no object — `Array.length` is one, not the number
     // of arrays. Their arities come from the same reading.
     ("global", "Array", 1),
+    ("global", "BigInt", 1),
     ("global", "Boolean", 1),
     ("global", "Date", 7),
     ("global", "Error", 1),
@@ -4178,6 +4320,8 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("String.prototype", "trimEnd", 0),
     ("String.prototype", "trimStart", 0),
     ("String.prototype", "valueOf", 0),
+    ("BigInt", "asIntN", 2),
+    ("BigInt", "asUintN", 2),
     ("Symbol", "for", 1),
     ("Symbol", "keyFor", 1),
 ];
@@ -8911,6 +9055,8 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Array", "from", array_from),
     ("Symbol", "for", symbol_for),
     ("Symbol", "keyFor", symbol_key_for),
+    ("BigInt", "asIntN", bigint_as_int_n),
+    ("BigInt", "asUintN", bigint_as_uint_n),
     ("Math", "abs", math_abs),
     ("Math", "floor", math_floor),
     ("Math", "ceil", math_ceil),
@@ -15838,7 +15984,11 @@ fn bigint_of(bits: u64) -> Option<BigInt> {
         return None;
     }
     let handle = value.as_address().map(GcRef::from_address)?;
-    with_runtime(|runtime| runtime.heap.with_bytes(handle, BigInt::from_signed_bytes_le))
+    with_runtime(|runtime| {
+        runtime
+            .heap
+            .with_bytes(handle, BigInt::from_signed_bytes_le)
+    })
 }
 
 /// Allocates a BigInt cell holding `value` and returns it as a BigInt-tagged value.
@@ -17570,7 +17720,14 @@ fn is_callable(value: u64) -> bool {
 /// [`GLOBAL_NATIVES`] is a constructor, so the list that has to stay correct is the short one.
 /// `Symbol` is here because `new Symbol()` is a `TypeError` — a symbol exists to be unequal to
 /// everything, and a wrapper for one would have an identity of its own.
-const NOT_CONSTRUCTORS: &[&str] = &["parseInt", "parseFloat", "isNaN", "isFinite", "Symbol"];
+const NOT_CONSTRUCTORS: &[&str] = &[
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "Symbol",
+    "BigInt",
+];
 
 /// The globals that own methods but are not functions themselves.
 ///
