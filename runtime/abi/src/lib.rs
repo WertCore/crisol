@@ -1835,6 +1835,14 @@ const GENERATOR_NATIVES: &[(&str, Native)] = &[
     ("throw", generator_throw),
 ];
 
+/// The methods on `BigInt.prototype` (D-248). Chained last in [`crisol_closure_code`], after
+/// [`GENERATOR_NATIVES`].
+const BIGINT_NATIVES: &[(&str, Native)] = &[
+    ("toString", bigint_to_text),
+    ("toLocaleString", bigint_to_locale_string),
+    ("valueOf", bigint_value_of),
+];
+
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
 /// order [`crisol_closure_code`] chains them. Shared by the two places that address the table so
 /// they cannot drift.
@@ -4023,6 +4031,87 @@ extern "C" fn bigint_as_uint_n(
     })
 }
 
+/// The BigInt a `BigInt.prototype` method's `this` names — the primitive itself, or the one a
+/// wrapper object boxes — or a `TypeError` for anything else. The mirror of [`require_number`].
+fn require_bigint(this_value: u64) -> Result<BigInt, u64> {
+    if Value::from_bits(this_value).is_bigint()
+        && let Some(value) = bigint_of(this_value)
+    {
+        return Ok(value);
+    }
+    if handle_of(this_value).is_some()
+        && let Some((_, boxed)) = own_property(this_value, STRING_PRIMITIVE)
+        && boxed.is_bigint()
+        && let Some(value) = bigint_of(boxed.to_bits())
+    {
+        return Ok(value);
+    }
+    Err(raise("this is not a BigInt", "TypeError"))
+}
+
+/// `BigInt.prototype.toString(radix)`.
+extern "C" fn bigint_to_text(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let value = match require_bigint(this_value) {
+        Ok(value) => value,
+        Err(thrown) => return thrown,
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let radix_arg = unsafe { argument(argc, argv, 0) };
+    let radix = if Value::from_bits(radix_arg).is_undefined() {
+        10.0
+    } else {
+        to_number(radix_arg)
+    };
+    if radix == 10.0 {
+        return new_string(&value.to_string());
+    }
+    if !(2.0..=36.0).contains(&radix) {
+        return raise("radix must be between 2 and 36", "RangeError");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked to be in 2..=36"
+    )]
+    let radix = radix as u32;
+    // `to_str_radix` writes the sign and lowercase digits, which is what `toString` produces.
+    new_string(&value.to_str_radix(radix))
+}
+
+/// `BigInt.prototype.valueOf` — the primitive itself.
+extern "C" fn bigint_value_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    match require_bigint(this_value) {
+        Ok(value) => new_bigint(&value),
+        Err(thrown) => thrown,
+    }
+}
+
+/// `BigInt.prototype.toLocaleString` — no locale data, so the decimal form, as `toString`.
+extern "C" fn bigint_to_locale_string(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    match require_bigint(this_value) {
+        Ok(value) => new_string(&value.to_string()),
+        Err(thrown) => thrown,
+    }
+}
+
 /// `Boolean(value)`.
 extern "C" fn to_boolean_global(
     _closure: u64,
@@ -4218,6 +4307,9 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Number.prototype", "toLocaleString", 0),
     ("Number.prototype", "toString", 1),
     ("Number.prototype", "valueOf", 0),
+    ("BigInt.prototype", "toString", 0),
+    ("BigInt.prototype", "toLocaleString", 0),
+    ("BigInt.prototype", "valueOf", 0),
     ("Object", "assign", 2),
     ("Object", "create", 2),
     ("Object", "defineProperties", 2),
@@ -10628,6 +10720,7 @@ extern "C" fn object_get_prototype(
         let prototype = match Value::from_bits(target).kind() {
             crisol_value::Kind::Number => NUMBER_PROTOTYPE.with(std::cell::Cell::get),
             crisol_value::Kind::Boolean => BOOLEAN_PROTOTYPE.with(std::cell::Cell::get),
+            crisol_value::Kind::BigInt => BIGINT_PROTOTYPE.with(std::cell::Cell::get),
             _ => None,
         };
         return prototype.map_or_else(|| Value::NULL.to_bits(), |p| p.to_value().to_bits());
@@ -12312,6 +12405,7 @@ impl Runtime {
             ("Number", NUMBER_PROTOTYPE.with(std::cell::Cell::get)),
             ("Boolean", BOOLEAN_PROTOTYPE.with(std::cell::Cell::get)),
             ("Promise", PROMISE_PROTOTYPE.with(std::cell::Cell::get)),
+            ("BigInt", BIGINT_PROTOTYPE.with(std::cell::Cell::get)),
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -13089,6 +13183,26 @@ impl Runtime {
                 self.define_method(prototype.handle(), "Generator", name, method.to_value());
             }
         }
+
+        // `BigInt.prototype`: `toString`/`toLocaleString`/`valueOf` (D-248). Chained after the
+        // generator natives, so its base continues from theirs.
+        {
+            let bigint_base = typed_natives_base() + TYPED_NATIVES.len() + GENERATOR_NATIVES.len();
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            BIGINT_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+            self.inherit_from_object(prototype.handle());
+            for (index, (name, _)) in BIGINT_NATIVES.iter().enumerate() {
+                let method = self.native_function(bigint_base + index);
+                self.define_method(
+                    prototype.handle(),
+                    "BigInt.prototype",
+                    name,
+                    method.to_value(),
+                );
+            }
+        }
     }
 }
 
@@ -13417,7 +13531,11 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
         // string does not need this because a string *is* a cell, which is why this gap only
         // showed when the other two grew methods worth reaching.
         let held = Value::from_bits(object);
-        if !matches!(held.kind(), crisol_value::Kind::Boolean) && held.as_number().is_none() {
+        if !matches!(
+            held.kind(),
+            crisol_value::Kind::Boolean | crisol_value::Kind::BigInt
+        ) && held.as_number().is_none()
+        {
             return nullish_access(object);
         }
         // SAFETY: the caller promises `length` readable UTF-8 bytes at `key`.
@@ -13433,10 +13551,10 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
         // a number rather than raising, so the failure arrived as a missing method rather than
         // as anything pointing here.
         return with_runtime(|runtime| {
-            let prototype = if held.kind() == crisol_value::Kind::Boolean {
-                BOOLEAN_PROTOTYPE.with(std::cell::Cell::get)
-            } else {
-                NUMBER_PROTOTYPE.with(std::cell::Cell::get)
+            let prototype = match held.kind() {
+                crisol_value::Kind::Boolean => BOOLEAN_PROTOTYPE.with(std::cell::Cell::get),
+                crisol_value::Kind::BigInt => BIGINT_PROTOTYPE.with(std::cell::Cell::get),
+                _ => NUMBER_PROTOTYPE.with(std::cell::Cell::get),
             };
             let Some(prototype) = prototype else {
                 return Value::UNDEFINED.to_bits();
@@ -15653,7 +15771,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + TYPED_NATIVES.len();
-        return GENERATOR_NATIVES
+        if let Some((_, function)) = GENERATOR_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + GENERATOR_NATIVES.len();
+        return BIGINT_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
@@ -18174,6 +18296,14 @@ fn to_primitive_text(value: u64) -> u64 {
 /// recursion — the specification throws there, and throwing from inside `==` would need an
 /// exception path the operator does not have.
 fn to_primitive(value: u64) -> u64 {
+    // **Only an object has a `ToPrimitive` to run.** Every primitive — a number, a string, a
+    // symbol and a BigInt — already is one, and the specification returns it untouched rather than
+    // calling `valueOf` on it. Running the loop anyway was harmless until BigInt grew a `valueOf`
+    // (D-248): it then allocated a copy of the operand mid-comparison, an intermediate the stack
+    // map did not yet carry, so a collection under stress freed it and `2n < 3n` read `false`.
+    if Value::from_bits(value).kind() != crisol_value::Kind::Object {
+        return value;
+    }
     for name in ["valueOf", "toString"] {
         let key = name.to_owned();
         // SAFETY: `key` is a live Rust string.

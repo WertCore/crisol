@@ -3389,6 +3389,27 @@ fn bigints_are_arbitrary_precision_integers() {
         "return BigInt.asUintN(64, -1n);",
         "18446744073709551615n",
     );
+
+    // Prototype methods: toString (default and with a radix), valueOf, and the TypeError a wrong
+    // receiver raises.
+    check("bigint-proto-tostring", "return (255n).toString();", "255");
+    check(
+        "bigint-proto-tostring-hex",
+        "return (255n).toString(16);",
+        "ff",
+    );
+    check(
+        "bigint-proto-tostring-bin",
+        "return (5n).toString(2);",
+        "101",
+    );
+    check("bigint-proto-valueof", "return (7n).valueOf() + 1n;", "8n");
+    check(
+        "bigint-proto-tostring-wrong-this",
+        "try { return BigInt.prototype.toString.call(5); } \
+         catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
 }
 
 /// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults
