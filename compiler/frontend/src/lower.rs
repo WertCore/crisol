@@ -155,6 +155,9 @@ struct Scope {
     /// no rooting) or `Unknown` (a BigInt is possible, so the collector must be able to see it).
     /// Per scope because a `ValueId` is numbered within one function (D-248).
     value_types: Vec<Type>,
+    /// The active `try … finally`s, innermost last (D-253). A `return`/`break`/`continue`/`throw`
+    /// that leaves a protected region routes through these so each finally runs.
+    finalizers: Vec<Finalizer>,
 }
 
 /// What a generator body accumulates as it lowers: one resume point per `yield`, and which slots
@@ -174,6 +177,49 @@ struct GenState {
     /// with a promise instead of returning it. `yield` is refused here and `await` in a plain
     /// generator.
     is_async: bool,
+}
+
+/// One active `try … finally` (D-253). Every way out of the protected region — falling off the end,
+/// `return`, `throw`, `break`, `continue` — routes to `entry`, which runs the finally block once and
+/// then replays the completion recorded in `completion`/`value`. Nested finallys chain: an outer
+/// `Finalizer` is still on the stack while an inner one's dispatch is built, so a `return` inside two
+/// of them runs both.
+struct Finalizer {
+    /// The block that runs the finally body and then dispatches on `completion`.
+    entry: BlockId,
+    /// Slot holding the completion code: `0` normal, `1` return, `2` throw, `3+` a break/continue
+    /// registered in `pending`.
+    completion: u32,
+    /// Slot holding the value a `return` carries or a `throw` is unwinding.
+    value: u32,
+    /// `breaks.len()` when this finalizer was pushed — a plain `break` crosses exactly the finallys
+    /// pushed at this same loop depth, so this tells which ones its jump has to run first.
+    breaks_len: usize,
+    /// `continues.len()` when pushed, for `continue` by the same reasoning.
+    continues_len: usize,
+    /// The break/continue jumps that route through this finally, each with the code that names it and
+    /// what to do after the finally runs.
+    pending: Vec<Pending>,
+    /// The next break/continue code to hand out.
+    next_code: f64,
+}
+
+/// A break/continue routed through a [`Finalizer`]: after the finally runs and `completion` equals
+/// `code`, do `action`.
+struct Pending {
+    code: f64,
+    action: PendingAction,
+}
+
+/// What a [`Pending`] does once its finally has run: jump straight to the loop target (this finally
+/// was the last one crossed), or route on to the next-outer finally (more remain before the target).
+enum PendingAction {
+    Jump(BlockId),
+    Route {
+        entry: BlockId,
+        completion: u32,
+        code: f64,
+    },
 }
 
 // **The three jump-target stacks live here and not on `Lowering`, because a `BlockId` names a
@@ -245,6 +291,7 @@ impl Lowering {
                 continues: Vec::new(),
                 generator: None,
                 value_types: Vec::new(),
+                finalizers: Vec::new(),
             }],
             unsupported: Vec::new(),
         };
@@ -862,10 +909,8 @@ impl Lowering {
     /// `try { … } catch (e) { … }`.
     fn try_statement(&mut self, statement: &oxc_ast::ast::TryStatement<'_>) {
         if statement.finalizer.is_some() {
-            // `finally` runs on *both* paths, including the one that leaves by throwing, and
-            // half of that is worse than none — a `finally` that ran only when nothing threw
-            // would look right in every test that does not throw.
-            self.note("try with finally", statement.span.start);
+            self.try_finally(statement);
+            return;
         }
         let Some(catch) = &statement.handler else {
             self.note("try without catch", statement.span.start);
@@ -886,6 +931,21 @@ impl Lowering {
         });
 
         self.switch_to(handler);
+        self.bind_caught(catch);
+        for inner in &catch.body.body {
+            self.statement(inner);
+        }
+        self.terminate(Terminator::Jump {
+            target: end,
+            args: Vec::new(),
+        });
+
+        self.switch_to(end);
+    }
+
+    /// Binds the exception to a `catch (e)` parameter, reading it from the runtime. Shared by the
+    /// try/catch and try/catch/finally paths.
+    fn bind_caught(&mut self, catch: &oxc_ast::ast::CatchClause<'_>) {
         let caught = self.emit(Type::Unknown, Op::CaughtValue);
         if let Some(parameter) = &catch.param {
             match parameter.pattern.get_identifier_name() {
@@ -896,15 +956,307 @@ impl Lowering {
                 None => self.note("destructuring catch parameter", catch.span.start),
             }
         }
-        for inner in &catch.body.body {
+    }
+
+    /// `try … finally` (with or without a `catch`), D-253. The finally block runs on **every** way
+    /// out of the protected region: falling off the end, an uncaught throw, a `return`, and a
+    /// `break`/`continue` that leaves it. Each exit records a completion code (and a value) in two
+    /// slots and jumps to the one finally block, which runs once and then replays the completion —
+    /// so the finally is lowered once, not per exit, and a finally that itself completes abruptly
+    /// (`try { return 1 } finally { return 2 }` is `2`) wins because its own statements terminate
+    /// the block before the replay.
+    fn try_finally(&mut self, statement: &oxc_ast::ast::TryStatement<'_>) {
+        let finally_body = statement
+            .finalizer
+            .as_ref()
+            .expect("try_finally is only called with a finalizer");
+        let completion = self.temporary();
+        let value = self.temporary();
+        let finally_entry = self.new_block();
+        let after = self.new_block();
+        let throw_land = self.new_block();
+
+        // Push the finalizer so a `return`/`break`/`continue` in the body (or catch) routes through
+        // the finally. It records the loop depths so a `break` knows which finallys its jump crosses.
+        let breaks_len = self.scope().breaks.len();
+        let continues_len = self.scope().continues.len();
+        self.scope_mut().finalizers.push(Finalizer {
+            entry: finally_entry,
+            completion,
+            value,
+            breaks_len,
+            continues_len,
+            pending: Vec::new(),
+            next_code: 3.0,
+        });
+
+        // The try body runs under a handler: the `catch` if there is one, else the finally's throw
+        // path directly. A throw the catch does not exist to take therefore still runs the finally.
+        let catch_entry = statement.handler.as_ref().map(|_| self.new_block());
+        let body_handler = catch_entry.unwrap_or(throw_land);
+        self.scope_mut().handlers.push(body_handler);
+        for inner in &statement.block.body {
             self.statement(inner);
         }
+        self.scope_mut().handlers.pop();
+        if !self.scope().terminated {
+            self.set_completion(completion, 0.0);
+            self.terminate(Terminator::Jump {
+                target: finally_entry,
+                args: Vec::new(),
+            });
+        }
+
+        // The catch, if present. Its own throws (and `return`/`break`/`continue`) still run the
+        // finally, so its handler is the finally's throw path and the finalizer is still active.
+        if let (Some(catch_entry), Some(catch)) = (catch_entry, statement.handler.as_ref()) {
+            self.switch_to(catch_entry);
+            self.bind_caught(catch);
+            self.scope_mut().handlers.push(throw_land);
+            for inner in &catch.body.body {
+                self.statement(inner);
+            }
+            self.scope_mut().handlers.pop();
+            if !self.scope().terminated {
+                self.set_completion(completion, 0.0);
+                self.terminate(Terminator::Jump {
+                    target: finally_entry,
+                    args: Vec::new(),
+                });
+            }
+        }
+
+        // Pop the finalizer, but keep it — its `pending` list (filled by breaks/continues above) and
+        // its slots drive the dispatch built below. Popping first means the finally body lowers with
+        // the *outer* finalizers active, so its own abrupt completions route correctly.
+        let finalizer = self.scope_mut().finalizers.pop().expect("just pushed");
+
+        // The throw path: an uncaught throw from the body, or a throw from the catch, lands here and
+        // records a throw completion carrying the thrown value.
+        self.switch_to(throw_land);
+        let caught = self.emit(Type::Unknown, Op::CaughtValue);
+        self.write(value, caught);
+        self.set_completion(completion, 2.0);
         self.terminate(Terminator::Jump {
-            target: end,
+            target: finally_entry,
             args: Vec::new(),
         });
 
-        self.switch_to(end);
+        // The finally block: run the body, then replay whatever completion brought us here.
+        self.switch_to(finally_entry);
+        for inner in &finally_body.body {
+            self.statement(inner);
+        }
+        if !self.scope().terminated {
+            self.emit_finally_dispatch(&finalizer, after);
+        }
+
+        self.switch_to(after);
+    }
+
+    /// Stores a completion code in `slot`.
+    fn set_completion(&mut self, slot: u32, code: f64) {
+        let value = self.emit(Type::Number, Op::Const(Constant::Number(code)));
+        self.write(slot, value);
+    }
+
+    /// After a finally body runs, replays the recorded completion: `1` returns, `2` re-throws, a
+    /// registered break/continue code jumps to its target (or on to the next-outer finally), and
+    /// anything else (`0`) is normal completion, continuing at `after`.
+    fn emit_finally_dispatch(&mut self, finalizer: &Finalizer, after: BlockId) {
+        // Return.
+        let return_block = self.new_block();
+        let next = self.new_block();
+        self.branch_if_completion(finalizer.completion, 1.0, return_block, next);
+        self.switch_to(return_block);
+        let value = self.read(finalizer.value);
+        self.emit_return(Some(value));
+        self.switch_to(next);
+
+        // Throw — re-raise, which reaches the outer handler this try's finalizer sat inside.
+        let throw_block = self.new_block();
+        let next = self.new_block();
+        self.branch_if_completion(finalizer.completion, 2.0, throw_block, next);
+        self.switch_to(throw_block);
+        let value = self.read(finalizer.value);
+        let signal = self.emit(
+            Type::Unknown,
+            Op::Unary {
+                op: UnaryOp::Throw,
+                operand: value,
+            },
+        );
+        self.propagate(signal);
+        if !self.scope().terminated {
+            // The value after a throw never flows on; the block still needs an end.
+            self.terminate(Terminator::Return(Some(signal)));
+        }
+        self.switch_to(next);
+
+        // Each break/continue that routed through this finally.
+        for pending in &finalizer.pending {
+            let case_block = self.new_block();
+            let next = self.new_block();
+            self.branch_if_completion(finalizer.completion, pending.code, case_block, next);
+            self.switch_to(case_block);
+            match &pending.action {
+                PendingAction::Jump(target) => {
+                    self.terminate(Terminator::Jump {
+                        target: *target,
+                        args: Vec::new(),
+                    });
+                }
+                PendingAction::Route {
+                    entry,
+                    completion,
+                    code,
+                } => {
+                    self.set_completion(*completion, *code);
+                    self.terminate(Terminator::Jump {
+                        target: *entry,
+                        args: Vec::new(),
+                    });
+                }
+            }
+            self.switch_to(next);
+        }
+
+        // Normal completion.
+        self.terminate(Terminator::Jump {
+            target: after,
+            args: Vec::new(),
+        });
+    }
+
+    /// Branches to `then_block` when the completion slot holds `code`, else to `else_block`.
+    fn branch_if_completion(
+        &mut self,
+        completion: u32,
+        code: f64,
+        then_block: BlockId,
+        else_block: BlockId,
+    ) {
+        let current = self.read(completion);
+        let code_value = self.emit(Type::Number, Op::Const(Constant::Number(code)));
+        let matches = self.emit(
+            Type::Bool,
+            Op::Compare {
+                op: CompareOp::StrictEqual,
+                left: current,
+                right: code_value,
+            },
+        );
+        self.terminate(Terminator::Branch {
+            condition: matches,
+            then_block,
+            then_args: Vec::new(),
+            else_block,
+            else_args: Vec::new(),
+        });
+    }
+
+    /// `return value` — routing through any active finally first, then finishing a generator with
+    /// the value or returning it plainly (D-253).
+    fn emit_return(&mut self, value: Option<ValueId>) {
+        if let Some(finalizer) = self.scope().finalizers.last() {
+            let (entry, completion, value_slot) =
+                (finalizer.entry, finalizer.completion, finalizer.value);
+            let value =
+                value.unwrap_or_else(|| self.emit(Type::Undefined, Op::Const(Constant::Undefined)));
+            self.write(value_slot, value);
+            self.set_completion(completion, 1.0);
+            self.terminate(Terminator::Jump {
+                target: entry,
+                args: Vec::new(),
+            });
+            return;
+        }
+        if self.scope().generator.is_some() {
+            let value =
+                value.unwrap_or_else(|| self.emit(Type::Undefined, Op::Const(Constant::Undefined)));
+            let this_slot = self.slot("this");
+            let this = self.read(this_slot);
+            self.emit_effect(Op::PropertyStore {
+                object: this,
+                key: PropertyKey::new(GEN_RETURN_KEY),
+                value,
+            });
+            let done = self.emit(Type::Number, Op::Const(Constant::Number(GEN_DONE_SIGNAL)));
+            self.terminate(Terminator::Return(Some(done)));
+            return;
+        }
+        self.terminate(Terminator::Return(value));
+    }
+
+    /// `break`/`continue` to `target`, running any finallys the jump crosses first (D-253). A jump
+    /// that crosses none is a plain jump; one that crosses finallys routes through the innermost,
+    /// whose dispatch runs it and routes on to the next until the outermost jumps to `target`.
+    fn exit_loop(&mut self, target: BlockId, is_continue: bool) {
+        let depth = if is_continue {
+            self.scope().continues.len()
+        } else {
+            self.scope().breaks.len()
+        };
+        // The finallys pushed at this loop's depth are exactly the ones between the jump and its
+        // target loop, innermost last.
+        let crossed: Vec<usize> = self
+            .scope()
+            .finalizers
+            .iter()
+            .enumerate()
+            .filter(|(_, finalizer)| {
+                depth
+                    == if is_continue {
+                        finalizer.continues_len
+                    } else {
+                        finalizer.breaks_len
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if crossed.is_empty() {
+            self.terminate(Terminator::Jump {
+                target,
+                args: Vec::new(),
+            });
+            return;
+        }
+        // One code per crossed finally, linked outermost-to-innermost: the outermost jumps to the
+        // target, each inner one routes to the next-outer.
+        let codes: Vec<f64> = crossed
+            .iter()
+            .map(|&index| {
+                let code = self.scope().finalizers[index].next_code;
+                self.scope_mut().finalizers[index].next_code += 1.0;
+                code
+            })
+            .collect();
+        for (position, &index) in crossed.iter().enumerate() {
+            let action = if position == 0 {
+                PendingAction::Jump(target)
+            } else {
+                let outer = &self.scope().finalizers[crossed[position - 1]];
+                PendingAction::Route {
+                    entry: outer.entry,
+                    completion: outer.completion,
+                    code: codes[position - 1],
+                }
+            };
+            self.scope_mut().finalizers[index].pending.push(Pending {
+                code: codes[position],
+                action,
+            });
+        }
+        let inner = *crossed.last().expect("crossed is non-empty");
+        let (entry, completion) = {
+            let finalizer = &self.scope().finalizers[inner];
+            (finalizer.entry, finalizer.completion)
+        };
+        self.set_completion(completion, *codes.last().expect("codes is non-empty"));
+        self.terminate(Terminator::Jump {
+            target: entry,
+            args: Vec::new(),
+        });
     }
 
     /// `switch`, as a chain of strict comparisons and a run of fall-through blocks.
@@ -1397,32 +1749,15 @@ impl Lowering {
                 self.variable_declaration(declaration);
             }
             Statement::ReturnStatement(statement) => {
-                // Inside a generator, `return e` is not the function's return — it finishes the
-                // generator with `e` as the result and hands the body's `DONE` signal back.
-                if self.scope().generator.is_some() {
-                    // `value_expression` so `return await p` / `return yield x` suspend first, then
-                    // finish with the settled value.
-                    let value = match &statement.argument {
-                        Some(argument) => self.value_expression(argument),
-                        None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
-                    };
-                    let this_slot = self.slot("this");
-                    let this = self.read(this_slot);
-                    self.emit_effect(Op::PropertyStore {
-                        object: this,
-                        key: PropertyKey::new(GEN_RETURN_KEY),
-                        value,
-                    });
-                    let done =
-                        self.emit(Type::Number, Op::Const(Constant::Number(GEN_DONE_SIGNAL)));
-                    self.terminate(Terminator::Return(Some(done)));
-                } else {
-                    let value = statement
-                        .argument
-                        .as_ref()
-                        .map(|argument| self.expression(argument));
-                    self.terminate(Terminator::Return(value));
-                }
+                // `value_expression` so `return await p` / `return yield x` suspend first. The
+                // value is `None` for a bare `return;`, which `emit_return` keeps as such (a plain
+                // `Return(None)`) unless a finally or generator needs a concrete value. `emit_return`
+                // routes through any active finally, then finishes a generator or returns (D-253).
+                let value = statement
+                    .argument
+                    .as_ref()
+                    .map(|argument| self.value_expression(argument));
+                self.emit_return(value);
             }
             Statement::IfStatement(statement) => {
                 let condition = self.expression(&statement.test);
@@ -1532,10 +1867,8 @@ impl Lowering {
                 if statement.label.is_some() {
                     self.note("labelled continue", statement.span.start);
                 } else if let Some(target) = self.scope().continues.last().copied() {
-                    self.terminate(Terminator::Jump {
-                        target,
-                        args: Vec::new(),
-                    });
+                    // Runs any finallys the jump crosses first (D-253).
+                    self.exit_loop(target, true);
                 } else {
                     self.note("continue outside a loop", statement.span.start);
                 }
@@ -1573,10 +1906,8 @@ impl Lowering {
                     // leave the wrong construct.
                     self.note("labelled break", statement.span.start);
                 } else if let Some(target) = self.scope().breaks.last().copied() {
-                    self.terminate(Terminator::Jump {
-                        target,
-                        args: Vec::new(),
-                    });
+                    // Runs any finallys the jump crosses first (D-253).
+                    self.exit_loop(target, false);
                 } else {
                     self.note("break outside a switch or loop", statement.span.start);
                 }
@@ -1641,8 +1972,21 @@ impl Lowering {
             }
             Expression::BinaryExpression(binary) => self.binary(binary),
             Expression::AssignmentExpression(assignment) => {
-                // The right side is evaluated first, so a `yield` there is safe: the target is
-                // resolved afterwards, in the resume block, with nothing live across the suspension.
+                use oxc_ast::ast::AssignmentOperator as AsgOp;
+                // `&&=`, `||=`, `??=` short-circuit — the right side runs only conditionally.
+                if matches!(
+                    assignment.operator,
+                    AsgOp::LogicalAnd | AsgOp::LogicalOr | AsgOp::LogicalNullish
+                ) {
+                    return self.logical_assignment(assignment);
+                }
+                // `+=`, `-=`, … read the target, combine with the right side, and store — the
+                // operator was being ignored, so `x += 1` compiled as `x = 1` (D-254).
+                if let Some(binop) = compound_binop(assignment.operator) {
+                    return self.compound_assignment(assignment, binop);
+                }
+                // Plain `=`. The right side is evaluated first, so a `yield` there is safe: the
+                // target is resolved afterwards, with nothing live across the suspension.
                 let value = self.value_expression(&assignment.right);
                 // Matched on the target's *shape*, not on `get_identifier_name`: that helper
                 // reports the **property** name for `this.x`, so using it turned `this.x = x`
@@ -2270,6 +2614,158 @@ impl Lowering {
         )
     }
 
+    /// `target op= rhs` — reads the target, combines it with the right side under `op`, stores the
+    /// result and answers it (D-254). The target reference is evaluated once: `o[k()] += v` calls
+    /// `k` a single time. The combine can throw (a BigInt mix, a getter), so its result propagates.
+    fn compound_assignment(
+        &mut self,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+        binop: BinaryOp,
+    ) -> ValueId {
+        match &assignment.left {
+            oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                let slot = self.slot(identifier.name.as_str());
+                let current = self.read(slot);
+                let rhs = self.value_expression(&assignment.right);
+                let combined = self.emit(
+                    Type::Unknown,
+                    Op::Binary {
+                        op: binop,
+                        left: current,
+                        right: rhs,
+                    },
+                );
+                let combined = self.propagate(combined);
+                self.write(slot, combined);
+                combined
+            }
+            oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let current = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object,
+                        key: PropertyKey::new(member.property.name.as_str()),
+                    },
+                );
+                let current = self.propagate(current);
+                let rhs = self.value_expression(&assignment.right);
+                let combined = self.emit(
+                    Type::Unknown,
+                    Op::Binary {
+                        op: binop,
+                        left: current,
+                        right: rhs,
+                    },
+                );
+                let combined = self.propagate(combined);
+                let outcome = self.emit(
+                    Type::Unknown,
+                    Op::PropertyStore {
+                        object,
+                        key: PropertyKey::new(member.property.name.as_str()),
+                        value: combined,
+                    },
+                );
+                self.propagate(outcome);
+                combined
+            }
+            oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                let current = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+                let current = self.propagate(current);
+                let rhs = self.value_expression(&assignment.right);
+                let combined = self.emit(
+                    Type::Unknown,
+                    Op::Binary {
+                        op: binop,
+                        left: current,
+                        right: rhs,
+                    },
+                );
+                let combined = self.propagate(combined);
+                let outcome = self.emit(
+                    Type::Unknown,
+                    Op::ComputedStore {
+                        object,
+                        key,
+                        value: combined,
+                    },
+                );
+                self.propagate(outcome);
+                combined
+            }
+            _ => {
+                self.note("assignment target", assignment.span.start);
+                self.value_expression(&assignment.right)
+            }
+        }
+    }
+
+    /// `x &&= y`, `x ||= y`, `x ??= y` — the right side is evaluated and stored only when the
+    /// current value permits it (truthy, falsy, nullish), and the expression answers the final
+    /// value (D-254). Only an identifier target is lowered; a member target is refused.
+    fn logical_assignment(
+        &mut self,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    ) -> ValueId {
+        use oxc_ast::ast::AssignmentOperator as AsgOp;
+        let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) =
+            &assignment.left
+        else {
+            self.note("logical assignment to a member", assignment.span.start);
+            return self.value_expression(&assignment.right);
+        };
+        let slot = self.slot(identifier.name.as_str());
+        let current = self.read(slot);
+        let assign = self.new_block();
+        let skip = self.new_block();
+        let join = self.new_block();
+        // The branch runs the assignment only when the operator says to: `&&=` on a truthy value,
+        // `||=` on a falsy one, `??=` on a nullish one.
+        match assignment.operator {
+            AsgOp::LogicalAnd => self.terminate(Terminator::Branch {
+                condition: current,
+                then_block: assign,
+                then_args: Vec::new(),
+                else_block: skip,
+                else_args: Vec::new(),
+            }),
+            AsgOp::LogicalOr => self.terminate(Terminator::Branch {
+                condition: current,
+                then_block: skip,
+                then_args: Vec::new(),
+                else_block: assign,
+                else_args: Vec::new(),
+            }),
+            _ => {
+                let nullish = self.is_nullish(current);
+                self.terminate(Terminator::Branch {
+                    condition: nullish,
+                    then_block: assign,
+                    then_args: Vec::new(),
+                    else_block: skip,
+                    else_args: Vec::new(),
+                });
+            }
+        }
+        self.switch_to(assign);
+        let rhs = self.value_expression(&assignment.right);
+        self.write(slot, rhs);
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+        self.switch_to(skip);
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+        self.switch_to(join);
+        self.read(slot)
+    }
+
     /// `a?.b.c`, `a?.[k]`, `f?.()` — an optional chain (D-251). Each `?.` short-circuits the whole
     /// chain to `undefined` when its base is nullish; otherwise it evaluates as an ordinary access
     /// or call. The result travels through a slot so the short-circuit and the full evaluation both
@@ -2509,6 +3005,7 @@ impl Lowering {
             continues: Vec::new(),
             generator: None,
             value_types: Vec::new(),
+            finalizers: Vec::new(),
         });
         let this_slot = self.declare("this");
         self.functions[index].this_slot = Some(this_slot);
@@ -2606,6 +3103,7 @@ impl Lowering {
                 is_async,
             }),
             value_types: Vec::new(),
+            finalizers: Vec::new(),
         });
         // The body's `this` is the generator object — how it reaches its resume state and its
         // locals.
@@ -2838,6 +3336,7 @@ impl Lowering {
             continues: Vec::new(),
             generator: None,
             value_types: Vec::new(),
+            finalizers: Vec::new(),
         });
 
         if binds_this {
@@ -3122,6 +3621,7 @@ impl Lowering {
             continues: Vec::new(),
             generator: None,
             value_types: Vec::new(),
+            finalizers: Vec::new(),
         });
         // `this_slot` recorded so the backend binds the incoming receiver — the base constructor did
         // not need it while its body was empty, but a field store writes through `this`.
@@ -3189,6 +3689,7 @@ impl Lowering {
             continues: Vec::new(),
             generator: None,
             value_types: Vec::new(),
+            finalizers: Vec::new(),
         });
         // **Recorded on the function**, exactly as `lower_function` does, so the backend binds the
         // incoming receiver to this slot — without it `this` reads `undefined` and `super()`
@@ -3401,6 +3902,27 @@ impl Lowering {
         }
         result
     }
+}
+
+/// The binary operator a compound assignment applies, or `None` for plain `=` and the logical
+/// forms (`&&=`/`||=`/`??=`, which short-circuit and are handled separately). D-254.
+fn compound_binop(operator: oxc_ast::ast::AssignmentOperator) -> Option<BinaryOp> {
+    use oxc_ast::ast::AssignmentOperator as A;
+    Some(match operator {
+        A::Addition => BinaryOp::Add,
+        A::Subtraction => BinaryOp::Subtract,
+        A::Multiplication => BinaryOp::Multiply,
+        A::Division => BinaryOp::Divide,
+        A::Remainder => BinaryOp::Remainder,
+        A::Exponential => BinaryOp::Exponent,
+        A::ShiftLeft => BinaryOp::ShiftLeft,
+        A::ShiftRight => BinaryOp::ShiftRight,
+        A::ShiftRightZeroFill => BinaryOp::UnsignedShiftRight,
+        A::BitwiseOR => BinaryOp::BitOr,
+        A::BitwiseXOR => BinaryOp::BitXor,
+        A::BitwiseAnd => BinaryOp::BitAnd,
+        A::Assign | A::LogicalAnd | A::LogicalOr | A::LogicalNullish => return None,
+    })
 }
 
 /// A statement's kind, for the unsupported list.

@@ -9912,6 +9912,148 @@ fn class_fields_initialise_each_instance() {
     );
 }
 
+/// `try … finally`: the finally block runs on every way out of the protected region — normal
+/// completion, an uncaught throw, `return`, `break` and `continue` — nested finallys chain in order,
+/// and a finally that completes abruptly overrides the completion it interrupted.
+#[test]
+fn finally_runs_on_every_exit_path() {
+    // Normal completion.
+    check(
+        "finally-normal",
+        "let s = \"\"; try { s = s + \"t\"; } finally { s = s + \"f\"; } return s;",
+        "tf",
+    );
+    // try/catch/finally, all three run.
+    check(
+        "finally-catch-all",
+        "let s = \"\"; try { s = s + \"t\"; throw 0; } catch (e) { s = s + \"c\"; } finally { s = s + \"f\"; } return s;",
+        "tcf",
+    );
+    // Finally runs and the catch does not, on normal completion.
+    check(
+        "finally-catch-skipped",
+        "let s = \"\"; try { s = s + \"t\"; } catch (e) { s = s + \"c\"; } finally { s = s + \"f\"; } return s;",
+        "tf",
+    );
+    // An uncaught throw runs the finally, then propagates to the outer catch.
+    check(
+        "finally-throw-propagates",
+        "let s = \"\"; try { try { throw \"x\"; } finally { s = s + \"f\"; } } catch (e) { s = s + \"c\" + e; } return s;",
+        "fcx",
+    );
+    // `return` runs the finally first (observed through a captured var), then returns.
+    check(
+        "finally-return-runs-first",
+        "var s = \"\"; function g() { try { return 1; } finally { s = s + \"f\"; } } let r = g(); return s + r;",
+        "f1",
+    );
+    // A `return` in the finally overrides the one it interrupted.
+    check(
+        "finally-return-overrides",
+        "return (function () { try { return 1; } finally { return 2; } })();",
+        "2",
+    );
+    // `break` runs the finally before leaving the loop.
+    check(
+        "finally-break",
+        "let s = \"\"; for (let i = 0; i < 3; i = i + 1) { try { if (i == 1) break; s = s + i; } finally { s = s + \"f\"; } } return s;",
+        "0ff",
+    );
+    // `continue` runs the finally before the next iteration.
+    check(
+        "finally-continue",
+        "let s = \"\"; for (let i = 0; i < 3; i = i + 1) { try { if (i == 1) continue; s = s + i; } finally { s = s + \"f\"; } } return s;",
+        "0ff2f",
+    );
+    // Nested finallys run inner-then-outer on a `return` crossing both.
+    check(
+        "finally-nested-return",
+        "var s = \"\"; function g() { try { try { return 1; } finally { s = s + \"a\"; } } finally { s = s + \"b\"; } } \
+         let r = g(); return s + r;",
+        "ab1",
+    );
+    // A `break` crossing two finallys runs both before leaving the loop.
+    check(
+        "finally-nested-break",
+        "let s = \"\"; for (let i = 0; i < 2; i = i + 1) { \
+         try { try { if (i == 0) break; } finally { s = s + \"a\"; } } finally { s = s + \"b\"; } s = s + \"x\"; } return s;",
+        "ab",
+    );
+    // A finally with no catch on a value that is not thrown just runs.
+    check(
+        "finally-no-catch-normal",
+        "let s = \"\"; try { s = s + \"t\"; } finally { s = s + \"f\"; } return s;",
+        "tf",
+    );
+}
+
+/// Compound assignment (`+=`, `-=`, …, `&&=`, `||=`, `??=`): the operator was being ignored, so
+/// `x += 1` compiled as `x = 1`. Each form now reads the target, combines and stores.
+#[test]
+fn compound_assignment_applies_its_operator() {
+    check("compound-add", "let x = 5; x += 3; return x;", "8");
+    check("compound-sub", "let x = 5; x -= 2; return x;", "3");
+    check("compound-mul", "let x = 5; x *= 2; return x;", "10");
+    check("compound-div", "let x = 10; x /= 4; return x;", "2.5");
+    check("compound-rem", "let x = 10; x %= 3; return x;", "1");
+    check("compound-pow", "let x = 2; x **= 3; return x;", "8");
+    check("compound-bitand", "let x = 5; x &= 3; return x;", "1");
+    check("compound-bitor", "let x = 5; x |= 2; return x;", "7");
+    check("compound-bitxor", "let x = 5; x ^= 1; return x;", "4");
+    check("compound-shl", "let x = 1; x <<= 3; return x;", "8");
+    check("compound-shr", "let x = 16; x >>= 2; return x;", "4");
+    // String concatenation — the shape that first exposed the bug.
+    check(
+        "compound-string",
+        "let s = \"a\"; s += \"b\"; s += \"c\"; return s;",
+        "abc",
+    );
+    // A member and a computed target, each evaluated once.
+    check(
+        "compound-member",
+        "let o = { n: 5 }; o.n += 3; return o.n;",
+        "8",
+    );
+    check(
+        "compound-computed",
+        "let a = [1, 2, 3]; a[1] += 10; return a[1];",
+        "12",
+    );
+    check(
+        "compound-evaluates-target-once",
+        "var calls = 0; let a = [0]; function k() { calls = calls + 1; return 0; } \
+         a[k()] += 5; return a[0] + \":\" + calls;",
+        "5:1",
+    );
+    // Compound assignment works across a try/finally boundary (the `+=` bug first showed there).
+    check(
+        "compound-in-finally",
+        "let s = \"a\"; try { s += \"b\"; } finally { s += \"c\"; } return s;",
+        "abc",
+    );
+    // Logical assignment short-circuits: it assigns only when the current value permits.
+    check("logical-and-truthy", "let x = 1; x &&= 5; return x;", "5");
+    check("logical-and-falsy", "let x = 0; x &&= 5; return x;", "0");
+    check("logical-or-falsy", "let x = 0; x ||= 5; return x;", "5");
+    check("logical-or-truthy", "let x = 3; x ||= 5; return x;", "3");
+    check(
+        "logical-nullish-null",
+        "let x = null; x ??= 5; return x;",
+        "5",
+    );
+    check(
+        "logical-nullish-present",
+        "let x = 0; x ??= 5; return x;",
+        "0",
+    );
+    // The right side of a logical assignment runs only when it assigns.
+    check(
+        "logical-short-circuits-rhs",
+        "let ran = 0; let x = 3; x ||= (ran = 1); return x + \":\" + ran;",
+        "3:0",
+    );
+}
+
 /// **A proxy answers through its handler, or forwards to its target when there is no trap** —
 /// which is what makes a handler with one trap a pass-through for everything else.
 #[test]

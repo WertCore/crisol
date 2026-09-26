@@ -7026,3 +7026,47 @@ Scope: a class with **both** fields and an explicit constructor is refused (note
 silently dropping the fields — injecting into a user-written body, around a `super()` that may sit
 anywhere in it, is the harder half and is not done. Also deferred: static fields, computed-name
 fields, private fields (`#x`), and static blocks.
+
+## D-253
+
+**try/finally — a completion record replayed after one finally block.**
+
+Status: Accepted
+
+The finally block runs on **every** way out of the protected region: falling off the end, an
+uncaught throw, `return`, `break` and `continue`. Rather than duplicate the finally at each exit (and
+re-lower its body N times), each exit writes a completion code and a value into two slots and jumps
+to a single finally block; the block runs the body once and then *replays* the completion — `1`
+returns, `2` re-throws, and a break/continue gets a code registered in the finalizer's `pending`
+list. A `Finalizer` on a per-scope stack carries the block, the slots, and the `breaks.len()`/
+`continues.len()` at push time, which is what tells a plain `break` exactly which finallys its jump
+crosses (those pushed at the same loop depth).
+
+Nested finallys chain naturally: the finalizer is popped *before* its body lowers, so a `return`
+inside the body routes through the outer finalizers still on the stack, and `emit_return` is the same
+code the plain `return` statement uses. A break crossing two finallys registers a code in each,
+linked innermost-to-outermost, the outermost jumping to the loop target. A finally that completes
+abruptly itself (`try { return 1 } finally { return 2 }` is `2`) wins for free: its own statements
+terminate the block before the replay is reached. `throw` routes through the handler stack — the
+try's body handler is the catch (if any) or the finally's throw path — so a throw the catch rethrows,
+or one with no catch, still runs the finally. Generators reuse the same `emit_return` (a return runs
+the finally, then the generator finish), so `try/finally` in a generator falls out.
+
+## D-254
+
+**Compound assignment applied its operator — a bug fix found while building try/finally.**
+
+Status: Accepted
+
+`AssignmentExpression` lowering ignored `assignment.operator` and stored the right side directly, so
+`x += 1` compiled as `x = 1`, `sum += v` as `sum = v`, and so on for every `-=`/`*=`/`&=`/… form —
+silently wrong, and pervasive. It went unseen because no test used a compound operator; it surfaced
+as `try { s += "t" } finally { s += "f" }` answering `"f"` (each `+=` an overwrite) while the same
+program with `s = s + …` was correct, which is what isolated it from try/finally itself.
+
+Fixed: an arithmetic/bitwise compound reads the target, applies the binary operator with the right
+side, and stores — the target reference evaluated once, so `o[k()] += v` calls `k` a single time, and
+the combine propagated since a BigInt mix or a getter can throw. The logical forms (`&&=`, `||=`,
+`??=`) short-circuit: the right side is evaluated and stored only when the current value permits
+(truthy, falsy, nullish). Plain `=` is untouched. A member target for a *logical* assignment is the
+one case still refused.
