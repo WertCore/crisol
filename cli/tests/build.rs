@@ -3410,6 +3410,46 @@ fn bigints_are_arbitrary_precision_integers() {
          catch (e) { return e instanceof TypeError; }",
         "true",
     );
+
+    // BigInt64Array / BigUint64Array: elements are BigInts, not Numbers.
+    check(
+        "bigint64-store-load",
+        "let a = new BigInt64Array(3); a[0] = 5n; return a[0];",
+        "5n",
+    );
+    check(
+        "bigint64-zero-init",
+        "return new BigInt64Array(2)[0];",
+        "0n",
+    );
+    check(
+        "bigint64-from-array",
+        "let a = new BigInt64Array([10n, 20n, 30n]); return a[0] + a[1] + a[2];",
+        "60n",
+    );
+    check(
+        "bigint64-length",
+        "return new BigUint64Array([1n, 2n, 3n]).length;",
+        "3",
+    );
+    // Signed wraps to i64, unsigned to u64 — same stored bytes, different reads.
+    check(
+        "bigint64-signed-wrap",
+        "let a = new BigInt64Array(1); a[0] = 18446744073709551615n; return a[0];",
+        "-1n",
+    );
+    check(
+        "biguint64-unsigned-wrap",
+        "let a = new BigUint64Array(1); a[0] = -1n; return a[0];",
+        "18446744073709551615n",
+    );
+    // Writing a Number into a BigInt array is a TypeError (ToBigInt, not NumberToBigInt).
+    check(
+        "bigint64-number-store-throws",
+        "let a = new BigInt64Array(1); \
+         try { a[0] = 5; return \"no\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
 }
 
 /// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults

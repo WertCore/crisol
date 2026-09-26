@@ -6913,6 +6913,12 @@ BigInt, a reference the collector must root, and typing it `Number` unconditiona
 freed it under GC stress. The same operators now propagate exceptions when their result is `unknown`,
 since a BigInt operator can throw where number arithmetic never does.
 
-Deferred to the library-surface follow-up: the `BigInt()` function, `BigInt.asIntN`/`asUintN`,
-`BigInt.prototype.toString`/`valueOf`, and `BigInt64Array`/`BigUint64Array`. `~` on a BigInt is out
-of reach until `~` itself is supported (it is an unimplemented unary operator for numbers too).
+Shipped across four commits: the value re-encoding + every operator; the `BigInt()` function (a
+Number converts here via `NumberToBigInt`, the one place it may) and `BigInt.asIntN`/`asUintN`;
+`BigInt.prototype.toString`(radix)/`valueOf`/`toLocaleString`; and `BigInt64Array`/`BigUint64Array`
+— two new `ElementKind`s (the fixed typed-array arrays grew 9→11, the two BigInt kinds last so the
+Number tags held), whose integer-indexed get/set take the BigInt path (`ToBigInt`, where a Number is
+a `TypeError` — *not* `NumberToBigInt`, which is the asymmetry that makes `bigIntArray[0] = 1` throw).
+The stored bytes are `value mod 2**64`, identical for signed and unsigned; only the read distinguishes
+them. Still deferred: `DataView.prototype.getBigInt64`/`setBigInt64` (a separate method surface), and
+`~` on a BigInt (out of reach until `~` is supported for Numbers, which it is not).

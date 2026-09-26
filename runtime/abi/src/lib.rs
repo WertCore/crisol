@@ -739,11 +739,11 @@ thread_local! {
     /// what each per-kind prototype below inherits from.
     static TYPED_ARRAY_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
-    /// The nine per-kind prototypes (`Int8Array.prototype`, …), in [`ELEMENT_KINDS`] order. Each
-    /// carries its own `BYTES_PER_ELEMENT` and `constructor` and inherits the shared methods from
-    /// [`TYPED_ARRAY_PROTOTYPE`].
-    static TYPED_ARRAY_PROTOTYPES: [std::cell::Cell<Option<GcRef>>; 9] =
-        const { [const { std::cell::Cell::new(None) }; 9] };
+    /// The eleven per-kind prototypes (`Int8Array.prototype`, …, `BigUint64Array.prototype`), in
+    /// [`ELEMENT_KINDS`] order. Each carries its own `BYTES_PER_ELEMENT` and `constructor` and
+    /// inherits the shared methods from [`TYPED_ARRAY_PROTOTYPE`].
+    static TYPED_ARRAY_PROTOTYPES: [std::cell::Cell<Option<GcRef>>; 11] =
+        const { [const { std::cell::Cell::new(None) }; 11] };
     /// The prototype every `DataView` inherits from.
     static DATA_VIEW_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
@@ -1740,12 +1740,14 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("Uint32Array", make_uint32_array),
     ("Float32Array", make_float32_array),
     ("Float64Array", make_float64_array),
+    ("BigInt64Array", make_bigint64_array),
+    ("BigUint64Array", make_biguint64_array),
     ("DataView", make_data_view),
     ("BigInt", bigint_global),
 ];
 
-/// The nine typed-array constructor names, in [`ELEMENT_KINDS`] order.
-const TYPED_ARRAY_NAMES: [&str; 9] = [
+/// The eleven typed-array constructor names, in [`ELEMENT_KINDS`] order.
+const TYPED_ARRAY_NAMES: [&str; 11] = [
     "Int8Array",
     "Uint8Array",
     "Uint8ClampedArray",
@@ -1755,6 +1757,8 @@ const TYPED_ARRAY_NAMES: [&str; 9] = [
     "Uint32Array",
     "Float32Array",
     "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
 ];
 
 /// The natives behind the `ArrayBuffer` and typed-array prototypes, installed by hand in
@@ -2363,10 +2367,16 @@ enum ElementKind {
     U32,
     F32,
     F64,
+    /// `BigInt64Array` — a 64-bit signed element read and written as a BigInt, not a Number
+    /// (D-248), since an `i64` does not fit an `f64` exactly.
+    I64,
+    /// `BigUint64Array`.
+    U64,
 }
 
-/// The kinds in tag order — the order every table that lists the typed arrays uses.
-const ELEMENT_KINDS: [ElementKind; 9] = [
+/// The kinds in tag order — the order every table that lists the typed arrays uses. The two
+/// BigInt kinds come last, so the nine Number kinds keep their tags.
+const ELEMENT_KINDS: [ElementKind; 11] = [
     ElementKind::I8,
     ElementKind::U8,
     ElementKind::U8Clamped,
@@ -2376,6 +2386,8 @@ const ELEMENT_KINDS: [ElementKind; 9] = [
     ElementKind::U32,
     ElementKind::F32,
     ElementKind::F64,
+    ElementKind::I64,
+    ElementKind::U64,
 ];
 
 impl ElementKind {
@@ -2395,8 +2407,13 @@ impl ElementKind {
             Self::I8 | Self::U8 | Self::U8Clamped => 1,
             Self::I16 | Self::U16 => 2,
             Self::I32 | Self::U32 | Self::F32 => 4,
-            Self::F64 => 8,
+            Self::F64 | Self::I64 | Self::U64 => 8,
         }
+    }
+
+    /// Whether this kind's elements are BigInts rather than Numbers.
+    fn is_bigint(self) -> bool {
+        matches!(self, Self::I64 | Self::U64)
     }
 
     /// The constructor name, which is also the `Symbol.toStringTag`.
@@ -2411,7 +2428,32 @@ impl ElementKind {
             Self::U32 => "Uint32Array",
             Self::F32 => "Float32Array",
             Self::F64 => "Float64Array",
+            Self::I64 => "BigInt64Array",
+            Self::U64 => "BigUint64Array",
         }
+    }
+
+    /// Decodes one BigInt element from `b`, exactly eight little-endian bytes — signed for
+    /// `I64`, unsigned for `U64`. The stored bytes are identical either way; only the reading
+    /// interpretation differs.
+    fn read_bigint(self, b: &[u8]) -> BigInt {
+        let bytes = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+        match self {
+            Self::U64 => BigInt::from(u64::from_le_bytes(bytes)),
+            // I64 and, defensively, anything else asking for a BigInt read.
+            _ => BigInt::from(i64::from_le_bytes(bytes)),
+        }
+    }
+
+    /// Encodes a BigInt into eight little-endian bytes — its value modulo `2**64`, which is what
+    /// `BigInt64Array` and `BigUint64Array` both store (the read is what distinguishes them).
+    fn bigint_to_bytes(self, value: &BigInt) -> [u8; 8] {
+        let modulus = BigInt::from(1u128 << 64);
+        let mut low = value % &modulus;
+        if low.is_negative() {
+            low += &modulus;
+        }
+        low.to_u64().unwrap_or(0).to_le_bytes()
     }
 
     /// Decodes one element from `b`, which is exactly [`ElementKind::bytes`] long and
@@ -2426,6 +2468,23 @@ impl ElementKind {
             Self::U32 => f64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
             Self::F32 => f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
             Self::F64 => f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+            // The BigInt kinds are read through `read_bigint`; the typed-array load path branches
+            // before reaching here. These arms keep the match total with a defined, if lossy,
+            // Number view rather than a panic.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "unreached fallback for a BigInt kind"
+            )]
+            Self::I64 => {
+                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
+            }
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "unreached fallback for a BigInt kind"
+            )]
+            Self::U64 => {
+                u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
+            }
         }
     }
 
@@ -2438,6 +2497,17 @@ impl ElementKind {
             Self::U8Clamped => out[0] = clamp_to_u8(value),
             Self::F32 => out[..4].copy_from_slice(&narrow_to_f32(value).to_le_bytes()),
             Self::F64 => out = value.to_le_bytes(),
+            // The BigInt kinds encode through `bigint_to_bytes`; the store path branches before
+            // reaching here. Kept off the `_` arm because `wrap_to_bits(_, 64)` would shift a
+            // `u64` by 64. A saturating cast is the defined, unreached fallback.
+            Self::I64 | Self::U64 => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "saturating fallback for a BigInt kind that this path does not take"
+                )]
+                let wrapped = value.trunc() as i64;
+                out = wrapped.to_le_bytes();
+            }
             _ => {
                 let bits = self.bytes() * 8;
                 out = wrap_to_bits(value, bits).to_le_bytes();
@@ -2610,6 +2680,7 @@ fn typed_array_element_load(object: u64, index: usize) -> u64 {
     };
     let at = offset + index * kind.bytes();
     match with_runtime(|runtime| runtime.heap.read_bytes(handle, at, kind.bytes())) {
+        Some(bytes) if kind.is_bigint() => new_bigint(&kind.read_bigint(&bytes)),
         Some(bytes) => Value::number(kind.read(&bytes)).to_bits(),
         None => Value::UNDEFINED.to_bits(),
     }
@@ -2619,6 +2690,11 @@ fn typed_array_element_load(object: u64, index: usize) -> u64 {
 /// of range is a no-op, as the specification's integer-indexed `[[Set]]` requires. Returns the
 /// exception if coercion threw. The caller has established that `object` is a typed array.
 fn typed_array_element_store(object: u64, index: usize, value: u64) -> Option<u64> {
+    // A BigInt array coerces with `ToBigInt`, every other with `ToNumber`, and the kind is fixed
+    // for the array's life, so it decides which coercion runs.
+    if matches!(typed_array_parts(object), Some((.., kind)) if kind.is_bigint()) {
+        return typed_array_element_store_bigint(object, index, value);
+    }
     // **The coercion happens even when the index is out of range**, because it can run a
     // `valueOf` the specification observes, and the store is skipped only afterwards.
     let number = match coerce_number(value) {
@@ -2634,6 +2710,30 @@ fn typed_array_element_store(object: u64, index: usize, value: u64) -> Option<u6
     let bytes = kind.to_bytes(number);
     with_runtime(|runtime| runtime.heap.write_bytes(handle, at, &bytes[..kind.bytes()]));
     None
+}
+
+/// [`typed_array_element_store`] for a `BigInt64Array`/`BigUint64Array`: `ToBigInt` in place of
+/// `ToNumber`. Split out so the Number path — the common one — carries none of this.
+fn typed_array_element_store_bigint(object: u64, index: usize, value: u64) -> Option<u64> {
+    // `ToBigInt` is observable and runs before the bounds check, as the Number coercion does.
+    let coerced = to_bigint(value);
+    if Value::from_bits(coerced).is_exception() {
+        return Some(coerced);
+    }
+    // The coerced BigInt is rooted across the parts read below, which allocates nothing but keeps
+    // the discipline uniform.
+    with_rooted(&[coerced], || {
+        let (buffer, offset, length, kind) = typed_array_parts(object)?;
+        if index >= length {
+            return None;
+        }
+        let handle = handle_of(buffer)?;
+        let magnitude = bigint_of(coerced)?;
+        let at = offset + index * kind.bytes();
+        let bytes = kind.bigint_to_bytes(&magnitude);
+        with_runtime(|runtime| runtime.heap.write_bytes(handle, at, &bytes));
+        None
+    })
 }
 
 /// Builds an `ArrayBuffer` of `length` zeroed bytes.
@@ -3213,6 +3313,28 @@ extern "C" fn make_float64_array(
 ) -> u64 {
     // SAFETY: as above.
     unsafe { new_typed_array(ElementKind::F64, argc, argv) }
+}
+
+extern "C" fn make_bigint64_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::I64, argc, argv) }
+}
+
+extern "C" fn make_biguint64_array(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: as above.
+    unsafe { new_typed_array(ElementKind::U64, argc, argv) }
 }
 
 // ============================== DataView ==============================
@@ -3903,34 +4025,56 @@ extern "C" fn bigint_global(
     // SAFETY: the convention guarantees `argc` readable values at `argv`. `BigInt()` with no
     // argument coerces `undefined`, which is a `TypeError`.
     let value = unsafe { argument(argc, argv, 0) };
-    with_rooted(&[value], || to_bigint(value))
+    with_rooted(&[value], || {
+        // **`BigInt(x)` is the one place a Number converts.** It uses `NumberToBigInt` — an
+        // integer becomes the BigInt, a fraction is a `RangeError` — where every *other* caller
+        // (`ToBigInt`, below) rejects a Number outright. An object is taken to a primitive first,
+        // with the number hint, and re-dispatched.
+        let held = Value::from_bits(value);
+        match held.kind() {
+            crisol_value::Kind::Number => number_to_bigint(held.as_number().unwrap_or(f64::NAN)),
+            crisol_value::Kind::Object => {
+                let primitive = to_primitive(value);
+                if Value::from_bits(primitive).kind() == crisol_value::Kind::Number {
+                    return number_to_bigint(
+                        Value::from_bits(primitive).as_number().unwrap_or(f64::NAN),
+                    );
+                }
+                with_rooted(&[primitive], || to_bigint(primitive))
+            }
+            _ => to_bigint(value),
+        }
+    })
 }
 
-/// `ToBigInt` — what `BigInt(x)` and a few internal operations perform.
+/// `NumberToBigInt` — a Number to a BigInt, which only `BigInt(x)` performs. An integer becomes
+/// the BigInt of the same value; a fraction or a non-finite Number is a `RangeError`.
+fn number_to_bigint(number: f64) -> u64 {
+    if !number.is_finite() || number.fract() != 0.0 {
+        return raise(
+            "The number is not a safe integer and cannot be converted to a BigInt",
+            "RangeError",
+        );
+    }
+    // `{:.0}` prints the integer exactly, so no precision is lost above 2^53.
+    BigInt::parse_bytes(format!("{number:.0}").as_bytes(), 10).map_or_else(
+        || raise("cannot convert this number to a BigInt", "RangeError"),
+        |value| new_bigint(&value),
+    )
+}
+
+/// `ToBigInt` — the coercion typed-array writes, `asIntN`/`asUintN` and the operators use.
 ///
-/// Stricter than `ToNumber`: a non-integer or non-finite Number is a `RangeError`, an
-/// unparseable string a `SyntaxError`, and `undefined`, `null` and a Symbol a `TypeError`. Only
-/// a Boolean, a String, a Number that is an integer, and a BigInt convert.
+/// **A Number is a `TypeError` here, integer or not** — the asymmetry with `BigInt(x)` above is
+/// deliberate and specified, so that `bigIntArray[0] = 1` throws rather than silently narrowing.
+/// A Boolean is `0n`/`1n`, a String parses (a bad one is a `SyntaxError`), and `undefined`,
+/// `null` and a Symbol are `TypeError`s.
 fn to_bigint(value: u64) -> u64 {
     let held = Value::from_bits(value);
     match held.kind() {
         crisol_value::Kind::BigInt => value,
         crisol_value::Kind::Boolean => {
             new_bigint(&BigInt::from(i32::from(held.as_boolean().unwrap_or(false))))
-        }
-        crisol_value::Kind::Number => {
-            let number = held.as_number().unwrap_or(f64::NAN);
-            if !number.is_finite() || number.fract() != 0.0 {
-                return raise(
-                    "The number is not a safe integer and cannot be converted to a BigInt",
-                    "RangeError",
-                );
-            }
-            // `{:.0}` prints the integer exactly, so no precision is lost above 2^53.
-            BigInt::parse_bytes(format!("{number:.0}").as_bytes(), 10).map_or_else(
-                || raise("cannot convert this number to a BigInt", "RangeError"),
-                |value| new_bigint(&value),
-            )
         }
         crisol_value::Kind::String => text_of(value)
             .and_then(|text| string_to_bigint(&text))
@@ -3947,7 +4091,7 @@ fn to_bigint(value: u64) -> u64 {
             }
             with_rooted(&[primitive], || to_bigint(primitive))
         }
-        // `undefined`, `null` and a Symbol have no BigInt.
+        // A Number (integer or not), `undefined`, `null` and a Symbol have no `ToBigInt`.
         _ => raise("Cannot convert this value to a BigInt", "TypeError"),
     }
 }
