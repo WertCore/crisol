@@ -106,6 +106,10 @@ pub enum Constant {
     Number(f64),
     /// A string.
     String(String),
+    /// A BigInt, as the base-10 digit string the parser normalised the literal to (`0xFFn`
+    /// arrives here as `"255"`). Kept as text because the value is unbounded — it cannot be a
+    /// machine word — and the runtime is what turns it into a heap cell (D-248).
+    BigInt(String),
 }
 
 impl Constant {
@@ -118,6 +122,9 @@ impl Constant {
             Self::Bool(_) => Type::Bool,
             Self::Number(_) => Type::Number,
             Self::String(_) => Type::String,
+            // No `Type::BigInt` in the lattice, as there is none for symbols either: the
+            // optimiser treats a BigInt as an opaque value rather than reasoning about it.
+            Self::BigInt(_) => Type::Unknown,
         }
     }
 }

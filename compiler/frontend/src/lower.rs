@@ -148,6 +148,13 @@ struct Scope {
     /// Set while lowering a generator body: the resume points `yield` has produced. `None` for an
     /// ordinary function, so a `yield` outside a generator is refused rather than miscompiled.
     generator: Option<GenState>,
+    /// The type of each SSA value this function has produced, indexed by [`ValueId::index`].
+    ///
+    /// Kept so a lowering step can ask an operand's type — arithmetic needs it to decide whether
+    /// a result is a Number (both operands provably numbers, so it cannot be a BigInt and needs
+    /// no rooting) or `Unknown` (a BigInt is possible, so the collector must be able to see it).
+    /// Per scope because a `ValueId` is numbered within one function (D-248).
+    value_types: Vec<Type>,
 }
 
 /// What a generator body accumulates as it lowers: one resume point per `yield`, and which slots
@@ -232,6 +239,7 @@ impl Lowering {
                 handlers: Vec::new(),
                 continues: Vec::new(),
                 generator: None,
+                value_types: Vec::new(),
             }],
             unsupported: Vec::new(),
         };
@@ -255,6 +263,17 @@ impl Lowering {
 
     fn scope(&self) -> &Scope {
         self.scopes.last().expect("a scope is always open")
+    }
+
+    /// The type the IR gave a value, or `Unknown` if it was produced somewhere that did not record
+    /// one (a block parameter, say). `Unknown` is the safe answer — it only ever causes *more*
+    /// rooting, never less.
+    fn type_of(&self, id: ValueId) -> Type {
+        self.scope()
+            .value_types
+            .get(id.index() as usize)
+            .copied()
+            .unwrap_or(Type::Unknown)
     }
 
     fn scope_mut(&mut self) -> &mut Scope {
@@ -1073,6 +1092,14 @@ impl Lowering {
 
     fn emit(&mut self, ty: Type, op: Op) -> ValueId {
         let result = self.function_mut().value();
+        // Record the result's type so a later step can ask an operand's — arithmetic uses it to
+        // tell a Number result (needs no rooting) from one that might be a BigInt (does).
+        let index = result.index() as usize;
+        let scope = self.scope_mut();
+        if scope.value_types.len() <= index {
+            scope.value_types.resize(index + 1, Type::Unknown);
+        }
+        scope.value_types[index] = ty;
         // The live set is empty because locals are in slots rather than in SSA values, so
         // nothing an allocation could invalidate is being held in one. When `mem2reg` lands
         // (M12) and values start living across allocations, this is where the live set gets
@@ -1550,6 +1577,13 @@ impl Lowering {
                 Type::String,
                 Op::Const(Constant::String(literal.value.to_string())),
             ),
+            // `literal.value` is already the base-10 digits the parser normalised `0xFFn` and
+            // `0b101n` down to, so the runtime parses one radix and the frontend needs no
+            // arbitrary-precision arithmetic of its own.
+            Expression::BigIntLiteral(literal) => self.emit(
+                Type::Unknown,
+                Op::Const(Constant::BigInt(literal.value.to_string())),
+            ),
             Expression::BooleanLiteral(literal) => {
                 self.emit(Type::Bool, Op::Const(Constant::Bool(literal.value)))
             }
@@ -1969,23 +2003,51 @@ impl Lowering {
         };
         let left = self.expression(&binary.left);
         let right = self.expression(&binary.right);
-        // Everything except `+` coerces with `ToNumber` and produces a number. `+` may
-        // concatenate, so its result is `Unknown` unless something later proves otherwise —
-        // typing it `Number` would let codegen emit a float add for a string concatenation.
-        let ty = if op.is_always_numeric() {
-            Type::Number
-        } else if op.is_always_boolean() {
+        // **A result is a Number only when both operands are provably Numbers.** Then it cannot be
+        // a BigInt or a string, so codegen may inline it and the collector need not root it. With
+        // anything else an operand could be a BigInt — and every arithmetic operator on two
+        // BigInts *produces* one (D-248), a heap reference the collector has to see — so the result
+        // is `Unknown` and gets rooted. Typing it `Number` unconditionally, as this once did, left
+        // a BigInt result invisible to the collector and freed under GC stress.
+        let both_numbers =
+            self.type_of(left) == Type::Number && self.type_of(right) == Type::Number;
+        let ty = if op.is_always_boolean() {
             Type::Bool
+        } else if matches!(op, BinaryOp::Add) {
+            // `+` stays `unknown` even for two numbers: codegen never inlines it, and typing it a
+            // Number could let a *consumer* inline a string concatenation as a float add. It may
+            // also concatenate or add BigInts.
+            Type::Unknown
+        } else if both_numbers {
+            Type::Number
         } else {
-            // `+` alone, which may concatenate — typing it `Number` would let codegen emit a
-            // float add for a string concatenation.
             Type::Unknown
         };
         let result = self.emit(ty, Op::Binary { op, left, right });
-        // **Only `in` can raise**, so only `in` pays for the check. `instanceof` and `+` answer
-        // for every input they are given, and the other operators coerce with `ToNumber`, which
-        // has no failing case over the values this engine has.
+        // **`in` can always raise**, so it always checks.
         if matches!(op, BinaryOp::In) {
+            return self.propagate(result);
+        }
+        // A BigInt operator raises on a type mismatch (`1n + 1`), a zero divisor (`1n / 0n`) or an
+        // unsigned right shift. It cannot when both operands are proven Numbers — then `ty` is
+        // `Number` — so the common numeric path stays a plain instruction with no unwind branch,
+        // and only the `Unknown` case pays for the check.
+        let arithmetic = matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::Divide
+                | BinaryOp::Remainder
+                | BinaryOp::Exponent
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::UnsignedShiftRight
+        );
+        if arithmetic && ty == Type::Unknown {
             return self.propagate(result);
         }
         result
@@ -1993,7 +2055,25 @@ impl Lowering {
 
     fn unary(&mut self, unary: &UnaryExpression<'_>) -> ValueId {
         let (op, ty) = match unary.operator {
-            UnaryOperator::UnaryNegation => (UnaryOp::Negate, Type::Number),
+            UnaryOperator::UnaryNegation => {
+                let operand = self.expression(&unary.argument);
+                // `-x` is a Number when `x` is one; on a BigInt it stays a BigInt — a reference
+                // the collector must see — so an unproven operand yields `Unknown`, which roots it.
+                let ty = if self.type_of(operand) == Type::Number {
+                    Type::Number
+                } else {
+                    Type::Unknown
+                };
+                return self.emit(
+                    ty,
+                    Op::Unary {
+                        op: UnaryOp::Negate,
+                        operand,
+                    },
+                );
+            }
+            // `+` is always a Number: on a BigInt it throws, and the exception signal is a
+            // singleton that needs no rooting, so `Number` stays sound.
             UnaryOperator::UnaryPlus => (UnaryOp::ToNumber, Type::Number),
             // `!` is `ToBoolean` inverted, so it always produces a boolean and never fails.
             UnaryOperator::LogicalNot => (UnaryOp::Not, Type::Bool),
@@ -2024,7 +2104,13 @@ impl Lowering {
             UnaryOperator::Delete => return self.delete(unary),
         };
         let operand = self.expression(&unary.argument);
-        self.emit(ty, Op::Unary { op, operand })
+        let result = self.emit(ty, Op::Unary { op, operand });
+        // `+x` raises a `TypeError` on a BigInt — the one coercion the language forbids. A proven
+        // Number cannot, so only the unproven case checks.
+        if matches!(op, UnaryOp::ToNumber) && self.type_of(operand) != Type::Number {
+            return self.propagate(result);
+        }
+        result
     }
 
     /// `&&`, `||` and `??`, which are **control flow rather than operators**.
@@ -2183,6 +2269,7 @@ impl Lowering {
             handlers: Vec::new(),
             continues: Vec::new(),
             generator: None,
+            value_types: Vec::new(),
         });
         let this_slot = self.declare("this");
         self.functions[index].this_slot = Some(this_slot);
@@ -2264,6 +2351,7 @@ impl Lowering {
                 resumes: Vec::new(),
                 locals: HashMap::new(),
             }),
+            value_types: Vec::new(),
         });
         // The body's `this` is the generator object — how it reaches its resume state and its
         // locals.
@@ -2474,6 +2562,7 @@ impl Lowering {
             handlers: Vec::new(),
             continues: Vec::new(),
             generator: None,
+            value_types: Vec::new(),
         });
 
         if binds_this {
@@ -2730,6 +2819,7 @@ impl Lowering {
             handlers: Vec::new(),
             continues: Vec::new(),
             generator: None,
+            value_types: Vec::new(),
         });
         self.declare("this");
         self.terminate(Terminator::Return(None));
@@ -2762,6 +2852,7 @@ impl Lowering {
             handlers: Vec::new(),
             continues: Vec::new(),
             generator: None,
+            value_types: Vec::new(),
         });
         // **Recorded on the function**, exactly as `lower_function` does, so the backend binds the
         // incoming receiver to this slot — without it `this` reads `undefined` and `super()`

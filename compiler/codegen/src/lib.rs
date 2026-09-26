@@ -149,6 +149,12 @@ pub trait Backend {
 /// is the defining list and a test here checks this against it.
 const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
     (BinaryOp::Add, "crisol_add"),
+    // Subtract, multiply and divide are inlined as `f64` when the IR proves both operands
+    // numeric; these are the fallback for operands it cannot, where a BigInt or a coercion may
+    // be involved.
+    (BinaryOp::Subtract, "crisol_subtract"),
+    (BinaryOp::Multiply, "crisol_multiply"),
+    (BinaryOp::Divide, "crisol_divide"),
     (BinaryOp::Remainder, "crisol_remainder"),
     (BinaryOp::Exponent, "crisol_exponent"),
     (BinaryOp::BitAnd, "crisol_bit_and"),
@@ -185,6 +191,7 @@ const STRICT_EQUAL_SYMBOL: &str = "crisol_strict_equal";
 const THROW_SYMBOL: &str = "crisol_throw";
 const PENDING_EXCEPTION_SYMBOL: &str = "crisol_pending_exception";
 const CREATE_STRING_SYMBOL: &str = "crisol_create_string";
+const CREATE_BIGINT_SYMBOL: &str = "crisol_create_bigint";
 const TRUTHY_SYMBOL: &str = "crisol_truthy";
 const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
 const DELETE_SYMBOL: &str = "crisol_delete";
@@ -251,6 +258,8 @@ struct ObjectHelpers<T> {
     pending: T,
     /// `crisol_create_string(text, length) -> string`
     create_string: T,
+    /// `crisol_create_bigint(digits, length) -> bigint`
+    create_bigint: T,
     /// One per unary operator that needs a runtime coercion.
     unary: Vec<(crisol_ir::UnaryOp, T)>,
     /// `crisol_truthy(value) -> boolean`
@@ -378,6 +387,13 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     create_string.params.push(AbiParam::new(types::I64));
     create_string.returns.push(AbiParam::new(types::I64));
 
+    // `crisol_create_bigint` takes the same (pointer, length) as `create_string` — the digits are
+    // base-10 text — and returns a BigInt-tagged value.
+    let mut create_bigint = module.make_signature();
+    create_bigint.params.push(AbiParam::new(pointer));
+    create_bigint.params.push(AbiParam::new(types::I64));
+    create_bigint.returns.push(AbiParam::new(types::I64));
+
     let mut truthy = module.make_signature();
     truthy.params.push(AbiParam::new(types::I64));
     truthy.returns.push(AbiParam::new(types::I64));
@@ -480,6 +496,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         throw: declare(THROW_SYMBOL, &throw)?,
         pending: declare(PENDING_EXCEPTION_SYMBOL, &pending)?,
         create_string: declare(CREATE_STRING_SYMBOL, &create_string)?,
+        create_bigint: declare(CREATE_BIGINT_SYMBOL, &create_bigint)?,
         truthy: declare(TRUTHY_SYMBOL, &truthy)?,
         global_load: declare(GLOBAL_LOAD_SYMBOL, &global_load)?,
         delete: declare(DELETE_SYMBOL, &delete)?,
@@ -548,6 +565,9 @@ fn keys_of(function: &Function) -> Vec<String> {
                 | Op::GlobalLoad { name: key }
                 | Op::GlobalLoadOptional { name: key } => key.as_str(),
                 Op::Const(Constant::String(text)) => text.as_str(),
+                // A BigInt literal's digits are baked and interned exactly like a string's: the
+                // runtime takes a pointer and a length and parses them into a heap cell.
+                Op::Const(Constant::BigInt(digits)) => digits.as_str(),
                 // A pattern and its flags are interned the same way, so the data section holds
                 // one copy of each however often the literal appears.
                 Op::CreateRegExp { source, flags } => {
@@ -1016,6 +1036,9 @@ impl Backend for Cranelift {
             create_string: self
                 .module
                 .declare_func_in_func(self.objects.create_string, &mut context.func),
+            create_bigint: self
+                .module
+                .declare_func_in_func(self.objects.create_bigint, &mut context.func),
             truthy: self
                 .module
                 .declare_func_in_func(self.objects.truthy, &mut context.func),
@@ -1384,6 +1407,16 @@ impl Lowering<'_> {
                     .call(self.objects.create_string, &[pointer, length]);
                 Some(self.builder.inst_results(call)[0])
             }
+            Op::Const(Constant::BigInt(digits)) => {
+                // Same shape as a string constant: the digits are interned in the data section,
+                // and the runtime parses them into a heap cell.
+                let (pointer, length) = self.text_operands(digits)?;
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.objects.create_bigint, &[pointer, length]);
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::Const(Constant::Undefined) => Some(
                 self.builder
                     .ins()
@@ -1420,8 +1453,13 @@ impl Lowering<'_> {
                 if matches!(
                     op,
                     BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
-                ) =>
+                ) && self.is_number(*left)
+                    && self.is_number(*right) =>
             {
+                // **Only when both operands are proven numbers.** A bitcast of a BigInt or a
+                // string to `f64` is a nonsense number rather than a coercion, so anything the IR
+                // cannot type falls through to the runtime helper below (which handles BigInt and
+                // `ToNumber`) exactly as `+` always does.
                 let left = self.value(*left);
                 let right = self.value(*right);
                 let left = self.as_f64(left);
@@ -2252,6 +2290,9 @@ impl Jit {
             create_string: self
                 .module
                 .declare_func_in_func(self.objects.create_string, &mut context.func),
+            create_bigint: self
+                .module
+                .declare_func_in_func(self.objects.create_bigint, &mut context.func),
             truthy: self
                 .module
                 .declare_func_in_func(self.objects.truthy, &mut context.func),

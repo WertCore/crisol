@@ -299,12 +299,13 @@ fn a_handle_round_trips_through_a_value() {
 }
 
 #[test]
-fn a_handle_fits_the_forty_eight_bits_a_value_carries() {
-    // The coupling between D-53 and this crate: a handle that did not fit would have to be
-    // boxed, and every object reference in the language would cost an indirection.
+fn a_handle_fits_the_forty_seven_bits_a_value_carries() {
+    // The coupling between D-53 (narrowed by D-248) and this crate: a handle that did not fit
+    // would have to be boxed, and every object reference in the language would cost an
+    // indirection. BigInt's tag took a payload bit from the slot, not the generation.
     let handle = GcRef::from_address(Address::new(Address::MAX).expect("in range"));
     assert_eq!(handle.to_address().get(), Address::MAX);
-    assert_eq!(handle.slot(), u32::MAX);
+    assert_eq!(handle.slot(), (1_u32 << 31) - 1);
     assert_eq!(handle.generation(), u16::MAX);
 }
 

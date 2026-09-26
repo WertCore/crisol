@@ -6875,3 +6875,44 @@ spilling a live SSA temporary across a `yield` is not done. Also deferred: `yiel
 found under GC stress and fixed the D-208 way — `crisol_make_generator` roots `body`/`this` before
 allocating, since the caller holds the body closure only in an SSA value the stack map does not yet
 carry, so allocating first collected it and the generator carried an uncallable object.
+
+## D-248
+
+**BigInt — a fifth reference tag, bought by narrowing the payload one bit, with the magnitude in the heap cell's byte store.**
+
+Status: Accepted
+
+BigInt is unbounded, so it cannot be a machine word — it has to be a heap reference like a string
+or an object, and a `Value` distinguishes those by a tag. The tag was two bits (object, string,
+symbol, singleton), all four values used, and there was no spare bit above the 48-bit payload: the
+tagged space below the reserved `e` bit is exactly fifty bits. So the tag became **three bits** and
+the payload **47**. Nothing else could give: the exponent and quiet bits are IEEE's, and the `e`
+bit is what keeps the canonical NaN on the number side (D-53).
+
+The 47th bit came from the *slot*, not the generation. `GcRef` packed 32 bits of slot and 16 of
+generation; it now packs 31 and 16. Two billion live slots is still more than any reachable heap —
+the code's own comment already called four billion "more than the address space allows" — while
+halving the generation would have halved stale-handle detection, the worse trade. The narrowing is
+one chokepoint (`crisol-value`'s masks and `crisol-gc`'s `SLOT_BITS`); codegen never spelled the
+tag layout, so it did not move, and the singletons and numbers are bit-identical.
+
+The magnitude lives in the **existing** `bytes` byte store the ArrayBuffer work added, as
+`num-bigint`'s two's-complement little-endian digits, distinguished from an ArrayBuffer by the
+value's tag. The rejected alternative was a `Box<BigInt>` field on every heap cell: it would spend
+eight bytes on every string, array and object to save a small allocation on the rare BigInt
+operation — the wrong trade for a niche type when struct size is paid by every cell. `with_bytes`
+hands the digits to `num-bigint` without a copy, so a decode is one allocation, not two.
+
+Operators dispatch in the runtime: each arithmetic helper returns early to a BigInt path when either
+operand is one (both must be, or it is a `TypeError` — these never coerce across the boundary as `+`
+does with a string), and comparison and equality compare by mathematical value. `handle_of` excludes
+BigInt so the hundred-plus "is this an object?" tests written as `handle_of(x).is_some()` keep
+answering no, while the collector still traces it through `as_address`. The frontend types an
+arithmetic result `Number` only when both operands are proven Numbers — otherwise it might be a
+BigInt, a reference the collector must root, and typing it `Number` unconditionally (as it once did)
+freed it under GC stress. The same operators now propagate exceptions when their result is `unknown`,
+since a BigInt operator can throw where number arithmetic never does.
+
+Deferred to the library-surface follow-up: the `BigInt()` function, `BigInt.asIntN`/`asUintN`,
+`BigInt.prototype.toString`/`valueOf`, and `BigInt64Array`/`BigUint64Array`. `~` on a BigInt is out
+of reach until `~` itself is supported (it is an unimplemented unary operator for numbers too).

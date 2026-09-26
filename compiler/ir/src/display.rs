@@ -204,6 +204,7 @@ impl fmt::Display for Literal<'_> {
             // about.
             Constant::Number(value) => write!(f, "{value:?}"),
             Constant::String(value) => write!(f, "{value:?}"),
+            Constant::BigInt(digits) => write!(f, "{digits}n"),
         }
     }
 }

@@ -706,6 +706,8 @@ dependencies = [
  "crisol-builtins",
  "crisol-gc",
  "crisol-value",
+ "num-bigint",
+ "num-traits",
 ]
 
 [[package]]

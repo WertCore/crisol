@@ -53,16 +53,26 @@ bb2:
     v5: unknown = load $1
     v6: unknown = load $2
     v7: unknown = + v5, v6  ; safepoint []
-    store $1, v7
-    jump bb3
+    v8: bool = is-exception v7
+    branch v8 -> bb5, bb6
 bb3:
-    v8: unknown = load $2
-    v9: number = const 1.0
-    v10: unknown = + v8, v9  ; safepoint []
-    store $2, v10
-    jump bb1
+    v9: unknown = load $2
+    v10: number = const 1.0
+    v11: unknown = + v9, v10  ; safepoint []
+    v12: bool = is-exception v11
+    branch v12 -> bb7, bb8
 bb4:
     return
+bb5:
+    return v7
+bb6:
+    store $1, v7
+    jump bb3
+bb7:
+    return v11
+bb8:
+    store $2, v11
+    jump bb1
 }
 
 === for-continue-break ===
@@ -1014,6 +1024,11 @@ bb0:  ; entry
     v0: number = const 1.0
     v1: number = const 2.0
     v2: unknown = + v0, v1  ; safepoint []
+    v3: bool = is-exception v2
+    branch v3 -> bb1, bb2
+bb1:
+    return v2
+bb2:
     store $1, v2
     return
 }
@@ -1092,6 +1107,11 @@ bb0:  ; entry
     v0: string = const "x"
     v1: string = const "y"
     v2: unknown = + v0, v1  ; safepoint []
+    v3: bool = is-exception v2
+    branch v3 -> bb1, bb2
+bb1:
+    return v2
+bb2:
     store $1, v2
     return
 }
@@ -1194,6 +1214,11 @@ function unary-plus {
 bb0:  ; entry
     v0: string = const "1"
     v1: number = + v0
+    v2: bool = is-exception v1
+    branch v2 -> bb1, bb2
+bb1:
+    return v1
+bb2:
     store $1, v1
     return
 }
@@ -1347,6 +1372,11 @@ bb0:  ; entry
     v2: number = const 3.0
     v3: number = * v1, v2
     v4: unknown = + v0, v3  ; safepoint []
+    v5: bool = is-exception v4
+    branch v5 -> bb1, bb2
+bb1:
+    return v4
+bb2:
     store $1, v4
     return
 }
@@ -1518,6 +1548,11 @@ bb0:  ; entry
     v0: unknown = load $0
     v1: unknown = load $1
     v2: unknown = + v0, v1  ; safepoint []
+    v3: bool = is-exception v2
+    branch v3 -> bb1, bb2
+bb1:
+    return v2
+bb2:
     return v2
 }
 

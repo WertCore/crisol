@@ -500,6 +500,24 @@ impl Heap {
         }
     }
 
+    /// The whole byte store of `handle`, if it has one, without copying it out.
+    ///
+    /// The counterpart of [`Heap::with_text`] for the byte store, and for the same reason: a
+    /// caller that only reads the bytes — a BigInt decoding its digits (D-248) is the motivating
+    /// case — would otherwise take a `Vec` copy through [`Heap::read_bytes`] on every access.
+    /// The closure keeps the borrow from outliving the call.
+    pub fn with_bytes<R>(&self, handle: GcRef, body: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let cells = self.cells.borrow();
+        let cell = cells.get(handle.slot() as usize)?;
+        if cell.generation != handle.generation() {
+            return None;
+        }
+        match &cell.state {
+            State::Live { object, .. } => object.bytes.as_deref().map(body),
+            State::Free => None,
+        }
+    }
+
     /// Turns `handle` into an array of `length` elements, all `undefined`.
     ///
     /// Separate from allocation so an array is still an object first — it has a shape, a

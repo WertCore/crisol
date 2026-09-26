@@ -109,6 +109,13 @@ oxc_resolver = "11.13.1"
 # engine would reject patterns that work everywhere else.
 regress = "0.10"
 
+# Arbitrary-precision integers for BigInt (D-248). JavaScript's `BigInt` is unbounded, so it
+# cannot be a machine word; `num-bigint` owns the representation and the arithmetic, and
+# `num-traits` supplies the `ToPrimitive`/`Zero`/`Signed` conversions the coercions need. Both
+# are already in the graph transitively, so naming them here adds no new download.
+num-bigint = "0.5"
+num-traits = "0.2"
+
 # §4 names Cranelift as the codegen backend, and §M13 needs stack maps at safepoints —
 # Cranelift emits them, which is the deciding feature rather than a convenience. LLVM would
 # mean a build dependency an embedder cannot vendor.

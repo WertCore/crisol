@@ -24,6 +24,8 @@ use std::cell::RefCell;
 
 use crisol_gc::{GcRef, Heap};
 use crisol_value::{PropertyKey, Shapes, Value};
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive, Zero};
 
 /// Every symbol this crate provides to generated code.
 ///
@@ -65,6 +67,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_throw",
     "crisol_pending_exception",
     "crisol_create_string",
+    "crisol_create_bigint",
     "crisol_negate",
     "crisol_to_number",
     "crisol_not",
@@ -188,24 +191,38 @@ pub extern "C" fn crisol_add(left: u64, right: u64) -> u64 {
             _ => from_number(f64::NAN),
         };
     }
+    // After the string check `+` behaves like the other arithmetic operators: two BigInts add,
+    // and a BigInt meeting a Number is a `TypeError`.
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::Add) {
+        return bits;
+    }
     from_number(to_number(left) + to_number(right))
 }
 
 /// `left - right`, for callers that could not prove both operands numeric.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_subtract(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::Subtract) {
+        return bits;
+    }
     from_number(to_number(left) - to_number(right))
 }
 
 /// `left * right`.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_multiply(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::Multiply) {
+        return bits;
+    }
     from_number(to_number(left) * to_number(right))
 }
 
 /// `left / right`.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_divide(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::Divide) {
+        return bits;
+    }
     from_number(to_number(left) / to_number(right))
 }
 
@@ -216,18 +233,27 @@ pub extern "C" fn crisol_divide(left: u64, right: u64) -> u64 {
 /// this is a one-liner and not a correction.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_remainder(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::Remainder) {
+        return bits;
+    }
     from_number(to_number(left) % to_number(right))
 }
 
 /// `left ** right`.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_exponent(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::Exponent) {
+        return bits;
+    }
     from_number(to_number(left).powf(to_number(right)))
 }
 
-/// `left & right`, on int32.
+/// `left & right`, on int32 — or on the full BigInts when either is one.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_bit_and(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::BitAnd) {
+        return bits;
+    }
     from_number(f64::from(
         to_int32(to_number(left)) & to_int32(to_number(right)),
     ))
@@ -236,6 +262,9 @@ pub extern "C" fn crisol_bit_and(left: u64, right: u64) -> u64 {
 /// `left | right`, on int32.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_bit_or(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::BitOr) {
+        return bits;
+    }
     from_number(f64::from(
         to_int32(to_number(left)) | to_int32(to_number(right)),
     ))
@@ -244,6 +273,9 @@ pub extern "C" fn crisol_bit_or(left: u64, right: u64) -> u64 {
 /// `left ^ right`, on int32.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_bit_xor(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::BitXor) {
+        return bits;
+    }
     from_number(f64::from(
         to_int32(to_number(left)) ^ to_int32(to_number(right)),
     ))
@@ -256,6 +288,9 @@ pub extern "C" fn crisol_bit_xor(left: u64, right: u64) -> u64 {
 /// matching what the hardware happens to do.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_shift_left(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::ShiftLeft) {
+        return bits;
+    }
     let count = to_uint32(to_number(right)) & 31;
     from_number(f64::from(to_int32(to_number(left)) << count))
 }
@@ -263,6 +298,9 @@ pub extern "C" fn crisol_shift_left(left: u64, right: u64) -> u64 {
 /// `left >> right`, sign-propagating.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_shift_right(left: u64, right: u64) -> u64 {
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::ShiftRight) {
+        return bits;
+    }
     let count = to_uint32(to_number(right)) & 31;
     from_number(f64::from(to_int32(to_number(left)) >> count))
 }
@@ -273,6 +311,10 @@ pub extern "C" fn crisol_shift_right(left: u64, right: u64) -> u64 {
 /// than `-1`. That is also the reason it cannot be folded in with the other two.
 #[unsafe(no_mangle)]
 pub extern "C" fn crisol_unsigned_shift_right(left: u64, right: u64) -> u64 {
+    // On a BigInt this is a `TypeError`, not a shift: `>>>` needs a fixed width to zero-fill.
+    if let Some(bits) = bigint_numeric(left, right, NumericOp::UnsignedShiftRight) {
+        return bits;
+    }
     let count = to_uint32(to_number(right)) & 31;
     from_number(f64::from(to_uint32(to_number(left)) >> count))
 }
@@ -301,6 +343,11 @@ pub extern "C" fn crisol_print(bits: u64) {
         crisol_value::Kind::String => match text_of(bits) {
             Some(text) => println!("{text}"),
             None => println!("[unreadable string]"),
+        },
+        crisol_value::Kind::BigInt => match bigint_of(bits) {
+            // `console.log(1n)` shows the `n`, which is how the REPL and Node both print one.
+            Some(value) => println!("{value}n"),
+            None => println!("[unreadable bigint]"),
         },
         crisol_value::Kind::Symbol | crisol_value::Kind::Object => {
             // Reaching into the heap needs a runtime this crate does not have. Saying so beats
@@ -610,6 +657,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
             .with(|protos| roots.extend(protos.iter().filter_map(std::cell::Cell::get)));
         roots.extend(DATA_VIEW_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(GENERATOR_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(BIGINT_PROTOTYPE.with(std::cell::Cell::get));
         // The microtask queue. It is data rather than closures precisely so this walk is
         // possible — a queue of `Box<dyn FnOnce>` hides its captures from the collector, and
         // a settled value reachable only from one would be freed under it. Everything *else*
@@ -702,6 +750,10 @@ thread_local! {
     /// `%GeneratorPrototype%` — where a generator's `next`/`return`/`throw`/`[Symbol.iterator]`
     /// live.
     static GENERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `BigInt.prototype` — what `ToObject` gives a BigInt wrapper, and where `toString` and
+    /// `valueOf` live.
+    static BIGINT_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// The microtask queue. Drained to empty, and jobs queued by jobs run in the same drain,
     /// which is what "microtasks run to completion" means.
@@ -4408,6 +4460,7 @@ fn to_object(value: u64) -> Option<u64> {
         crisol_value::Kind::Number => NUMBER_PROTOTYPE.with(std::cell::Cell::get),
         crisol_value::Kind::Boolean => BOOLEAN_PROTOTYPE.with(std::cell::Cell::get),
         crisol_value::Kind::Symbol => SYMBOL_PROTOTYPE.with(std::cell::Cell::get),
+        crisol_value::Kind::BigInt => BIGINT_PROTOTYPE.with(std::cell::Cell::get),
     };
     // The primitive stays rooted across the allocation: a string and a symbol are heap cells,
     // and one held only in a Rust local while something else allocates is invisible.
@@ -12904,7 +12957,16 @@ pub fn with_runtime<R>(f: impl FnOnce(&Runtime) -> R) -> R {
 
 /// The handle a boxed value names, if it names one.
 fn handle_of(bits: u64) -> Option<GcRef> {
-    Value::from_bits(bits).as_address().map(GcRef::from_address)
+    let value = Value::from_bits(bits);
+    // **A BigInt has a heap cell but is not an object.** Its handle is reached through
+    // `as_address` where it is genuinely needed — the collector tracing it (D-248) and
+    // `bigint_of` reading its digits — but every "is this an object?" test in this crate is
+    // written as `handle_of(x).is_some()`, and a BigInt must answer no to all of them exactly as
+    // a string does. So it is excluded here, at the one chokepoint, rather than at each of them.
+    if value.is_bigint() {
+        return None;
+    }
+    value.as_address().map(GcRef::from_address)
 }
 
 /// The object every unresolved name is looked up in, as a value.
@@ -15339,6 +15401,8 @@ fn is_truthy(value: Value) -> bool {
         // **An empty string is falsy and every other string is truthy** — the one case where a
         // string's characters decide a branch.
         crisol_value::Kind::String => text_of(value.to_bits()).is_some_and(|text| !text.is_empty()),
+        // **`0n` is the only falsy BigInt**, the mirror of `0` among numbers.
+        crisol_value::Kind::BigInt => bigint_of(value.to_bits()).is_some_and(|v| !v.is_zero()),
         // An object is always truthy, including `new Boolean(false)`.
         _ => true,
     }
@@ -15653,6 +15717,11 @@ pub extern "C" fn crisol_strict_equal(left: u64, right: u64) -> u64 {
                 .zip(text_of(right.to_bits()))
                 .is_some_and(|(a, b)| a == b)
         }
+        // **Two BigInts compare by value, not by handle**, for the same reason strings do: they
+        // are primitives, so `1n === 1n` is true however many cells the two came from.
+        (None, None) if left.is_bigint() && right.is_bigint() => bigint_of(left.to_bits())
+            .zip(bigint_of(right.to_bits()))
+            .is_some_and(|(a, b)| a == b),
         (None, None) => left.kind() == right.kind() && left.to_bits() == right.to_bits(),
         _ => false,
     };
@@ -15758,6 +15827,209 @@ fn text_of(bits: u64) -> Option<String> {
     with_runtime(|runtime| runtime.heap.with_text(handle, ToOwned::to_owned))
 }
 
+/// Reads the `BigInt` a value names, or `None` if it is not one.
+///
+/// The magnitude lives in the heap cell's byte store as two's-complement little-endian digits
+/// (D-248) — the shape `num_bigint` reads back without a separate sign — and [`Heap::with_bytes`]
+/// hands them over without a copy.
+fn bigint_of(bits: u64) -> Option<BigInt> {
+    let value = Value::from_bits(bits);
+    if !value.is_bigint() {
+        return None;
+    }
+    let handle = value.as_address().map(GcRef::from_address)?;
+    with_runtime(|runtime| runtime.heap.with_bytes(handle, BigInt::from_signed_bytes_le))
+}
+
+/// Allocates a BigInt cell holding `value` and returns it as a BigInt-tagged value.
+///
+/// A leaf like a string: its digits hold no references, so nothing needs rooting across the
+/// allocation and the collector traces nothing through it.
+fn new_bigint(value: &BigInt) -> u64 {
+    let digits = value.to_signed_bytes_le();
+    with_runtime(|runtime| {
+        let shape = runtime.shapes.borrow().root();
+        let scope = runtime.heap.scope();
+        let cell = scope.alloc(shape, 0);
+        let handle = cell.handle();
+        runtime.heap.attach_bytes(handle, digits.len());
+        runtime.heap.write_bytes(handle, 0, &digits);
+        if let Some(prototype) = BIGINT_PROTOTYPE.with(std::cell::Cell::get) {
+            runtime.heap.set_prototype(handle, Some(prototype));
+        }
+        // The same handle bits, re-tagged BigInt rather than object — `to_value` owns the
+        // packing, so this cannot drift from it.
+        handle.to_value().as_address().map_or_else(
+            || Value::UNDEFINED.to_bits(),
+            |address| Value::bigint(address).to_bits(),
+        )
+    })
+}
+
+/// The binary operators that coerce with `ToNumeric` rather than comparing — every arithmetic
+/// and bitwise operator. `+` is one of them once its string-concatenation case is dealt with.
+#[derive(Clone, Copy)]
+enum NumericOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    Exponent,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
+    UnsignedShiftRight,
+}
+
+/// Applies `op` under BigInt rules when either operand is a BigInt, or `None` when neither is.
+///
+/// `None` is the signal to run the ordinary `f64` path — so a caller writes `if let Some(bits) =
+/// bigint_numeric(...) { return bits; }` above its numeric code and pays nothing when no BigInt
+/// is involved. When exactly one operand is a BigInt the operator is a `TypeError`: these never
+/// coerce across the boundary the way `+` does with a string, and that case is handled in
+/// [`crisol_add`] before this is reached.
+fn bigint_numeric(left: u64, right: u64, op: NumericOp) -> Option<u64> {
+    if !Value::from_bits(left).is_bigint() && !Value::from_bits(right).is_bigint() {
+        return None;
+    }
+    let (Some(a), Some(b)) = (bigint_of(left), bigint_of(right)) else {
+        return Some(raise(
+            "Cannot mix BigInt and other types, use explicit conversions",
+            "TypeError",
+        ));
+    };
+    let result: BigInt = match op {
+        NumericOp::Add => a + b,
+        NumericOp::Subtract => a - b,
+        NumericOp::Multiply => a * b,
+        NumericOp::Divide => {
+            if b.is_zero() {
+                return Some(raise("Division by zero", "RangeError"));
+            }
+            // BigInt division truncates toward zero, which is Rust's `/` on `BigInt` — `7n / 2n`
+            // is `3n` and `-7n / 2n` is `-3n`.
+            a / b
+        }
+        NumericOp::Remainder => {
+            if b.is_zero() {
+                return Some(raise("Division by zero", "RangeError"));
+            }
+            a % b
+        }
+        NumericOp::Exponent => {
+            if b.is_negative() {
+                return Some(raise("Exponent must be non-negative", "RangeError"));
+            }
+            match b.to_u32() {
+                Some(exp) => a.pow(exp),
+                // An exponent past `u32` would need more memory than exists; the specified answer
+                // is a `RangeError`, not an attempt that exhausts the heap.
+                None => return Some(raise("Maximum BigInt size exceeded", "RangeError")),
+            }
+        }
+        NumericOp::BitAnd => a & b,
+        NumericOp::BitOr => a | b,
+        NumericOp::BitXor => a ^ b,
+        NumericOp::ShiftLeft => bigint_shift(a, &b, true),
+        NumericOp::ShiftRight => bigint_shift(a, &b, false),
+        NumericOp::UnsignedShiftRight => {
+            // `>>>` is defined only on Numbers: a BigInt has no fixed width to zero-fill into.
+            return Some(raise(
+                "BigInts have no unsigned right shift, use >> instead",
+                "TypeError",
+            ));
+        }
+    };
+    Some(new_bigint(&result))
+}
+
+/// `a << b` (when `left_shift`) or `a >> b`, with a BigInt shift count.
+///
+/// A negative count reverses direction, as the language specifies: `1n << -1n` is `0n` and
+/// `1n >> -1n` is `2n`. The count is narrowed to a machine integer — one that does not fit is
+/// astronomically large, and no realistic program shifts by more than `usize::MAX` bits.
+fn bigint_shift(a: BigInt, b: &BigInt, left_shift: bool) -> BigInt {
+    let count = b
+        .to_i64()
+        .unwrap_or(if b.is_negative() { i64::MIN } else { i64::MAX });
+    let do_left = left_shift == (count >= 0);
+    let bits = usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX);
+    // num-bigint's `>>` is arithmetic — it sign-extends — which is what `>>` on a BigInt means.
+    if do_left { a << bits } else { a >> bits }
+}
+
+/// `StringToBigInt`: the coercion `BigInt("…")` and `==` against a string use.
+///
+/// Stricter than `ToNumber`: an empty or all-whitespace string is `0n`, but a fraction or an
+/// exponent (`"1.5"`, `"1e3"`) is not a BigInt at all — the caller reads `None` as "not equal"
+/// or as the `SyntaxError` that `BigInt("1.5")` throws.
+fn string_to_bigint(text: &str) -> Option<BigInt> {
+    let trimmed = text.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if trimmed.is_empty() {
+        return Some(BigInt::from(0));
+    }
+    let (radix, digits) = if let Some(rest) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        (16, rest)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("0o")
+        .or_else(|| trimmed.strip_prefix("0O"))
+    {
+        (8, rest)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("0b")
+        .or_else(|| trimmed.strip_prefix("0B"))
+    {
+        (2, rest)
+    } else {
+        (10, trimmed)
+    };
+    BigInt::parse_bytes(digits.as_bytes(), radix)
+}
+
+/// Whether a BigInt equals a Number exactly, for `==` and `===`-free cross-type comparison.
+///
+/// Only an integer-valued, finite Number can equal a BigInt: `1n == 1` is true, `1n == 1.5` is
+/// false, and `1n == Infinity` is false. The comparison is exact rather than through `a as f64`,
+/// which would call a large BigInt equal to a Number it merely rounds to.
+fn bigint_eq_number(a: &BigInt, n: f64) -> bool {
+    if !n.is_finite() || n.fract() != 0.0 {
+        return false;
+    }
+    // `{:.0}` prints the f64's exact integer value, so the comparison never rounds.
+    BigInt::parse_bytes(format!("{n:.0}").as_bytes(), 10).is_some_and(|nb| *a == nb)
+}
+
+/// Orders a BigInt against a Number, or `None` when the Number is `NaN` (which makes every
+/// relational operator false). Exact: the fractional part decides ties rather than being lost.
+fn bigint_cmp_number(a: &BigInt, n: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if n.is_nan() {
+        return None;
+    }
+    if n == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if n == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    let trunc = n.trunc();
+    let whole = BigInt::parse_bytes(format!("{trunc:.0}").as_bytes(), 10)?;
+    Some(match a.cmp(&whole) {
+        // `a` equals the integer part of `n`, so the fraction breaks the tie: a positive
+        // fraction makes `n` the larger, a negative one makes it the smaller.
+        Ordering::Equal => n
+            .partial_cmp(&trunc)
+            .map_or(Ordering::Equal, Ordering::reverse),
+        other => other,
+    })
+}
+
 /// Allocates a string cell holding `text`.
 fn new_string(text: &str) -> u64 {
     with_runtime(|runtime| {
@@ -15797,6 +16069,24 @@ pub unsafe extern "C" fn crisol_create_string(text: *const u8, length: u64) -> u
     new_string(&text)
 }
 
+/// A BigInt literal, from the base-10 digits the object file carries (D-248).
+///
+/// # Safety
+///
+/// `digits` must point to `length` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_create_bigint(digits: *const u8, length: u64) -> u64 {
+    // SAFETY: the caller promises `length` readable UTF-8 bytes at `digits`.
+    let Some(text) = (unsafe { key_text(digits, length) }) else {
+        return Value::UNDEFINED.to_bits();
+    };
+    // The frontend passes the parser's base-10 normalisation, so radix 10 always parses; an empty
+    // literal, which the grammar does not produce, falls back to `0n` rather than panicking.
+    let value = BigInt::parse_bytes(text.as_bytes(), 10).unwrap_or_default();
+    new_bigint(&value)
+}
+
 /// How a value reads as text, for `+` and for printing.
 ///
 /// **An object is asked**, through `toString` and then `valueOf`. Reading `[object Object]` off
@@ -15819,23 +16109,35 @@ fn to_text(bits: u64) -> Option<String> {
         crisol_value::Kind::Boolean => {
             Some(if value.as_boolean()? { "true" } else { "false" }.to_owned())
         }
+        // A BigInt reads as its decimal digits with **no** trailing `n` — `String(1n)` is `"1"`,
+        // and the `n` only appears when a debugger or `console.log` prints one.
+        crisol_value::Kind::BigInt => bigint_of(bits).map(|value| value.to_string()),
         // An object needs `ToPrimitive`, which calls user code. Recorded rather than guessed at
         // with something that would read plausibly.
         _ => None,
     }
 }
 
-/// `-value`, after `ToNumber`.
+/// `-value`, after `ToNumeric` — so `-(1n)` is `-1n`, staying a BigInt.
 #[unsafe(no_mangle)]
 #[must_use]
 pub extern "C" fn crisol_negate(value: u64) -> u64 {
+    if Value::from_bits(value).is_bigint() {
+        return bigint_of(value).map_or_else(|| Value::UNDEFINED.to_bits(), |v| new_bigint(&(-v)));
+    }
     from_number(-to_number(value))
 }
 
 /// `+value` — `ToNumber`, which is why `+"1"` is `1`.
+///
+/// **`+` on a BigInt throws.** It is the one coercion the language forbids, precisely so that
+/// `+x` cannot silently narrow an arbitrary-precision value to a double.
 #[unsafe(no_mangle)]
 #[must_use]
 pub extern "C" fn crisol_to_number(value: u64) -> u64 {
+    if Value::from_bits(value).is_bigint() {
+        return raise("Cannot convert a BigInt to a number", "TypeError");
+    }
     from_number(to_number(value))
 }
 
@@ -15867,6 +16169,7 @@ pub extern "C" fn crisol_typeof(value: u64) -> u64 {
         crisol_value::Kind::Number => "number",
         crisol_value::Kind::String => "string",
         crisol_value::Kind::Symbol => "symbol",
+        crisol_value::Kind::BigInt => "bigint",
         crisol_value::Kind::Object => {
             if is_callable(value.to_bits()) {
                 "function"
@@ -17590,20 +17893,96 @@ fn loosely_equal(left: u64, right: u64, round: u32) -> bool {
         return loosely_equal(left, from_number(to_number(right)), round + 1);
     }
 
-    // An object meeting a primitive becomes a primitive.
+    // **A BigInt is `==` a Number or numeric string of the same value**, unlike `===`. `1n == 1`
+    // and `1n == "1"` are both true; `1n == 1.5` is false. This is the one place two different
+    // types are equal by value rather than after coercing one to the other.
+    if a.is_bigint() && (numeric(b) || stringy(b)) {
+        return bigint_loose_eq_primitive(left, right);
+    }
+    if (numeric(a) || stringy(a)) && b.is_bigint() {
+        return bigint_loose_eq_primitive(right, left);
+    }
+
+    // An object meeting a primitive becomes a primitive — a BigInt counts as one here, so
+    // `Object(1n) == 1n` coerces the wrapper and compares.
     let objectish = |value: u64| {
         handle_of(value).is_some() && Value::from_bits(value).kind() != crisol_value::Kind::String
     };
     // **The fresh primitive is rooted before the next round.** `toString` returns a new
     // string, and the round after this one may call *another* `valueOf` — which allocates,
     // with the string reachable from nothing.
-    if objectish(left) && (numeric(b) || stringy(b)) {
+    if objectish(left) && (numeric(b) || stringy(b) || b.is_bigint()) {
         let primitive = to_primitive(left);
         return with_rooted(&[primitive], || loosely_equal(primitive, right, round + 1));
     }
-    if (numeric(a) || stringy(a)) && objectish(right) {
+    if (numeric(a) || stringy(a) || a.is_bigint()) && objectish(right) {
         let primitive = to_primitive(right);
         return with_rooted(&[primitive], || loosely_equal(left, primitive, round + 1));
+    }
+    false
+}
+
+/// `<`, `<=`, `>`, `>=` when a BigInt is on at least one side, both already primitives.
+///
+/// `which` is 0/1/2/3 for `<`/`<=`/`>`/`>=`. An incomparable pair — a BigInt against `NaN`, or a
+/// string that is not a BigInt literal — makes every one of the four false, which is what an
+/// undefined abstract-relational result becomes.
+fn bigint_relational(left: u64, right: u64, which: u64) -> u64 {
+    use std::cmp::Ordering;
+    let l = Value::from_bits(left);
+    let r = Value::from_bits(right);
+    let ordering = match (l.is_bigint(), r.is_bigint()) {
+        (true, true) => bigint_of(left)
+            .zip(bigint_of(right))
+            .map(|(a, b)| a.cmp(&b)),
+        (true, false) => bigint_cmp_primitive(left, right),
+        // Right is the BigInt: compare it to the left, then flip so the ordering is still
+        // `left`-relative-to-`right`.
+        (false, true) => bigint_cmp_primitive(right, left).map(Ordering::reverse),
+        (false, false) => None,
+    };
+    let outcome = match which {
+        0 => ordering == Some(Ordering::Less),
+        1 => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+        2 => ordering == Some(Ordering::Greater),
+        _ => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
+    };
+    boolean(outcome).to_bits()
+}
+
+/// Orders a BigInt against a primitive that is a Number, a numeric string, or a
+/// boolean/null/undefined the language coerces to a Number. `None` when they are incomparable.
+fn bigint_cmp_primitive(big: u64, other: u64) -> Option<std::cmp::Ordering> {
+    let a = bigint_of(big)?;
+    let other = Value::from_bits(other);
+    if other.kind() == crisol_value::Kind::String {
+        // A string is parsed as a BigInt, not a Number: `1n < "2"` compares `1n` with `2n`.
+        return text_of(other.to_bits())
+            .and_then(|text| string_to_bigint(&text))
+            .map(|b| a.cmp(&b));
+    }
+    // Number directly; boolean/null/undefined through `ToNumber`, as the specification's
+    // `ToNumeric` does on the non-BigInt side.
+    bigint_cmp_number(&a, to_number(other.to_bits()))
+}
+
+/// `bigint == number` / `bigint == string`: equality across types by mathematical value.
+///
+/// A number equals the BigInt only when it is a finite integer of the same value; a string is
+/// first parsed as a BigInt, and one that is not a valid BigInt literal (`"1.5"`, `"x"`) is
+/// simply not equal rather than an error.
+fn bigint_loose_eq_primitive(big: u64, other: u64) -> bool {
+    let Some(a) = bigint_of(big) else {
+        return false;
+    };
+    let other = Value::from_bits(other);
+    if let Some(n) = other.as_number() {
+        return bigint_eq_number(&a, n);
+    }
+    if other.kind() == crisol_value::Kind::String {
+        return text_of(other.to_bits())
+            .and_then(|text| string_to_bigint(&text))
+            .is_some_and(|b| a == b);
     }
     false
 }
@@ -17828,6 +18207,12 @@ pub extern "C" fn crisol_relational(left: u64, right: u64, which: u64) -> u64 {
         let left = to_primitive(left);
         with_rooted(&[left], || {
             let right = to_primitive(right);
+            // A BigInt on either side compares by mathematical value against the other, whether
+            // that is a BigInt, a Number or a numeric string — `1n < 2`, `2n > 1.5` and
+            // `1n < "2"` all decide the ordinary way rather than after a lossy `ToNumber`.
+            if Value::from_bits(left).is_bigint() || Value::from_bits(right).is_bigint() {
+                return bigint_relational(left, right, which);
+            }
             let both_strings = Value::from_bits(left).kind() == crisol_value::Kind::String
                 && Value::from_bits(right).kind() == crisol_value::Kind::String;
 

@@ -3259,6 +3259,82 @@ fn generators_yield_and_resume() {
     );
 }
 
+/// BigInt: literals of every base, `typeof`, the arithmetic and bitwise operators (including a
+/// value past `u64` to prove the precision is arbitrary), comparison and equality across types,
+/// truthiness, string coercion, and the `TypeError` that mixing with a Number raises.
+#[test]
+fn bigints_are_arbitrary_precision_integers() {
+    // Literals print with the trailing `n`, and `typeof` names them.
+    check("bigint-literal", "return 42n;", "42n");
+    check("bigint-typeof", "return typeof 1n;", "bigint");
+    check("bigint-hex", "return 0xFFn;", "255n");
+    check("bigint-binary", "return 0b1010n;", "10n");
+
+    // Arithmetic stays a BigInt; division truncates toward zero; remainder takes the dividend's
+    // sign, as it does for numbers.
+    check("bigint-add", "return 2n + 3n;", "5n");
+    check("bigint-sub", "return 10n - 3n;", "7n");
+    check("bigint-mul", "return 6n * 7n;", "42n");
+    check("bigint-div", "return 20n / 6n;", "3n");
+    check("bigint-rem", "return -20n % 6n;", "-2n");
+    check("bigint-pow", "return 2n ** 10n;", "1024n");
+    check("bigint-negate", "return -(5n);", "-5n");
+
+    // The value the whole re-encoding exists for: 2**64 does not fit in 64 bits, and a correct
+    // BigInt carries every digit.
+    check(
+        "bigint-past-u64",
+        "return 2n ** 64n;",
+        "18446744073709551616n",
+    );
+
+    // Bitwise on the full integers, two's-complement like the language specifies.
+    check("bigint-and", "return 12n & 10n;", "8n");
+    check("bigint-or", "return 12n | 10n;", "14n");
+    check("bigint-xor", "return 12n ^ 10n;", "6n");
+    check("bigint-shl", "return 5n << 2n;", "20n");
+    check("bigint-shr", "return 20n >> 2n;", "5n");
+
+    // Comparison works within BigInt and across to Number by mathematical value.
+    check("bigint-lt", "return 2n < 3n;", "true");
+    check("bigint-gt-cross", "return 5n > 2;", "true");
+    check("bigint-lt-frac", "return 2n < 1.5;", "false");
+
+    // `===` is same-type-and-value; `==` crosses to Number and numeric strings.
+    check("bigint-strict-eq", "return 1n === 1n;", "true");
+    check("bigint-strict-ne-number", "return 1n === 1;", "false");
+    check("bigint-loose-eq-number", "return 1n == 1;", "true");
+    check("bigint-loose-eq-string", "return 255n == \"255\";", "true");
+    check("bigint-loose-ne-frac", "return 1n == 1.5;", "false");
+
+    // `0n` is the only falsy BigInt.
+    check("bigint-falsy", "return 0n ? \"t\" : \"f\";", "f");
+    check("bigint-truthy", "return 5n ? \"t\" : \"f\";", "t");
+
+    // With a string `+` concatenates the decimal digits, no `n`; `String()` does the same.
+    check("bigint-concat", "return 1n + \"x\";", "1x");
+    check("bigint-tostring", "return String(255n);", "255");
+
+    // Mixing a BigInt with a Number in arithmetic is a TypeError, not a silent coercion.
+    check(
+        "bigint-mix-throws",
+        "try { return (1n + 1) + \"\"; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    // So is `+` (unary) on a BigInt.
+    check(
+        "bigint-unary-plus-throws",
+        "try { return +2n; } catch (e) { return e instanceof TypeError; }",
+        "true",
+    );
+    // Dividing by `0n` is a RangeError.
+    check(
+        "bigint-div-zero-throws",
+        "try { return 1n / 0n; } catch (e) { return e instanceof RangeError; }",
+        "true",
+    );
+}
+
 /// Destructuring a `let`/`const`/`var` declaration: object and array patterns, renaming, defaults
 /// (taken only when the value is `undefined`), holes, nesting, a computed key, a string source,
 /// and the `TypeError` a nullish source raises.
