@@ -7103,3 +7103,31 @@ acceptance harness re-runs each case under `CRISOL_GC_STRESS`; a normal run coll
 land in the window. (Also: `cargo build -p crisol` does not rebuild the `staticlib` a compiled program
 links — `cargo build -p crisol-abi` does. A runtime edit tested through the CLI is invisible until it
 is rebuilt, which cost real time here.)
+
+## D-256
+
+**The typed-array-producing prototype methods, and the `of`/`from` statics.**
+
+Status: Accepted
+
+`%TypedArray%.prototype` gains `map`, `filter`, `sort`, `toSorted`, `toReversed` and `with`, and every
+per-kind constructor gains the `of` and `from` statics. These are the members that must *build* a typed
+array; the ones that only read and write through the integer indices (`forEach`, `reduce`, `indexOf`,
+`fill`, `reverse`, `keys`, …) were already the identical `Array.prototype` functions, aliased onto the
+shared prototype (D-243's `alias_array_methods`), because a typed array answers those indices from its
+buffer. A builder cannot be shared that way — its result must be a typed array of the receiver's kind,
+not a plain one — so each is its own native, chained onto the end of `TYPED_NATIVES` so the indices
+before it do not move. `sort`'s default order is *numeric* (`NaN` last, `-0` before `+0`; BigInt by
+value), not the string order `Array.prototype.sort` imposes, which is the whole reason it is not aliased.
+
+The statics resolve their kind from the receiver: each constructor carries a `TA_CTOR_KIND` stamp, so
+one shared `of`/`from` native reached through `Int8Array.of`, `Float64Array.from`, … builds the right
+array. `from` reads an array directly and drains anything else through its iterator (arrays, typed
+arrays, strings, sets, maps, generators); a plain array-like without a `Symbol.iterator` reaches the
+"not iterable" path rather than the array-like one — the one corner still owed.
+
+Every one of these obeys D-255's rule, which cost several stress-only failures to relearn: a callback,
+a comparator, a `with` value, and each element read by `sort` all had to be rooted *before* the result
+buffer or the element snapshot was allocated. Reading a BigInt array's elements is itself a string of
+allocations — one BigInt per element — so `sort` stashes them in a rooted holder array as it reads,
+rather than into a bare `Vec` the collector cannot see (`typed_array_snapshot`).

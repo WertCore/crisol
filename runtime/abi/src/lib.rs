@@ -1819,6 +1819,14 @@ const TYPED_NATIVES: &[Native] = &[
     dv_set_uint32,
     dv_set_float32,
     dv_set_float64,
+    typed_array_map,         // TA_MAP_METHOD
+    typed_array_filter,      // TA_FILTER_METHOD
+    typed_array_sort,        // TA_SORT_METHOD
+    typed_array_to_sorted,   // TA_TO_SORTED_METHOD
+    typed_array_to_reversed, // TA_TO_REVERSED_METHOD
+    typed_array_with,        // TA_WITH_METHOD
+    typed_array_of,          // TA_OF_METHOD (static)
+    typed_array_from,        // TA_FROM_METHOD (static)
 ];
 
 /// Indices into [`TYPED_NATIVES`].
@@ -1840,6 +1848,17 @@ const DV_BYTE_OFFSET_GET: usize = 13;
 /// [`DATA_VIEW_KINDS`] order.
 const DV_GET_BASE: usize = 14;
 const DV_SET_BASE: usize = 22;
+/// The typed-array-producing prototype methods, appended after the eight `DataView` setters
+/// (`DV_SET_BASE + 8 == 30`), so the indices before them do not move (D-256).
+const TA_MAP_METHOD: usize = 30;
+const TA_FILTER_METHOD: usize = 31;
+const TA_SORT_METHOD: usize = 32;
+const TA_TO_SORTED_METHOD: usize = 33;
+const TA_TO_REVERSED_METHOD: usize = 34;
+const TA_WITH_METHOD: usize = 35;
+/// The two typed-array-producing *statics*, installed on each per-kind constructor.
+const TA_OF_METHOD: usize = 36;
+const TA_FROM_METHOD: usize = 37;
 
 /// The eight kinds a `DataView` reads and writes, in the order [`DV_GET_BASE`]/[`DV_SET_BASE`]
 /// lay them out — `Uint8Clamped` is absent, so this is not [`ELEMENT_KINDS`].
@@ -2902,6 +2921,10 @@ const TA_OFFSET: &str = "__taOffset";
 const TA_LENGTH: &str = "__taLength";
 /// A typed array's element kind, as the tag [`ElementKind::tag`] gives.
 const TA_KIND: &str = "__taKind";
+/// The element kind stamped on each per-kind *constructor*, so `%TypedArray%.of`/`from` — one
+/// shared native reached through `Int8Array.of`, `Float64Array.from`, … — can tell which kind of
+/// array to build from the receiver they were called on.
+const TA_CTOR_KIND: &str = "__taCtorKind";
 
 /// The nine element kinds a typed array can have. `BigInt64`/`BigUint64` are absent because
 /// BigInt is not implemented.
@@ -3204,6 +3227,13 @@ fn typed_array_parts(object: u64) -> Option<(u64, usize, usize, ElementKind)> {
     Some((buffer, offset, length, kind))
 }
 
+/// The element kind a typed-array constructor builds, read from the [`TA_CTOR_KIND`] stamp — the
+/// receiver of `%TypedArray%.of`/`from`. `None` for any other object, which is the `TypeError`
+/// those two answer when called on a receiver that is not one of the constructors.
+fn typed_ctor_kind(constructor: u64) -> Option<ElementKind> {
+    ElementKind::from_tag(count_of(property_number(constructor, TA_CTOR_KIND)?))
+}
+
 /// `ToIndex(value)` — a non-negative integer no larger than `2**53 - 1`, or the `RangeError` it
 /// is not one.
 fn to_index(value: u64) -> Result<usize, u64> {
@@ -3282,6 +3312,34 @@ fn typed_array_element_store_bigint(object: u64, index: usize, value: u64) -> Op
         let bytes = kind.bigint_to_bytes(&magnitude);
         with_runtime(|runtime| runtime.heap.write_bytes(handle, at, &bytes));
         None
+    })
+}
+
+/// Reads every element of `array` into a `Vec`, keeping each one rooted while the next is read.
+///
+/// **A BigInt array allocates a fresh BigInt per element on load**, so reading straight into a
+/// `Vec` would leave the ones already read unrooted while a later load collects — the same
+/// stress-only reclaim [`make_weakref`] hit (D-255). Stashing each into a rooted holder array as it
+/// is read keeps the whole set alive; the caller roots the returned `Vec` before its next
+/// allocation. Number kinds allocate nothing on load and would not need this, but one path is
+/// simpler than two.
+fn typed_array_snapshot(array: u64, length: usize) -> Vec<u64> {
+    with_rooted(&[array], || {
+        let holder = array_of_values(&[]);
+        let Some(handle) = handle_of(holder) else {
+            return Vec::new();
+        };
+        with_rooted(&[holder], || {
+            for index in 0..length {
+                let element = typed_array_element_load(array, index);
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(handle, index, Value::from_bits(element));
+                });
+            }
+            (0..length).map(|index| element_at(handle, index)).collect()
+        })
     })
 }
 
@@ -3762,6 +3820,470 @@ extern "C" fn typed_array_slice(
         }
     });
     result
+}
+
+/// `%TypedArray%.prototype.map` — a new typed array of the same kind, each element mapped and
+/// coerced back to the element type. Distinct from the aliased `Array.prototype` methods (D-256):
+/// those read and write through the integer indices a typed array already answers, but one that
+/// *builds* a result must build a typed array, not a plain one.
+extern "C" fn typed_array_map(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
+    // SAFETY: as above.
+    let this_arg = unsafe { argument(argc, argv, 1) };
+    // The callback is rooted before the result is allocated, not after — the allocation is a
+    // collection point, and an argument passed to a native is not otherwise kept alive across one
+    // (D-255).
+    with_rooted(&[this_value, callback, this_arg], || {
+        let result = match typed_array_over_new_buffer(kind, length) {
+            Ok(result) => result,
+            Err(thrown) => return thrown,
+        };
+        let outcome = with_rooted(&[result], || {
+            for index in 0..length {
+                let element = typed_array_element_load(this_value, index);
+                let mapped = call_value(
+                    callback,
+                    this_arg,
+                    &[element, index_value(index), this_value],
+                );
+                if Value::from_bits(mapped).is_exception() {
+                    return Some(mapped);
+                }
+                if let Some(thrown) = typed_array_element_store(result, index, mapped) {
+                    return Some(thrown);
+                }
+            }
+            None
+        });
+        outcome.unwrap_or(result)
+    })
+}
+
+/// `%TypedArray%.prototype.filter` — a new typed array of the same kind holding the elements the
+/// callback keeps.
+extern "C" fn typed_array_filter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if !is_callable(callback) {
+        return raise("a callback must be a function", "TypeError");
+    }
+    // SAFETY: as above.
+    let this_arg = unsafe { argument(argc, argv, 1) };
+    let mut kept: Vec<u64> = Vec::new();
+    let outcome = with_rooted(&[this_value, callback, this_arg], || {
+        for index in 0..length {
+            let element = typed_array_element_load(this_value, index);
+            let keep = call_value(
+                callback,
+                this_arg,
+                &[element, index_value(index), this_value],
+            );
+            if Value::from_bits(keep).is_exception() {
+                return Some(keep);
+            }
+            if is_truthy(Value::from_bits(keep)) {
+                kept.push(element);
+            }
+        }
+        None
+    });
+    if let Some(thrown) = outcome {
+        return thrown;
+    }
+    // `kept` may hold BigInt references, which must survive the allocation below and the stores.
+    let result = match with_rooted(&kept, || typed_array_over_new_buffer(kind, kept.len())) {
+        Ok(result) => result,
+        Err(thrown) => return thrown,
+    };
+    with_rooted(&kept, || {
+        with_rooted(&[result], || {
+            for (index, element) in kept.iter().enumerate() {
+                typed_array_element_store(result, index, *element);
+            }
+        });
+    });
+    result
+}
+
+/// The order the default (`undefined` comparator) sort imposes on a non-BigInt typed array:
+/// ascending, with `NaN` sorted after every number and `-0` before `+0`.
+fn default_number_order(a: Value, b: Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let x = a.as_number().unwrap_or(f64::NAN);
+    let y = b.as_number().unwrap_or(f64::NAN);
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            if x < y {
+                Ordering::Less
+            } else if x > y {
+                Ordering::Greater
+            } else {
+                // Equal magnitude: `-0` precedes `+0`, everything else ties.
+                match (x.is_sign_negative(), y.is_sign_negative()) {
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    _ => Ordering::Equal,
+                }
+            }
+        }
+    }
+}
+
+/// Sorts `array`'s `length` elements in place, by `comparator` if it is callable and by the
+/// numeric default otherwise. Shared by `sort` (which sorts the receiver) and `toSorted` (which
+/// sorts a copy). Returns the exception if a `comparator` call or a coercion threw; the array's
+/// order is then unspecified, which the specification permits.
+fn typed_array_sort_into(
+    array: u64,
+    length: usize,
+    kind: ElementKind,
+    comparator: u64,
+) -> Option<u64> {
+    use std::cmp::Ordering;
+    let mut elements = typed_array_snapshot(array, length);
+    if comparator == Value::UNDEFINED.to_bits() {
+        if kind.is_bigint() {
+            elements.sort_by(|a, b| match (bigint_of(*a), bigint_of(*b)) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                _ => Ordering::Equal,
+            });
+        } else {
+            elements
+                .sort_by(|a, b| default_number_order(Value::from_bits(*a), Value::from_bits(*b)));
+        }
+    } else {
+        let mut thrown: Option<u64> = None;
+        // Every element (BigInt references included) and the comparator stay rooted across the
+        // calls, which allocate. Sorting only reorders `elements`, so the rooted snapshot still
+        // covers every value.
+        let snapshot = elements.clone();
+        with_rooted(&snapshot, || {
+            with_rooted(&[comparator], || {
+                elements.sort_by(|a, b| {
+                    if thrown.is_some() {
+                        return Ordering::Equal;
+                    }
+                    let verdict = call_value(comparator, Value::UNDEFINED.to_bits(), &[*a, *b]);
+                    if Value::from_bits(verdict).is_exception() {
+                        thrown = Some(verdict);
+                        return Ordering::Equal;
+                    }
+                    match coerce_number(verdict) {
+                        Ok(number) if number < 0.0 => Ordering::Less,
+                        Ok(number) if number > 0.0 => Ordering::Greater,
+                        // Zero and `NaN` both tie, per `SortCompare`.
+                        Ok(_) => Ordering::Equal,
+                        Err(exception) => {
+                            thrown = Some(exception);
+                            Ordering::Equal
+                        }
+                    }
+                });
+            });
+        });
+        if thrown.is_some() {
+            return thrown;
+        }
+    }
+    let snapshot = elements.clone();
+    with_rooted(&snapshot, || {
+        with_rooted(&[array], || {
+            for (index, element) in elements.iter().enumerate() {
+                typed_array_element_store(array, index, *element);
+            }
+        });
+    });
+    None
+}
+
+/// `%TypedArray%.prototype.sort` — sorts the receiver in place and returns it.
+extern "C" fn typed_array_sort(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let comparator = unsafe { argument(argc, argv, 0) };
+    if comparator != Value::UNDEFINED.to_bits() && !is_callable(comparator) {
+        return raise(
+            "the comparator must be a function or undefined",
+            "TypeError",
+        );
+    }
+    // The comparator is rooted across `sort_into`, whose element snapshot allocates (D-255).
+    with_rooted(&[this_value, comparator], || {
+        match typed_array_sort_into(this_value, length, kind, comparator) {
+            Some(thrown) => thrown,
+            None => this_value,
+        }
+    })
+}
+
+/// `%TypedArray%.prototype.toSorted` — a sorted copy, the receiver untouched.
+extern "C" fn typed_array_to_sorted(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let comparator = unsafe { argument(argc, argv, 0) };
+    if comparator != Value::UNDEFINED.to_bits() && !is_callable(comparator) {
+        return raise(
+            "the comparator must be a function or undefined",
+            "TypeError",
+        );
+    }
+    // The comparator is rooted before the copy is allocated (D-255): the allocation collects, and
+    // `sort_into` calls the comparator afterwards.
+    with_rooted(&[this_value, comparator], || {
+        let result = match typed_array_over_new_buffer(kind, length) {
+            Ok(result) => result,
+            Err(thrown) => return thrown,
+        };
+        with_rooted(&[result], || {
+            for index in 0..length {
+                let source = typed_array_element_load(this_value, index);
+                typed_array_element_store(result, index, source);
+            }
+            match typed_array_sort_into(result, length, kind, comparator) {
+                Some(thrown) => thrown,
+                None => result,
+            }
+        })
+    })
+}
+
+/// `%TypedArray%.prototype.toReversed` — a reversed copy.
+extern "C" fn typed_array_to_reversed(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    let result = match typed_array_over_new_buffer(kind, length) {
+        Ok(result) => result,
+        Err(thrown) => return thrown,
+    };
+    with_rooted(&[result, this_value], || {
+        for index in 0..length {
+            let source = typed_array_element_load(this_value, length - 1 - index);
+            typed_array_element_store(result, index, source);
+        }
+    });
+    result
+}
+
+/// `%TypedArray%.prototype.with` — a copy with the element at `index` replaced by `value`.
+extern "C" fn typed_array_with(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some((_, _, length, kind)) = typed_array_parts(this_value) else {
+        return raise("this is not a typed array", "TypeError");
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let relative = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let value = unsafe { argument(argc, argv, 1) };
+    // `ToIntegerOrInfinity(index)`, then map a negative index from the end.
+    let number = match coerce_number(relative) {
+        Ok(number) => number,
+        Err(thrown) => return thrown,
+    };
+    let integer = if number.is_nan() { 0.0 } else { number.trunc() };
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a typed array's length is far below 2^53"
+    )]
+    let span = length as f64;
+    let resolved = if integer < 0.0 {
+        span + integer
+    } else {
+        integer
+    };
+    if resolved < 0.0 || resolved >= span {
+        return raise("invalid or out-of-range index", "RangeError");
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked into 0..length just above"
+    )]
+    let actual = resolved as usize;
+    // `value` is rooted before the copy is allocated (D-255): the allocation collects, and the
+    // replacement store happens afterwards.
+    with_rooted(&[this_value, value], || {
+        let result = match typed_array_over_new_buffer(kind, length) {
+            Ok(result) => result,
+            Err(thrown) => return thrown,
+        };
+        let outcome = with_rooted(&[result], || {
+            for index in 0..length {
+                let source = typed_array_element_load(this_value, index);
+                typed_array_element_store(result, index, source);
+            }
+            typed_array_element_store(result, actual, value)
+        });
+        match outcome {
+            Some(thrown) => thrown,
+            None => result,
+        }
+    })
+}
+
+/// `%TypedArray%.of(...items)` — a typed array of the receiver's kind holding the arguments,
+/// each coerced to the element type.
+extern "C" fn typed_array_of(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(kind) = typed_ctor_kind(this_value) else {
+        return raise(
+            "TypedArray.of requires a typed-array constructor as its receiver",
+            "TypeError",
+        );
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        let count = argc as usize;
+        let result = match typed_array_over_new_buffer(kind, count) {
+            Ok(result) => result,
+            Err(thrown) => return thrown,
+        };
+        let outcome = with_rooted(&[result], || {
+            for index in 0..count {
+                // SAFETY: as above.
+                let item = unsafe { argument(argc, argv, index) };
+                if let Some(thrown) = typed_array_element_store(result, index, item) {
+                    return Some(thrown);
+                }
+            }
+            None
+        });
+        outcome.unwrap_or(result)
+    })
+}
+
+/// `%TypedArray%.from(source, mapFn?, thisArg?)` — a typed array of the receiver's kind built from
+/// an array or any iterable, each element optionally passed through `mapFn` first.
+///
+/// **Array-like objects that are not iterable are not accepted** — the source is read as an array
+/// or drained through its iterator, which covers arrays, typed arrays, strings, sets, maps and
+/// generators. A plain `{length, 0, 1}` without a `Symbol.iterator` reaches the "not iterable"
+/// path rather than the array-like one (D-256), the one corner of `from` still owed.
+extern "C" fn typed_array_from(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let Some(kind) = typed_ctor_kind(this_value) else {
+        return raise(
+            "TypedArray.from requires a typed-array constructor as its receiver",
+            "TypeError",
+        );
+    };
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let source = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let mapper = unsafe { argument(argc, argv, 1) };
+    // SAFETY: as above.
+    let this_arg = unsafe { argument(argc, argv, 2) };
+    // SAFETY: as above.
+    let live = unsafe { live_values(this_value, argc, argv) };
+    with_rooted(&live, || {
+        // An array is read directly; anything else is drained through its iterator, which answers
+        // an array (or the exception if it is not iterable). Collecting into a `Vec` roots nothing,
+        // so it happens before the result is allocated.
+        let taken = if elements_of(source).is_some() {
+            source
+        } else {
+            crisol_iterate(source)
+        };
+        if Value::from_bits(taken).is_exception() {
+            return taken;
+        }
+        with_rooted(&[taken], || {
+            let values: Vec<u64> = match elements_of(taken) {
+                Some((array, length)) => {
+                    (0..length).map(|index| element_at(array, index)).collect()
+                }
+                None => Vec::new(),
+            };
+            with_rooted(&values, || {
+                let result = match typed_array_over_new_buffer(kind, values.len()) {
+                    Ok(result) => result,
+                    Err(thrown) => return thrown,
+                };
+                let outcome = with_rooted(&[result], || {
+                    for (index, &element) in values.iter().enumerate() {
+                        let stored = if is_callable(mapper) {
+                            let mapped =
+                                call_value(mapper, this_arg, &[element, index_value(index)]);
+                            if Value::from_bits(mapped).is_exception() {
+                                return Some(mapped);
+                            }
+                            mapped
+                        } else {
+                            element
+                        };
+                        if let Some(thrown) = typed_array_element_store(result, index, stored) {
+                            return Some(thrown);
+                        }
+                    }
+                    None
+                });
+                outcome.unwrap_or(result)
+            })
+        })
+    })
 }
 
 /// The nine `new Int8Array(...)` bodies. Each names its kind and shares [`new_typed_array`].
@@ -11282,6 +11804,7 @@ const INTERNAL_PROPERTIES: &[&str] = &[
     NOT_EXTENSIBLE,
     FIXED_LENGTH,
     ELEMENT_RULES,
+    TA_CTOR_KIND,
     ERROR_DATA,
     PROMISE_SETTLES,
     PROMISE_REJECTS,
@@ -13405,6 +13928,17 @@ impl Runtime {
                     "BYTES_PER_ELEMENT",
                     Value::number(index_number(kind.bytes())),
                 );
+                // The kind stamp `of`/`from` read to know which array to build, and those two
+                // statics themselves.
+                self.define_hidden(
+                    constructor,
+                    TA_CTOR_KIND,
+                    Value::number(index_number(kind.tag())),
+                );
+                for (name, offset) in [("of", TA_OF_METHOD), ("from", TA_FROM_METHOD)] {
+                    let method = self.native_function(typed_natives_base() + offset);
+                    self.define_method(constructor, name, name, method.to_value());
+                }
             }
         }
         if let (Some(constructor), Some(prototype)) = (
@@ -14069,6 +14603,12 @@ impl Runtime {
                 ("set", TA_SET_METHOD),
                 ("subarray", TA_SUBARRAY_METHOD),
                 ("slice", TA_SLICE_METHOD),
+                ("map", TA_MAP_METHOD),
+                ("filter", TA_FILTER_METHOD),
+                ("sort", TA_SORT_METHOD),
+                ("toSorted", TA_TO_SORTED_METHOD),
+                ("toReversed", TA_TO_REVERSED_METHOD),
+                ("with", TA_WITH_METHOD),
             ] {
                 let method = self.native_function(base + offset);
                 self.define_method(

@@ -1107,6 +1107,92 @@ fn weak_collections_have_their_synchronous_surface() {
     );
 }
 
+/// `%TypedArray%.prototype` map/filter/sort/toSorted/toReversed/with, and the `of`/`from` statics
+/// (D-256) — the members that must *build* a typed array rather than read through the indices the
+/// aliased `Array.prototype` methods already handle.
+#[test]
+fn typed_arrays_have_their_producing_methods() {
+    check(
+        "typed-map",
+        "var a = new Int8Array([1, 2, 3]); var m = a.map(function (x) { return x * 2; }); \
+         return m[0] + \",\" + m[2] + \",\" + (m instanceof Int8Array) + \",\" + a[0];",
+        "2,6,true,1",
+    );
+    check(
+        "typed-filter",
+        "var a = new Uint8Array([1, 2, 3, 4]); \
+         var f = a.filter(function (x) { return x % 2 === 0; }); \
+         return f.length + \",\" + f[0] + \",\" + f[1];",
+        "2,2,4",
+    );
+    // Default sort is numeric, not the string order Array.prototype.sort would impose.
+    check(
+        "typed-sort-numeric",
+        "var a = new Uint16Array([10, 2, 33, 4]); a.sort(); \
+         return a[0] + \",\" + a[1] + \",\" + a[2] + \",\" + a[3];",
+        "2,4,10,33",
+    );
+    check(
+        "typed-sort-comparator",
+        "var a = new Float64Array([1, 2, 3]); a.sort(function (x, y) { return y - x; }); \
+         return a[0] + \",\" + a[2];",
+        "3,1",
+    );
+    check(
+        "typed-to-sorted",
+        "var a = new Int16Array([3, 1, 2]); var s = a.toSorted(); \
+         return \"\" + s[0] + s[1] + s[2] + \",\" + a[0] + \",\" + (s instanceof Int16Array);",
+        "123,3,true",
+    );
+    check(
+        "typed-to-reversed",
+        "var a = new Int8Array([1, 2, 3]); var r = a.toReversed(); \
+         return \"\" + r[0] + r[1] + r[2] + \",\" + a[0];",
+        "321,1",
+    );
+    check(
+        "typed-with",
+        "var a = new Int8Array([1, 2, 3]); var w = a.with(1, 9); \
+         return \"\" + w[0] + w[1] + w[2] + \",\" + a[1];",
+        "193,2",
+    );
+    check(
+        "typed-with-out-of-range",
+        "try { new Int8Array([1]).with(5, 0); return 1; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // Statics: of from arguments, from over an array, an iterator, and with a map function.
+    check(
+        "typed-of",
+        "var o = Int16Array.of(10, 20, 30); \
+         return o.length + \",\" + o[2] + \",\" + (o instanceof Int16Array);",
+        "3,30,true",
+    );
+    check(
+        "typed-from-array",
+        "var f = Uint8Array.from([1, 2, 3]); return \"\" + f[0] + f[1] + f[2] + \",\" + f.length;",
+        "123,3",
+    );
+    check(
+        "typed-from-iterator-with-map",
+        "var f = Int8Array.from([1, 2, 3].values(), function (x) { return x * 10; }); \
+         return f[0] + \",\" + f[2];",
+        "10,30",
+    );
+    check(
+        "typed-from-non-iterable",
+        "try { Int8Array.from(5); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A BigInt typed array sorts by value, and maps back to a BigInt array.
+    check(
+        "typed-bigint-sort",
+        "var a = new BigInt64Array([3n, 1n, 2n]); a.sort(); \
+         return a[0] + \",\" + a[2] + \",\" + typeof a[0];",
+        "1,3,bigint",
+    );
+}
+
 /// **A string method on `null`/`undefined` or a symbol is a `TypeError`.**
 ///
 /// `ToString(RequireObjectCoercible(this))`: nullish fails the first step, a symbol the second.
