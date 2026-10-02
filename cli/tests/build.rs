@@ -10982,3 +10982,47 @@ fn destructuring_rest_catch_and_assignment() {
         "15",
     );
 }
+
+/// Static class members (D-261): static methods, static fields, static accessors, and inheritance
+/// of statics through the constructor chain. They live on the constructor, not the prototype.
+#[test]
+fn static_class_members_live_on_the_constructor() {
+    check(
+        "static-method",
+        "class C { static f() { return 6; } } return C.f();",
+        "6",
+    );
+    check("static-field", "class C { static x = 9; } return C.x;", "9");
+    check(
+        "static-field-no-init",
+        "class C { static x; } return typeof C.x;",
+        "undefined",
+    );
+    check(
+        "static-getter",
+        "class C { static get v() { return 42; } } return C.v;",
+        "42",
+    );
+    check(
+        "static-and-instance-coexist",
+        "class C { static s() { return 1; } m() { return 2; } } return C.s() + new C().m();",
+        "3",
+    );
+    check(
+        "static-inherited",
+        "class A { static f() { return 5; } } class B extends A {} return B.f();",
+        "5",
+    );
+    check(
+        "static-not-on-instance",
+        "class C { static f() { return 1; } } return typeof new C().f;",
+        "undefined",
+    );
+    // Instance members still behave as before.
+    check(
+        "instance-method-after-static",
+        "class C { static s() { return 1; } constructor() { this.x = 7; } m() { return this.x; } } \
+         return new C().m();",
+        "7",
+    );
+}

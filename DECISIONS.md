@@ -7236,3 +7236,23 @@ identifiers, members, and destructuring targets share one path. oxc's assignment
 INHERIT macro, so the element targets come back through `as_assignment_target()` (an `Option`, since the
 with-default case is a sibling variant), not by matching the flattened variants directly. Entirely a
 frontend change; no runtime op was added.
+
+## D-261
+
+**Static class members: static methods, fields, and accessors.**
+
+Status: Accepted
+
+A `static` method or field belongs to the constructor, not the prototype — `C.f()` and `C.x`, not
+`new C().f`. The class lowering builds the prototype and its members inside one loop, but the
+constructor does not exist until after it (it may be the implicit one), so static members are
+*collected* during the loop — the methods already lowered to closures — and installed on the
+constructor once it is built: `PropertyStore` for a method or field, `DefineAccessor` for a static
+getter/setter. Inheritance of statics was already handled: the constructor's own `[[Prototype]]` is
+linked to the parent constructor (D-243), so `class B extends A {}` reaches `A.f` with no extra work.
+
+A static field's initialiser runs at class definition, in the class scope — so `this` is the enclosing
+one rather than the constructor, and the class's own name is not yet bound. `static x = 5` and
+`static y = Other.value` (nearly all of them) are right; `static y = this.x` or `static y = C.x` reach a
+wrong `this` / an unbound name, recorded as the gap still owed, alongside static blocks and
+computed-name members, which stay refused.

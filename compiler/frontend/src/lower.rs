@@ -3833,18 +3833,30 @@ impl Lowering {
         // Instance fields, in source order, each with its initialiser. They are run in the
         // constructor on every instance (D-252); collected here and injected below.
         let mut fields: Vec<(String, Option<&Expression<'_>>)> = Vec::new();
+        // Static methods and fields go on the constructor, which does not exist until after this
+        // loop — so they are collected (the methods already lowered to closures) and installed once
+        // it does (D-261).
+        let mut static_methods: Vec<(String, oxc_ast::ast::MethodDefinitionKind, ValueId)> =
+            Vec::new();
+        let mut static_fields: Vec<(String, Option<&Expression<'_>>)> = Vec::new();
 
         for element in &class.body.body {
             let method = match element {
                 oxc_ast::ast::ClassElement::MethodDefinition(method) => method,
-                // `x = 1;` — an instance field. Static and computed-name fields are not lowered.
-                oxc_ast::ast::ClassElement::PropertyDefinition(property)
-                    if !property.r#static && !property.computed =>
-                {
+                // `x = 1;` / `static x = 1;` — an instance or static field. A computed-name field is
+                // not lowered yet.
+                oxc_ast::ast::ClassElement::PropertyDefinition(property) if !property.computed => {
                     match property.key.static_name() {
+                        Some(key) if property.r#static => {
+                            static_fields.push((key.to_string(), property.value.as_ref()));
+                        }
                         Some(key) => fields.push((key.to_string(), property.value.as_ref())),
                         None => self.note("computed class field", property.span.start),
                     }
+                    continue;
+                }
+                oxc_ast::ast::ClassElement::PropertyDefinition(property) => {
+                    self.note("computed class field", property.span.start);
                     continue;
                 }
                 _ => {
@@ -3852,10 +3864,6 @@ impl Lowering {
                     continue;
                 }
             };
-            if method.r#static {
-                self.note("static class member", method.span.start);
-                continue;
-            }
             let Some(key) = method.key.static_name() else {
                 self.note("computed method name", method.span.start);
                 continue;
@@ -3869,11 +3877,17 @@ impl Lowering {
                 true,
             );
             let closure = self.close_over(id, &captures);
-            if method_name == "constructor" {
+            if method_name == "constructor" && !method.r#static {
                 // Remembered, **not returned**. Returning here dropped every method declared
                 // after the constructor — and `constructor` conventionally comes first, so the
                 // common ordering was the broken one.
                 constructor = Some(closure);
+                continue;
+            }
+            // A static method goes on the constructor, which is not built yet — collected and
+            // installed below (D-261).
+            if method.r#static {
+                static_methods.push((method_name, method.kind, closure));
                 continue;
             }
             // A class body's accessors are accessors, exactly as a literal's are — and a
@@ -3941,6 +3955,51 @@ impl Lowering {
             self.emit_effect(Op::SetPrototype {
                 object: constructor,
                 prototype: parent,
+            });
+        }
+        // Static members live on the constructor (D-261). The parent-chain link above already lets a
+        // static method reach an inherited one. A static field's initialiser runs here, at class
+        // definition — in the class scope, so `this` is the enclosing one rather than the
+        // constructor, which is right for the `static x = 5` and `static y = Name.other` that make up
+        // nearly all of them and recorded as a gap for the rest.
+        for (method_name, kind, closure) in static_methods {
+            match kind {
+                oxc_ast::ast::MethodDefinitionKind::Get => {
+                    let absent = self.placeholder();
+                    self.emit_effect(Op::DefineAccessor {
+                        object: constructor,
+                        key: PropertyKey::new(&method_name),
+                        getter: closure,
+                        setter: absent,
+                    });
+                }
+                oxc_ast::ast::MethodDefinitionKind::Set => {
+                    let absent = self.placeholder();
+                    self.emit_effect(Op::DefineAccessor {
+                        object: constructor,
+                        key: PropertyKey::new(&method_name),
+                        getter: absent,
+                        setter: closure,
+                    });
+                }
+                _ => {
+                    self.emit_effect(Op::PropertyStore {
+                        object: constructor,
+                        key: PropertyKey::new(&method_name),
+                        value: closure,
+                    });
+                }
+            }
+        }
+        for (field_name, initialiser) in static_fields {
+            let value = match initialiser {
+                Some(expression) => self.value_expression(expression),
+                None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+            };
+            self.emit_effect(Op::PropertyStore {
+                object: constructor,
+                key: PropertyKey::new(&field_name),
+                value,
             });
         }
         constructor

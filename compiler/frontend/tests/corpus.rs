@@ -350,7 +350,14 @@ fn unfaithful_programs_are_reported_not_guessed() {
             "class C { x = 1; constructor() {} }",
             "class field with an explicit constructor",
         ),
-        ("class C { static m() { } }", "static class member"),
+        // Static *methods* and *fields* lower now (D-261); a static **block** does not — it runs
+        // arbitrary statements at class definition, which the class lowering does not synthesise.
+        (
+            "class C { static { } }",
+            "class member that is not a method",
+        ),
+        // A computed field name needs the key evaluated at definition, which is not wired yet.
+        ("class C { [x] = 1; }", "computed class field"),
     ];
 
     for (source, expected) in cases {
