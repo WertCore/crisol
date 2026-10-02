@@ -164,6 +164,13 @@ struct Scope {
     labels: Vec<(String, BlockId, Option<BlockId>)>,
 }
 
+/// The resolved target of a logical assignment (`&&=`/`||=`/`??=`), evaluated once (D-264).
+enum LogicalTarget {
+    Slot(u32),
+    Static { object: ValueId, name: String },
+    Computed { object: ValueId, key: ValueId },
+}
+
 /// What a generator body accumulates as it lowers: one resume point per `yield`, and which slots
 /// are the body's own locals (kept on the generator object so they survive a suspension).
 struct GenState {
@@ -2580,15 +2587,72 @@ impl Lowering {
             }
             Expression::NewExpression(new) => {
                 let callee = self.expression(&new.callee);
+                let spread = new
+                    .arguments
+                    .iter()
+                    .any(|argument| matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)));
+                if spread {
+                    // `new F(...xs)` gathers its arguments into an array — as a spread call does —
+                    // and constructs through `Reflect.construct(F, array)`, whose default new-target
+                    // is the target, which is what `new` uses (D-264). (This reads the `Reflect`
+                    // global, so replacing it is observed — a narrow deviation noted rather than a
+                    // new IR op for a rare form.)
+                    let array = self.emit(
+                        Type::Object(None),
+                        Op::CreateArray {
+                            elements: Vec::new(),
+                        },
+                    );
+                    for argument in &new.arguments {
+                        if let oxc_ast::ast::Argument::SpreadElement(element) = argument {
+                            let value = self.expression(&element.argument);
+                            let extended = self.emit(
+                                Type::Undefined,
+                                Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: true,
+                                },
+                            );
+                            self.propagate(extended);
+                        } else if let Some(expression) = argument.as_expression() {
+                            let value = self.expression(expression);
+                            self.emit_effect(Op::ArrayExtend {
+                                array,
+                                value,
+                                spread: false,
+                            });
+                        }
+                    }
+                    let reflect = self.emit(
+                        Type::Unknown,
+                        Op::GlobalLoad {
+                            name: PropertyKey::new("Reflect"),
+                        },
+                    );
+                    let reflect = self.propagate(reflect);
+                    let construct = self.emit(
+                        Type::Unknown,
+                        Op::PropertyLoad {
+                            object: reflect,
+                            key: PropertyKey::new("construct"),
+                        },
+                    );
+                    let construct = self.propagate(construct);
+                    let result = self.emit(
+                        Type::Object(None),
+                        Op::Call {
+                            callee: construct,
+                            this_value: reflect,
+                            args: vec![callee, array],
+                        },
+                    );
+                    return self.propagate(result);
+                }
                 let mut args = Vec::with_capacity(new.arguments.len());
                 for argument in &new.arguments {
-                    match argument.as_expression() {
-                        Some(expression) => args.push(self.expression(expression)),
-                        None => {
-                            self.note("spread argument", new.span.start);
-                            let placeholder = self.placeholder();
-                            args.push(placeholder);
-                        }
+                    if let Some(expression) = argument.as_expression() {
+                        args.push(self.expression(expression));
                     }
                 }
                 let result = self.emit(Type::Object(None), Op::Construct { callee, args });
@@ -3056,14 +3120,57 @@ impl Lowering {
         assignment: &oxc_ast::ast::AssignmentExpression<'_>,
     ) -> ValueId {
         use oxc_ast::ast::AssignmentOperator as AsgOp;
-        let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) =
-            &assignment.left
-        else {
-            self.note("logical assignment to a member", assignment.span.start);
-            return self.value_expression(&assignment.right);
+        // The target is resolved once — the object and any computed key are evaluated a single time,
+        // before the branch — so `o[k()] ||= v` runs `k` once whether or not it assigns (D-264).
+        let target = match &assignment.left {
+            oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                LogicalTarget::Slot(self.slot(identifier.name.as_str()))
+            }
+            oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                LogicalTarget::Static {
+                    object,
+                    name: member.property.name.to_string(),
+                }
+            }
+            oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                LogicalTarget::Computed { object, key }
+            }
+            _ => {
+                self.note("logical assignment target", assignment.span.start);
+                return self.value_expression(&assignment.right);
+            }
         };
-        let slot = self.slot(identifier.name.as_str());
-        let current = self.read(slot);
+        // The current value, through the ordinary read for the kind of target.
+        let current = match &target {
+            LogicalTarget::Slot(slot) => self.read(*slot),
+            LogicalTarget::Static { object, name } => {
+                let read = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object: *object,
+                        key: PropertyKey::new(name),
+                    },
+                );
+                self.propagate(read)
+            }
+            LogicalTarget::Computed { object, key } => {
+                let read = self.emit(
+                    Type::Unknown,
+                    Op::ComputedLoad {
+                        object: *object,
+                        key: *key,
+                    },
+                );
+                self.propagate(read)
+            }
+        };
+        // The result travels through a slot, so the short-circuit and the assignment both write one
+        // place — a member target has no slot of its own to re-read.
+        let result = self.temporary();
+        self.write(result, current);
         let assign = self.new_block();
         let skip = self.new_block();
         let join = self.new_block();
@@ -3097,7 +3204,32 @@ impl Lowering {
         }
         self.switch_to(assign);
         let rhs = self.value_expression(&assignment.right);
-        self.write(slot, rhs);
+        self.write(result, rhs);
+        match &target {
+            LogicalTarget::Slot(slot) => self.write(*slot, rhs),
+            LogicalTarget::Static { object, name } => {
+                let stored = self.emit(
+                    Type::Unknown,
+                    Op::PropertyStore {
+                        object: *object,
+                        key: PropertyKey::new(name),
+                        value: rhs,
+                    },
+                );
+                self.propagate(stored);
+            }
+            LogicalTarget::Computed { object, key } => {
+                let stored = self.emit(
+                    Type::Unknown,
+                    Op::ComputedStore {
+                        object: *object,
+                        key: *key,
+                        value: rhs,
+                    },
+                );
+                self.propagate(stored);
+            }
+        }
         self.terminate(Terminator::Jump {
             target: join,
             args: Vec::new(),
@@ -3108,7 +3240,7 @@ impl Lowering {
             args: Vec::new(),
         });
         self.switch_to(join);
-        self.read(slot)
+        self.read(result)
     }
 
     /// `a?.b.c`, `a?.[k]`, `f?.()` — an optional chain (D-251). Each `?.` short-circuits the whole

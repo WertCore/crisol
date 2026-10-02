@@ -7295,3 +7295,22 @@ emitted after the parameters are bound and before the body — empty for every f
 class's constructor. A **derived** class still refuses the combination: its fields must run after
 `super()` returns, wherever that call sits in the body, and synthesising that is not done — so the note
 stays for that case, rather than running the fields at the wrong time.
+
+## D-264
+
+**Logical assignment to a member, and spread in `new`.**
+
+Status: Accepted
+
+`o.a ||= v`, `o.a &&= v`, `o.a ??= v` were refused for a member target — `logical_assignment` handled
+only identifiers. It now resolves the target first (a slot for an identifier, an evaluated object and,
+for a computed key, an evaluated key for a member), reads the current value through that, and routes the
+result through a temporary so the short-circuit and the assignment both write one place. The object and
+any computed key are evaluated **once**, before the branch, so `o[k()] ||= v` runs `k` a single time
+whether or not it assigns.
+
+`new F(...xs)` was the remaining "spread argument" refusal. Its arguments are gathered into an array —
+exactly as a spread call's are — and it constructs through `Reflect.construct(F, array)`, whose default
+new-target is the target, which is what `new` uses. That reads the `Reflect` global, so replacing
+`Reflect.construct` is observable — a narrow deviation taken deliberately over adding a whole
+`ConstructSpread` IR op (enum, codegen, runtime) for a form this rare.

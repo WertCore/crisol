@@ -11103,3 +11103,58 @@ fn fields_initialise_inside_an_explicit_constructor() {
         "9",
     );
 }
+
+/// Logical assignment to a member target, and spread in `new` (D-264).
+#[test]
+fn logical_member_assignment_and_new_spread() {
+    check(
+        "logical-or-member",
+        "var o = { a: 0 }; o.a ||= 5; return o.a;",
+        "5",
+    );
+    check(
+        "logical-and-member",
+        "var o = { a: 1 }; o.a &&= 7; return o.a;",
+        "7",
+    );
+    check(
+        "logical-nullish-member",
+        "var o = { a: null }; o.a ??= 9; o.b ??= 3; return o.a + \",\" + o.b;",
+        "9,3",
+    );
+    check(
+        "logical-computed-member",
+        "var o = {}; var k = \"x\"; o[k] ||= 4; return o.x;",
+        "4",
+    );
+    // The operator short-circuits: `||=` on a truthy value does not assign.
+    check(
+        "logical-member-skips",
+        "var o = { a: 5 }; o.a ||= 99; return o.a;",
+        "5",
+    );
+    // The object and a computed key are evaluated once.
+    check(
+        "logical-member-evaluates-key-once",
+        "var n = 0; function k() { n++; return \"x\"; } var o = { x: 0 }; o[k()] ||= 1; \
+         return n + \":\" + o.x;",
+        "1:1",
+    );
+    // Spread in `new`.
+    check(
+        "new-spread",
+        "function F(a, b) { this.s = a + b; } return new F(...[3, 4]).s;",
+        "7",
+    );
+    check(
+        "new-spread-mixed",
+        "function F(a, b, c) { this.s = a + \",\" + b + \",\" + c; } return new F(1, ...[2, 3]).s;",
+        "1,2,3",
+    );
+    check(
+        "new-spread-iterable",
+        "class P { constructor(a, b, c) { this.s = a + b + c; } } \
+         var s = new Set(); s.add(1); s.add(2); s.add(3); return new P(...s).s;",
+        "6",
+    );
+}
