@@ -7416,3 +7416,41 @@ does, rather than refusing.
 `true` and `forEach` visits them. True holes need the heap array and every method that walks it (`in`,
 `forEach`/`map`/…, `hasOwnProperty`) to distinguish an absent slot from one holding `undefined` — a
 runtime-wide change, deferred rather than half-done in the frontend.
+
+## D-270
+
+**Computed accessors, computed fields, and static computed members.**
+
+Status: Accepted
+
+`{ get [k]() {…} }`, `class { get [k]() {…} }`, `class { [k] = v }`, and the `static` forms of
+all of these now lower, completing the computed-member work D-265 began (which did instance
+*methods* only).
+
+The enabler is one new op, `ComputedDefineAccessor { object, key, getter, setter }` — `DefineAccessor`
+with the key as a value rather than an interned `PropertyKey`, so it coerces through `ToPropertyKey`
+at run time and may be a symbol (`get [Symbol.iterator]()`). It routes through the same
+`object_define_property` the named accessor does, so a partial descriptor still merges: a `get [k]`
+and a `set [k]` on one key become a single accessor rather than the setter erasing the getter.
+
+A computed field's key is evaluated **once, at class definition, in source order** with the other
+members — not once per `new`. The key is parked in a synthetic class-scope slot (` fieldkey<n>`,
+named apart from any identifier by its leading space) that the constructor captures and reads; the
+field *value* still runs per instance in the constructor, as every field initialiser does. Static
+computed members defer the same way the named statics do (D-261): the key is evaluated in the loop
+and the member installed on the constructor once it exists. A numeric field key (`class { 1 = 5 }`)
+takes this path too, since its name is likewise not known until coerced.
+
+**Two pre-existing bugs surfaced while verifying this, neither introduced here — a computed field
+behaves identically to a named one on both:**
+
+- A field initialiser that *directly* writes an outer variable (`class C { x = ++n }`) does not
+  persist the write: the variable is captured-and-assigned by the constructor through the injected
+  initialiser, but the cell-promotion scan does not look inside field-initialiser expressions, so
+  the write lands in a by-value copy. A field initialiser that *calls* a function which mutates
+  (`x = inc()`) is fine, as is the same write in an explicit constructor body.
+- The class name is not bound inside any method body (`class C { m() { return C; } }` throws
+  `ReferenceError: C`). `this` reaches the constructor for statics, so it is a workaround, not a
+  fix.
+
+Both block real test262 cases and are filed as follow-ups rather than folded in here.

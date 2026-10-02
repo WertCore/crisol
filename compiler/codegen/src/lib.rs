@@ -176,6 +176,7 @@ const HELPER_SYMBOLS: &[(BinaryOp, &str)] = &[
 const CREATE_OBJECT_SYMBOL: &str = "crisol_create_object";
 const PROPERTY_STORE_SYMBOL: &str = "crisol_property_store";
 const DEFINE_ACCESSOR_SYMBOL: &str = "crisol_define_accessor";
+const COMPUTED_DEFINE_ACCESSOR_SYMBOL: &str = "crisol_computed_define_accessor";
 const PROPERTY_LOAD_SYMBOL: &str = "crisol_property_load";
 const CLOSURE_CAPTURE_SYMBOL: &str = "crisol_closure_capture";
 const CREATE_CLOSURE_SYMBOL: &str = "crisol_create_closure";
@@ -234,6 +235,8 @@ struct ObjectHelpers<T> {
     load: T,
     /// `crisol_define_accessor(object, key, length, getter, setter) -> undefined or the signal`
     define_accessor: T,
+    /// `crisol_computed_define_accessor(object, key, getter, setter) -> undefined or the signal`
+    computed_define_accessor: T,
     /// `crisol_closure_capture(closure, index) -> value`
     capture: T,
     /// `crisol_create_closure(function, captures) -> closure`
@@ -323,6 +326,25 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     define_accessor.params.push(AbiParam::new(types::I64));
     define_accessor.params.push(AbiParam::new(types::I64));
     define_accessor.returns.push(AbiParam::new(types::I64));
+
+    // `crisol_computed_define_accessor(object, key, getter, setter)` — the key is a value, not an
+    // interned pointer-and-length, so there is no length argument (D-270).
+    let mut computed_define_accessor = module.make_signature();
+    computed_define_accessor
+        .params
+        .push(AbiParam::new(types::I64));
+    computed_define_accessor
+        .params
+        .push(AbiParam::new(types::I64));
+    computed_define_accessor
+        .params
+        .push(AbiParam::new(types::I64));
+    computed_define_accessor
+        .params
+        .push(AbiParam::new(types::I64));
+    computed_define_accessor
+        .returns
+        .push(AbiParam::new(types::I64));
 
     let mut load = module.make_signature();
     load.params.push(AbiParam::new(types::I64));
@@ -503,6 +525,10 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         create: declare(CREATE_OBJECT_SYMBOL, &create)?,
         store: declare(PROPERTY_STORE_SYMBOL, &store)?,
         define_accessor: declare(DEFINE_ACCESSOR_SYMBOL, &define_accessor)?,
+        computed_define_accessor: declare(
+            COMPUTED_DEFINE_ACCESSOR_SYMBOL,
+            &computed_define_accessor,
+        )?,
         load: declare(PROPERTY_LOAD_SYMBOL, &load)?,
         capture: declare(CLOSURE_CAPTURE_SYMBOL, &capture)?,
         create_closure: declare(CREATE_CLOSURE_SYMBOL, &create_closure)?,
@@ -1015,6 +1041,9 @@ impl Backend for Cranelift {
             define_accessor: self
                 .module
                 .declare_func_in_func(self.objects.define_accessor, &mut context.func),
+            computed_define_accessor: self
+                .module
+                .declare_func_in_func(self.objects.computed_define_accessor, &mut context.func),
             load: self
                 .module
                 .declare_func_in_func(self.objects.load, &mut context.func),
@@ -1962,6 +1991,22 @@ impl Lowering<'_> {
                 );
                 Some(self.builder.inst_results(call)[0])
             }
+            Op::ComputedDefineAccessor {
+                object,
+                key,
+                getter,
+                setter,
+            } => {
+                let object = self.value(*object);
+                let key = self.value(*key);
+                let getter = self.value(*getter);
+                let setter = self.value(*setter);
+                let call = self.builder.ins().call(
+                    self.objects.computed_define_accessor,
+                    &[object, key, getter, setter],
+                );
+                Some(self.builder.inst_results(call)[0])
+            }
             Op::PropertyLoad { object, key } => {
                 let object = self.value(*object);
                 let (pointer, length) = self.key_operands(key)?;
@@ -2298,6 +2343,9 @@ impl Jit {
             define_accessor: self
                 .module
                 .declare_func_in_func(self.objects.define_accessor, &mut context.func),
+            computed_define_accessor: self
+                .module
+                .declare_func_in_func(self.objects.computed_define_accessor, &mut context.func),
             load: self
                 .module
                 .declare_func_in_func(self.objects.load, &mut context.func),

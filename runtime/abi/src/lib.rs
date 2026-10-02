@@ -8601,6 +8601,51 @@ pub unsafe extern "C" fn crisol_define_accessor(
     })
 }
 
+/// [`crisol_define_accessor`] with the name computed at run time — `{ get [k]() {…} }` and
+/// `class { get [k]() {…} }` (D-270).
+///
+/// The only difference is the key: a value rather than an interned pointer-and-length, so it goes
+/// to `defineProperty` as-is and coerces through `ToPropertyKey` there — including the symbol case
+/// `{ get [Symbol.iterator]() {…} }`, which an interned name could not carry. Everything else is
+/// shared, so the three ways of making an accessor still cannot disagree about what one is, and a
+/// partial descriptor still merges: a `get [k]` and a `set [k]` on the same key are one property.
+///
+/// # Safety
+///
+/// This function has no pointer arguments; it is `unsafe` only to share the `extern "C"` ABI.
+#[unsafe(no_mangle)]
+#[must_use]
+pub unsafe extern "C" fn crisol_computed_define_accessor(
+    object: u64,
+    key: u64,
+    getter: u64,
+    setter: u64,
+) -> u64 {
+    with_rooted(&[object, key, getter, setter], || {
+        let descriptor = crisol_create_object();
+        with_rooted(&[descriptor, key, getter, setter], || {
+            let Some(into) = handle_of(descriptor) else {
+                return Value::UNDEFINED.to_bits();
+            };
+            with_runtime(|runtime| {
+                // **Only the half that was written** — see [`crisol_define_accessor`].
+                if !Value::from_bits(getter).is_undefined() {
+                    runtime.define(into, "get", Value::from_bits(getter));
+                }
+                if !Value::from_bits(setter).is_undefined() {
+                    runtime.define(into, "set", Value::from_bits(setter));
+                }
+                runtime.define(into, "enumerable", Value::TRUE);
+                runtime.define(into, "configurable", Value::TRUE);
+            });
+            let arguments = [object, key, descriptor];
+            with_rooted(&arguments, || {
+                object_define_property(0, 0, 0, 3, arguments.as_ptr())
+            })
+        })
+    })
+}
+
 /// `Error.isError(value)`.
 ///
 /// **Not `instanceof`.** An object from another realm, or one whose prototype has been

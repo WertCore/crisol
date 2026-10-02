@@ -501,6 +501,21 @@ pub enum Op {
         /// The setter, or `undefined` when there is none.
         setter: ValueId,
     },
+    /// [`DefineAccessor`](Self::DefineAccessor) with the name computed at run time —
+    /// `{ get [k]() {…} }` and `class { get [k]() {…} }`. The key is a value rather than an
+    /// interned name, so it coerces through `ToPropertyKey` and may be a symbol; a partial
+    /// descriptor merges with any accessor already there, so a `get [k]` and a `set [k]` on the
+    /// same key become one property (D-270).
+    ComputedDefineAccessor {
+        /// The receiver.
+        object: ValueId,
+        /// The key, as a value.
+        key: ValueId,
+        /// The getter, or `undefined` when there is none.
+        getter: ValueId,
+        /// The setter, or `undefined` when there is none.
+        setter: ValueId,
+    },
     /// Sets `object`'s `[[Prototype]]`. `class B extends A` links `B.prototype` to `A.prototype`
     /// and `B` to `A`, which is what makes an instance inherit the parent's methods and a static
     /// call reach the parent's statics.
@@ -608,6 +623,7 @@ impl Op {
                 | Self::PropertyLoad { .. }
                 | Self::PropertyStore { .. }
                 | Self::DefineAccessor { .. }
+                | Self::ComputedDefineAccessor { .. }
                 | Self::ComputedLoad { .. }
                 | Self::ComputedStore { .. }
                 | Self::Delete { .. }
@@ -663,6 +679,12 @@ impl Op {
                 setter,
                 ..
             } => vec![*object, *getter, *setter],
+            Self::ComputedDefineAccessor {
+                object,
+                key,
+                getter,
+                setter,
+            } => vec![*object, *key, *getter, *setter],
             Self::ComputedLoad { object, key } | Self::Delete { object, key } => {
                 vec![*object, *key]
             }

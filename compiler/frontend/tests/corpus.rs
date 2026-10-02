@@ -347,8 +347,14 @@ fn unfaithful_programs_are_reported_not_guessed() {
             "class C { static { } }",
             "class member that is not a method",
         ),
-        // A computed field name needs the key evaluated at definition, which is not wired yet.
-        ("class C { [x] = 1; }", "computed class field"),
+        // Computed member names — methods, accessors, fields, and their static forms — all lower
+        // now (D-265/D-270). `yield` as a *subexpression* does not: its value would have to
+        // survive the suspension in a compiler temporary, which the generator lowering cannot yet
+        // spill (a statement-position `yield` is fine).
+        (
+            "function* g() { f(yield 1); }",
+            "yield in expression position",
+        ),
     ];
 
     for (source, expected) in cases {

@@ -114,6 +114,12 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
             getter,
             setter,
         } => write!(f, "accessor {object}.{key:?} get {getter} set {setter}"),
+        Op::ComputedDefineAccessor {
+            object,
+            key,
+            getter,
+            setter,
+        } => write!(f, "accessor {object}[{key}] get {getter} set {setter}"),
         Op::ComputedLoad { object, key } => write!(f, "get {object}[{key}]"),
         Op::Delete { object, key } => write!(f, "delete {object}[{key}]"),
         Op::Enumerate { object } => write!(f, "enumerate {object}"),

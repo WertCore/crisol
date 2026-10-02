@@ -11337,3 +11337,75 @@ fn for_targets_and_optional_call_spread() {
         "undefined",
     );
 }
+
+/// Computed accessors (object and class), computed fields, and static computed members (D-270).
+#[test]
+fn computed_class_members_and_accessors() {
+    // An object literal's computed getter, and a computed get/set pair that merges into one
+    // property rather than the setter erasing the getter.
+    check(
+        "object-computed-getter",
+        "var k = 'x'; var o = { get [k]() { return 42; } }; return o.x;",
+        "42",
+    );
+    check(
+        "object-computed-accessor-pair",
+        "var k = 'x'; var o = { get [k]() { return this._x; }, set [k](v) { this._x = v; } }; o.x = 5; return o.x;",
+        "5",
+    );
+    check(
+        "object-computed-data-and-accessor",
+        "var a = 'a', b = 'b'; var o = { [a]: 1, get [b]() { return 2; } }; return o.a + o.b;",
+        "3",
+    );
+    // A class's computed accessor, the get/set pair again merging.
+    check(
+        "class-computed-accessor-pair",
+        "var k = 'x'; class C { get [k]() { return this._v; } set [k](v) { this._v = v; } } var c = new C(); c.x = 6; return c.x;",
+        "6",
+    );
+    // A computed instance field: its value, its freshness per instance, and its key evaluated
+    // exactly once at class definition rather than once per `new`.
+    check(
+        "class-computed-field",
+        "var k = 'x'; class C { [k] = 2 + 3; } return new C().x;",
+        "5",
+    );
+    check(
+        "class-computed-field-per-instance",
+        "var k = 'x'; class C { [k] = {}; } var a = new C(); var b = new C(); return a.x === b.x;",
+        "false",
+    );
+    check(
+        "class-computed-field-key-evaluated-once",
+        "var n = 0; function k() { n++; return 'x'; } class C { [k()] = 1; } new C(); new C(); return n;",
+        "1",
+    );
+    // A symbol key, and a numeric key — both reach the field through the computed path.
+    check(
+        "class-symbol-field",
+        "var s = Symbol(); class C { [s] = 7; } return new C()[s];",
+        "7",
+    );
+    check(
+        "class-numeric-field",
+        "class C { 1 = 5; } return new C()[1];",
+        "5",
+    );
+    // Static computed members live on the constructor: a method, a field, and an accessor pair.
+    check(
+        "static-computed-method",
+        "var k = 'm'; class C { static [k]() { return 3; } } return C.m();",
+        "3",
+    );
+    check(
+        "static-computed-field",
+        "var k = 's'; class C { static [k] = 8; } return C.s;",
+        "8",
+    );
+    check(
+        "static-computed-accessor",
+        "var k = 'p'; class C { static get [k]() { return this._p; } static set [k](v) { this._p = v; } } C.p = 9; return C.p;",
+        "9",
+    );
+}

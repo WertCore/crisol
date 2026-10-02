@@ -171,6 +171,17 @@ enum LogicalTarget {
     Computed { object: ValueId, key: ValueId },
 }
 
+/// The name of a class field as the constructor needs to see it.
+///
+/// A plain `x = 1` carries its name. A computed `[k] = 1` has its key evaluated once at class
+/// definition — in source order with the other members, which is the one observable thing about
+/// *when* — and parked in a synthetic class-scope slot; the constructor captures that slot and
+/// reads the already-computed key from it, so the key is not re-evaluated per instance (D-270).
+enum FieldKey {
+    Named(String),
+    Computed(String),
+}
+
 /// What a generator body accumulates as it lowers: one resume point per `yield`, and which slots
 /// are the body's own locals (kept on the generator object so they survive a suspension).
 struct GenState {
@@ -4225,7 +4236,7 @@ impl Lowering {
         binds_this: bool,
         // Instance fields to run before the body — non-empty only for a base class's explicit
         // constructor, where they initialise each instance ahead of the user's code (D-263).
-        constructor_fields: &[(String, Option<&Expression<'_>>)],
+        constructor_fields: &[(FieldKey, Option<&Expression<'_>>)],
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(name);
@@ -4471,31 +4482,56 @@ impl Lowering {
         let mut constructor_method: Option<&oxc_ast::ast::MethodDefinition<'_>> = None;
         // Instance fields, in source order, each with its initialiser. They are run in the
         // constructor on every instance (D-252); collected here and injected below.
-        let mut fields: Vec<(String, Option<&Expression<'_>>)> = Vec::new();
+        let mut fields: Vec<(FieldKey, Option<&Expression<'_>>)> = Vec::new();
         // Static methods and fields go on the constructor, which does not exist until after this
         // loop — so they are collected (the methods already lowered to closures) and installed once
         // it does (D-261).
         let mut static_methods: Vec<(String, oxc_ast::ast::MethodDefinitionKind, ValueId)> =
             Vec::new();
-        let mut static_fields: Vec<(String, Option<&Expression<'_>>)> = Vec::new();
+        let mut static_fields: Vec<(FieldKey, Option<&Expression<'_>>)> = Vec::new();
+        // Static *computed* members — `static [k]() {}`, `static get [k]() {}`. The key is a value
+        // evaluated at definition (above), paired with its kind and closure, and installed on the
+        // constructor once it exists (D-270), the same deferral the named statics use.
+        let mut static_computed: Vec<(ValueId, oxc_ast::ast::MethodDefinitionKind, ValueId)> =
+            Vec::new();
 
+        // One synthetic slot per computed field key, named apart from any identifier by its space.
+        let mut computed_field_slots = 0usize;
         for element in &class.body.body {
             let method = match element {
                 oxc_ast::ast::ClassElement::MethodDefinition(method) => method,
-                // `x = 1;` / `static x = 1;` — an instance or static field. A computed-name field is
-                // not lowered yet.
-                oxc_ast::ast::ClassElement::PropertyDefinition(property) if !property.computed => {
+                // `x = 1;` / `static x = 1;` — an instance or static field, computed or not.
+                oxc_ast::ast::ClassElement::PropertyDefinition(property) => {
                     match property.key.static_name() {
                         Some(key) if property.r#static => {
-                            static_fields.push((key.to_string(), property.value.as_ref()));
+                            static_fields
+                                .push((FieldKey::Named(key.to_string()), property.value.as_ref()));
                         }
-                        Some(key) => fields.push((key.to_string(), property.value.as_ref())),
-                        None => self.note("computed class field", property.span.start),
+                        Some(key) => {
+                            fields
+                                .push((FieldKey::Named(key.to_string()), property.value.as_ref()));
+                        }
+                        // `[k] = v` / `static [k] = v` (and a numeric key, which is a name not
+                        // known until coerced). The key is evaluated here, in source order, and
+                        // parked in a slot the constructor reads so it is computed once rather than
+                        // per instance (D-270).
+                        None => {
+                            let Some(key_value) = self.property_key_value(&property.key) else {
+                                self.note("computed class field", property.span.start);
+                                continue;
+                            };
+                            let slot_name = format!(" fieldkey{computed_field_slots}");
+                            computed_field_slots += 1;
+                            let slot = self.declare(&slot_name);
+                            self.bind(&slot_name, slot, key_value);
+                            let field = (FieldKey::Computed(slot_name), property.value.as_ref());
+                            if property.r#static {
+                                static_fields.push(field);
+                            } else {
+                                fields.push(field);
+                            }
+                        }
                     }
-                    continue;
-                }
-                oxc_ast::ast::ClassElement::PropertyDefinition(property) => {
-                    self.note("computed class field", property.span.start);
                     continue;
                 }
                 _ => {
@@ -4504,23 +4540,11 @@ impl Lowering {
                 }
             };
             let Some(key) = method.key.static_name() else {
-                // A computed method name (`[k]() {}`, `[Symbol.iterator]() {}`) installs through the
-                // computed path on the prototype, as an object literal's does (D-265). A computed
-                // *accessor* or a *static* computed member is still owed — `DefineAccessor` takes a
-                // `PropertyKey`, not a value, and a static one needs the not-yet-built constructor.
-                if method.r#static {
-                    self.note("computed method name", method.span.start);
-                    continue;
-                }
-                if matches!(
-                    method.kind,
-                    oxc_ast::ast::MethodDefinitionKind::Get
-                        | oxc_ast::ast::MethodDefinitionKind::Set
-                ) {
-                    self.note("computed accessor name", method.span.start);
-                    continue;
-                }
-                // The key is evaluated before the method value, the order the specification gives.
+                // A computed member — `[k]() {}`, `get [k]() {}`, `static [k]() {}`. The key is
+                // evaluated here, in source order with the other members, whatever it lands on: a
+                // method goes through the computed store, an accessor through the computed accessor
+                // operation (D-270), and a `static` one is parked until the constructor it belongs
+                // on exists (D-261).
                 let Some(computed_key) = self.property_key_value(&method.key) else {
                     self.note("computed method name", method.span.start);
                     continue;
@@ -4534,11 +4558,36 @@ impl Lowering {
                     &[],
                 );
                 let closure = self.close_over(id, &captures);
-                self.emit_effect(Op::ComputedStore {
-                    object: prototype,
-                    key: computed_key,
-                    value: closure,
-                });
+                if method.r#static {
+                    static_computed.push((computed_key, method.kind, closure));
+                    continue;
+                }
+                let absent = self.placeholder();
+                match method.kind {
+                    oxc_ast::ast::MethodDefinitionKind::Get => {
+                        self.emit_effect(Op::ComputedDefineAccessor {
+                            object: prototype,
+                            key: computed_key,
+                            getter: closure,
+                            setter: absent,
+                        });
+                    }
+                    oxc_ast::ast::MethodDefinitionKind::Set => {
+                        self.emit_effect(Op::ComputedDefineAccessor {
+                            object: prototype,
+                            key: computed_key,
+                            getter: absent,
+                            setter: closure,
+                        });
+                    }
+                    _ => {
+                        self.emit_effect(Op::ComputedStore {
+                            object: prototype,
+                            key: computed_key,
+                            value: closure,
+                        });
+                    }
+                }
                 continue;
             };
             let method_name = key.to_string();
@@ -4674,11 +4723,57 @@ impl Lowering {
                 Some(expression) => self.value_expression(expression),
                 None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
             };
-            self.emit_effect(Op::PropertyStore {
-                object: constructor,
-                key: PropertyKey::new(&field_name),
-                value,
-            });
+            match field_name {
+                FieldKey::Named(name) => {
+                    self.emit_effect(Op::PropertyStore {
+                        object: constructor,
+                        key: PropertyKey::new(&name),
+                        value,
+                    });
+                }
+                // The key, computed at definition and parked in a slot, read back here in the same
+                // scope that filled it (D-270).
+                FieldKey::Computed(slot_name) => {
+                    let slot = self.slot(&slot_name);
+                    let key = self.read(slot);
+                    self.emit_effect(Op::ComputedStore {
+                        object: constructor,
+                        key,
+                        value,
+                    });
+                }
+            }
+        }
+        // Static computed members, their keys already evaluated at definition — installed on the
+        // constructor now that it exists, an accessor through the computed accessor operation and a
+        // method through the computed store (D-270).
+        for (key, kind, closure) in static_computed {
+            let absent = self.placeholder();
+            match kind {
+                oxc_ast::ast::MethodDefinitionKind::Get => {
+                    self.emit_effect(Op::ComputedDefineAccessor {
+                        object: constructor,
+                        key,
+                        getter: closure,
+                        setter: absent,
+                    });
+                }
+                oxc_ast::ast::MethodDefinitionKind::Set => {
+                    self.emit_effect(Op::ComputedDefineAccessor {
+                        object: constructor,
+                        key,
+                        getter: absent,
+                        setter: closure,
+                    });
+                }
+                _ => {
+                    self.emit_effect(Op::ComputedStore {
+                        object: constructor,
+                        key,
+                        value: closure,
+                    });
+                }
+            }
         }
         constructor
     }
@@ -4687,7 +4782,7 @@ impl Lowering {
     fn implicit_constructor(
         &mut self,
         name: &str,
-        fields: &[(String, Option<&Expression<'_>>)],
+        fields: &[(FieldKey, Option<&Expression<'_>>)],
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
@@ -4734,18 +4829,33 @@ impl Lowering {
 
     /// Emits `this.field = <initialiser>` for each instance field, `undefined` when a field has no
     /// initialiser. Run at the top of a class's constructor (D-252).
-    fn emit_field_inits(&mut self, this_slot: u32, fields: &[(String, Option<&Expression<'_>>)]) {
+    fn emit_field_inits(&mut self, this_slot: u32, fields: &[(FieldKey, Option<&Expression<'_>>)]) {
         for (field_name, initialiser) in fields {
             let value = match initialiser {
                 Some(expression) => self.expression(expression),
                 None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
             };
             let this = self.read(this_slot);
-            self.emit_effect(Op::PropertyStore {
-                object: this,
-                key: PropertyKey::new(field_name),
-                value,
-            });
+            match field_name {
+                FieldKey::Named(name) => {
+                    self.emit_effect(Op::PropertyStore {
+                        object: this,
+                        key: PropertyKey::new(name),
+                        value,
+                    });
+                }
+                // The key was computed once at definition and left in this slot; the constructor
+                // captures it by reading it here (D-270).
+                FieldKey::Computed(slot_name) => {
+                    let slot = self.slot(slot_name);
+                    let key = self.read(slot);
+                    self.emit_effect(Op::ComputedStore {
+                        object: this,
+                        key,
+                        value,
+                    });
+                }
+            }
         }
     }
 
@@ -4756,7 +4866,7 @@ impl Lowering {
     fn implicit_derived_constructor(
         &mut self,
         name: &str,
-        fields: &[(String, Option<&Expression<'_>>)],
+        fields: &[(FieldKey, Option<&Expression<'_>>)],
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
@@ -5033,19 +5143,35 @@ impl Lowering {
                             // specification gives and is observable whenever either has an
                             // effect.
                             let value = self.expression(&property.value);
-                            if property.kind != oxc_ast::ast::PropertyKind::Init {
-                                // A computed accessor name needs a key the accessor operation
-                                // cannot take — it carries a `PropertyKey`, not a value.
-                                // Refused rather than stored as data, which is the wrong
-                                // answer this whole arm exists to stop.
-                                self.note("computed accessor name", property.span.start);
-                                continue;
+                            match property.kind {
+                                oxc_ast::ast::PropertyKind::Init => {
+                                    self.emit_effect(Op::ComputedStore {
+                                        object: result,
+                                        key,
+                                        value,
+                                    });
+                                }
+                                // `{ get [k]() {…} }` / `{ set [k]() {…} }` — the key is a value, so
+                                // it goes through the computed accessor operation (D-270).
+                                oxc_ast::ast::PropertyKind::Get => {
+                                    let absent = self.placeholder();
+                                    self.emit_effect(Op::ComputedDefineAccessor {
+                                        object: result,
+                                        key,
+                                        getter: value,
+                                        setter: absent,
+                                    });
+                                }
+                                oxc_ast::ast::PropertyKind::Set => {
+                                    let absent = self.placeholder();
+                                    self.emit_effect(Op::ComputedDefineAccessor {
+                                        object: result,
+                                        key,
+                                        getter: absent,
+                                        setter: value,
+                                    });
+                                }
                             }
-                            self.emit_effect(Op::ComputedStore {
-                                object: result,
-                                key,
-                                value,
-                            });
                         }
                     }
                 }
