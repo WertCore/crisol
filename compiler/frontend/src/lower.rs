@@ -276,6 +276,9 @@ struct Lowering {
     /// the loop's `enter_loop` (or the switch) drains them, registering each with the construct's
     /// `break`/`continue` targets.
     pending_labels: Vec<String>,
+    /// Hands out distinct names for the generator-local slots a `yield` in expression position
+    /// spills its live operands into (D-276). Module-wide, so two generators never collide.
+    spill_counter: u32,
 }
 
 /// The property a cell keeps its value in.
@@ -313,6 +316,7 @@ impl Lowering {
             shared: std::collections::HashSet::new(),
             binds_arguments: Vec::new(),
             pending_labels: Vec::new(),
+            spill_counter: 0,
             scopes: vec![Scope {
                 function: 0,
                 current: entry,
@@ -2829,6 +2833,42 @@ impl Lowering {
                     .arguments
                     .iter()
                     .any(|argument| matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)));
+                // A `yield` among the arguments (fixed-arity only) leaves the callee, the receiver,
+                // and any earlier argument live across the suspension — so each is spilled to a
+                // generator local before the `yield` and read back after (D-276). `value_expression`
+                // lowers a plain `yield`/`await` argument; a nested one recurses into its own
+                // handler, which spills for itself. A spread with a `yield` stays refused.
+                if !spread
+                    && self.scope().generator.is_some()
+                    && call.arguments.iter().any(|argument| {
+                        argument
+                            .as_expression()
+                            .is_some_and(|expression| self.expression_may_yield(expression))
+                    })
+                {
+                    let callee_slot = self.spill(callee);
+                    let this_slot = self.spill(this_value);
+                    let mut arg_slots = Vec::with_capacity(call.arguments.len());
+                    for argument in &call.arguments {
+                        if let Some(expression) = argument.as_expression() {
+                            let value = self.value_expression(expression);
+                            arg_slots.push(self.spill(value));
+                        }
+                    }
+                    let callee = self.reload(callee_slot);
+                    let this_value = self.reload(this_slot);
+                    let args: Vec<ValueId> =
+                        arg_slots.iter().map(|slot| self.reload(*slot)).collect();
+                    let result = self.emit(
+                        Type::Unknown,
+                        Op::Call {
+                            callee,
+                            this_value,
+                            args,
+                        },
+                    );
+                    return self.propagate(result);
+                }
                 let result = if spread {
                     let array = self.emit(
                         Type::Object(None),
@@ -3185,6 +3225,26 @@ impl Lowering {
         }
     }
 
+    /// Evaluates a binary operator's two operands, left then right, spilling the left across the
+    /// right when the right can suspend — `a + (yield b)` must keep `a` while the `yield` returns,
+    /// and a plain `yield` in either position is lowered rather than refused (D-276).
+    fn binary_operands(
+        &mut self,
+        left: &Expression<'_>,
+        right: &Expression<'_>,
+    ) -> (ValueId, ValueId) {
+        if self.scope().generator.is_some() && self.expression_may_yield(right) {
+            let left_value = self.value_expression(left);
+            let left_slot = self.spill(left_value);
+            let right_value = self.value_expression(right);
+            let left_value = self.reload(left_slot);
+            return (left_value, right_value);
+        }
+        let left_value = self.value_expression(left);
+        let right_value = self.value_expression(right);
+        (left_value, right_value)
+    }
+
     fn binary(&mut self, binary: &BinaryExpression<'_>) -> ValueId {
         let op = match binary.operator {
             BinaryOperator::StrictEquality => CompareOp::StrictEqual,
@@ -3195,8 +3255,7 @@ impl Lowering {
             BinaryOperator::GreaterEqualThan => CompareOp::GreaterEqual,
             other => return self.arithmetic(binary, other),
         };
-        let left = self.expression(&binary.left);
-        let right = self.expression(&binary.right);
+        let (left, right) = self.binary_operands(&binary.left, &binary.right);
         self.emit(Type::Bool, Op::Compare { op, left, right })
     }
 
@@ -3227,8 +3286,7 @@ impl Lowering {
                 return self.placeholder();
             }
         };
-        let left = self.expression(&binary.left);
-        let right = self.expression(&binary.right);
+        let (left, right) = self.binary_operands(&binary.left, &binary.right);
         // **A result is a Number only when both operands are provably Numbers.** Then it cannot be
         // a BigInt or a string, so codegen may inline it and the collector need not root it. With
         // anything else an operand could be a BigInt — and every arithmetic operator on two
@@ -4395,10 +4453,95 @@ impl Lowering {
                 .is_some_and(|generator| generator.is_async)
     }
 
+    /// Parks `value` in a generator-local slot — a property of the generator object — so it
+    /// survives a suspension, returning the slot to read it back with [`Self::reload`]. A `yield`
+    /// in expression position leaves the operands evaluated before it live across the return the
+    /// suspension compiles to; as compiler temporaries they would be gone when the generator is
+    /// re-entered, so they are spilled here and reloaded after (D-276).
+    fn spill(&mut self, value: ValueId) -> u32 {
+        let name = format!(" spill{}", self.spill_counter);
+        self.spill_counter += 1;
+        let slot = self.declare(&name);
+        self.write(slot, value);
+        slot
+    }
+
+    /// Reads back a value [`Self::spill`] parked, after the suspension it had to survive (D-276).
+    fn reload(&mut self, slot: u32) -> ValueId {
+        self.read(slot)
+    }
+
+    /// Whether evaluating `expression` could suspend here — a `yield`, or an `await` in an async
+    /// body — not counting one inside a nested function or class, which belongs to that body. Used
+    /// to decide whether a compound expression must spill its earlier operands before this one
+    /// (D-276). **Conservative in the safe direction:** an unrecognised shape answers `false`, and
+    /// the cost of a missed suspension is only that the plain path refuses it rather than a value
+    /// lost across a resume — the general `yield`-in-expression arm still refuses what no handler
+    /// has spilled for.
+    fn expression_may_yield(&self, expression: &Expression<'_>) -> bool {
+        use Expression as E;
+        use oxc_ast::ast::Argument;
+        use oxc_ast::ast::ArrayExpressionElement as Element;
+        let is_async = self
+            .scope()
+            .generator
+            .as_ref()
+            .is_some_and(|generator| generator.is_async);
+        let yields = |me: &Self, expression: &Expression<'_>| me.expression_may_yield(expression);
+        let argument_yields = |me: &Self, argument: &Argument<'_>| {
+            argument
+                .as_expression()
+                .is_some_and(|expression| me.expression_may_yield(expression))
+        };
+        match expression {
+            E::YieldExpression(_) => true,
+            E::AwaitExpression(_) => is_async,
+            E::ParenthesizedExpression(inner) => yields(self, &inner.expression),
+            E::UnaryExpression(unary) => yields(self, &unary.argument),
+            E::BinaryExpression(binary) => {
+                yields(self, &binary.left) || yields(self, &binary.right)
+            }
+            E::LogicalExpression(logical) => {
+                yields(self, &logical.left) || yields(self, &logical.right)
+            }
+            E::ConditionalExpression(conditional) => {
+                yields(self, &conditional.test)
+                    || yields(self, &conditional.consequent)
+                    || yields(self, &conditional.alternate)
+            }
+            E::SequenceExpression(sequence) => sequence.expressions.iter().any(|e| yields(self, e)),
+            E::AssignmentExpression(assignment) => yields(self, &assignment.right),
+            E::StaticMemberExpression(member) => yields(self, &member.object),
+            E::ComputedMemberExpression(member) => {
+                yields(self, &member.object) || yields(self, &member.expression)
+            }
+            E::CallExpression(call) => {
+                yields(self, &call.callee)
+                    || call.arguments.iter().any(|a| argument_yields(self, a))
+            }
+            E::NewExpression(new) => {
+                yields(self, &new.callee) || new.arguments.iter().any(|a| argument_yields(self, a))
+            }
+            E::ArrayExpression(array) => array.elements.iter().any(|element| match element {
+                Element::SpreadElement(spread) => yields(self, &spread.argument),
+                Element::Elision(_) => false,
+                other => other
+                    .as_expression()
+                    .is_some_and(|expression| yields(self, expression)),
+            }),
+            _ => false,
+        }
+    }
+
     /// A value expression that may itself be a `yield` or an `await` — the right side of an
     /// initialiser or a simple assignment, the positions where the sent/awaited value is bound
     /// with nothing else live across the suspension.
     fn value_expression(&mut self, expression: &Expression<'_>) -> ValueId {
+        // See through parentheses: `(yield x)`, which is how a `yield` reaches an operand position
+        // at all — its precedence needs them — wraps the yield this handles (D-276).
+        if let Expression::ParenthesizedExpression(inner) = expression {
+            return self.value_expression(&inner.expression);
+        }
         if self.is_plain_yield(expression) {
             let Expression::YieldExpression(yield_expression) = expression else {
                 unreachable!("is_plain_yield checked the shape")

@@ -347,12 +347,12 @@ fn unfaithful_programs_are_reported_not_guessed() {
             "class C { static { } }",
             "class member that is not a method",
         ),
-        // Computed member names — methods, accessors, fields, and their static forms — all lower
-        // now (D-265/D-270). `yield` as a *subexpression* does not: its value would have to
-        // survive the suspension in a compiler temporary, which the generator lowering cannot yet
-        // spill (a statement-position `yield` is fine).
+        // `yield` as the argument of a call, or an operand of a binary operator, lowers now — the
+        // live operands are spilled across the suspension (D-276). As an *array element* it does
+        // not: the array accumulator and the earlier elements would have to be spilled too, which
+        // that lowering does not do yet, so it is refused rather than losing them across the resume.
         (
-            "function* g() { f(yield 1); }",
+            "function* g() { return [yield 1, yield 2]; }",
             "yield in expression position",
         ),
     ];

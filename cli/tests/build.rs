@@ -11597,3 +11597,45 @@ fn update_of_member_targets() {
         "606",
     );
 }
+
+/// `yield` in expression position — a call argument or a binary operand — with its live operands
+/// spilled across the suspension; verified by stepping the generator, whose values are synchronous
+/// (D-276).
+#[test]
+fn yield_in_expression_position() {
+    // `id(yield 5)`: the yield surfaces 5; resumed with 21, id doubles it to 42.
+    check(
+        "yield-as-call-argument",
+        "function id(v) { return v * 2; } function* g() { return id(yield 5); } var it = g(); var y = it.next().value; var r = it.next(21).value; return y * 1000 + r;",
+        "5042",
+    );
+    // Two yields as arguments: the callee and the first argument survive the second yield.
+    check(
+        "two-yields-as-arguments",
+        "function add(a, b) { return a + b; } function* g() { return add(yield 1, yield 2); } var it = g(); var a = it.next().value; var b = it.next(10).value; var r = it.next(20).value; return a * 10000 + b * 1000 + r;",
+        "12030",
+    );
+    // The receiver survives: o.add(yield 7) keeps `o` across the suspension.
+    check(
+        "yield-argument-keeps-receiver",
+        "var o = { base: 100, add(v) { return this.base + v; } }; function* g() { return o.add(yield 7); } var it = g(); it.next(); return it.next(5).value;",
+        "105",
+    );
+    // A binary operand: the left operand survives the yield on the right, and both sides may yield.
+    check(
+        "yield-as-binary-operand",
+        "function* g() { return 100 + (yield 1); } var it = g(); var y = it.next().value; var r = it.next(7).value; return y * 1000 + r;",
+        "1107",
+    );
+    check(
+        "yield-on-both-binary-operands",
+        "function* g() { return (yield 1) * (yield 2); } var it = g(); var a = it.next().value; var b = it.next(6).value; var r = it.next(7).value; return a * 10000 + b * 1000 + r;",
+        "12042",
+    );
+    // Nested: a binary with a yield inside a call argument.
+    check(
+        "yield-in-binary-in-call",
+        "function id(v) { return v; } function* g() { return id(50 + (yield 1)); } var it = g(); it.next(); return it.next(8).value;",
+        "58",
+    );
+}

@@ -7578,3 +7578,26 @@ The step stays a plain `+ 1`/`- 1`, the same the variable form has always used �
 counter, which is nearly every `++`, is right, and a string or BigInt operand has the same coercion
 gap a variable's `++` already had rather than a new one. `super.x++` is still not handled; it is the
 rare case and `super` as a plain object does not lower.
+
+## D-276
+
+**`yield` (and `await`) in expression position: a call argument or a binary operand.**
+
+Status: Accepted
+
+`f(yield x)`, `o.m(yield x)`, and `a + (yield b)` lower now, as do their `await` forms in an async
+body — the two commonest places a suspension appears mid-expression. The obstacle was that an
+operand evaluated before the `yield` is a compiler temporary, and a `yield` compiles to a return
+from the generator function; when the generator is re-entered at its resume block that temporary is
+gone. The fix spills each live operand into a generator-local slot — a property of the generator
+object, which already survives a suspension because that is how named locals do — before the
+`yield`, and reads it back after. A call spills its callee, receiver, and each argument; a binary
+operator spills its left side across a right that can suspend. `value_expression` sees through the
+parentheses a `yield` operand needs, and lowers the plain `yield`/`await` once nothing else is live.
+
+**Safe by construction for what is *not* done.** Only a handler that spills lowers a `yield` in its
+operands; everywhere else the general arm still refuses `yield in expression position`. So a `yield`
+in an array element, an object value, a conditional branch, or a logical operand is refused, not
+miscompiled — a missed spill costs a refusal, never a value lost across a resume. Those positions
+are the remaining work. Verified by stepping the generator, whose values are synchronous, unlike an
+async result.
