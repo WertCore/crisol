@@ -10913,3 +10913,72 @@ fn function_parameters_default_rest_and_destructure() {
         "9",
     );
 }
+
+/// Destructuring beyond the plain declaration (D-260): rest patterns, a destructured catch
+/// parameter, and destructuring assignment to targets that already exist.
+#[test]
+fn destructuring_rest_catch_and_assignment() {
+    // Rest patterns in declarations.
+    check(
+        "array-rest-pattern",
+        "var [a, ...r] = [1, 2, 3, 4]; return a + \":\" + r.join(\",\");",
+        "1:2,3,4",
+    );
+    check(
+        "object-rest-pattern",
+        "var { a, ...r } = { a: 1, b: 2, c: 3 }; return a + \":\" + JSON.stringify(r);",
+        "1:{\"b\":2,\"c\":3}",
+    );
+    check(
+        "nested-rest-pattern",
+        "var { a, b: [c, ...d] } = { a: 1, b: [2, 3, 4] }; return a + c + d.length;",
+        "5",
+    );
+    // A destructured catch parameter.
+    check(
+        "catch-destructure",
+        "try { throw { code: 5, message: \"x\" }; } catch ({ code }) { return code; }",
+        "5",
+    );
+    // Destructuring assignment to existing bindings and members.
+    check(
+        "assign-array",
+        "var a, b; [a, b] = [1, 2]; return a + b;",
+        "3",
+    );
+    check(
+        "assign-object-shorthand",
+        "var a; ({ a } = { a: 9 }); return a;",
+        "9",
+    );
+    check(
+        "assign-object-rename",
+        "var x; ({ a: x } = { a: 7 }); return x;",
+        "7",
+    );
+    check(
+        "assign-array-default",
+        "var a, b; [a, b = 5] = [1]; return a + b;",
+        "6",
+    );
+    check(
+        "assign-array-rest",
+        "var a, r; [a, ...r] = [1, 2, 3]; return a + \":\" + r.join(\",\");",
+        "1:2,3",
+    );
+    check(
+        "assign-to-member",
+        "var o = {}; var a; [o.x, a] = [1, 2]; return o.x + a;",
+        "3",
+    );
+    check(
+        "assign-swap",
+        "var a = 1, b = 2; [a, b] = [b, a]; return a + \":\" + b;",
+        "2:1",
+    );
+    check(
+        "assign-nested",
+        "var a, b; ({ x: [a, b] } = { x: [7, 8] }); return a + b;",
+        "15",
+    );
+}

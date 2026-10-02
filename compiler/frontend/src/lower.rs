@@ -487,20 +487,38 @@ impl Lowering {
                 self.bind_pattern(&assignment.left, resolved, hoisted, span);
             }
             oxc_ast::ast::BindingPattern::ObjectPattern(object) => {
-                if object.rest.is_some() {
-                    // A rest element gathers the remaining own enumerable keys into a fresh
-                    // object — a runtime copy this does not have yet.
-                    self.note("object rest pattern", span);
-                }
                 for property in &object.properties {
                     let read = self.read_binding_key(value, &property.key, property.computed, span);
                     self.bind_pattern(&property.value, read, hoisted, span);
                 }
+                if let Some(rest) = &object.rest {
+                    // A rest element binds a fresh object holding every own enumerable property not
+                    // already named — a copy of the source (`{ ...value }`) with the named keys
+                    // deleted (D-260).
+                    let shape = crisol_value::Shapes::new().root();
+                    let remainder = self.emit(Type::Object(None), Op::CreateObject { shape });
+                    let extended = self.emit(
+                        Type::Undefined,
+                        Op::ObjectExtend {
+                            object: remainder,
+                            source: value,
+                        },
+                    );
+                    self.propagate(extended);
+                    for property in &object.properties {
+                        if let Some(key) =
+                            self.binding_key_value(&property.key, property.computed, span)
+                        {
+                            self.emit_effect(Op::Delete {
+                                object: remainder,
+                                key,
+                            });
+                        }
+                    }
+                    self.bind_pattern(&rest.argument, remainder, hoisted, span);
+                }
             }
             oxc_ast::ast::BindingPattern::ArrayPattern(array) => {
-                if array.rest.is_some() {
-                    self.note("array rest pattern", span);
-                }
                 // `Op::Iterate` raises on a non-iterable, so `let [a] = null` throws as it must —
                 // the signal has to be honoured here or the reads below would run over it.
                 let iterated = self.emit(Type::Object(None), Op::Iterate { object: value });
@@ -522,6 +540,32 @@ impl Lowering {
                     );
                     let read = self.propagate(read);
                     self.bind_pattern(pattern, read, hoisted, span);
+                }
+                if let Some(rest) = &array.rest {
+                    // The rest binding gathers the remaining iterated values — `values.slice(n)`,
+                    // the same slice a rest parameter uses (D-260).
+                    #[expect(clippy::cast_precision_loss, reason = "a destructuring arity")]
+                    let from = self.emit(
+                        Type::Number,
+                        Op::Const(Constant::Number(array.elements.len() as f64)),
+                    );
+                    let slice = self.emit(
+                        Type::Unknown,
+                        Op::PropertyLoad {
+                            object: values,
+                            key: PropertyKey::new("slice"),
+                        },
+                    );
+                    let gathered = self.emit(
+                        Type::Object(None),
+                        Op::Call {
+                            callee: slice,
+                            this_value: values,
+                            args: vec![from],
+                        },
+                    );
+                    let gathered = self.propagate(gathered);
+                    self.bind_pattern(&rest.argument, gathered, hoisted, span);
                 }
             }
         }
@@ -596,6 +640,196 @@ impl Lowering {
             },
         };
         self.propagate(read)
+    }
+
+    /// A binding pattern's key as a value, for deleting it from an object rest's copy. A named key
+    /// becomes a string constant; a computed or numeric key goes through the shared key-value path
+    /// (which re-evaluates a computed key — a rare `{ [k]: x, ...r }` runs `k` twice).
+    fn binding_key_value(&mut self, key: &Key<'_>, computed: bool, _span: u32) -> Option<ValueId> {
+        if !computed {
+            match key {
+                Key::StaticIdentifier(identifier) => {
+                    return Some(self.emit(
+                        Type::String,
+                        Op::Const(Constant::String(identifier.name.to_string())),
+                    ));
+                }
+                Key::StringLiteral(literal) => {
+                    return Some(self.emit(
+                        Type::String,
+                        Op::Const(Constant::String(literal.value.to_string())),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        self.property_key_value(key)
+    }
+
+    /// Assigns `value` to an assignment target — the left side of `=` that is not a declaration.
+    /// Identifiers and member expressions write directly; array and object targets destructure, so
+    /// `[a, b] = pair` and `({ x } = o)` reach the bindings or members that already exist (D-260).
+    fn assign_to(
+        &mut self,
+        target: &oxc_ast::ast::AssignmentTarget<'_>,
+        value: ValueId,
+        span: u32,
+    ) {
+        use oxc_ast::ast::AssignmentTarget as Target;
+        use oxc_ast::ast::AssignmentTargetProperty as Property;
+        match target {
+            Target::AssignmentTargetIdentifier(identifier) => {
+                let slot = self.slot(identifier.name.as_str());
+                self.write(slot, value);
+            }
+            Target::StaticMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let outcome = self.emit(
+                    Type::Unknown,
+                    Op::PropertyStore {
+                        object,
+                        key: PropertyKey::new(member.property.name.as_str()),
+                        value,
+                    },
+                );
+                self.propagate(outcome);
+            }
+            Target::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                let outcome = self.emit(Type::Unknown, Op::ComputedStore { object, key, value });
+                self.propagate(outcome);
+            }
+            Target::ArrayAssignmentTarget(array) => {
+                let iterated = self.emit(Type::Object(None), Op::Iterate { object: value });
+                let values = self.propagate(iterated);
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    #[expect(clippy::cast_precision_loss, reason = "a destructuring arity")]
+                    let position = index as f64;
+                    let key = self.emit(Type::Number, Op::Const(Constant::Number(position)));
+                    let read = self.emit(
+                        Type::Unknown,
+                        Op::ComputedLoad {
+                            object: values,
+                            key,
+                        },
+                    );
+                    let read = self.propagate(read);
+                    self.assign_maybe_default(element, read, span);
+                }
+                if let Some(rest) = &array.rest {
+                    #[expect(clippy::cast_precision_loss, reason = "a destructuring arity")]
+                    let from = self.emit(
+                        Type::Number,
+                        Op::Const(Constant::Number(array.elements.len() as f64)),
+                    );
+                    let slice = self.emit(
+                        Type::Unknown,
+                        Op::PropertyLoad {
+                            object: values,
+                            key: PropertyKey::new("slice"),
+                        },
+                    );
+                    let gathered = self.emit(
+                        Type::Object(None),
+                        Op::Call {
+                            callee: slice,
+                            this_value: values,
+                            args: vec![from],
+                        },
+                    );
+                    let gathered = self.propagate(gathered);
+                    self.assign_to(&rest.target, gathered, span);
+                }
+            }
+            Target::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        Property::AssignmentTargetPropertyIdentifier(shorthand) => {
+                            // `{ a }` or `{ a = 1 }`: read `value.a`, apply the default, write `a`.
+                            let read = self.emit(
+                                Type::Unknown,
+                                Op::PropertyLoad {
+                                    object: value,
+                                    key: PropertyKey::new(shorthand.binding.name.as_str()),
+                                },
+                            );
+                            let read = self.propagate(read);
+                            let resolved = match &shorthand.init {
+                                Some(default) => self.default_if_undefined(read, default),
+                                None => read,
+                            };
+                            let slot = self.slot(shorthand.binding.name.as_str());
+                            self.write(slot, resolved);
+                        }
+                        Property::AssignmentTargetPropertyProperty(renamed) => {
+                            // `{ key: target }` or `{ key: target = default }`.
+                            let read =
+                                self.read_binding_key(value, &renamed.name, renamed.computed, span);
+                            self.assign_maybe_default(&renamed.binding, read, span);
+                        }
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    let shape = crisol_value::Shapes::new().root();
+                    let remainder = self.emit(Type::Object(None), Op::CreateObject { shape });
+                    let extended = self.emit(
+                        Type::Undefined,
+                        Op::ObjectExtend {
+                            object: remainder,
+                            source: value,
+                        },
+                    );
+                    self.propagate(extended);
+                    for property in &object.properties {
+                        let key = match property {
+                            Property::AssignmentTargetPropertyIdentifier(shorthand) => {
+                                Some(self.emit(
+                                    Type::String,
+                                    Op::Const(Constant::String(shorthand.binding.name.to_string())),
+                                ))
+                            }
+                            Property::AssignmentTargetPropertyProperty(renamed) => {
+                                self.binding_key_value(&renamed.name, renamed.computed, span)
+                            }
+                        };
+                        if let Some(key) = key {
+                            self.emit_effect(Op::Delete {
+                                object: remainder,
+                                key,
+                            });
+                        }
+                    }
+                    self.assign_to(&rest.target, remainder, span);
+                }
+            }
+            _ => self.note("assignment target", span),
+        }
+    }
+
+    /// An array element or renamed property target, which may carry its own default.
+    fn assign_maybe_default(
+        &mut self,
+        maybe: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
+        value: ValueId,
+        span: u32,
+    ) {
+        match maybe {
+            oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(
+                with_default,
+            ) => {
+                let resolved = self.default_if_undefined(value, &with_default.init);
+                self.assign_to(&with_default.binding, resolved, span);
+            }
+            other => {
+                if let Some(target) = other.as_assignment_target() {
+                    self.assign_to(target, value, span);
+                }
+            }
+        }
     }
 
     /// `value` unless it is `undefined`, in which case the `default` expression — evaluated only
@@ -982,13 +1216,10 @@ impl Lowering {
     fn bind_caught(&mut self, catch: &oxc_ast::ast::CatchClause<'_>) {
         let caught = self.emit(Type::Unknown, Op::CaughtValue);
         if let Some(parameter) = &catch.param {
-            match parameter.pattern.get_identifier_name() {
-                Some(name) => {
-                    let slot = self.declare(name.as_str());
-                    self.bind(name.as_str(), slot, caught);
-                }
-                None => self.note("destructuring catch parameter", catch.span.start),
-            }
+            // `catch (e)` and `catch ({ code })` alike: `bind_pattern` handles the identifier fast
+            // path and the destructuring one, so a destructured catch parameter is no longer refused
+            // (D-260).
+            self.bind_pattern(&parameter.pattern, caught, false, catch.span.start);
         }
     }
 
@@ -2022,41 +2253,11 @@ impl Lowering {
                 // Plain `=`. The right side is evaluated first, so a `yield` there is safe: the
                 // target is resolved afterwards, with nothing live across the suspension.
                 let value = self.value_expression(&assignment.right);
-                // Matched on the target's *shape*, not on `get_identifier_name`: that helper
-                // reports the **property** name for `this.x`, so using it turned `this.x = x`
-                // into `x = x` — a silently wrong translation with no note, which is the one
-                // outcome the unsupported list exists to prevent.
-                match &assignment.left {
-                    oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                        let slot = self.slot(identifier.name.as_str());
-                        self.write(slot, value);
-                    }
-                    oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) => {
-                        let object = self.expression(&member.object);
-                        let outcome = self.emit(
-                            Type::Unknown,
-                            Op::PropertyStore {
-                                object,
-                                key: PropertyKey::new(member.property.name.as_str()),
-                                value,
-                            },
-                        );
-                        self.propagate(outcome);
-                    }
-                    oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) => {
-                        // Evaluation order matters and is observable: the object, then the
-                        // key, then the value — which is already in hand, because the right
-                        // side was evaluated above. That is wrong for `a[f()] = g()` if `f`
-                        // and `g` both have effects, and is recorded rather than reordered
-                        // silently.
-                        let object = self.expression(&member.object);
-                        let key = self.expression(&member.expression);
-                        let outcome =
-                            self.emit(Type::Unknown, Op::ComputedStore { object, key, value });
-                        self.propagate(outcome);
-                    }
-                    _ => self.note("assignment target", assignment.span.start),
-                }
+                // `assign_to` matches on the target's *shape* — never `get_identifier_name`, which
+                // reports the **property** name for `this.x` and would turn `this.x = x` into
+                // `x = x` — and handles identifiers, members, and destructuring targets alike
+                // (D-260).
+                self.assign_to(&assignment.left, value, assignment.span.start);
                 value
             }
             Expression::StaticMemberExpression(member) => {

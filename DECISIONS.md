@@ -7212,3 +7212,27 @@ stashes each on the generator object under `$g_<name>`, and the body declares th
 locals that redirect to it. Both halves now walk the patterns through one shared `collect_binding_names`,
 so they agree on the full set of names a destructuring or rest parameter introduces, not just a single
 identifier. No runtime change — this is entirely in the frontend lowering.
+
+## D-260
+
+**Destructuring, the rest of it: rest patterns, a destructured catch parameter, and destructuring assignment.**
+
+Status: Accepted
+
+Declaration destructuring already lowered (D-242); three forms around it did not. **Rest patterns**
+(`let [a, ...r]`, `let { a, ...r }`) were refused for want of a runtime copy. An array rest is
+`values.slice(n)` over the already-iterated values — the same slice a rest parameter uses — and an
+object rest is `{ ...source }` with the named keys deleted, both built from ops that already existed
+(`Iterate`, `PropertyLoad`+`Call`, `CreateObject`+`ObjectExtend`+`Delete`). A **destructured catch
+parameter** (`catch ({ code })`) now runs through `bind_pattern` like any other binding, instead of the
+identifier-only fast path.
+
+**Destructuring assignment** (`[a, b] = pair`, `({ x } = o)`) was the "assignment target" refusal. It
+differs from a declaration because the targets already exist and can be members, not just new names —
+`[o.x, arr[i]] = pair` assigns through `PropertyStore`/`ComputedStore`. A new `assign_to` walks an
+`AssignmentTarget` the way `bind_pattern` walks a `BindingPattern`, with `assign_maybe_default` for the
+array-element and renamed-property defaults; the plain `=` handler now delegates to it entirely, so
+identifiers, members, and destructuring targets share one path. oxc's assignment-target enums use the
+INHERIT macro, so the element targets come back through `as_assignment_target()` (an `Option`, since the
+with-default case is a sibling variant), not by matching the flattened variants directly. Entirely a
+frontend change; no runtime op was added.
