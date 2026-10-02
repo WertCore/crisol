@@ -527,6 +527,40 @@ impl Lowering {
         }
     }
 
+    /// Every identifier a binding pattern introduces, left to right. A generator's outer stub and
+    /// its body both walk the parameters this way, so they agree on which names to stash on and
+    /// read back from the generator object (D-259).
+    fn collect_binding_names(
+        &self,
+        pattern: &oxc_ast::ast::BindingPattern<'_>,
+        out: &mut Vec<String>,
+    ) {
+        match pattern {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) => {
+                out.push(identifier.name.to_string());
+            }
+            oxc_ast::ast::BindingPattern::AssignmentPattern(assignment) => {
+                self.collect_binding_names(&assignment.left, out);
+            }
+            oxc_ast::ast::BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    self.collect_binding_names(&property.value, out);
+                }
+                if let Some(rest) = &object.rest {
+                    self.collect_binding_names(&rest.argument, out);
+                }
+            }
+            oxc_ast::ast::BindingPattern::ArrayPattern(array) => {
+                for element in array.elements.iter().flatten() {
+                    self.collect_binding_names(element, out);
+                }
+                if let Some(rest) = &array.rest {
+                    self.collect_binding_names(&rest.argument, out);
+                }
+            }
+        }
+    }
+
     /// Reads the property a binding pattern's key names — `{a}` and `{a: x}` by name, `{[k]: x}`
     /// and `{0: x}` through the computed path, where the number-to-name rule lives.
     fn read_binding_key(
@@ -3009,18 +3043,70 @@ impl Lowering {
         });
         let this_slot = self.declare("this");
         self.functions[index].this_slot = Some(this_slot);
+        // The outer stub binds its parameters exactly as an ordinary function does — defaults
+        // applied, patterns destructured, the rest gathered — into its own locals, then copies each
+        // resulting binding onto the generator object for the body to read (D-259).
         let mut parameter_slots = Vec::with_capacity(params.items.len());
+        let mut parameter_names = Vec::new();
         for param in &params.items {
-            match param.pattern.get_identifier_name() {
-                Some(param_name) => parameter_slots.push(self.declare(param_name.as_str())),
-                None => {
-                    self.note("destructuring parameter", param.span.start);
-                    parameter_slots.push(self.temporary());
+            match (&param.pattern, &param.initializer) {
+                (oxc_ast::ast::BindingPattern::BindingIdentifier(identifier), None) => {
+                    parameter_slots.push(self.declare(identifier.name.as_str()));
+                    parameter_names.push(identifier.name.to_string());
+                }
+                (pattern, initializer) => {
+                    let slot = self.temporary();
+                    parameter_slots.push(slot);
+                    let mut arrived = self.emit(Type::Unknown, Op::Load { slot });
+                    if let Some(default) = initializer {
+                        arrived = self.default_if_undefined(arrived, default);
+                    }
+                    self.bind_pattern(pattern, arrived, false, param.span.start);
+                    self.collect_binding_names(pattern, &mut parameter_names);
                 }
             }
         }
+        if let Some(rest) = &params.rest {
+            let arguments_slot = match self.functions[index].arguments_slot {
+                Some(slot) => slot,
+                None => {
+                    let slot = self.temporary();
+                    self.functions[index].arguments_slot = Some(slot);
+                    slot
+                }
+            };
+            let arguments = self.emit(
+                Type::Unknown,
+                Op::Load {
+                    slot: arguments_slot,
+                },
+            );
+            let slice = self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object: arguments,
+                    key: PropertyKey::new("slice"),
+                },
+            );
+            #[expect(clippy::cast_precision_loss, reason = "a parameter count is tiny")]
+            let from = self.emit(
+                Type::Number,
+                Op::Const(Constant::Number(params.items.len() as f64)),
+            );
+            let gathered = self.emit(
+                Type::Object(None),
+                Op::Call {
+                    callee: slice,
+                    this_value: arguments,
+                    args: vec![from],
+                },
+            );
+            let gathered = self.propagate(gathered);
+            self.bind_pattern(&rest.rest.argument, gathered, false, rest.rest.span.start);
+            self.collect_binding_names(&rest.rest.argument, &mut parameter_names);
+        }
         // Build the generator object over the body closure and the caller's `this`, store each
-        // parameter on it under the key the body reads it by, and return it.
+        // bound name on it under the key the body reads it by, and return it.
         let body_closure = self.close_over(body_id, &body_captures);
         let this_value = self.read(this_slot);
         let generator = self.emit(
@@ -3030,15 +3116,14 @@ impl Lowering {
                 this_value,
             },
         );
-        for (param, slot) in params.items.iter().zip(&parameter_slots) {
-            if let Some(param_name) = param.pattern.get_identifier_name() {
-                let value = self.read(*slot);
-                self.emit_effect(Op::PropertyStore {
-                    object: generator,
-                    key: PropertyKey::new(&format!("$g_{param_name}")),
-                    value,
-                });
-            }
+        for name in &parameter_names {
+            let slot = self.slot(name);
+            let value = self.read(slot);
+            self.emit_effect(Op::PropertyStore {
+                object: generator,
+                key: PropertyKey::new(&format!("$g_{name}")),
+                value,
+            });
         }
         self.functions[index].parameters = parameter_slots;
         // A generator function returns the generator object; an async function returns the promise
@@ -3109,13 +3194,20 @@ impl Lowering {
         // locals.
         let this_slot = self.declare("this");
         self.functions[index].this_slot = Some(this_slot);
-        // Declare the parameters as generator locals (`declare` marks them, so reads redirect to
-        // the generator object). The outer function stores the incoming argument values under the
-        // matching keys, so the body sees them and they survive suspension.
+        // Declare every name the parameters introduce as a generator local (`declare` marks them,
+        // so reads redirect to the generator object). The outer stub stores each incoming value
+        // under the matching key, so the body sees them and they survive suspension. Destructuring
+        // and rest parameters contribute every name they bind, not just a single identifier
+        // (D-259).
+        let mut parameter_names = Vec::new();
         for param in &params.items {
-            if let Some(param_name) = param.pattern.get_identifier_name() {
-                self.declare(param_name.as_str());
-            }
+            self.collect_binding_names(&param.pattern, &mut parameter_names);
+        }
+        if let Some(rest) = &params.rest {
+            self.collect_binding_names(&rest.rest.argument, &mut parameter_names);
+        }
+        for name in &parameter_names {
+            self.declare(name);
         }
 
         // Lower the body into a start block; the entry (block zero) becomes the dispatch below.
@@ -3360,23 +3452,79 @@ impl Lowering {
         let mut parameter_slots = Vec::with_capacity(params.items.len());
         let mut shared_parameters = Vec::new();
         for param in &params.items {
-            match param.pattern.get_identifier_name() {
-                // `declare`, not `slot`: a parameter shadows an outer binding of the same name.
-                Some(param_name) => {
-                    let slot = self.declare(param_name.as_str());
-                    if self.shared.contains(param_name.as_str()) {
+            match (&param.pattern, &param.initializer) {
+                // A plain parameter with no default: its slot *is* the binding, and the incoming
+                // argument lands there directly. `declare`, not `slot`: a parameter shadows an
+                // outer binding.
+                (oxc_ast::ast::BindingPattern::BindingIdentifier(identifier), None) => {
+                    let slot = self.declare(identifier.name.as_str());
+                    if self.shared.contains(identifier.name.as_str()) {
                         shared_parameters.push(slot);
                     }
                     parameter_slots.push(slot);
                 }
-                None => {
-                    self.note("destructuring parameter", param.span.start);
-                    // Still consumes a position, or every later parameter would shift down one
-                    // and silently receive the wrong argument.
-                    let placeholder = self.temporary();
-                    parameter_slots.push(placeholder);
+                // A default (`a = 1` — oxc keeps the default in `initializer`, not the pattern),
+                // an object, or an array parameter: a fresh slot receives the argument, the
+                // default is applied if the argument was `undefined`, then `bind_pattern`
+                // destructures it into the real bindings — the machinery a destructuring `let`
+                // already uses (D-259).
+                (pattern, initializer) => {
+                    let slot = self.temporary();
+                    parameter_slots.push(slot);
+                    let mut arrived = self.emit(Type::Unknown, Op::Load { slot });
+                    if let Some(default) = initializer {
+                        arrived = self.default_if_undefined(arrived, default);
+                    }
+                    self.bind_pattern(pattern, arrived, false, param.span.start);
                 }
             }
+        }
+        // A rest parameter (`...rest`) gathers the arguments past the fixed ones into an `Array`.
+        // That is `arguments.slice(fixed)`: the arguments array already exists and `slice` already
+        // builds a real `Array`, so only the binding is new. An ordinary function shares the body's
+        // `arguments`; an arrow has none, so its own argument array is materialised into a fresh
+        // slot (the collector fills it the same way, from the arrow's own `argv`).
+        if let Some(rest) = &params.rest {
+            let arguments_slot = if binds_this {
+                self.slot("arguments")
+            } else {
+                match self.functions[index].arguments_slot {
+                    Some(slot) => slot,
+                    None => {
+                        let slot = self.temporary();
+                        self.functions[index].arguments_slot = Some(slot);
+                        slot
+                    }
+                }
+            };
+            let arguments = self.emit(
+                Type::Unknown,
+                Op::Load {
+                    slot: arguments_slot,
+                },
+            );
+            let slice = self.emit(
+                Type::Unknown,
+                Op::PropertyLoad {
+                    object: arguments,
+                    key: PropertyKey::new("slice"),
+                },
+            );
+            #[expect(clippy::cast_precision_loss, reason = "a parameter count is tiny")]
+            let from = self.emit(
+                Type::Number,
+                Op::Const(Constant::Number(params.items.len() as f64)),
+            );
+            let gathered = self.emit(
+                Type::Object(None),
+                Op::Call {
+                    callee: slice,
+                    this_value: arguments,
+                    args: vec![from],
+                },
+            );
+            let gathered = self.propagate(gathered);
+            self.bind_pattern(&rest.rest.argument, gathered, false, rest.rest.span.start);
         }
 
         // A shared parameter arrives as a plain value — the caller has no cell to pass — so it

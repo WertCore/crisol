@@ -10810,3 +10810,106 @@ fn a_string_cannot_be_asked_to_grow_without_limit() {
         "RangeError",
     );
 }
+
+/// Function parameters beyond plain identifiers (D-259): default values (which were silently
+/// ignored before), rest parameters (which were unbound), and destructuring parameters.
+#[test]
+fn function_parameters_default_rest_and_destructure() {
+    // Defaults: taken only when the argument is `undefined`, evaluated then and not before, and
+    // able to see the parameters to their left.
+    check(
+        "default-missing",
+        "function f(a, b = 10) { return a + b; } return f(5);",
+        "15",
+    );
+    check(
+        "default-present",
+        "function f(a, b = 10) { return a + b; } return f(5, 20);",
+        "25",
+    );
+    check(
+        "default-undefined-triggers",
+        "function f(a = 3) { return a; } return f(undefined);",
+        "3",
+    );
+    check(
+        "default-evaluated-once-when-needed",
+        "var n = 0; function d() { n++; return 1; } function f(a = d()) { return a; } \
+         f(); f(9); return n;",
+        "1",
+    );
+    check(
+        "default-sees-earlier-param",
+        "function f(a, b = a * 2) { return b; } return f(5);",
+        "10",
+    );
+    // Rest: gathers the trailing arguments into a real Array.
+    check(
+        "rest-param",
+        "function f(a, ...rest) { return a + \":\" + rest.join(\",\"); } return f(1, 2, 3);",
+        "1:2,3",
+    );
+    check(
+        "rest-empty",
+        "function f(a, ...rest) { return rest.length; } return f(1);",
+        "0",
+    );
+    check(
+        "rest-is-array",
+        "function f(...xs) { return Array.isArray(xs) + \",\" + xs.map(function (x) { return x * 2; }).join(\"\"); } \
+         return f(1, 2, 3);",
+        "true,246",
+    );
+    // Destructuring parameters, including a default on the whole pattern.
+    check(
+        "destructure-object-param",
+        "function f({ a, b }) { return a + b; } return f({ a: 1, b: 2 });",
+        "3",
+    );
+    check(
+        "destructure-array-param",
+        "function f([a, b]) { return a * b; } return f([3, 4]);",
+        "12",
+    );
+    check(
+        "destructure-param-with-default",
+        "function f({ a = 5 } = {}) { return a; } return f();",
+        "5",
+    );
+    // Arrows and methods take the same treatment.
+    check("arrow-default", "var f = (a = 4) => a; return f();", "4");
+    check(
+        "arrow-rest",
+        "var f = (...xs) => xs.length; return f(1, 2, 3, 4);",
+        "4",
+    );
+    check(
+        "method-default",
+        "var o = { f(a = 2) { return a; } }; return o.f();",
+        "2",
+    );
+    // Everything at once.
+    check(
+        "params-mixed",
+        "function f(a, { b }, c = 9, ...r) { return a + b + c + r.length; } \
+         return f(1, { b: 2 }, undefined, 7, 8);",
+        "14",
+    );
+    // Generators and async functions stash their parameters on the generator object, and that
+    // path takes defaults, rest, and destructuring too.
+    check(
+        "gen-default",
+        "function* g(a = 10) { yield a; } return g().next().value;",
+        "10",
+    );
+    check(
+        "gen-rest",
+        "function* g(...xs) { yield xs.length; } return g(1, 2, 3).next().value;",
+        "3",
+    );
+    check(
+        "gen-destructure",
+        "function* g({ a, b }) { yield a + b; } return g({ a: 4, b: 5 }).next().value;",
+        "9",
+    );
+}

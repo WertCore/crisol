@@ -7183,3 +7183,32 @@ anything else (`require_set_argument`), which is right for every ordinary call a
 `Map` or a hand-rolled set-like passed as the argument — the one part still owed, and the reason these
 are not yet fully conformant. `Map.groupBy` needed nothing: it was already implemented and registered,
 one of several audit "gaps" that were not.
+
+## D-259
+
+**Function parameters: default values, rest, and destructuring — in ordinary functions and in generators.**
+
+Status: Accepted
+
+Three parameter forms were missing or wrong, all on the same binding path. **Defaults were silently
+ignored** — `function f(a = 5)` returned `undefined` for `f()`, because the loop bound parameters by
+`get_identifier_name()` and dropped everything else. **Rest parameters were unbound** — `...xs` lives
+in `FormalParameters::rest`, which the loop never looked at, so `xs` was a `ReferenceError`.
+**Destructuring parameters were refused** outright.
+
+The fix reuses what the declaration path already had. A plain identifier with no default keeps the fast
+path (its slot *is* the binding, the argument lands there). Everything else — a default, an object
+pattern, an array pattern — takes a fresh slot for the incoming argument, applies the default with the
+existing `default_if_undefined`, and hands the value to the existing `bind_pattern`. The one oxc-shaped
+surprise: a top-level parameter default is **not** an `AssignmentPattern` in `param.pattern`; oxc keeps
+it in a separate `param.initializer`, so the pattern reads as a bare `BindingIdentifier` and the default
+has to be pulled from the sibling field. A rest parameter is `arguments.slice(fixed)` — the arguments
+array already exists and `slice` already builds a real `Array`, so no new IR op was needed; an arrow,
+which has no `arguments` binding, gets its own argument array materialised into a fresh slot that the
+collector fills from the arrow's own `argv`.
+
+Generators and async functions bind parameters in two halves — an outer stub receives the arguments and
+stashes each on the generator object under `$g_<name>`, and the body declares those names as generator
+locals that redirect to it. Both halves now walk the patterns through one shared `collect_binding_names`,
+so they agree on the full set of names a destructuring or rest parameter introduces, not just a single
+identifier. No runtime change — this is entirely in the frontend lowering.
