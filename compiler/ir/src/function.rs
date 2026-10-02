@@ -98,6 +98,10 @@ impl FunctionId {
 pub enum Constant {
     /// `undefined`.
     Undefined,
+    /// An array *hole* — the absent element of `[1, , 3]`, stored so a sparse literal keeps its
+    /// gaps rather than filling them with `undefined` (D-282). Only ever an array element; it reads
+    /// back as `undefined` but `in`, `hasOwnProperty`, and the hole-skipping methods tell it apart.
+    Empty,
     /// `null`.
     Null,
     /// A boolean.
@@ -118,6 +122,9 @@ impl Constant {
     pub const fn type_of(&self) -> Type {
         match self {
             Self::Undefined => Type::Undefined,
+            // A hole reads as `undefined`, so that is its type everywhere the optimiser looks
+            // (D-282).
+            Self::Empty => Type::Undefined,
             Self::Null => Type::Null,
             Self::Bool(_) => Type::Bool,
             Self::Number(_) => Type::Number,

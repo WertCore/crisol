@@ -63,6 +63,11 @@ const SINGLETON_FALSE: u64 = 2;
 const SINGLETON_TRUE: u64 = 3;
 /// Not a JavaScript value: the signal that a call threw. See [`Value::EXCEPTION`].
 const SINGLETON_EXCEPTION: u64 = 4;
+/// Not a JavaScript value: the marker for an array *hole* — an index a sparse array skips. See
+/// [`Value::EMPTY`]. Only ever lives in the element store; a read that would return it answers
+/// `undefined`, and the questions that distinguish an absent slot from one holding `undefined`
+/// (`in`, `hasOwnProperty`, enumeration) check for it first (D-282).
+const SINGLETON_EMPTY: u64 = 5;
 
 /// The NaN every value that is not a number canonicalises to.
 ///
@@ -160,6 +165,21 @@ impl Value {
     /// than aborting — a wrong answer in a corner is recoverable, and a crash inside a
     /// half-unwound call is not.
     pub const EXCEPTION: Self = Self::singleton(SINGLETON_EXCEPTION);
+
+    /// An array hole — the absence of an element at an index a sparse array skips (D-282).
+    ///
+    /// Like [`Value::EXCEPTION`], it is not a JavaScript value and [`Value::kind`] reports it as
+    /// `Undefined`: a read that reaches a hole answers `undefined`, which is what `a[i]` on a hole
+    /// gives. It lives only in the element store, and the operations that must tell an absent slot
+    /// from one holding `undefined` — `in`, `hasOwnProperty`, enumeration, the array methods that
+    /// skip holes — ask [`Value::is_empty`] before deciding.
+    pub const EMPTY: Self = Self::singleton(SINGLETON_EMPTY);
+
+    /// Whether this is the [`Value::EMPTY`] hole marker.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.bits == Self::EMPTY.bits
+    }
 
     const fn singleton(which: u64) -> Self {
         Self {

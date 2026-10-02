@@ -618,7 +618,11 @@ impl Heap {
                     return false;
                 };
                 if index >= elements.len() {
-                    elements.resize(index + 1, Value::UNDEFINED);
+                    // The skipped indices are **holes**, not `undefined`: a longer array created by
+                    // `a[5] = x` skips 3 and 4, and the marker distinguishes an absent slot from one
+                    // holding `undefined` for `in`, enumeration, and the methods that skip holes
+                    // (D-282).
+                    elements.resize(index + 1, Value::EMPTY);
                 }
                 elements[index] = value;
                 true

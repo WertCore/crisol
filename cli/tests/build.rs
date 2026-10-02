@@ -206,10 +206,10 @@ fn a_construct_the_compiler_cannot_handle_is_refused_rather_than_miscompiled() {
     let file = directory.join("main.js");
     // This case has to be replaced whenever the construct it names becomes supported — which is
     // the point: the test is about *refusing*, so it must always name something actually refused.
-    // It has named `for-of`, a regular expression literal, and `class extends`, and been rewritten
-    // each time one landed. An array hole is refused because a hole is not `undefined` (D-64) and
-    // the IR cannot yet say which a position holds.
-    std::fs::write(&file, "let a = [1, , 3]; return 1;").expect("write");
+    // It has named `for-of`, a regular expression literal, `class extends`, and an array hole, and
+    // been rewritten each time one landed. A class `static` block is refused because it runs
+    // arbitrary statements at class definition, which the class lowering does not synthesise.
+    std::fs::write(&file, "class C { static { } }").expect("write");
 
     let error =
         crisol::build::build(&file, &directory.join("main"), &runtime).expect_err("should refuse");
@@ -11812,5 +11812,83 @@ fn yield_in_object_and_new() {
         "yield-on-two-new-arguments",
         "class C { constructor(a, b) { this.s = a + b; } } function* g() { return new C(yield 1, yield 2).s; } var it = g(); it.next(); it.next(10); return it.next(20).value;",
         "30",
+    );
+}
+
+/// Array holes — `[1, , 3]` and sparse writes keep a slot absent, not `undefined` (D-282).
+#[test]
+fn array_holes() {
+    // A literal hole: present at 0 and 2, absent at 1, but reads back as undefined.
+    check("array-hole-length", "return [1, , 3].length;", "3");
+    check(
+        "array-hole-in",
+        "var a = [1, , 3]; return (0 in a) + ',' + (1 in a) + ',' + (2 in a);",
+        "true,false,true",
+    );
+    check("array-hole-read", "return [1, , 3][1];", "undefined");
+    check(
+        "array-hole-hasown",
+        "return [1, , 3].hasOwnProperty(1);",
+        "false",
+    );
+    // A hole is distinct from a stored undefined.
+    check(
+        "hole-is-not-undefined",
+        "var a = [,]; var b = [undefined]; return (0 in a) + ',' + (0 in b);",
+        "false,true",
+    );
+    // Sparse write creates holes in the gap.
+    check(
+        "sparse-write-holes",
+        "var a = []; a[2] = 5; return a.length + ',' + (0 in a) + ',' + (2 in a);",
+        "3,false,true",
+    );
+    // The hole-skipping methods skip, and map preserves the hole.
+    check(
+        "hole-forEach-skips",
+        "var a = [1, , 3]; var c = 0; a.forEach(function (x) { c += x; }); return c;",
+        "4",
+    );
+    check(
+        "hole-map-preserves",
+        "var a = [1, , 3]; var r = a.map(function (x) { return x * 2; }); return r[0] + ',' + (1 in r) + ',' + r[2];",
+        "2,false,6",
+    );
+    check(
+        "hole-filter-skips",
+        "return [1, , 3, , 5].filter(function () { return true; }).length;",
+        "3",
+    );
+    check(
+        "hole-reduce-skips",
+        "return [10, , 20].reduce(function (s, x) { return s + x; });",
+        "30",
+    );
+    check(
+        "hole-indexOf-skips",
+        "return [1, , 3].indexOf(undefined);",
+        "-1",
+    );
+    // The visit-as-undefined operations see undefined at a hole.
+    check(
+        "hole-json-null",
+        "return JSON.stringify([1, , 3]);",
+        "[1,null,3]",
+    );
+    check(
+        "hole-includes-undefined",
+        "return [1, , 3].includes(undefined);",
+        "true",
+    );
+    check(
+        "hole-for-of-undefined",
+        "var s = ''; for (var v of [1, , 3]) s += (v === undefined ? 'u' : v); return s;",
+        "1u3",
+    );
+    // A dense array is unchanged.
+    check(
+        "dense-array-unchanged",
+        "var a = [1, 2, 3]; return (0 in a) + ',' + a[1] + ',' + a.indexOf(2);",
+        "true,2,1",
     );
 }

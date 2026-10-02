@@ -333,12 +333,9 @@ fn unfaithful_programs_are_reported_not_guessed() {
     // dump. A compiler that silently emits `undefined` for syntax it did not read produces a
     // program that runs and is wrong, which is worse than one that refuses.
     let cases = [
-        // Destructuring, including the **rest** element, lowers now (D-242, D-260).
-        // A hole is not `undefined` (D-64) and the IR cannot yet say so, so it is recorded
-        // rather than filled in with a value that reads the same and answers `in` differently.
-        // A hole is still refused; a spread is not. The two used to share a note, which made
-        // `[...a]` look like a gap it had not been for some time.
-        ("let a = [1, , 3];", "array hole"),
+        // Destructuring, including the **rest** element, lowers now (D-242, D-260). An array hole
+        // lowers now too — `[1, , 3]` stores a hole marker the runtime tells from `undefined`
+        // (D-282), so it is no longer here.
         // Instance fields lower in every constructor now — base or derived, implicit or explicit
         // (D-252/D-263/D-266).
         // Static *methods* and *fields* lower now (D-261); a static **block** does not — it runs

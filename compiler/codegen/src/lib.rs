@@ -1486,6 +1486,13 @@ impl Lowering<'_> {
                     .ins()
                     .iconst(types::I64, crisol_value::Value::UNDEFINED.to_bits() as i64),
             ),
+            // The array-hole marker (D-282). Only ever written into an array element, where the
+            // reads and the hole-aware methods tell it from a stored `undefined`.
+            Op::Const(Constant::Empty) => Some(
+                self.builder
+                    .ins()
+                    .iconst(types::I64, crisol_value::Value::EMPTY.to_bits() as i64),
+            ),
             Op::Const(Constant::Null) => Some(
                 self.builder
                     .ins()

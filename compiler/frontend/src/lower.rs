@@ -3190,7 +3190,15 @@ impl Lowering {
                                 self.propagate(extended);
                             }
                             ArrayExpressionElement::Elision(_) => {
-                                self.note("array hole", array.span.start);
+                                // A hole — appended as the hole marker so the array stays sparse
+                                // (D-282).
+                                let empty = self.emit(Type::Undefined, Op::Const(Constant::Empty));
+                                let array = self.reload(array_slot);
+                                self.emit_effect(Op::ArrayExtend {
+                                    array,
+                                    value: empty,
+                                    spread: false,
+                                });
                             }
                             other => {
                                 let Some(expression) = other.as_expression() else {
@@ -3212,7 +3220,8 @@ impl Lowering {
                 // **The leading run is built in one go and the rest is appended.** An array
                 // with no spread costs exactly what it did before — one `CreateArray` — and
                 // only what follows a spread pays for being appended one piece at a time.
-                let mut spreading = false;
+                // `result` is `Some` exactly once a spread (or a later hole) has forced the array
+                // into existence, which is the one bit of state the elements after it need.
                 let mut result = None;
                 for element in &array.elements {
                     match element {
@@ -3235,24 +3244,20 @@ impl Lowering {
                                 },
                             );
                             self.propagate(extended);
-                            spreading = true;
                         }
-                        // A hole in `[1, , 3]`. **Not a spread and not `undefined`** (D-64):
-                        // the IR still has no way to say "absent", so this is recorded rather
-                        // than filled in with a value that reads the same and answers `in`
-                        // differently.
+                        // A hole in `[1, , 3]` — the hole marker, so the array stays sparse: it reads
+                        // back as `undefined` but `in` and the hole-skipping methods tell it apart
+                        // from a stored `undefined` (D-282, which the runtime now represents).
                         ArrayExpressionElement::Elision(_) => {
-                            self.note("array hole", array.span.start);
-                            let placeholder = self.placeholder();
-                            if spreading {
-                                let array = result.unwrap_or(placeholder);
+                            let empty = self.emit(Type::Undefined, Op::Const(Constant::Empty));
+                            if let Some(array) = result {
                                 self.emit_effect(Op::ArrayExtend {
                                     array,
-                                    value: placeholder,
+                                    value: empty,
                                     spread: false,
                                 });
                             } else {
-                                elements.push(placeholder);
+                                elements.push(empty);
                             }
                         }
                         other => {

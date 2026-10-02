@@ -1497,7 +1497,20 @@ extern "C" fn array_reduce_right(
                     "TypeError",
                 );
             } else {
-                position -= 1;
+                // The seed is the last *present* element; trailing holes are skipped, and an array
+                // that is all holes has none — the same `TypeError` as an empty one (D-282).
+                loop {
+                    position -= 1;
+                    if !element_is_hole(receiver, position) {
+                        break;
+                    }
+                    if position == 0 {
+                        return raise(
+                            "reduceRight of an empty array with no initial value",
+                            "TypeError",
+                        );
+                    }
+                }
                 match indexed_get_checked(receiver, position) {
                     Ok(last) => last,
                     Err(thrown) => return thrown,
@@ -1505,6 +1518,10 @@ extern "C" fn array_reduce_right(
             };
             while position > 0 {
                 position -= 1;
+                // A hole is not folded (D-282).
+                if element_is_hole(receiver, position) {
+                    continue;
+                }
                 let element =
                     match with_rooted(&[total], || indexed_get_checked(receiver, position)) {
                         Ok(element) => element,
@@ -11912,7 +11929,9 @@ fn derived_own_property(object: u64, name: &str) -> Option<(u64, crisol_value::A
             ));
         }
         let index = canonical_index(name)?;
-        if index >= count {
+        // A hole is not an own property: `1 in [0, , 2]` is `false`, and `hasOwnProperty` and a
+        // descriptor query agree (D-282). Past the end is likewise absent.
+        if index >= count || !element_present(handle, index) {
             return None;
         }
         return Some((indexed_get(object, index), element_rule(object, index)));
@@ -16104,7 +16123,10 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
         // handled the string one, and the two spellings have to agree.
         if let Some(index) = canonical_index(&name)
             && let Some(value) = runtime.heap.element(handle, index)
+            && !value.is_empty()
         {
+            // A hole falls through to the prototype, as a missing index does — it is not an own
+            // value (D-282).
             return Found::Value(value.to_bits());
         }
         // **A string wrapper is indexed by its characters.** `new String("abc")[0]` is `"a"`,
@@ -16688,9 +16710,35 @@ fn array_species_create(original: u64, length: usize) -> u64 {
 
 /// Reads one element, or `undefined` past the end.
 fn element_at(array: GcRef, index: usize) -> u64 {
+    let value =
+        with_runtime(|runtime| runtime.heap.element(array, index)).unwrap_or(Value::UNDEFINED);
+    // A hole reads as `undefined` — `a[i]` on a skipped index is `undefined`, and the marker must
+    // never reach a caller as a value (D-282). The questions that care whether the slot is *there*
+    // use `element_present` instead.
+    if value.is_empty() {
+        Value::UNDEFINED.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+/// Whether `array` has an own element at `index` — a slot that exists and is not a hole (D-282).
+/// This is the question `in`, `hasOwnProperty`, enumeration, and the hole-skipping array methods
+/// ask, the one `element_at` cannot answer because it turns both a missing slot and a hole into
+/// `undefined`.
+fn element_present(array: GcRef, index: usize) -> bool {
     with_runtime(|runtime| runtime.heap.element(array, index))
-        .unwrap_or(Value::UNDEFINED)
-        .to_bits()
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// Whether `object` is an array whose `index` is a hole — the test the methods that *skip* holes
+/// (`forEach`, `map`, `filter`, `every`, `some`, `reduce`) make before visiting an index (D-282).
+/// A non-array array-like keeps its indices in slots, where there are no holes, so it is never one.
+fn element_is_hole(object: u64, index: usize) -> bool {
+    match elements_of(object) {
+        Some((array, _)) => !element_present(array, index),
+        None => false,
+    }
 }
 
 /// An index as a JavaScript number, for the second argument every callback gets.
@@ -17195,6 +17243,14 @@ extern "C" fn array_map(
             let this_arg = unsafe { argument(argc, argv, 1) };
             with_new_array(length, |result| {
                 for index in 0..length {
+                    // A hole is preserved, not mapped: the callback is not called and the result
+                    // keeps a hole at the same index (D-282).
+                    if element_is_hole(receiver, index) {
+                        with_runtime(|runtime| {
+                            runtime.heap.set_element(result, index, Value::EMPTY)
+                        });
+                        continue;
+                    }
                     let element = match indexed_get_checked(receiver, index) {
                         Ok(element) => element,
                         Err(thrown) => return thrown,
@@ -17258,6 +17314,10 @@ extern "C" fn array_filter(
             with_new_array(length, |result| {
                 let mut kept = 0;
                 for index in 0..length {
+                    // A hole is skipped — never tested, never kept (D-282).
+                    if element_is_hole(receiver, index) {
+                        continue;
+                    }
                     let element = match indexed_get_checked(receiver, index) {
                         Ok(element) => element,
                         Err(thrown) => return thrown,
@@ -17313,6 +17373,10 @@ extern "C" fn array_for_each(
             // SAFETY: as above.
             let this_arg = unsafe { argument(argc, argv, 1) };
             for index in 0..length {
+                // A hole is skipped, not visited as `undefined` (D-282).
+                if element_is_hole(receiver, index) {
+                    continue;
+                }
                 let element = match indexed_get_checked(receiver, index) {
                     Ok(element) => element,
                     Err(thrown) => return thrown,
@@ -17370,12 +17434,29 @@ extern "C" fn array_reduce(
                     "TypeError",
                 );
             } else {
-                match indexed_get_checked(receiver, 0) {
-                    Ok(first) => (first, 1),
+                // The seed is the first element that is *present* — leading holes are skipped, and
+                // an array that is all holes has no seed, which is the same `TypeError` as an empty
+                // one (D-282).
+                let mut seed = 0;
+                while seed < length && element_is_hole(receiver, seed) {
+                    seed += 1;
+                }
+                if seed >= length {
+                    return raise(
+                        "reduce of an empty array with no initial value",
+                        "TypeError",
+                    );
+                }
+                match indexed_get_checked(receiver, seed) {
+                    Ok(first) => (first, seed + 1),
                     Err(thrown) => return thrown,
                 }
             };
             for index in start..length {
+                // A hole is not folded (D-282).
+                if element_is_hole(receiver, index) {
+                    continue;
+                }
                 let element =
                     match with_rooted(&[accumulator], || indexed_get_checked(receiver, index)) {
                         Ok(element) => element,
@@ -17976,6 +18057,10 @@ fn quantify(this_value: u64, argc: u64, argv: *const u64, want_all: bool) -> u64
             // SAFETY: as above.
             let this_arg = unsafe { argument(argc, argv, 1) };
             for index in 0..length {
+                // A hole is skipped — `every` passes over it and `some` never sees it (D-282).
+                if element_is_hole(receiver, index) {
+                    continue;
+                }
                 let element = match indexed_get_checked(receiver, index) {
                     Ok(element) => element,
                     Err(thrown) => return thrown,
@@ -18058,8 +18143,10 @@ extern "C" fn array_fill(
 /// index 0. A dense array is present exactly in range; anything else asks the `in` operator,
 /// which walks the prototype chain as `HasProperty` does.
 fn indexed_has(value: u64, index: usize) -> bool {
-    if let Some((_, length)) = elements_of(value) {
-        return index < length;
+    if let Some((array, length)) = elements_of(value) {
+        // A hole is absent — `HasProperty` is false for it, which is what makes `indexOf` and
+        // `lastIndexOf` skip it rather than match a hole against `undefined` (D-282).
+        return index < length && element_present(array, index);
     }
     if handle_of(value).is_none() {
         return false;
@@ -18398,8 +18485,13 @@ pub extern "C" fn crisol_computed_load(object: u64, key: u64) -> u64 {
     };
     let key = Value::from_bits(key);
 
-    let element =
-        with_runtime(|runtime| as_index(key).and_then(|index| runtime.heap.element(handle, index)));
+    let element = with_runtime(|runtime| {
+        as_index(key)
+            .and_then(|index| runtime.heap.element(handle, index))
+            // A hole is not a value here — fall through to the name lookup, which reaches the
+            // prototype and answers `undefined` (D-282).
+            .filter(|value| !value.is_empty())
+    });
     if let Some(value) = element {
         return value.to_bits();
     }
@@ -20822,10 +20914,15 @@ pub extern "C" fn crisol_in(key: u64, object: u64) -> u64 {
         };
         return proxy_has(target, handler, &name);
     }
+    // A present element answers `true` straight away; a hole or an out-of-range index falls
+    // through to the general own-and-prototype walk, which finds neither and answers `false` —
+    // so `0 in [0, , 2]` is `true` but `1 in [0, , 2]` is `false` (D-282).
     if let Some(index) = as_index(Value::from_bits(key))
-        && let Some((_, length)) = elements_of(object)
+        && let Some((array, length)) = elements_of(object)
+        && index < length
+        && element_present(array, index)
     {
-        return boolean(index < length).to_bits();
+        return Value::TRUE.to_bits();
     }
     if Value::from_bits(key).kind() == crisol_value::Kind::Symbol {
         let Some(symbol) = key_of(Value::from_bits(key)) else {

@@ -7699,3 +7699,32 @@ position.
 Only `f(...(yield xs))` — a `yield` as the *source of a spread call argument* — stays refused: that
 path gathers into an array through its own loop, which does not spill yet. It is the one remaining
 expression position, and refused rather than miscompiled.
+
+## D-282
+
+**Array holes: a true-absent element, distinct from a stored `undefined`.**
+
+Status: Accepted
+
+`[1, , 3]`, a sparse write (`a[5] = x`), and the gaps they make were the last common construct the
+frontend refused — the IR had no way to say "absent", so a hole would have been `undefined`, which
+answers `in` and the hole-skipping methods wrong. There is now a `Value::EMPTY` singleton, a sixth
+alongside `undefined`/`null`/`true`/`false`/the exception marker, living only in the element store.
+Its `kind()` is `Undefined`, so a read of a hole is `undefined`; what tells it apart is a direct bit
+check. The frontend emits a new `Constant::Empty` for an elision, and `set_element` fills a grown
+array's gap with it.
+
+The read and write split cleanly. `element_at` turns a hole into `undefined`, so every method that
+*visits* a hole as `undefined` — `indexOf`'s found value, `join`, `includes`, `find`, iteration,
+`JSON.stringify` (which then writes `null`) — is correct for free. The questions that must tell an
+absent slot from a present `undefined` call `element_present`: `in`, `hasOwnProperty`, a descriptor
+query (`derived_own_property`), and `HasProperty` (`indexed_has`, which is how `indexOf` and
+`lastIndexOf` skip holes). The methods that *skip* holes — `forEach`, `map` (which also keeps a hole
+in the result), `filter`, `every`, `some`, `reduce`, `reduceRight` (the last two seeding from the
+first/last present element) — check `element_is_hole` before visiting an index.
+
+Two deviations remain, noted not hidden: `new Array(n)` fills `n` `undefined`s rather than `n` holes
+(the array factory still initialises dense, left so the broad change stayed bounded), and `slice`,
+`concat`, and spread *densify* a hole to `undefined` rather than preserving it. Both are graceful
+wrong answers in a corner, not crashes, and the common holes — literal, sparse, and the method
+semantics above — are right.

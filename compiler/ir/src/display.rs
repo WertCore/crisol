@@ -208,6 +208,7 @@ impl fmt::Display for Literal<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Constant::Undefined => f.write_str("undefined"),
+            Constant::Empty => f.write_str("empty"),
             Constant::Null => f.write_str("null"),
             Constant::Bool(value) => write!(f, "{value}"),
             // `{:?}` rather than `{}` so that a whole number prints as `1.0` and not `1`. The
