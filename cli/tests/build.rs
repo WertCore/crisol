@@ -11639,3 +11639,43 @@ fn yield_in_expression_position() {
         "58",
     );
 }
+
+/// `yield` in a conditional branch, a logical operand, and an array element (D-276). Results are
+/// derived to numbers rather than returned as the array, which a separate rooting bug corrupts
+/// under GC stress (generator return of a fresh heap value).
+#[test]
+fn yield_in_conditional_logical_and_array() {
+    // A conditional: the yield is in the chosen branch, or the test itself.
+    check(
+        "yield-in-conditional-branch",
+        "function* g() { return true ? (yield 1) : 99; } var it = g(); var y = it.next().value; var r = it.next(42).value; return y * 100 + r;",
+        "142",
+    );
+    check(
+        "yield-in-conditional-test",
+        "function* g() { return (yield 1) ? 10 : 20; } var it = g(); it.next(); return it.next(0).value;",
+        "20",
+    );
+    // A logical operand: evaluated only when the left does not short-circuit.
+    check(
+        "yield-in-logical-and",
+        "function* g() { return 5 && (yield 1); } var it = g(); var y = it.next().value; var r = it.next(8).value; return y * 100 + r;",
+        "108",
+    );
+    check(
+        "logical-short-circuit-skips-yield",
+        "function* g() { return 0 && (yield 1); } return g().next().value;",
+        "0",
+    );
+    // Array elements: the array accumulator survives each suspension. Consumed to a number here.
+    check(
+        "yield-in-array-elements",
+        "function sum(a) { return a[0] + a[1]; } function* g() { return sum([yield 1, yield 2]); } var it = g(); it.next(); it.next(10); return it.next(20).value;",
+        "30",
+    );
+    check(
+        "yield-in-array-with-literal",
+        "function* g() { return [5, yield 1, 7][1]; } var it = g(); it.next(); return it.next(99).value;",
+        "99",
+    );
+}

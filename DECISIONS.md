@@ -7601,3 +7601,26 @@ in an array element, an object value, a conditional branch, or a logical operand
 miscompiled — a missed spill costs a refusal, never a value lost across a resume. Those positions
 are the remaining work. Verified by stepping the generator, whose values are synchronous, unlike an
 async result.
+
+## D-277
+
+**`yield`/`await` in a conditional, a logical operand, and an array element.**
+
+Status: Accepted
+
+Extends D-276 to three more positions. A conditional (`c ? yield a : b`) and a logical operand
+(`a && (yield b)`) need no spill at all: each already lowers through separate blocks with a result
+slot, the test or left side is consumed by the branch before any suspension, and a branch writes
+its value to the slot only after its own `yield` has resumed — so nothing of the expression is live
+across a suspension, and lowering every part through `value_expression` is enough. An array element
+(`[a, yield b, c]`) does need the spill: the array being built and the elements already in it must
+survive, so the array is kept in a generator-local slot and extended one element at a time, reloaded
+around each `yield`; the value just computed is appended before the next element runs, so it never
+crosses a later suspension. A hole in such an array stays refused.
+
+Still refused, so still safe rather than miscompiled: a `yield` as an object property value, a `new`
+argument, or a spread-call argument. And note a **pre-existing** limitation this surfaced but does
+not touch: a generator that *returns or yields a freshly built array or object* has that value freed
+under GC stress (a value held in a generator local first is fine) — so these were verified by
+deriving a number from the result rather than returning the array, and the rooting bug is filed
+separately.

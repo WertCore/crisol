@@ -3099,6 +3099,63 @@ impl Lowering {
             Expression::LogicalExpression(logical) => self.logical(logical),
             Expression::ConditionalExpression(conditional) => self.conditional(conditional),
             Expression::ArrayExpression(array) => {
+                // A `yield` among the elements needs the array being built, and every element
+                // already in it, to survive the suspension — so the array is kept in a
+                // generator-local slot and extended one element at a time, reloaded around each
+                // `yield` (D-276). The value just computed is appended before the next element runs,
+                // so it never crosses a later suspension. A hole stays refused.
+                if self.scope().generator.is_some()
+                    && array.elements.iter().any(|element| match element {
+                        ArrayExpressionElement::SpreadElement(spread) => {
+                            self.expression_may_yield(&spread.argument)
+                        }
+                        ArrayExpressionElement::Elision(_) => false,
+                        other => other
+                            .as_expression()
+                            .is_some_and(|expression| self.expression_may_yield(expression)),
+                    })
+                {
+                    let created = self.emit(
+                        Type::Object(None),
+                        Op::CreateArray {
+                            elements: Vec::new(),
+                        },
+                    );
+                    let array_slot = self.spill(created);
+                    for element in &array.elements {
+                        match element {
+                            ArrayExpressionElement::SpreadElement(spread) => {
+                                let value = self.value_expression(&spread.argument);
+                                let array = self.reload(array_slot);
+                                let extended = self.emit(
+                                    Type::Undefined,
+                                    Op::ArrayExtend {
+                                        array,
+                                        value,
+                                        spread: true,
+                                    },
+                                );
+                                self.propagate(extended);
+                            }
+                            ArrayExpressionElement::Elision(_) => {
+                                self.note("array hole", array.span.start);
+                            }
+                            other => {
+                                let Some(expression) = other.as_expression() else {
+                                    continue;
+                                };
+                                let value = self.value_expression(expression);
+                                let array = self.reload(array_slot);
+                                self.emit_effect(Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: false,
+                                });
+                            }
+                        }
+                    }
+                    return self.reload(array_slot);
+                }
                 let mut elements = Vec::with_capacity(array.elements.len());
                 // **The leading run is built in one go and the rest is appended.** An array
                 // with no spread costs exactly what it did before — one `CreateArray` — and
@@ -3409,7 +3466,11 @@ impl Lowering {
     /// the language in the first place.
     fn logical(&mut self, logical: &LogicalExpression<'_>) -> ValueId {
         let slot = self.temporary();
-        let left = self.expression(&logical.left);
+        // `value_expression` for both sides, so a `yield` in either lowers (D-276). No spill: the
+        // left is consumed by the branch before any suspension, and when the right is evaluated its
+        // `yield` resumes and overwrites `slot` before the join reads it — so nothing of this
+        // expression is live across a suspension. The short-circuit path has no `yield` at all.
+        let left = self.value_expression(&logical.left);
         self.emit_effect(Op::Store { slot, value: left });
 
         let right_block = self.new_block();
@@ -3438,7 +3499,7 @@ impl Lowering {
         });
 
         self.switch_to(right_block);
-        let right = self.expression(&logical.right);
+        let right = self.value_expression(&logical.right);
         self.emit_effect(Op::Store { slot, value: right });
         self.terminate(Terminator::Jump {
             target: join,
@@ -3930,7 +3991,11 @@ impl Lowering {
     /// `test ? consequent : alternate`, which is control flow for the same reason as `&&`.
     fn conditional(&mut self, conditional: &oxc_ast::ast::ConditionalExpression<'_>) -> ValueId {
         let slot = self.temporary();
-        let condition = self.expression(&conditional.test);
+        // `value_expression` throughout, so a `yield` in the test or either branch lowers (D-276).
+        // No operand is spilled: the test is consumed by the branch before any suspension, and a
+        // branch writes its value to `slot` *after* its own `yield` resumes, so nothing of this
+        // expression is live across one — the block structure already separates the three parts.
+        let condition = self.value_expression(&conditional.test);
         let then_block = self.new_block();
         let else_block = self.new_block();
         let join = self.new_block();
@@ -3943,7 +4008,7 @@ impl Lowering {
         });
 
         self.switch_to(then_block);
-        let consequent = self.expression(&conditional.consequent);
+        let consequent = self.value_expression(&conditional.consequent);
         self.emit_effect(Op::Store {
             slot,
             value: consequent,
@@ -3954,7 +4019,7 @@ impl Lowering {
         });
 
         self.switch_to(else_block);
-        let alternate = self.expression(&conditional.alternate);
+        let alternate = self.value_expression(&conditional.alternate);
         self.emit_effect(Op::Store {
             slot,
             value: alternate,

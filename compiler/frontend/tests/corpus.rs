@@ -347,12 +347,13 @@ fn unfaithful_programs_are_reported_not_guessed() {
             "class C { static { } }",
             "class member that is not a method",
         ),
-        // `yield` as the argument of a call, or an operand of a binary operator, lowers now — the
-        // live operands are spilled across the suspension (D-276). As an *array element* it does
-        // not: the array accumulator and the earlier elements would have to be spilled too, which
-        // that lowering does not do yet, so it is refused rather than losing them across the resume.
+        // `yield` as a call argument, a binary operand, a conditional or logical branch, or an
+        // array element lowers now — the live operands are spilled across the suspension
+        // (D-276). As an *object property value* it does not: the half-built object would have to
+        // be spilled too, which that lowering does not do yet, so it is refused rather than losing
+        // it across the resume.
         (
-            "function* g() { return [yield 1, yield 2]; }",
+            "function* g() { return { k: yield 1 }; }",
             "yield in expression position",
         ),
     ];
