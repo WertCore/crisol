@@ -271,6 +271,11 @@ struct Lowering {
     /// An arrow is absent from this, which is what makes it inherit the enclosing function's —
     /// the same rule `this` follows, and it falls out of the lookup rather than being a case.
     binds_arguments: Vec<usize>,
+    /// Functions that would bind `new.target` if the body read it, innermost last — every non-arrow
+    /// function (an arrow inherits the enclosing one, the same rule `this` and `arguments` follow).
+    /// A generator or async body is absent: it can never be constructed, so its `new.target` is
+    /// always `undefined` and is answered as a constant rather than a slot (D-279).
+    binds_new_target: Vec<usize>,
     /// Labels waiting to be attached to the loop or switch about to be lowered (D-262) — a stack, so
     /// `a: b: for (…)` attaches both. A `LabeledStatement` whose body is one of those pushes here;
     /// the loop's `enter_loop` (or the switch) drains them, registering each with the construct's
@@ -315,6 +320,7 @@ impl Lowering {
             functions: vec![function],
             shared: std::collections::HashSet::new(),
             binds_arguments: Vec::new(),
+            binds_new_target: Vec::new(),
             pending_labels: Vec::new(),
             spill_counter: 0,
             scopes: vec![Scope {
@@ -2291,6 +2297,28 @@ impl Lowering {
         Some(self.slot("arguments"))
     }
 
+    /// The slot holding `new.target`, declared lazily the first time a body reads it — the same
+    /// deal `arguments` gets, so a function that never mentions it keeps its old slot numbering
+    /// (D-279). `None` at the top level, where there is no function to own it. An arrow finds the
+    /// enclosing non-arrow function's slot by walking out, exactly as it does for `this`.
+    fn new_target_slot(&mut self) -> Option<u32> {
+        if self.resolves(" newtarget") {
+            return Some(self.slot(" newtarget"));
+        }
+        let owner = *self.binds_new_target.last()?;
+        let depth = self
+            .scopes
+            .iter()
+            .rposition(|scope| scope.function == owner)?;
+        let next = self.scopes[depth].next_slot;
+        self.scopes[depth].next_slot += 1;
+        self.scopes[depth]
+            .slots
+            .insert(" newtarget".to_owned(), next);
+        self.functions[owner].new_target_slot = Some(next);
+        Some(self.slot(" newtarget"))
+    }
+
     fn resolves(&self, name: &str) -> bool {
         self.scopes
             .iter()
@@ -3259,6 +3287,21 @@ impl Lowering {
                     },
                 );
                 self.propagate(value)
+            }
+            // `new.target`: the constructor for a `new` call, `undefined` otherwise. A generator or
+            // async body can never be constructed, so it is `undefined` there; the top level has no
+            // function to own it, likewise `undefined`. Elsewhere it reads the slot the backend
+            // fills from the third incoming argument, which an arrow captures from its enclosing
+            // function (D-279).
+            Expression::NewTarget(_) => {
+                if self.scope().generator.is_some() {
+                    self.emit(Type::Undefined, Op::Const(Constant::Undefined))
+                } else {
+                    match self.new_target_slot() {
+                        Some(slot) => self.read(slot),
+                        None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+                    }
+                }
             }
             // `#x in obj` — the brand check, asked as the ordinary `in` against that key (D-274).
             Expression::PrivateInExpression(expression) => {
@@ -4689,6 +4732,9 @@ impl Lowering {
             // parameter down by one in every function, which broke closures in a way that only
             // showed under GC stress.
             self.binds_arguments.push(index);
+            // Same ownership for `new.target`: this non-arrow function is where one reached from
+            // here binds, and an arrow lowered inside it walks out to this (D-279).
+            self.binds_new_target.push(index);
         }
 
         let mut parameter_slots = Vec::with_capacity(params.items.len());
@@ -4813,6 +4859,7 @@ impl Lowering {
             // Paired with the push above. Without this an arrow lowered after a nested function
             // would look up `arguments` in a function that had already finished.
             self.binds_arguments.pop();
+            self.binds_new_target.pop();
         }
         let scope = self.scopes.pop().expect("just pushed");
         let names: Vec<String> = scope

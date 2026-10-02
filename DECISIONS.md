@@ -7640,3 +7640,25 @@ reachable. Rooting `value` across the allocation — the ordering `crisol_make_g
 and already follows — fixes it, and with it the canonical `return [yield a, yield b]` that D-277
 could build but not return under stress. Primitives were never affected, since they are not heap
 references; this is why generators of numbers always passed.
+
+## D-279
+
+**`new.target`.**
+
+Status: Accepted
+
+`new.target` lowers now: the constructor for a `new` call, `undefined` for a plain one. The backend
+already received it as the third incoming argument (`this` is the second) but nothing read it; the
+frontend now binds it into a slot the same lazy way `arguments` is — declared the first time a body
+mentions it, so a function that does not keeps its old slot numbering — and an arrow finds the
+enclosing function's slot by walking out, exactly as it does for `this`. A generator or async body
+is answered a constant `undefined`: neither can be constructed, so its `new.target` is always
+`undefined` and needs no slot. At the top level, where there is no function to own it, likewise
+`undefined`.
+
+Correct in every position a program reads it except one, filed as a follow-up: `new.target` in a
+**parent** constructor reached through `super()` reads `undefined` rather than the derived class that
+was `new`ed. The chain should carry it unchanged, but `super()` lowers to a plain call, which passes
+`new.target` as `undefined`; forwarding it needs a call that carries an explicit `new.target`, which
+the IR does not have yet. The newed class's own constructor — base or derived — sees it correctly,
+which is the common case.

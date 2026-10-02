@@ -11706,3 +11706,48 @@ fn generator_result_roots_a_fresh_heap_value() {
         "120",
     );
 }
+
+/// `new.target` — the constructor for a `new` call, undefined for a plain call; undefined in a
+/// generator (never constructed) and inherited by an arrow (D-279).
+#[test]
+fn new_target() {
+    check(
+        "new-target-in-constructor",
+        "class C { constructor() { this.t = new.target === C; } } return new C().t;",
+        "true",
+    );
+    check(
+        "new-target-plain-call-is-undefined",
+        "function f() { return new.target === undefined; } return f();",
+        "true",
+    );
+    check(
+        "new-target-distinguishes-new-from-call",
+        "function F() { this.v = new.target === F; } return new F().v;",
+        "true",
+    );
+    // A derived class's own constructor sees itself.
+    check(
+        "new-target-in-derived-own-constructor",
+        "class A { constructor() {} } class B extends A { constructor() { var t = new.target; super(); this.t = t === B; } } return new B().t;",
+        "true",
+    );
+    // An arrow inherits the enclosing function's new.target.
+    check(
+        "new-target-inherited-by-arrow",
+        "function F() { this.r = (() => new.target)() === F; } return new F().r;",
+        "true",
+    );
+    // A generator can never be constructed, so new.target there is undefined.
+    check(
+        "new-target-in-generator-is-undefined",
+        "function* g() { yield (new.target === undefined); } return g().next().value;",
+        "true",
+    );
+    // A method is called, not constructed.
+    check(
+        "new-target-in-method-is-undefined",
+        "var o = { m() { return new.target === undefined; } }; return o.m();",
+        "true",
+    );
+}

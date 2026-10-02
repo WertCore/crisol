@@ -845,6 +845,11 @@ pub struct Function {
     /// the backend has to know which slot to fill, and guessing would bind a plausible wrong
     /// value rather than fail.
     pub arguments_slot: Option<u32>,
+    /// The slot holding `new.target`, for a non-arrow function whose body reads it. The backend
+    /// fills it from the third incoming argument, exactly as `this_slot` is filled from the
+    /// second — `None` when the body never mentions it, so no call pays to bind what it will not
+    /// read. An arrow has none and captures the enclosing one, the same way it does `this`.
+    pub new_target_slot: Option<u32>,
     /// Slots that receive the captured values, positionally matching [`Op::Closure`]'s
     /// `captures`.
     ///
@@ -875,6 +880,7 @@ impl Function {
             parameters: Vec::new(),
             this_slot: None,
             arguments_slot: None,
+            new_target_slot: None,
             captures: Vec::new(),
             entry: BlockId(0),
             blocks: vec![Block {

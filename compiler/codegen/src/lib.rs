@@ -1273,7 +1273,12 @@ impl Lowering<'_> {
             let variable = self.variable(slot);
             self.builder.def_var(variable, incoming[1]);
         }
-        // `incoming[2]` is `new.target`, which nothing reads until classes.
+        // `incoming[2]` is `new.target` — the constructor for a `new` call, `undefined` otherwise.
+        // Bound only for a function whose body reads it, the same deal `this_slot` gets.
+        if let Some(slot) = function.new_target_slot {
+            let variable = self.variable(slot);
+            self.builder.def_var(variable, incoming[2]);
+        }
 
         // `arguments`, built here because this is where `argc` and `argv` are. Only for a
         // function whose body actually named it — the frontend leaves the slot unset otherwise,
