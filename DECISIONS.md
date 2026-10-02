@@ -7256,3 +7256,24 @@ one rather than the constructor, and the class's own name is not yet bound. `sta
 `static y = Other.value` (nearly all of them) are right; `static y = this.x` or `static y = C.x` reach a
 wrong `this` / an unbound name, recorded as the gap still owed, alongside static blocks and
 computed-name members, which stay refused.
+
+## D-262
+
+**Labeled statements, and `yield*` delegation.**
+
+Status: Accepted
+
+`break`/`continue` to a label were refused because the loop machinery tracked only anonymous
+innermost `break`/`continue` targets. A `labels` stack on the scope now maps each label to its
+`break` target and (for a loop) its `continue` target. A `LabeledStatement` whose body is a loop or
+switch pushes the label onto a `pending_labels` stack; the construct's `enter_loop` (or the switch)
+drains them, registering each against its own targets — so `a: b: for (…)` attaches both. A label on
+anything else is a `break`-only target: a fresh block the statement falls through to, which `break
+label` jumps to instead. `continue` to a non-loop label is refused, as the grammar requires.
+
+`yield* inner` at statement level drains the iterable through `Op::Iterate` and yields each value in a
+loop whose counter and array live in generator-local slots, so they survive each suspension. This is
+the value-delegation that `yield*` is used for; it does **not** forward a `.next(v)` sent in to the
+inner iterator, nor produce the inner's return value, so `yield*` in value position (`x = yield* g()`)
+stays refused rather than returning the wrong thing. `lower_yield` was split so the suspend-and-resume
+core (`yield_value`) takes an already-evaluated value, which the delegation loop reuses per element.

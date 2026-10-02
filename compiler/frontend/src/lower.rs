@@ -158,6 +158,10 @@ struct Scope {
     /// The active `try … finally`s, innermost last (D-253). A `return`/`break`/`continue`/`throw`
     /// that leaves a protected region routes through these so each finally runs.
     finalizers: Vec<Finalizer>,
+    /// Named labels in scope (D-262), innermost last: the label, its `break` target, and its
+    /// `continue` target — `None` for a label on a non-loop (`break` leaves it; `continue` to it
+    /// is a syntax error a program does not reach here).
+    labels: Vec<(String, BlockId, Option<BlockId>)>,
 }
 
 /// What a generator body accumulates as it lowers: one resume point per `yield`, and which slots
@@ -245,6 +249,11 @@ struct Lowering {
     /// An arrow is absent from this, which is what makes it inherit the enclosing function's —
     /// the same rule `this` follows, and it falls out of the lookup rather than being a case.
     binds_arguments: Vec<usize>,
+    /// Labels waiting to be attached to the loop or switch about to be lowered (D-262) — a stack, so
+    /// `a: b: for (…)` attaches both. A `LabeledStatement` whose body is one of those pushes here;
+    /// the loop's `enter_loop` (or the switch) drains them, registering each with the construct's
+    /// `break`/`continue` targets.
+    pending_labels: Vec<String>,
 }
 
 /// The property a cell keeps its value in.
@@ -278,6 +287,7 @@ impl Lowering {
             functions: vec![function],
             shared: std::collections::HashSet::new(),
             binds_arguments: Vec::new(),
+            pending_labels: Vec::new(),
             scopes: vec![Scope {
                 function: 0,
                 current: entry,
@@ -292,6 +302,7 @@ impl Lowering {
                 generator: None,
                 value_types: Vec::new(),
                 finalizers: Vec::new(),
+                labels: Vec::new(),
             }],
             unsupported: Vec::new(),
         };
@@ -888,6 +899,41 @@ impl Lowering {
     ///
     /// `continue` goes to the increment and not the test, for the same reason it does in a
     /// `for` loop: skipping the increment is a hang rather than a wrong answer.
+    /// Pushes a loop's `break` and `continue` targets, attaching a pending label to them if a
+    /// `LabeledStatement` set one (D-262). Returns whether a label was attached, for `leave_loop`.
+    fn enter_loop(&mut self, break_to: BlockId, continue_to: BlockId) -> usize {
+        self.scope_mut().breaks.push(break_to);
+        self.scope_mut().continues.push(continue_to);
+        let pending = std::mem::take(&mut self.pending_labels);
+        let count = pending.len();
+        for label in pending {
+            self.scope_mut()
+                .labels
+                .push((label, break_to, Some(continue_to)));
+        }
+        count
+    }
+
+    /// Pops what [`Self::enter_loop`] pushed — the `break`/`continue` targets and `count` labels.
+    fn leave_loop(&mut self, count: usize) {
+        self.scope_mut().breaks.pop();
+        self.scope_mut().continues.pop();
+        for _ in 0..count {
+            self.scope_mut().labels.pop();
+        }
+    }
+
+    /// A named label's `break` target and its `continue` target (`None` for a non-loop label),
+    /// searched innermost first (D-262).
+    fn label_targets(&self, name: &str) -> Option<(BlockId, Option<BlockId>)> {
+        self.scope()
+            .labels
+            .iter()
+            .rev()
+            .find(|(label, _, _)| label == name)
+            .map(|(_, break_to, continue_to)| (*break_to, *continue_to))
+    }
+
     fn for_in_statement(&mut self, statement: &oxc_ast::ast::ForInStatement<'_>) {
         let subject = self.expression(&statement.right);
         let names = self.emit(Type::Object(None), Op::Enumerate { object: subject });
@@ -991,11 +1037,9 @@ impl Lowering {
         );
         self.bind_loop_variable(left, name);
 
-        self.scope_mut().breaks.push(exit);
-        self.scope_mut().continues.push(step);
+        let labeled = self.enter_loop(exit, step);
         self.statement(body_statement);
-        self.scope_mut().breaks.pop();
-        self.scope_mut().continues.pop();
+        self.leave_loop(labeled);
         self.terminate(Terminator::Jump {
             target: step,
             args: Vec::new(),
@@ -1109,11 +1153,9 @@ impl Lowering {
         }
 
         self.switch_to(body);
-        self.scope_mut().breaks.push(exit);
-        self.scope_mut().continues.push(update);
+        let labeled = self.enter_loop(exit, update);
         self.statement(&statement.body);
-        self.scope_mut().breaks.pop();
-        self.scope_mut().continues.pop();
+        self.leave_loop(labeled);
         self.terminate(Terminator::Jump {
             target: update,
             args: Vec::new(),
@@ -1586,6 +1628,13 @@ impl Lowering {
         });
 
         self.scope_mut().breaks.push(end);
+        // A `switch` is a `break` target but not a `continue` one, so a label on it carries no
+        // continue block (D-262).
+        let pending = std::mem::take(&mut self.pending_labels);
+        let labelled = pending.len();
+        for label in pending {
+            self.scope_mut().labels.push((label, end, None));
+        }
         for (index, case) in statement.cases.iter().enumerate() {
             self.switch_to(bodies[index]);
             for inner in &case.consequent {
@@ -1599,6 +1648,9 @@ impl Lowering {
             });
         }
         self.scope_mut().breaks.pop();
+        for _ in 0..labelled {
+            self.scope_mut().labels.pop();
+        }
         self.switch_to(end);
     }
 
@@ -2006,6 +2058,15 @@ impl Lowering {
                         unreachable!("is_plain_await checked the shape")
                     };
                     self.lower_yield(Some(&await_expression.argument));
+                } else if matches!(&statement.expression,
+                    Expression::YieldExpression(delegating) if delegating.delegate)
+                    && self.scope().generator.is_some()
+                {
+                    // `yield* inner;` at statement level: delegate to the iterable (D-262).
+                    let Expression::YieldExpression(delegating) = &statement.expression else {
+                        unreachable!("matched the shape just above")
+                    };
+                    self.lower_yield_delegate(delegating.argument.as_ref());
                 } else {
                     self.expression(&statement.expression);
                 }
@@ -2077,11 +2138,9 @@ impl Lowering {
                 });
 
                 self.switch_to(body);
-                self.scope_mut().breaks.push(exit);
-                self.scope_mut().continues.push(header);
+                let labeled = self.enter_loop(exit, header);
                 self.statement(&statement.body);
-                self.scope_mut().breaks.pop();
-                self.scope_mut().continues.pop();
+                self.leave_loop(labeled);
                 self.terminate(Terminator::Jump {
                     target: header,
                     args: Vec::new(),
@@ -2104,13 +2163,11 @@ impl Lowering {
                 });
 
                 self.switch_to(body);
-                self.scope_mut().breaks.push(exit);
                 // `continue` goes to the *test*, not back to the top — it ends this iteration
                 // rather than skipping the condition.
-                self.scope_mut().continues.push(header);
+                let labeled = self.enter_loop(exit, header);
                 self.statement(&statement.body);
-                self.scope_mut().breaks.pop();
-                self.scope_mut().continues.pop();
+                self.leave_loop(labeled);
                 self.terminate(Terminator::Jump {
                     target: header,
                     args: Vec::new(),
@@ -2128,16 +2185,25 @@ impl Lowering {
 
                 self.switch_to(exit);
             }
-            Statement::ContinueStatement(statement) => {
-                if statement.label.is_some() {
-                    self.note("labelled continue", statement.span.start);
-                } else if let Some(target) = self.scope().continues.last().copied() {
-                    // Runs any finallys the jump crosses first (D-253).
-                    self.exit_loop(target, true);
-                } else {
-                    self.note("continue outside a loop", statement.span.start);
+            Statement::ContinueStatement(statement) => match &statement.label {
+                // `continue label` resumes the named loop (D-262); the label must name a loop, not
+                // a switch or a plain block.
+                Some(label) => match self.label_targets(label.name.as_str()) {
+                    Some((_, Some(target))) => self.exit_loop(target, true),
+                    Some((_, None)) => {
+                        self.note("continue to a non-loop label", statement.span.start);
+                    }
+                    None => self.note("continue to an unknown label", statement.span.start),
+                },
+                None => {
+                    if let Some(target) = self.scope().continues.last().copied() {
+                        // Runs any finallys the jump crosses first (D-253).
+                        self.exit_loop(target, true);
+                    } else {
+                        self.note("continue outside a loop", statement.span.start);
+                    }
                 }
-            }
+            },
             Statement::BlockStatement(block) => {
                 // No scope of its own: locals are slots keyed by name, so a shadowing `let`
                 // inside a block would reuse the outer slot. Recorded rather than pretended
@@ -2164,19 +2230,21 @@ impl Lowering {
             // Already bound by `hoist`, before any statement in this list ran.
             Statement::FunctionDeclaration(_) => {}
             Statement::SwitchStatement(switch) => self.switch_statement(switch),
-            Statement::BreakStatement(statement) => {
-                if statement.label.is_some() {
-                    // A labelled break leaves a named construct, which needs the label to name
-                    // a block. Refused rather than treated as an unlabelled one, which would
-                    // leave the wrong construct.
-                    self.note("labelled break", statement.span.start);
-                } else if let Some(target) = self.scope().breaks.last().copied() {
-                    // Runs any finallys the jump crosses first (D-253).
-                    self.exit_loop(target, false);
-                } else {
-                    self.note("break outside a switch or loop", statement.span.start);
+            Statement::BreakStatement(statement) => match &statement.label {
+                // `break label` leaves the named loop, switch, or block (D-262).
+                Some(label) => match self.label_targets(label.name.as_str()) {
+                    Some((target, _)) => self.exit_loop(target, false),
+                    None => self.note("break to an unknown label", statement.span.start),
+                },
+                None => {
+                    if let Some(target) = self.scope().breaks.last().copied() {
+                        // Runs any finallys the jump crosses first (D-253).
+                        self.exit_loop(target, false);
+                    } else {
+                        self.note("break outside a switch or loop", statement.span.start);
+                    }
                 }
-            }
+            },
             Statement::ClassDeclaration(class) => {
                 let name = class
                     .id
@@ -2185,6 +2253,39 @@ impl Lowering {
                 let value = self.class(class, &name);
                 let slot = self.declare(&name);
                 self.bind(&name, slot, value);
+            }
+            Statement::LabeledStatement(labeled) => {
+                let label = labeled.label.name.to_string();
+                // A label on a loop or switch is attached to that construct's own `break`/`continue`
+                // targets, which it registers as it is lowered. A label on anything else is a
+                // `break`-only target that leaves the statement (D-262).
+                if matches!(
+                    labeled.body,
+                    Statement::ForStatement(_)
+                        | Statement::ForInStatement(_)
+                        | Statement::ForOfStatement(_)
+                        | Statement::WhileStatement(_)
+                        | Statement::DoWhileStatement(_)
+                        | Statement::SwitchStatement(_)
+                ) {
+                    self.pending_labels.push(label.clone());
+                    self.statement(&labeled.body);
+                    // The construct drains the pending labels; this drops ours only if an early
+                    // refusal left it, so it cannot wrongly attach to a later loop.
+                    self.pending_labels.retain(|pending| pending != &label);
+                } else {
+                    let after = self.new_block();
+                    self.scope_mut().labels.push((label, after, None));
+                    self.statement(&labeled.body);
+                    self.scope_mut().labels.pop();
+                    if !self.scope().terminated {
+                        self.terminate(Terminator::Jump {
+                            target: after,
+                            args: Vec::new(),
+                        });
+                    }
+                    self.switch_to(after);
+                }
             }
             Statement::EmptyStatement(_) => {}
             other => {
@@ -3241,6 +3342,7 @@ impl Lowering {
             generator: None,
             value_types: Vec::new(),
             finalizers: Vec::new(),
+            labels: Vec::new(),
         });
         let this_slot = self.declare("this");
         self.functions[index].this_slot = Some(this_slot);
@@ -3390,6 +3492,7 @@ impl Lowering {
             }),
             value_types: Vec::new(),
             finalizers: Vec::new(),
+            labels: Vec::new(),
         });
         // The body's `this` is the generator object — how it reaches its resume state and its
         // locals.
@@ -3500,6 +3603,12 @@ impl Lowering {
             Some(argument) => self.expression(argument),
             None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
         };
+        self.yield_value(value)
+    }
+
+    /// Suspends the generator on an already-evaluated `value` and resumes with the sent value — the
+    /// core of [`Self::lower_yield`], shared with `yield*` delegation (D-262).
+    fn yield_value(&mut self, value: ValueId) -> ValueId {
         let this_slot = self.slot("this");
         let this = self.read(this_slot);
         self.emit_effect(Op::PropertyStore {
@@ -3543,6 +3652,92 @@ impl Lowering {
                 key: PropertyKey::new(GEN_SENT_KEY),
             },
         )
+    }
+
+    /// Lowers `yield* inner` at statement level (D-262): drains the iterable and yields each value.
+    ///
+    /// The values are collected by `Op::Iterate` up front, so a `.next(v)` sent in is not forwarded
+    /// to the inner iterator and the inner's return value is not produced — the common delegation of
+    /// a sequence of values is what this covers. The loop's counter and the drained array are held
+    /// in generator-local slots so they survive each suspension.
+    fn lower_yield_delegate(&mut self, argument: Option<&Expression<'_>>) {
+        let source = match argument {
+            Some(argument) => self.expression(argument),
+            None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+        };
+        let iterated = self.emit(Type::Object(None), Op::Iterate { object: source });
+        let values = self.propagate(iterated);
+        let values_slot = self.temporary();
+        self.write(values_slot, values);
+        let length = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: values,
+                key: PropertyKey::new("length"),
+            },
+        );
+        let length_slot = self.temporary();
+        self.write(length_slot, length);
+        let index_slot = self.temporary();
+        let zero = self.emit(Type::Number, Op::Const(Constant::Number(0.0)));
+        self.write(index_slot, zero);
+
+        let header = self.new_block();
+        let body = self.new_block();
+        let exit = self.new_block();
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(header);
+        let index = self.read(index_slot);
+        let length = self.read(length_slot);
+        let more = self.emit(
+            Type::Bool,
+            Op::Compare {
+                op: CompareOp::Less,
+                left: index,
+                right: length,
+            },
+        );
+        self.terminate(Terminator::Branch {
+            condition: more,
+            then_block: body,
+            then_args: Vec::new(),
+            else_block: exit,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(body);
+        let index = self.read(index_slot);
+        let values = self.read(values_slot);
+        let element = self.emit(
+            Type::Unknown,
+            Op::ComputedLoad {
+                object: values,
+                key: index,
+            },
+        );
+        let element = self.propagate(element);
+        self.yield_value(element);
+        let index = self.read(index_slot);
+        let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
+        let next = self.emit(
+            Type::Number,
+            Op::Binary {
+                op: BinaryOp::Add,
+                left: index,
+                right: one,
+            },
+        );
+        self.write(index_slot, next);
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(exit);
     }
 
     /// Whether an expression is a `yield` that [`Self::lower_yield`] can handle here (not a
@@ -3630,6 +3825,7 @@ impl Lowering {
             generator: None,
             value_types: Vec::new(),
             finalizers: Vec::new(),
+            labels: Vec::new(),
         });
 
         if binds_this {
@@ -4030,6 +4226,7 @@ impl Lowering {
             generator: None,
             value_types: Vec::new(),
             finalizers: Vec::new(),
+            labels: Vec::new(),
         });
         // `this_slot` recorded so the backend binds the incoming receiver — the base constructor did
         // not need it while its body was empty, but a field store writes through `this`.
@@ -4098,6 +4295,7 @@ impl Lowering {
             generator: None,
             value_types: Vec::new(),
             finalizers: Vec::new(),
+            labels: Vec::new(),
         });
         // **Recorded on the function**, exactly as `lower_function` does, so the backend binds the
         // incoming receiver to this slot — without it `this` reads `undefined` and `super()`

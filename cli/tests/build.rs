@@ -11026,3 +11026,51 @@ fn static_class_members_live_on_the_constructor() {
         "7",
     );
 }
+
+/// Labeled statements and `yield*` delegation (D-262).
+#[test]
+fn labels_and_yield_delegation() {
+    // `break`/`continue` to a label on an outer loop.
+    check(
+        "labeled-break",
+        "var c = 0; outer: for (var i = 0; i < 3; i++) { \
+         for (var j = 0; j < 3; j++) { if (j === 1) break outer; c++; } } return c;",
+        "1",
+    );
+    check(
+        "labeled-continue",
+        "var c = 0; outer: for (var i = 0; i < 3; i++) { \
+         for (var j = 0; j < 3; j++) { if (j === 1) continue outer; c++; } } return c;",
+        "3",
+    );
+    check(
+        "labeled-while",
+        "var c = 0; loop: while (true) { c++; if (c === 3) break loop; } return c;",
+        "3",
+    );
+    // `break` out of a labeled block and a labeled switch.
+    check(
+        "labeled-block",
+        "var r = 0; blk: { r = 1; break blk; r = 2; } return r;",
+        "1",
+    );
+    check(
+        "labeled-switch",
+        "var r = 0; sw: switch (1) { case 1: r = 1; break sw; r = 99; } return r;",
+        "1",
+    );
+    // `yield*` delegates to an array and to another generator.
+    check(
+        "yield-delegate-array",
+        "function* g() { yield* [1, 2, 3]; } \
+         var out = []; for (var x of g()) out.push(x); return out.join(\",\");",
+        "1,2,3",
+    );
+    check(
+        "yield-delegate-generator",
+        "function* inner() { yield 1; yield 2; } \
+         function* g() { yield 0; yield* inner(); yield 3; } \
+         var out = []; for (var x of g()) out.push(x); return out.join(\",\");",
+        "0,1,2,3",
+    );
+}
