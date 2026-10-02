@@ -7507,3 +7507,28 @@ over-approximates, costing a spare cell, which is the trade the pass already mak
 
 This also closed the two field-initialiser gaps D-270 and D-271 had filed — the write-side (`x =
 ++n`) and the read-of-class-name (`x = C.id`) were the same missing cell.
+
+## D-273
+
+**Class declaration names are hoisted; a class expression's name is scoped to its body.**
+
+Status: Accepted
+
+`class A { m() { return new B(); } } class B {}` threw `ReferenceError: B`: unlike a function
+declaration, a class is not hoisted, so when `A`'s method was lowered `B`'s binding did not exist
+and `B` resolved to a global load. `hoist` now gives every class *declaration* in a scope its name
+and cell up front — only the binding, not a value, since a class is in its temporal dead zone until
+its own statement runs, which is where the constructor is written back. So an earlier class (or a
+hoisted function) can capture a sibling declared later, and mutual recursion between two classes
+works. The lowering reuses that pre-made slot (D-271 made the write-back land in it) rather than
+shadowing it with a second one.
+
+The matching fix on the expression side: a named class *expression*'s name is scoped to its body in
+the specification, so `var C = 1; var X = class C { m() { return C; } }` must leave the outer `C`
+alone — the method sees the class, the outer `C` stays `1`, and nothing named `C` escapes. The inner
+name now gets a genuinely fresh slot (not `declare`'s, which reuses the outer one and so overwrote
+it), and what the name meant outside is restored once the body is lowered. This retires the leak
+D-271 had accepted as a simplification.
+
+With this, the three class-binding follow-ups filed during D-271/D-272 are all closed; private
+fields and `yield` in expression position remain the open class/generator gaps.

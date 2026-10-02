@@ -1954,6 +1954,27 @@ impl Lowering {
             }
         }
 
+        // A class declaration binds its name from the top of the scope too, so a function or an
+        // earlier class lowered before it can capture a sibling declared later — `class A { m() {
+        // return new B(); } } class B {}`. Only the *binding* is hoisted, not a value: a class is
+        // in its temporal dead zone until its own statement runs, which is where the constructor
+        // is written into this slot (D-273). The cell, when the name is shared, is made here so
+        // the capturing closure and the later declaration share it.
+        for statement in statements {
+            if let Statement::ClassDeclaration(class) = statement
+                && let Some(id) = &class.id
+            {
+                let name = id.name.to_string();
+                if self.scope().slots.contains_key(&name) {
+                    continue;
+                }
+                let slot = self.declare(&name);
+                if self.shared.contains(&name) {
+                    self.make_cell(slot);
+                }
+            }
+        }
+
         for (name, declaration) in &named {
             let (id, captures) = if declaration.generator || declaration.r#async {
                 // An async generator (`async function*`) is both — the body takes `yield` and
@@ -2478,7 +2499,13 @@ impl Lowering {
                     .id
                     .as_ref()
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                let value = self.class(class, &name);
+                // `hoist` already made a named class's slot (D-273); reuse it so the write-back
+                // fills the cell a sibling may have captured.
+                let reuse = class
+                    .id
+                    .as_ref()
+                    .and_then(|_| self.scope().slots.get(&name).copied());
+                let value = self.class(class, &name, reuse, false);
                 // A *named* class already bound its name, in this scope, as the inner binding its
                 // methods capture (D-271) — so binding it again here would shadow that with a
                 // second slot the methods do not share. Only an anonymous one (`export default
@@ -2879,7 +2906,9 @@ impl Lowering {
                     .id
                     .as_ref()
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                self.class(class, &name)
+                // An expression's inner name is scoped to the body, so it never reuses a slot the
+                // surrounding scope already holds — a fresh one, always (D-273).
+                self.class(class, &name, None, true)
             }
             Expression::ThisExpression(_) => {
                 let slot = self.slot("this");
@@ -4448,17 +4477,44 @@ impl Lowering {
     /// which is why methods are stored on it once rather than copied per instance — an
     /// implementation that stored them on the instance would work until someone compared two
     /// objects' methods for identity, or counted `Object.keys`.
-    fn class(&mut self, class: &oxc_ast::ast::Class<'_>, name: &str) -> ValueId {
+    fn class(
+        &mut self,
+        class: &oxc_ast::ast::Class<'_>,
+        name: &str,
+        reuse_slot: Option<u32>,
+        is_expression: bool,
+    ) -> ValueId {
         // A named class binds its own name for its methods to see — `class C { m() { return C; }
         // }`. The binding is made here, before any method is lowered, so a method captures it; a
         // cell when the name is shared, exactly as a named function's own name is (see `hoist`),
         // because the value it will hold — the constructor — does not exist until the bottom of
         // this function, where it is written back (D-271). For a class *declaration* this is also
-        // the outer binding, so its statement does not bind the name again; for a named class
-        // *expression* the name is scoped to the body in the specification, and binding it in the
-        // enclosing scope here is a deliberate simplification rather than a separate class scope.
+        // the outer binding, so its statement does not bind the name again.
+        //
+        // A declaration's slot was already made by `hoist`, so a sibling could capture it — that
+        // slot is reused here rather than shadowed, so the write-back lands in the cell the
+        // sibling holds (D-273). An expression makes a fresh one, and its name is scoped to the
+        // body: what the name meant outside is remembered and restored below, so the expression
+        // does not leak or clobber an enclosing binding of the same name (D-273).
+        let shadowed = if is_expression && class.id.is_some() {
+            Some(self.scope().slots.get(name).copied())
+        } else {
+            None
+        };
         let name_slot = class.id.as_ref().map(|_| {
-            let slot = self.declare(name);
+            if let Some(slot) = reuse_slot {
+                return slot;
+            }
+            // A *fresh* slot, not `declare`'s — which reuses the slot a same-named outer binding
+            // already holds, so the inner name would alias and overwrite it (`var C = 1; class C
+            // {}`). Allocated directly and pointed at, then restored below (D-273).
+            let slot = {
+                let scope = self.scope_mut();
+                let fresh = scope.next_slot;
+                scope.next_slot += 1;
+                scope.slots.insert(name.to_owned(), fresh);
+                fresh
+            };
             if self.shared.contains(name) {
                 self.make_cell(slot);
             }
@@ -4800,6 +4856,19 @@ impl Lowering {
         // method reading the class name sees the finished constructor (D-271).
         if let Some(slot) = name_slot {
             self.write(slot, constructor);
+        }
+        // An expression's inner name was scoped to the body: put the enclosing meaning back, so
+        // `var C = 1; (class C {}); C` is still `1` and the name does not escape (D-273). The slot
+        // and its cell live on, reachable only through the methods that captured them.
+        if let Some(previous) = shadowed {
+            match previous {
+                Some(slot) => {
+                    self.scope_mut().slots.insert(name.to_owned(), slot);
+                }
+                None => {
+                    self.scope_mut().slots.remove(name);
+                }
+            }
         }
         constructor
     }

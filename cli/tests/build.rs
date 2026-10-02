@@ -11477,3 +11477,31 @@ fn field_initialisers_capture_outer_variables() {
         "5",
     );
 }
+
+/// A class declaration's name is bound from the top of its scope, so classes can refer to each
+/// other regardless of order; a named class expression's name stays scoped to its body (D-273).
+#[test]
+fn classes_reference_each_other_and_expressions_stay_scoped() {
+    // A method constructs a sibling declared later, and two classes recurse through each other.
+    check(
+        "class-forward-reference",
+        "class A { make() { return new B(); } } class B { v() { return 5; } } return new A().make().v();",
+        "5",
+    );
+    check(
+        "class-mutual-recursion",
+        "class E { static is(n) { return n === 0 ? true : O.is(n - 1); } } class O { static is(n) { return n === 0 ? false : E.is(n - 1); } } return E.is(4);",
+        "true",
+    );
+    // A named class expression sees its own name inside, but does not leak or clobber one outside.
+    check(
+        "named-class-expression-inner-name",
+        "var C = 1; var X = class C { self() { return C; } }; return (new X().self() === X) && C === 1;",
+        "true",
+    );
+    check(
+        "named-class-expression-no-leak",
+        "var X = class C {}; return typeof C;",
+        "undefined",
+    );
+}
