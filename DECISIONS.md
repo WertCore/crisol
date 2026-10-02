@@ -7351,3 +7351,36 @@ The corner left: a derived constructor that accesses `super()` other than as a b
 an expression, or absent entirely) does not get the after-super injection — but a derived constructor
 that never calls `super` is already a `this`-before-`super` error, and the bare-statement form is all
 real code uses.
+
+## D-267
+
+**Async generators and `for await…of`.**
+
+Status: Accepted
+
+`async function*` and `for await (x of …)` — the last big subsystem. An async generator is a generator
+whose consumer sees promises: `next`/`return`/`throw` each answer one. It reuses the whole generator
+machinery; the outer stub, instead of returning the generator (sync) or `crisol_async_start`'s promise
+(async function), returns the body turned into an async generator — a new `UnaryOp::AsyncGenerator`
+that sets the brand and the `%AsyncGeneratorPrototype%`, whose methods answer promises. The driver
+(`async_gen_drive`) steps the body to the next *yield*, chaining any *await* with `.then` the way an
+async function's spawn does, then settles the promise with `{ value, done }`. Yield and await share the
+one suspension, so the body records which it was in `GEN_AWAITING` (the frontend threads `is_await`
+through `yield_value`), and the driver reads it to tell "surface this to the consumer" from "await it
+and resume". `[Symbol.asyncIterator]` answers the generator itself.
+
+`for await (x of iterable)` reuses the `await` suspension, so it lowers only inside an async body. It
+takes the iterator (`iterable[Symbol.asyncIterator]`, falling back to `[Symbol.iterator]` so a sync
+iterable works), then loops: `awaited = await iterator.next()`, branch on `awaited.done`, bind
+`awaited.value`. One `await` sits in the loop header and is re-entered each turn, exactly as a
+`while (true) { await … }` is — the generator state machine already handles a loop with a suspension in
+it. The same loop serves async and sync iterables because `await` of a non-promise is the value itself.
+
+**Verification, stated plainly.** The acceptance harness observes only a program's synchronous return;
+async values settle in the microtask drain after it. So this is verified locally for *shape* (an async
+iterator whose `next()` is a promise, `[Symbol.asyncIterator]` returning self), for the full pipeline
+*running and draining without faulting under GC stress*, and for the correct refusal of `for await`
+outside an async body — and its *resolved values* are left to test262 in CI, a tradeoff taken
+deliberately. Recorded shortcuts, the same the sync generator and async function already take: `yield x`
+does not `Await(x)` first, and a rejected await or a `.throw()` rejects the result rather than resuming
+an inner `catch`.

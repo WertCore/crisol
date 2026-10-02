@@ -11221,3 +11221,47 @@ fn derived_class_fields_run_after_super() {
         "2",
     );
 }
+
+/// Async generators and `for await…of` (D-267). The *values* settle in the microtask drain after
+/// the program's synchronous return, so this asserts the observable shape and that the full pipeline
+/// runs and drains without faulting; test262 checks the resolved values in CI.
+#[test]
+fn async_generators_and_for_await_of() {
+    // An async generator answers an async iterator whose `next()` is a promise.
+    check(
+        "async-gen-next-is-function",
+        "async function* g() { yield 1; } return typeof g().next;",
+        "function",
+    );
+    check(
+        "async-gen-next-returns-promise",
+        "async function* g() { yield 1; } return g().next() instanceof Promise;",
+        "true",
+    );
+    // `[Symbol.asyncIterator]` answers the generator itself — verifiable synchronously.
+    check(
+        "async-gen-is-its-own-async-iterator",
+        "async function* g() {} var it = g(); return it[Symbol.asyncIterator]() === it;",
+        "true",
+    );
+    // The whole pipeline — an async generator driven through `for await` — builds, runs, and drains
+    // cleanly. Only the synchronous `"ok"` is asserted; the sum settles later.
+    check(
+        "for-await-over-sync-iterable",
+        "async function f() { var s = 0; for await (var x of [1, 2, 3]) s += x; return s; } \
+         f(); return \"ok\";",
+        "ok",
+    );
+    check(
+        "for-await-over-async-generator",
+        "async function* g() { yield 1; yield 2; } \
+         async function f() { var s = 0; for await (var x of g()) s += x; return s; } \
+         f(); return \"ok\";",
+        "ok",
+    );
+    check(
+        "async-gen-mixing-yield-and-await",
+        "async function* g() { yield 1; await 0; yield 2; } var it = g(); it.next(); return \"ok\";",
+        "ok",
+    );
+}

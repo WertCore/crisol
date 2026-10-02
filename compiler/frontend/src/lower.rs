@@ -188,6 +188,10 @@ struct GenState {
     /// with a promise instead of returning it. `yield` is refused here and `await` in a plain
     /// generator.
     is_async: bool,
+    /// Whether this is an async *generator*'s body (D-267) — one with both `yield` and `await`. Its
+    /// suspensions record `GEN_AWAITING` so the driver can tell a yield (surface to the consumer)
+    /// from an await (chain and resume). A plain async function or sync generator leaves it unset.
+    is_async_generator: bool,
 }
 
 /// One active `try … finally` (D-253). Every way out of the protected region — falling off the end,
@@ -279,6 +283,9 @@ const GEN_YIELDED_KEY: &str = "__genYielded";
 const GEN_RETURN_KEY: &str = "__genReturn";
 /// The caller's `this`, kept on the generator object because the body's own `this` is the object.
 const GEN_THIS_KEY: &str = "__genThis";
+/// Set on each suspension of an async generator: `true` for an `await`, `false` for a `yield`, so the
+/// async-generator driver can tell them apart (D-267).
+const GEN_AWAITING_KEY: &str = "__genAwaiting";
 /// The body's return value tells the runtime what it did: `0` yielded, `1` finished.
 const GEN_YIELD_SIGNAL: f64 = 0.0;
 const GEN_DONE_SIGNAL: f64 = 1.0;
@@ -961,7 +968,7 @@ impl Lowering {
     /// engine.
     fn for_of_statement(&mut self, statement: &oxc_ast::ast::ForOfStatement<'_>) {
         if statement.r#await {
-            self.note("for-await-of statement", statement.span.start);
+            self.lower_for_await_of(statement);
             return;
         }
         let subject = self.expression(&statement.right);
@@ -970,6 +977,215 @@ impl Lowering {
         // the loop would run over the signal itself.
         let values = self.propagate(values);
         self.indexed_loop(values, &statement.left, &statement.body);
+    }
+
+    /// `for await (x of iterable)` (D-267): walk through the iterator protocol, `await`-ing each
+    /// `next()`. One `await` sits in the loop header and is re-entered each turn, exactly as a
+    /// `while (true) { await … }` would be. The same loop serves an async iterable (whose `next()`
+    /// answers a promise) and a sync one (whose result `await` passes straight through), because
+    /// `await` of a non-promise is the value itself.
+    fn lower_for_await_of(&mut self, statement: &oxc_ast::ast::ForOfStatement<'_>) {
+        // `await` reuses the generator suspension, so this only lowers inside an async body.
+        if self.scope().generator.is_none() {
+            self.note(
+                "for-await-of outside an async function",
+                statement.span.start,
+            );
+            return;
+        }
+        let iterable = self.expression(&statement.right);
+        let iterable_slot = self.temporary();
+        self.emit_effect(Op::Store {
+            slot: iterable_slot,
+            value: iterable,
+        });
+        // `iterator = (iterable[Symbol.asyncIterator] ?? iterable[Symbol.iterator]).call(iterable)`.
+        let method = self.async_iterator_method(iterable_slot);
+        let iterable = self.read(iterable_slot);
+        let iterator = self.emit(
+            Type::Unknown,
+            Op::Call {
+                callee: method,
+                this_value: iterable,
+                args: Vec::new(),
+            },
+        );
+        let iterator = self.propagate(iterator);
+        let iterator_slot = self.temporary();
+        self.emit_effect(Op::Store {
+            slot: iterator_slot,
+            value: iterator,
+        });
+        let awaited_slot = self.temporary();
+
+        let header = self.new_block();
+        let body = self.new_block();
+        let step = self.new_block();
+        let exit = self.new_block();
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        // Header: `awaited = await iterator.next()`, then branch on `awaited.done`.
+        self.switch_to(header);
+        let iterator = self.read(iterator_slot);
+        let next = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: iterator,
+                key: PropertyKey::new("next"),
+            },
+        );
+        let next = self.propagate(next);
+        let iterator = self.read(iterator_slot);
+        let result = self.emit(
+            Type::Unknown,
+            Op::Call {
+                callee: next,
+                this_value: iterator,
+                args: Vec::new(),
+            },
+        );
+        let result = self.propagate(result);
+        let awaited = self.yield_value(result, true);
+        self.emit_effect(Op::Store {
+            slot: awaited_slot,
+            value: awaited,
+        });
+        let awaited = self.read(awaited_slot);
+        let done = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: awaited,
+                key: PropertyKey::new("done"),
+            },
+        );
+        let done = self.propagate(done);
+        // `!!done` — a real boolean for the branch, whatever the result object carried.
+        let not_done = self.emit(
+            Type::Bool,
+            Op::Unary {
+                op: UnaryOp::Not,
+                operand: done,
+            },
+        );
+        let is_done = self.emit(
+            Type::Bool,
+            Op::Unary {
+                op: UnaryOp::Not,
+                operand: not_done,
+            },
+        );
+        self.terminate(Terminator::Branch {
+            condition: is_done,
+            then_block: exit,
+            then_args: Vec::new(),
+            else_block: body,
+            else_args: Vec::new(),
+        });
+
+        // Body: bind `awaited.value` to the loop target and run the body.
+        self.switch_to(body);
+        let awaited = self.read(awaited_slot);
+        let value = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: awaited,
+                key: PropertyKey::new("value"),
+            },
+        );
+        let value = self.propagate(value);
+        self.bind_loop_variable(&statement.left, value);
+        let labeled = self.enter_loop(exit, step);
+        self.statement(&statement.body);
+        self.leave_loop(labeled);
+        self.terminate(Terminator::Jump {
+            target: step,
+            args: Vec::new(),
+        });
+
+        // `continue` lands here and goes straight back to the header — there is no increment.
+        self.switch_to(step);
+        self.terminate(Terminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.switch_to(exit);
+    }
+
+    /// The iterator method `for await` uses: `iterable[Symbol.asyncIterator]`, or its
+    /// `[Symbol.iterator]` when that is nullish (so a sync iterable works too). `iterable` is read
+    /// from its slot in each block, since the two reads live on different sides of the branch.
+    fn async_iterator_method(&mut self, iterable_slot: u32) -> ValueId {
+        let result = self.temporary();
+        let iterable = self.read(iterable_slot);
+        let async_key = self.well_known_symbol_value("asyncIterator");
+        let async_method = self.emit(
+            Type::Unknown,
+            Op::ComputedLoad {
+                object: iterable,
+                key: async_key,
+            },
+        );
+        let async_method = self.propagate(async_method);
+        self.emit_effect(Op::Store {
+            slot: result,
+            value: async_method,
+        });
+        let nullish = self.is_nullish(async_method);
+        let fallback = self.new_block();
+        let join = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition: nullish,
+            then_block: fallback,
+            then_args: Vec::new(),
+            else_block: join,
+            else_args: Vec::new(),
+        });
+
+        self.switch_to(fallback);
+        let iterable = self.read(iterable_slot);
+        let iterator_key = self.well_known_symbol_value("iterator");
+        let sync_method = self.emit(
+            Type::Unknown,
+            Op::ComputedLoad {
+                object: iterable,
+                key: iterator_key,
+            },
+        );
+        let sync_method = self.propagate(sync_method);
+        self.emit_effect(Op::Store {
+            slot: result,
+            value: sync_method,
+        });
+        self.terminate(Terminator::Jump {
+            target: join,
+            args: Vec::new(),
+        });
+
+        self.switch_to(join);
+        self.read(result)
+    }
+
+    /// `Symbol.<name>` as a value — a global `Symbol` load followed by the named property.
+    fn well_known_symbol_value(&mut self, name: &str) -> ValueId {
+        let symbol = self.emit(
+            Type::Unknown,
+            Op::GlobalLoad {
+                name: PropertyKey::new("Symbol"),
+            },
+        );
+        let symbol = self.propagate(symbol);
+        let key = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: symbol,
+                key: PropertyKey::new(name),
+            },
+        );
+        self.propagate(key)
     }
 
     /// The loop both `for-in` and `for-of` are: walk `list` by index, binding each element.
@@ -1726,25 +1942,15 @@ impl Lowering {
         }
 
         for (name, declaration) in &named {
-            let (id, captures) = if declaration.r#async && declaration.generator {
-                // An async generator needs `Symbol.asyncIterator` and a queue of pending reads —
-                // a separate feature. Lowered as a plain function, which then refuses the `yield`
-                // and `await` inside rather than miscompiling them.
-                self.note("async generator", declaration.span.start);
-                self.lower_function(
-                    name,
-                    &declaration.params,
-                    declaration.body.as_deref(),
-                    None,
-                    true,
-                    &[],
-                )
-            } else if declaration.generator || declaration.r#async {
+            let (id, captures) = if declaration.generator || declaration.r#async {
+                // An async generator (`async function*`) is both — the body takes `yield` and
+                // `await`, and the outer returns an async generator (D-267).
                 self.lower_generator(
                     name,
                     &declaration.params,
                     declaration.body.as_deref(),
                     declaration.r#async,
+                    declaration.r#async && declaration.generator,
                 )
             } else {
                 self.lower_function(
@@ -2059,14 +2265,14 @@ impl Lowering {
                     else {
                         unreachable!("is_plain_yield checked the shape")
                     };
-                    self.lower_yield(yield_expression.argument.as_ref());
+                    self.lower_yield(yield_expression.argument.as_ref(), false);
                 } else if self.is_plain_await(&statement.expression) {
                     // `await e;` suspends and discards the settled value.
                     let Expression::AwaitExpression(await_expression) = &statement.expression
                     else {
                         unreachable!("is_plain_await checked the shape")
                     };
-                    self.lower_yield(Some(&await_expression.argument));
+                    self.lower_yield(Some(&await_expression.argument), true);
                 } else if matches!(&statement.expression,
                     Expression::YieldExpression(delegating) if delegating.delegate)
                     && self.scope().generator.is_some()
@@ -2533,22 +2739,13 @@ impl Lowering {
                     .id
                     .as_ref()
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
-                let (id, names) = if function.r#async && function.generator {
-                    self.note("async generator", function.span.start);
-                    self.lower_function(
-                        &name,
-                        &function.params,
-                        function.body.as_deref(),
-                        None,
-                        true,
-                        &[],
-                    )
-                } else if function.generator || function.r#async {
+                let (id, names) = if function.generator || function.r#async {
                     self.lower_generator(
                         &name,
                         &function.params,
                         function.body.as_deref(),
                         function.r#async,
+                        function.r#async && function.generator,
                     )
                 } else {
                     self.lower_function(
@@ -3461,8 +3658,10 @@ impl Lowering {
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
         is_async: bool,
+        is_async_generator: bool,
     ) -> (FunctionId, Vec<String>) {
-        let (body_id, body_captures) = self.lower_generator_body(name, params, body, is_async);
+        let (body_id, body_captures) =
+            self.lower_generator_body(name, params, body, is_async, is_async_generator);
 
         let index = self.functions.len();
         let mut outer = Function::new(name);
@@ -3570,9 +3769,19 @@ impl Lowering {
             });
         }
         self.functions[index].parameters = parameter_slots;
-        // A generator function returns the generator object; an async function returns the promise
-        // that `crisol_async_start` settles as it drives that generator to completion (D-249).
-        let result = if is_async {
+        // A sync generator returns the generator object; an async function returns the promise
+        // `crisol_async_start` settles as it drives the body to completion (D-249); an async
+        // generator returns the body made into an async generator, whose methods answer promises
+        // (D-267).
+        let result = if is_async_generator {
+            self.emit(
+                Type::Object(None),
+                Op::Unary {
+                    op: UnaryOp::AsyncGenerator,
+                    operand: generator,
+                },
+            )
+        } else if is_async {
             self.emit(
                 Type::Object(None),
                 Op::Unary {
@@ -3608,6 +3817,7 @@ impl Lowering {
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
         is_async: bool,
+        is_async_generator: bool,
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}~body"));
@@ -3630,6 +3840,7 @@ impl Lowering {
                 resumes: Vec::new(),
                 locals: HashMap::new(),
                 is_async,
+                is_async_generator,
             }),
             value_types: Vec::new(),
             finalizers: Vec::new(),
@@ -3739,17 +3950,19 @@ impl Lowering {
     /// sent in. The caller must be in statement or simple-assignment position, so no compiler
     /// temporary is live across the suspension (the resume block is entered from the entry
     /// dispatch, not from before the `yield`).
-    fn lower_yield(&mut self, argument: Option<&Expression<'_>>) -> ValueId {
+    fn lower_yield(&mut self, argument: Option<&Expression<'_>>, is_await: bool) -> ValueId {
         let value = match argument {
             Some(argument) => self.expression(argument),
             None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
         };
-        self.yield_value(value)
+        self.yield_value(value, is_await)
     }
 
     /// Suspends the generator on an already-evaluated `value` and resumes with the sent value — the
-    /// core of [`Self::lower_yield`], shared with `yield*` delegation (D-262).
-    fn yield_value(&mut self, value: ValueId) -> ValueId {
+    /// core of [`Self::lower_yield`], shared with `yield*` delegation (D-262). `is_await` records
+    /// whether the suspension is an `await` rather than a `yield`, which an async generator's driver
+    /// reads (D-267).
+    fn yield_value(&mut self, value: ValueId, is_await: bool) -> ValueId {
         let this_slot = self.slot("this");
         let this = self.read(this_slot);
         self.emit_effect(Op::PropertyStore {
@@ -3757,6 +3970,22 @@ impl Lowering {
             key: PropertyKey::new(GEN_YIELDED_KEY),
             value,
         });
+        // In an async generator, record which kind of suspension this is so the driver can tell a
+        // yield (surface to the consumer) from an await (chain and resume). Elsewhere it is unread.
+        if self
+            .scope()
+            .generator
+            .as_ref()
+            .is_some_and(|generator| generator.is_async_generator)
+        {
+            let this = self.read(this_slot);
+            let flag = self.emit(Type::Bool, Op::Const(Constant::Bool(is_await)));
+            self.emit_effect(Op::PropertyStore {
+                object: this,
+                key: PropertyKey::new(GEN_AWAITING_KEY),
+                value: flag,
+            });
+        }
         let state = {
             let generator = self
                 .scope_mut()
@@ -3861,7 +4090,7 @@ impl Lowering {
             },
         );
         let element = self.propagate(element);
-        self.yield_value(element);
+        self.yield_value(element, false);
         let index = self.read(index_slot);
         let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
         let next = self.emit(
@@ -3910,7 +4139,7 @@ impl Lowering {
             let Expression::YieldExpression(yield_expression) = expression else {
                 unreachable!("is_plain_yield checked the shape")
             };
-            return self.lower_yield(yield_expression.argument.as_ref());
+            return self.lower_yield(yield_expression.argument.as_ref(), false);
         }
         if self.is_plain_await(expression) {
             let Expression::AwaitExpression(await_expression) = expression else {
@@ -3918,7 +4147,7 @@ impl Lowering {
             };
             // `await e` suspends exactly as `yield e` does; the driver resumes with the settled
             // value, which becomes the expression's result.
-            return self.lower_yield(Some(&await_expression.argument));
+            return self.lower_yield(Some(&await_expression.argument), true);
         }
         self.expression(expression)
     }

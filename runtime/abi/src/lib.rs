@@ -660,6 +660,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
             .with(|protos| roots.extend(protos.iter().filter_map(std::cell::Cell::get)));
         roots.extend(DATA_VIEW_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(GENERATOR_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(ASYNC_GENERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BIGINT_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(WEAKMAP_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(WEAKSET_PROTOTYPE.with(std::cell::Cell::get));
@@ -757,6 +758,10 @@ thread_local! {
     /// `%GeneratorPrototype%` — where a generator's `next`/`return`/`throw`/`[Symbol.iterator]`
     /// live.
     static GENERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%AsyncGeneratorPrototype%` (D-267) — where an async generator's `next`/`return`/`throw`
+    /// (each answering a promise) and its `[Symbol.asyncIterator]` live.
+    static ASYNC_GENERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// `BigInt.prototype` — what `ToObject` gives a BigInt wrapper, and where `toString` and
     /// `valueOf` live.
@@ -4906,6 +4911,12 @@ const GEN_YIELDED: &str = "__genYielded";
 const GEN_RETURN: &str = "__genReturn";
 const GEN_THIS: &str = "__genThis";
 const GEN_BODY: &str = "__genBody";
+/// The mark an async generator carries, so its `next`/`return`/`throw` answer promises (D-267).
+const ASYNC_GENERATOR_BRAND: &str = "__asyncGenerator";
+/// Set on each suspension: `true` when the body stopped on an `await`, `false` on a `yield`. Only
+/// the async-generator driver reads it — a plain generator's suspensions are all yields and an async
+/// function's all awaits, so each ignores it (D-267).
+const GEN_AWAITING: &str = "__genAwaiting";
 
 /// What the body returns to report what it did: `1` for a return or fall-off, anything else for a
 /// `yield` (the frontend uses `0`). A thrown exception is the exception signal, handled first.
@@ -5174,6 +5185,219 @@ extern "C" fn async_resume_call(
             settle_promise(promise, settled, true);
         } else {
             async_drive(generator, promise, settled);
+        }
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+// ============================== Async generators ==============================
+//
+// An async generator (D-267) is a generator whose consumer sees promises: `next`/`return`/`throw`
+// each answer one. The driver steps the body to the next *yield* — chaining any *await* along the way
+// with `.then`, the spawn an async function uses — then settles the promise with `{ value, done }`.
+// Yield and await share the one suspension; the body records which it was in `GEN_AWAITING`, and the
+// driver reads it to tell "surface this value" (yield) from "await it and resume" (await). Recorded
+// shortcuts, the same the sync generator and async function already take: `yield x` does not
+// `Await(x)` first, a rejected await rejects the result rather than resuming an inner `catch`, and
+// `throw` does not resume a `catch`.
+
+/// `crisol_async_generator(generator)` — turns the generator a `function*` outer stub made into an
+/// async one: its brand and async prototype, so its methods answer promises. It keeps the generator
+/// machinery (`GENERATOR_BRAND`, `GEN_BODY`, …) the driver resumes.
+#[unsafe(no_mangle)]
+#[must_use]
+pub extern "C" fn crisol_async_generator(generator: u64) -> u64 {
+    if let Some(handle) = handle_of(generator) {
+        with_rooted(&[generator], || {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, ASYNC_GENERATOR_BRAND, Value::TRUE);
+                if let Some(prototype) = ASYNC_GENERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+                    runtime.heap.set_prototype(handle, Some(prototype));
+                }
+            });
+        });
+    }
+    generator
+}
+
+/// `%AsyncGeneratorPrototype%.next(value)` — a promise for the next `{ value, done }`.
+extern "C" fn async_gen_next(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, ASYNC_GENERATOR_BRAND) {
+        return raise("this is not an async generator", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let sent = unsafe { argument(argc, argv, 0) };
+    with_rooted(&[this_value, sent], || {
+        let promise = new_promise_object();
+        with_rooted(&[promise, this_value, sent], || {
+            async_gen_drive(this_value, promise, sent);
+        });
+        promise
+    })
+}
+
+/// `%AsyncGeneratorPrototype%.return(value)` — finishes it and answers a promise for
+/// `{ value, done: true }`. The abrupt form (no `finally`), as the sync `return` is.
+extern "C" fn async_gen_return(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, ASYNC_GENERATOR_BRAND) {
+        return raise("this is not an async generator", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    set_generator_done(this_value);
+    with_rooted(&[this_value, value], || {
+        let promise = new_promise_object();
+        with_rooted(&[promise, value], || {
+            let result = iterator_result(value, true);
+            with_rooted(&[promise, result], || {
+                settle_promise(promise, result, false)
+            });
+        });
+        promise
+    })
+}
+
+/// `%AsyncGeneratorPrototype%.throw(value)` — finishes it and answers a rejected promise. The
+/// uncaught form (no inner `catch`), as the sync `throw` is.
+extern "C" fn async_gen_throw(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if !own_flag(this_value, ASYNC_GENERATOR_BRAND) {
+        return raise("this is not an async generator", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    set_generator_done(this_value);
+    with_rooted(&[this_value, value], || {
+        let promise = new_promise_object();
+        with_rooted(&[promise, value], || settle_promise(promise, value, true));
+        promise
+    })
+}
+
+/// Steps the async generator once, resuming its body with `sent`: settles `promise` with the final
+/// `{ value, done: true }` on return (or rejects it on an uncaught throw), with `{ value, done:
+/// false }` on a yield, and chains `.then` to resume on an await (D-267).
+fn async_gen_drive(generator: u64, promise: u64, sent: u64) {
+    if is_truthy(Value::from_bits(property_of(generator, GEN_DONE))) {
+        let result = iterator_result(Value::UNDEFINED.to_bits(), true);
+        with_rooted(&[promise, result], || {
+            settle_promise(promise, result, false)
+        });
+        return;
+    }
+    if let Some(handle) = handle_of(generator) {
+        with_rooted(&[generator, sent], || {
+            with_runtime(|runtime| runtime.define_hidden(handle, GEN_SENT, Value::from_bits(sent)));
+        });
+    }
+    let stepped = with_rooted(&[generator, promise], || generator_resume(generator));
+    if Value::from_bits(stepped).is_exception() {
+        let reason = crisol_pending_exception();
+        with_rooted(&[promise, reason], || settle_promise(promise, reason, true));
+        return;
+    }
+    let done = is_truthy(Value::from_bits(property_of(stepped, "done")));
+    let value = property_of(stepped, "value");
+    if done {
+        let result = with_rooted(&[value], || iterator_result(value, true));
+        with_rooted(&[promise, result], || {
+            settle_promise(promise, result, false)
+        });
+        return;
+    }
+    if !is_truthy(Value::from_bits(property_of(generator, GEN_AWAITING))) {
+        // A yield surfaces to the consumer: resolve with `{ value, done: false }`.
+        let result = with_rooted(&[value], || iterator_result(value, false));
+        with_rooted(&[promise, result], || {
+            settle_promise(promise, result, false)
+        });
+        return;
+    }
+    // An await chains: resume the body when `value` settles, still driving the same promise.
+    with_rooted(&[generator, promise, value], || {
+        let awaited = if is_promise(value) {
+            value
+        } else {
+            let wrapper = with_rooted(&[value], new_promise_object);
+            with_rooted(&[wrapper, value], || settle_promise(wrapper, value, false));
+            wrapper
+        };
+        with_rooted(&[awaited, generator, promise], || {
+            let on_fulfilled = async_gen_resume_function(generator, promise, false);
+            let on_rejected = with_rooted(&[on_fulfilled], || {
+                async_gen_resume_function(generator, promise, true)
+            });
+            with_rooted(&[awaited, on_fulfilled, on_rejected], || {
+                promise_then(awaited, on_fulfilled, on_rejected, false);
+            });
+        });
+    });
+}
+
+/// One await-resume callback for an async generator — the generator, the result promise, and whether
+/// the awaited value rejected. Mirrors `async_resume_function`, pointed at the async-gen driver.
+fn async_gen_resume_function(generator: u64, promise: u64, rejects: bool) -> u64 {
+    let function = with_rooted(&[generator, promise], || {
+        with_runtime(|runtime| {
+            runtime
+                .native_function(
+                    NATIVES.len()
+                        + GLOBAL_NATIVES.len()
+                        + NAMESPACE_NATIVES.len()
+                        + ASYNC_GEN_RESUME_CALL,
+                )
+                .to_value()
+                .to_bits()
+        })
+    });
+    with_rooted(&[function, generator, promise], || {
+        if let Some(handle) = handle_of(function) {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, ASYNC_GEN, Value::from_bits(generator));
+                runtime.define_hidden(handle, ASYNC_PROMISE, Value::from_bits(promise));
+                runtime.define_hidden(handle, ASYNC_REJECTS, boolean(rejects));
+            });
+        }
+    });
+    function
+}
+
+/// The body of an async generator's await-resume callback: drive on with the fulfilled value, or
+/// reject the result promise when the awaited value rejected.
+extern "C" fn async_gen_resume_call(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    let generator = property_of(closure, ASYNC_GEN);
+    let promise = property_of(closure, ASYNC_PROMISE);
+    let rejects = is_truthy(Value::from_bits(property_of(closure, ASYNC_REJECTS)));
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let settled = unsafe { argument(argc, argv, 0) };
+    with_rooted(&[generator, promise, settled], || {
+        if rejects {
+            settle_promise(promise, settled, true);
+        } else {
+            async_gen_drive(generator, promise, settled);
         }
     });
     Value::UNDEFINED.to_bits()
@@ -6083,6 +6307,10 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     iterator_self,
     string_iterator,
     async_resume_call,
+    async_gen_next,
+    async_gen_return,
+    async_gen_throw,
+    async_gen_resume_call,
 ];
 
 /// Where a `resolve`/`reject` function keeps the promise it settles.
@@ -6214,6 +6442,13 @@ const STRING_ITERATOR: usize = 12;
 /// The index within [`ANONYMOUS_NATIVES`] of the callback that resumes an async function when the
 /// value it awaited settles (D-249).
 const ASYNC_RESUME_CALL: usize = 13;
+
+/// The indices within [`ANONYMOUS_NATIVES`] of the async generator's prototype methods and its
+/// await-resume callback (D-267), installed by hand on `ASYNC_GENERATOR_PROTOTYPE`.
+const ASYNC_GEN_NEXT: usize = 14;
+const ASYNC_GEN_RETURN: usize = 15;
+const ASYNC_GEN_THROW: usize = 16;
+const ASYNC_GEN_RESUME_CALL: usize = 17;
 
 /// Marks an array whose `length` has been made non-writable.
 ///
@@ -14091,6 +14326,31 @@ impl Runtime {
             self.define_keyed(prototype, &key, function.to_value());
         }
 
+        // **An async generator is its own async-iterator** — `for await` reaches its `next` through
+        // `[Symbol.asyncIterator]`, which answers `this` (D-267).
+        if let Some(prototype) = ASYNC_GENERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+            let async_iterator = {
+                let async_key = PropertyKey::new("asyncIterator");
+                self.heap
+                    .shape_of(symbol)
+                    .and_then(|shape| self.shapes.borrow().lookup(shape, &async_key))
+                    .and_then(|slot| self.heap.get(symbol, slot.index()))
+                    .and_then(|value| value.as_address())
+            };
+            if let Some(async_iterator) = async_iterator {
+                let async_key = PropertyKey::symbol(async_iterator, "Symbol.asyncIterator");
+                KEY_SYMBOLS.with(|symbols| {
+                    if let Ok(mut entries) = symbols.try_borrow_mut() {
+                        entries.insert(Value::symbol(async_iterator).to_bits());
+                    }
+                });
+                let index =
+                    NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ITERATOR_SELF;
+                let function = self.native_function(index);
+                self.define_keyed(prototype, &async_key, function.to_value());
+            }
+        }
+
         // **A string answers `Symbol.iterator` with a code-point iterator.** `[...s]` already
         // works through the fast path, but `s[Symbol.iterator]()` needs the method itself.
         if let Some(prototype) = STRING_PROTOTYPE.with(std::cell::Cell::get) {
@@ -15272,6 +15532,31 @@ impl Runtime {
             for (index, (name, _)) in GENERATOR_NATIVES.iter().enumerate() {
                 let method = self.native_function(gen_base + index);
                 self.define_method(prototype.handle(), "Generator", name, method.to_value());
+            }
+        }
+
+        // `%AsyncGeneratorPrototype%`: `next`/`return`/`throw`, each answering a promise (D-267). Its
+        // `[Symbol.asyncIterator]` is added in `build_symbol_keyed_methods`. The three live in
+        // `ANONYMOUS_NATIVES`, addressed by the `ASYNC_GEN_*` constants.
+        {
+            let anonymous_base = NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len();
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let prototype = scope.alloc(shape, 0);
+            ASYNC_GENERATOR_PROTOTYPE.with(|cell| cell.set(Some(prototype.handle())));
+            self.inherit_from_object(prototype.handle());
+            for (name, offset) in [
+                ("next", ASYNC_GEN_NEXT),
+                ("return", ASYNC_GEN_RETURN),
+                ("throw", ASYNC_GEN_THROW),
+            ] {
+                let method = self.native_function(anonymous_base + offset);
+                self.define_method(
+                    prototype.handle(),
+                    "AsyncGenerator",
+                    name,
+                    method.to_value(),
+                );
             }
         }
 

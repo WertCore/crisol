@@ -275,6 +275,9 @@ pub enum UnaryOp {
     /// Starts an async function's body (a generator, D-249) and returns the promise it settles.
     /// Not a JavaScript operator — an internal one-in, one-out call, like [`UnaryOp::Throw`].
     AsyncStart,
+    /// Turns a freshly-made generator into an async generator (D-267): sets its brand and async
+    /// prototype, then returns it. Internal, like [`UnaryOp::AsyncStart`].
+    AsyncGenerator,
 }
 
 impl UnaryOp {
@@ -291,6 +294,7 @@ impl UnaryOp {
             Self::Throw => "throw",
             Self::IsException => "is-exception",
             Self::AsyncStart => "async-start",
+            Self::AsyncGenerator => "async-generator",
         }
     }
 }
