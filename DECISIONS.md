@@ -7398,3 +7398,21 @@ tag is allowed to see) carrying a `raw` array of the uncooked ones — reusing `
 ordinary call, with a member tag passing its object as `this`. The template object is not frozen or
 cached across evaluations (every engine caches it per call site); a recorded shortcut with no effect on
 a tag that only reads it.
+
+## D-269
+
+**Non-declaration for-of/for-in targets, and a spread in an optional call.**
+
+Status: Accepted
+
+`for (o.x of …)` and `for ([a, b] of …)` — a for-of/for-in target that is a member or a destructuring
+*assignment* (not a `const`/`let` declaration) — now bind through `assign_to`, the same path plain
+destructuring assignment uses, reached via `ForStatementLeft::as_assignment_target()`. And `f?.(...xs)`
+gathers its arguments into an array and goes through `CallSpread` exactly as a non-optional spread call
+does, rather than refusing.
+
+**Array holes stay refused**, and the reason is now the runtime, not the frontend: a sparse write
+(`a[2] = v`) fills the skipped indices with `undefined` rather than leaving them absent, so `0 in a` is
+`true` and `forEach` visits them. True holes need the heap array and every method that walks it (`in`,
+`forEach`/`map`/…, `hasOwnProperty`) to distinguish an absent slot from one holding `undefined` — a
+runtime-wide change, deferred rather than half-done in the frontend.

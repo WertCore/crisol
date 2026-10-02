@@ -1313,14 +1313,16 @@ impl Lowering {
                     None => self.bind_pattern(&first.id, value, false, declaration.span.start),
                 }
             }
-            oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(identifier) => {
-                let slot = self.slot(identifier.name.as_str());
-                self.write(slot, value);
+            // Not a declaration, so an assignment target — a plain name, a member (`for (o.x of …)`),
+            // or a destructuring pattern (`for ([a, b] of …)`). `assign_to` binds each, assigning to
+            // bindings or members that already exist rather than declaring (D-269).
+            other => {
+                if let Some(target) = other.as_assignment_target() {
+                    self.assign_to(target, value, 0);
+                } else {
+                    self.note("for-in binding that is not a plain name", 0);
+                }
             }
-            // A member expression or a pattern. Reported without a position, because a
-            // `ForStatementLeft` does not carry one without the span trait in scope and the
-            // construct is named precisely enough to find.
-            _ => self.note("for-in binding that is not a plain name", 0),
         }
     }
 
@@ -3593,24 +3595,64 @@ impl Lowering {
         if call.optional {
             self.short_circuit_if_nullish(callee, short);
         }
-        let mut args = Vec::with_capacity(call.arguments.len());
-        for argument in &call.arguments {
-            if let Some(expression) = argument.as_expression() {
-                args.push(self.expression(expression));
-            } else {
-                // Spread inside an optional call is rare; refused rather than miscompiled.
-                self.note("spread argument", call.span.start);
-                args.push(self.placeholder());
+        // A spread argument gathers the arguments into an array and goes through `CallSpread`, as a
+        // non-optional call's does (D-269); without one the fixed-operand `Op::Call` is unchanged.
+        let spread = call
+            .arguments
+            .iter()
+            .any(|argument| matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)));
+        let result = if spread {
+            let array = self.emit(
+                Type::Object(None),
+                Op::CreateArray {
+                    elements: Vec::new(),
+                },
+            );
+            for argument in &call.arguments {
+                if let oxc_ast::ast::Argument::SpreadElement(element) = argument {
+                    let value = self.expression(&element.argument);
+                    let extended = self.emit(
+                        Type::Undefined,
+                        Op::ArrayExtend {
+                            array,
+                            value,
+                            spread: true,
+                        },
+                    );
+                    self.propagate(extended);
+                } else if let Some(expression) = argument.as_expression() {
+                    let value = self.expression(expression);
+                    self.emit_effect(Op::ArrayExtend {
+                        array,
+                        value,
+                        spread: false,
+                    });
+                }
             }
-        }
-        let result = self.emit(
-            Type::Unknown,
-            Op::Call {
-                callee,
-                this_value,
-                args,
-            },
-        );
+            self.emit(
+                Type::Unknown,
+                Op::CallSpread {
+                    callee,
+                    this_value,
+                    arguments: array,
+                },
+            )
+        } else {
+            let mut args = Vec::with_capacity(call.arguments.len());
+            for argument in &call.arguments {
+                if let Some(expression) = argument.as_expression() {
+                    args.push(self.expression(expression));
+                }
+            }
+            self.emit(
+                Type::Unknown,
+                Op::Call {
+                    callee,
+                    this_value,
+                    args,
+                },
+            )
+        };
         self.propagate(result)
     }
 

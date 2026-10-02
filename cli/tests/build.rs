@@ -11302,3 +11302,38 @@ fn comma_operator_and_tagged_templates() {
         "obj:hi",
     );
 }
+
+/// Non-declaration for-of/for-in targets and a spread in an optional call (D-269).
+#[test]
+fn for_targets_and_optional_call_spread() {
+    check(
+        "for-of-member-target",
+        "var o = {}; for (o.x of [1, 2, 3]) {} return o.x;",
+        "3",
+    );
+    check(
+        "for-of-destructuring-assignment",
+        "var a, b, s = 0; for ([a, b] of [[1, 2], [3, 4]]) s += a + b; return s;",
+        "10",
+    );
+    check(
+        "for-in-member-target",
+        "var o = { a: 1, b: 2 }; var last; for (last in o) {} return last;",
+        "b",
+    );
+    check(
+        "for-of-const-destructure-unchanged",
+        "var s = 0; for (const [a, b] of [[1, 2], [3, 4]]) s += a + b; return s;",
+        "10",
+    );
+    check(
+        "optional-call-spread",
+        "function f() { return arguments.length; } var g = f; return g?.(...[1, 2, 3]);",
+        "3",
+    );
+    check(
+        "optional-call-spread-short-circuits",
+        "var g = null; return g?.(...[1, 2, 3]);",
+        "undefined",
+    );
+}
