@@ -7332,3 +7332,22 @@ What stays refused: a computed **accessor** name (`get [k]() {}`), because `Defi
 needs the constructor that is not built until after the member loop; and a computed **field** name,
 whose key is evaluated once at definition but whose value runs per instance, which the field machinery
 does not thread yet.
+
+## D-266
+
+**Derived class fields run after `super()` — class fields are now complete.**
+
+Status: Accepted
+
+The last field refusal: `class D extends B { x = 1; constructor() { super(); } }`. A derived class's
+field initialisers must run immediately after `super()` returns, which is where `this` first exists, not
+at the top of the constructor (a base class's run at the top — D-263). `lower_function` tells the two
+apart by scanning the body for a bare `super(...)` statement: with one, the fields are emitted right
+after it as it is lowered (so a field initialiser reads what the parent set — `x = this.v + 5` works);
+with none, at the top as before. No new parameter — the body itself says which class it is. With this,
+instance fields lower in every constructor shape: base or derived, implicit or explicit.
+
+The corner left: a derived constructor that accesses `super()` other than as a bare statement (nested in
+an expression, or absent entirely) does not get the after-super injection — but a derived constructor
+that never calls `super` is already a `this`-before-`super` error, and the bare-statement form is all
+real code uses.

@@ -11188,3 +11188,36 @@ fn computed_class_method_names() {
         "3",
     );
 }
+
+/// A derived class's instance fields run inside an explicit constructor, right after `super()`
+/// returns — so they see what the parent initialised (D-266). Class fields are now complete.
+#[test]
+fn derived_class_fields_run_after_super() {
+    check(
+        "derived-field-and-constructor",
+        "class B { constructor() { this.b = 1; } } \
+         class D extends B { x = 2; constructor() { super(); this.y = 3; } } \
+         var d = new D(); return d.b + \",\" + d.x + \",\" + d.y;",
+        "1,2,3",
+    );
+    // The field runs after super(), so its initialiser sees the parent-set state.
+    check(
+        "derived-field-sees-parent-state",
+        "class B { constructor() { this.v = 10; } } \
+         class D extends B { x = this.v + 5; constructor() { super(); } } return new D().x;",
+        "15",
+    );
+    // A derived field with no explicit constructor still works (implicit derived constructor).
+    check(
+        "derived-field-implicit-constructor",
+        "class B { constructor() { this.b = 1; } } class D extends B { x = 5; } \
+         var d = new D(); return d.x + d.b;",
+        "6",
+    );
+    // Base class with an explicit constructor still injects at the top.
+    check(
+        "base-field-and-constructor-unchanged",
+        "class C { x = 1; constructor() { this.y = this.x + 1; } } return new C().y;",
+        "2",
+    );
+}

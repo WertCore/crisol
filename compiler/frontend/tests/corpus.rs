@@ -339,19 +339,8 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // A hole is still refused; a spread is not. The two used to share a note, which made
         // `[...a]` look like a gap it had not been for some time.
         ("let a = [1, , 3];", "array hole"),
-        // `==` is not `===`: it coerces, and the coercion table needs machinery that is not
-        // here yet. Lowering it as a strict comparison would be wrong for every mixed-type
-        // operand, which is the only case anyone writes `==` for.
-        // `extends`/`super` lower now (D-243); a class **field** does not — it initialises per
-        // instance inside the constructor, which the class lowering does not synthesise yet.
-        // An instance field lowers now (D-252) when the class has no explicit constructor; one that
-        // *does* still needs the field injected into that body, which is not synthesised yet.
-        // A base class injects its fields into an explicit constructor now (D-263); a *derived* one
-        // would have to run them after `super()`, wherever that is, which is not synthesised yet.
-        (
-            "class D extends Object { x = 1; constructor() { super(); } }",
-            "class field with an explicit constructor",
-        ),
+        // Instance fields lower in every constructor now — base or derived, implicit or explicit
+        // (D-252/D-263/D-266).
         // Static *methods* and *fields* lower now (D-261); a static **block** does not — it runs
         // arbitrary statements at class definition, which the class lowering does not synthesise.
         (

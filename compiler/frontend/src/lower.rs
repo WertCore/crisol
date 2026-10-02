@@ -4077,17 +4077,26 @@ impl Lowering {
             self.write(slot, arrived);
         }
 
-        // A base class's explicit constructor runs its instance-field initialisers before the
-        // user's body (D-263), the same order `implicit_constructor` uses.
-        if !constructor_fields.is_empty() {
+        // A constructor's instance-field initialisers run before the user's body in a base class
+        // (D-263) and immediately after `super()` returns in a derived one (D-266), which is where
+        // `this` first exists. Which it is falls out of whether the body calls `super`.
+        let fields_after_super = !constructor_fields.is_empty()
+            && body.is_some_and(|body| body.statements.iter().any(is_super_call_statement));
+        if !constructor_fields.is_empty() && !fields_after_super {
             let this_slot = self.slot("this");
             self.emit_field_inits(this_slot, constructor_fields);
         }
 
         if let Some(body) = body {
             self.hoist(&body.statements);
+            let mut fields_injected = !fields_after_super;
             for statement in &body.statements {
                 self.statement(statement);
+                if !fields_injected && is_super_call_statement(statement) {
+                    let this_slot = self.slot("this");
+                    self.emit_field_inits(this_slot, constructor_fields);
+                    fields_injected = true;
+                }
             }
         } else if let Some(expression) = expression_body {
             // A concise arrow body is an implicit return, not a statement.
@@ -4308,25 +4317,16 @@ impl Lowering {
 
         let constructor = match constructor_method {
             Some(method) => {
-                // A base class injects its field initialisers into the constructor body, ahead of
-                // the user's code (D-263). A derived class would have to run them after `super()`,
-                // wherever that call is, which is not synthesised yet — so that combination is still
-                // recorded rather than dropping the fields.
-                let injected: &[(String, Option<&Expression<'_>>)] = if fields.is_empty() {
-                    &[]
-                } else if parent.is_some() {
-                    self.note("class field with an explicit constructor", class.span.start);
-                    &[]
-                } else {
-                    &fields
-                };
+                // The fields are injected into the constructor body — at the top for a base class,
+                // after `super()` for a derived one, which `lower_function` tells apart by whether
+                // the body calls `super` (D-263/D-266).
                 let (id, captures) = self.lower_function(
                     &format!("{name}.constructor"),
                     &method.value.params,
                     method.value.body.as_deref(),
                     None,
                     true,
-                    injected,
+                    &fields,
                 );
                 self.close_over(id, &captures)
             }
@@ -4731,6 +4731,14 @@ fn compound_binop(operator: oxc_ast::ast::AssignmentOperator) -> Option<BinaryOp
         A::BitwiseAnd => BinaryOp::BitAnd,
         A::Assign | A::LogicalAnd | A::LogicalOr | A::LogicalNullish => return None,
     })
+}
+
+/// Whether a statement is a bare `super(...)` call — where a derived class's field initialisers run
+/// right after it returns (D-266).
+fn is_super_call_statement(statement: &Statement<'_>) -> bool {
+    matches!(statement, Statement::ExpressionStatement(expression)
+        if matches!(&expression.expression, Expression::CallExpression(call)
+            if matches!(call.callee, Expression::Super(_))))
 }
 
 /// A statement's kind, for the unsupported list.
