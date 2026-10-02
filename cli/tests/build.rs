@@ -11409,3 +11409,39 @@ fn computed_class_members_and_accessors() {
         "9",
     );
 }
+
+/// A class's own name is bound inside its method bodies, for self-reference (D-271).
+#[test]
+fn class_name_is_bound_inside_methods() {
+    check(
+        "class-name-in-instance-method",
+        "class C { self() { return C; } } return new C().self() === C;",
+        "true",
+    );
+    check(
+        "class-name-static-recursion",
+        "class C { static fac(n) { return n <= 1 ? 1 : n * C.fac(n - 1); } } return C.fac(5);",
+        "120",
+    );
+    check(
+        "class-name-static-construct",
+        "class C { static make() { return new C(); } } return C.make() instanceof C;",
+        "true",
+    );
+    check(
+        "class-name-method-reads-static",
+        "class C { static id = 42; read() { return C.id; } } return new C().read();",
+        "42",
+    );
+    check(
+        "named-class-expression-self-reference",
+        "var X = class C { self() { return C; } }; return new X().self() === X;",
+        "true",
+    );
+    // The name reaches a method that also uses `super`, and a static one on the same class.
+    check(
+        "class-name-with-super",
+        "class A { v() { return 1; } } class B extends A { v() { return super.v() + B.tag(); } static tag() { return 10; } } return new B().v();",
+        "11",
+    );
+}

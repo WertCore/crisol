@@ -7454,3 +7454,34 @@ behaves identically to a named one on both:**
   fix.
 
 Both block real test262 cases and are filed as follow-ups rather than folded in here.
+
+## D-271
+
+**A class binds its own name inside its method bodies.**
+
+Status: Accepted
+
+`class C { m() { return C; } }`, `static make() { return new C(); }`, and self-recursion through
+`C` all reached a `ReferenceError` before — the class name was bound only *after* the class value
+existed, so no method could see it. It is now bound at the top of the class lowering, before any
+method, as a cell the methods capture and the finished constructor is written back into at the
+bottom — the same forward reference a named function's own name already used (see `hoist`). The
+escape pass gains a `visit_class` that counts the class name as assigned, which is what gives that
+name a cell when a method captures it, mirroring the function-name rule beside it.
+
+For a class *declaration* this inner binding is also the outer one — the same slot — so the
+declaration statement no longer binds the name a second time (which would shadow the cell the
+methods share with a plain slot). For a named class *expression* the name is scoped to the body in
+the specification; binding it in the enclosing scope here lets it leak, a deliberate simplification
+rather than standing up a separate class scope for the one name.
+
+Two neighbours are **not** fixed by this and stay as filed follow-ups, because both are the same
+shape as bugs already recorded rather than this one:
+
+- A *field initialiser* that reads the class name (`class C { tag = C.id }`) still sees `undefined`:
+  a field initialiser is not syntactically inside a function body, so the escape pass does not count
+  the name as captured there, and the constructor takes a by-value copy from before the write-back.
+  This is the field-initialiser-capture gap (the write-side of which D-270 already noted).
+- A forward reference between sibling classes (`class A { m() { return new B(); } } class B {}`)
+  throws: unlike function declarations, class declarations are not hoisted, so `B`'s binding does
+  not exist when `A`'s method is lowered. That wants class-name hoisting into a TDZ binding.

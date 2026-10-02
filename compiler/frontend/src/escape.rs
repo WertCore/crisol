@@ -122,6 +122,18 @@ impl<'a> Visit<'a> for Escape {
         oxc_ast_visit::walk::walk_function(self, function, flags);
     }
 
+    /// **A class's own name is a binding its methods refer to**, bound only once the class value
+    /// exists — the same forward reference a function's name is, for the same reason. `class C {
+    /// m() { return C; } }` captures the name before the constructor is built, so counting the
+    /// class as an assignment to its name gives that name a cell and the capture sees the finished
+    /// class rather than the empty slot before it.
+    fn visit_class(&mut self, class: &oxc_ast::ast::Class<'a>) {
+        if let Some(id) = &class.id {
+            self.assigned.insert(id.name.to_string());
+        }
+        oxc_ast_visit::walk::walk_class(self, class);
+    }
+
     fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
         // `n++` is an assignment, and forgetting it would leave the most common mutation of a
         // captured variable — a loop counter — silently copied.

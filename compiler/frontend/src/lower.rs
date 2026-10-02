@@ -2479,8 +2479,14 @@ impl Lowering {
                     .as_ref()
                     .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
                 let value = self.class(class, &name);
-                let slot = self.declare(&name);
-                self.bind(&name, slot, value);
+                // A *named* class already bound its name, in this scope, as the inner binding its
+                // methods capture (D-271) — so binding it again here would shadow that with a
+                // second slot the methods do not share. Only an anonymous one (`export default
+                // class {}`) still needs its synthesised name bound.
+                if class.id.is_none() {
+                    let slot = self.declare(&name);
+                    self.bind(&name, slot, value);
+                }
             }
             Statement::LabeledStatement(labeled) => {
                 let label = labeled.label.name.to_string();
@@ -4443,6 +4449,21 @@ impl Lowering {
     /// implementation that stored them on the instance would work until someone compared two
     /// objects' methods for identity, or counted `Object.keys`.
     fn class(&mut self, class: &oxc_ast::ast::Class<'_>, name: &str) -> ValueId {
+        // A named class binds its own name for its methods to see — `class C { m() { return C; }
+        // }`. The binding is made here, before any method is lowered, so a method captures it; a
+        // cell when the name is shared, exactly as a named function's own name is (see `hoist`),
+        // because the value it will hold — the constructor — does not exist until the bottom of
+        // this function, where it is written back (D-271). For a class *declaration* this is also
+        // the outer binding, so its statement does not bind the name again; for a named class
+        // *expression* the name is scoped to the body in the specification, and binding it in the
+        // enclosing scope here is a deliberate simplification rather than a separate class scope.
+        let name_slot = class.id.as_ref().map(|_| {
+            let slot = self.declare(name);
+            if self.shared.contains(name) {
+                self.make_cell(slot);
+            }
+            slot
+        });
         // `extends`: evaluate the parent once and expose it to the methods as the grammar-illegal
         // names ` super` (the parent constructor) and ` superproto` (its prototype), which a
         // method or the constructor captures exactly when it writes `super`.
@@ -4774,6 +4795,11 @@ impl Lowering {
                     });
                 }
             }
+        }
+        // The inner name now has its value: written through the cell the methods captured, so a
+        // method reading the class name sees the finished constructor (D-271).
+        if let Some(slot) = name_slot {
+            self.write(slot, constructor);
         }
         constructor
     }
