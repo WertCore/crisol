@@ -1743,22 +1743,10 @@ function class-with-both {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: object = closure @1 []  ; safepoint []
+    set v0."m" = v1  ; safepoint []
     v2: object = closure @2 []  ; safepoint []
-    set v0."m" = v2  ; safepoint []
-    set v1."prototype" = v0  ; safepoint []
-    store $1, v1
-    return
-}
-function C.constructor($1) {
-bb0:  ; entry
-    v0: unknown = load $1
-    v1: unknown = load $0
-    v2: unknown = set v1."x" = v0  ; safepoint []
-    v3: bool = is-exception v2
-    branch v3 -> bb1, bb2
-bb1:
-    return v2
-bb2:
+    set v2."prototype" = v0  ; safepoint []
+    store $1, v2
     return
 }
 function C.m {
@@ -1771,6 +1759,18 @@ bb1:
     return v1
 bb2:
     return v1
+}
+function C.constructor($1) {
+bb0:  ; entry
+    v0: unknown = load $1
+    v1: unknown = load $0
+    v2: unknown = set v1."x" = v0  ; safepoint []
+    v3: bool = is-exception v2
+    branch v3 -> bb1, bb2
+bb1:
+    return v2
+bb2:
+    return
 }
 
 === class-with-no-constructor-still-has-one ===

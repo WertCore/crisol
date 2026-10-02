@@ -7277,3 +7277,21 @@ the value-delegation that `yield*` is used for; it does **not** forward a `.next
 inner iterator, nor produce the inner's return value, so `yield*` in value position (`x = yield* g()`)
 stays refused rather than returning the wrong thing. `lower_yield` was split so the suspend-and-resume
 core (`yield_value`) takes an already-evaluated value, which the delegation loop reuses per element.
+
+## D-263
+
+**Instance fields run inside an explicit constructor (for a base class).**
+
+Status: Accepted
+
+`class C { x = 1; constructor() { … } }` was refused: fields were only injected into the *implicit*
+constructor. Now a base class's field initialisers run at the top of an explicit constructor's body,
+ahead of the user's code — the same order and the same `emit_field_inits` the implicit one uses.
+
+Two things had to move. The constructor is lowered *after* the member loop rather than inside it,
+because the fields it must run are collected throughout the loop and are not complete until it ends; it
+is stashed as its AST and lowered last. And `lower_function` took a `constructor_fields` parameter,
+emitted after the parameters are bound and before the body — empty for every function but a base
+class's constructor. A **derived** class still refuses the combination: its fields must run after
+`super()` returns, wherever that call sits in the body, and synthesising that is not done — so the note
+stays for that case, rather than running the fields at the wrong time.

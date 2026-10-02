@@ -1730,6 +1730,7 @@ impl Lowering {
                     declaration.body.as_deref(),
                     None,
                     true,
+                    &[],
                 )
             } else if declaration.generator || declaration.r#async {
                 self.lower_generator(
@@ -1745,6 +1746,7 @@ impl Lowering {
                     declaration.body.as_deref(),
                     None,
                     true,
+                    &[],
                 )
             };
             let closure = self.close_over(id, &captures);
@@ -2532,6 +2534,7 @@ impl Lowering {
                         function.body.as_deref(),
                         None,
                         true,
+                        &[],
                     )
                 } else if function.generator || function.r#async {
                     self.lower_generator(
@@ -2547,6 +2550,7 @@ impl Lowering {
                         function.body.as_deref(),
                         None,
                         true,
+                        &[],
                     )
                 };
                 self.close_over(id, &names)
@@ -2556,11 +2560,16 @@ impl Lowering {
                 // AST, so the distinction is read off the type rather than reconstructed from
                 // a boolean plus a guess at the single statement inside.
                 let (id, names) = match (arrow.get_expression(), arrow.get_function_body()) {
-                    (Some(expression), _) => {
-                        self.lower_function("arrow", &arrow.params, None, Some(expression), false)
-                    }
+                    (Some(expression), _) => self.lower_function(
+                        "arrow",
+                        &arrow.params,
+                        None,
+                        Some(expression),
+                        false,
+                        &[],
+                    ),
                     (None, Some(body)) => {
-                        self.lower_function("arrow", &arrow.params, Some(body), None, false)
+                        self.lower_function("arrow", &arrow.params, Some(body), None, false, &[])
                     }
                     (None, None) => {
                         self.note("arrow with no body", arrow.span.start);
@@ -3802,6 +3811,9 @@ impl Lowering {
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
         expression_body: Option<&Expression<'_>>,
         binds_this: bool,
+        // Instance fields to run before the body — non-empty only for a base class's explicit
+        // constructor, where they initialise each instance ahead of the user's code (D-263).
+        constructor_fields: &[(String, Option<&Expression<'_>>)],
     ) -> (FunctionId, Vec<String>) {
         let index = self.functions.len();
         let mut function = Function::new(name);
@@ -3933,6 +3945,13 @@ impl Lowering {
             self.write(slot, arrived);
         }
 
+        // A base class's explicit constructor runs its instance-field initialisers before the
+        // user's body (D-263), the same order `implicit_constructor` uses.
+        if !constructor_fields.is_empty() {
+            let this_slot = self.slot("this");
+            self.emit_field_inits(this_slot, constructor_fields);
+        }
+
         if let Some(body) = body {
             self.hoist(&body.statements);
             for statement in &body.statements {
@@ -4025,7 +4044,10 @@ impl Lowering {
                 prototype: parent_prototype,
             });
         }
-        let mut constructor = None;
+        // The explicit constructor's definition, stashed rather than lowered in the loop: its field
+        // initialisers are not all collected until the loop finishes, and a base class injects them
+        // into its body (D-263).
+        let mut constructor_method: Option<&oxc_ast::ast::MethodDefinition<'_>> = None;
         // Instance fields, in source order, each with its initialiser. They are run in the
         // constructor on every instance (D-252); collected here and injected below.
         let mut fields: Vec<(String, Option<&Expression<'_>>)> = Vec::new();
@@ -4065,21 +4087,21 @@ impl Lowering {
                 continue;
             };
             let method_name = key.to_string();
+            if method_name == "constructor" && !method.r#static {
+                // Stashed, not lowered here: the fields it must run first are still being
+                // collected. Lowered once the loop finishes (D-263).
+                constructor_method = Some(method);
+                continue;
+            }
             let (id, captures) = self.lower_function(
                 &format!("{name}.{method_name}"),
                 &method.value.params,
                 method.value.body.as_deref(),
                 None,
                 true,
+                &[],
             );
             let closure = self.close_over(id, &captures);
-            if method_name == "constructor" && !method.r#static {
-                // Remembered, **not returned**. Returning here dropped every method declared
-                // after the constructor — and `constructor` conventionally comes first, so the
-                // common ordering was the broken one.
-                constructor = Some(closure);
-                continue;
-            }
             // A static method goes on the constructor, which is not built yet — collected and
             // installed below (D-261).
             if method.r#static {
@@ -4118,15 +4140,29 @@ impl Lowering {
             }
         }
 
-        let constructor = match constructor {
-            Some(closure) => {
-                // Fields need to run at the top of the constructor (after `super()` when derived);
-                // injecting them into a user-written constructor's body is not done yet, so a class
-                // with both is recorded rather than silently dropping the fields.
-                if !fields.is_empty() {
+        let constructor = match constructor_method {
+            Some(method) => {
+                // A base class injects its field initialisers into the constructor body, ahead of
+                // the user's code (D-263). A derived class would have to run them after `super()`,
+                // wherever that call is, which is not synthesised yet — so that combination is still
+                // recorded rather than dropping the fields.
+                let injected: &[(String, Option<&Expression<'_>>)] = if fields.is_empty() {
+                    &[]
+                } else if parent.is_some() {
                     self.note("class field with an explicit constructor", class.span.start);
-                }
-                closure
+                    &[]
+                } else {
+                    &fields
+                };
+                let (id, captures) = self.lower_function(
+                    &format!("{name}.constructor"),
+                    &method.value.params,
+                    method.value.body.as_deref(),
+                    None,
+                    true,
+                    injected,
+                );
+                self.close_over(id, &captures)
             }
             None => {
                 // No explicit constructor: the class still needs one, because `new` has to call

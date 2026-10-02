@@ -11074,3 +11074,32 @@ fn labels_and_yield_delegation() {
         "0,1,2,3",
     );
 }
+
+/// A base class's instance fields now run inside an explicit constructor, before its body (D-263).
+#[test]
+fn fields_initialise_inside_an_explicit_constructor() {
+    check(
+        "field-and-constructor",
+        "class C { x = 1; constructor() { this.y = 2; } } var c = new C(); return c.x + \",\" + c.y;",
+        "1,2",
+    );
+    // The field runs first, so the constructor body sees its value.
+    check(
+        "field-runs-before-body",
+        "class C { x = 10; constructor() { this.x = this.x + 5; } } return new C().x;",
+        "15",
+    );
+    check(
+        "multiple-fields-and-constructor",
+        "class C { a = 1; b = 2; constructor(v) { this.c = v; } } \
+         var o = new C(3); return o.a + o.b + o.c;",
+        "6",
+    );
+    // A field with no explicit constructor still works, and a constructor with no field too.
+    check("field-only", "class C { x = 7; } return new C().x;", "7");
+    check(
+        "constructor-only",
+        "class C { constructor() { this.z = 9; } } return new C().z;",
+        "9",
+    );
+}

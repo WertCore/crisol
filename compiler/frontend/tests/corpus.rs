@@ -346,8 +346,10 @@ fn unfaithful_programs_are_reported_not_guessed() {
         // instance inside the constructor, which the class lowering does not synthesise yet.
         // An instance field lowers now (D-252) when the class has no explicit constructor; one that
         // *does* still needs the field injected into that body, which is not synthesised yet.
+        // A base class injects its fields into an explicit constructor now (D-263); a *derived* one
+        // would have to run them after `super()`, wherever that is, which is not synthesised yet.
         (
-            "class C { x = 1; constructor() {} }",
+            "class D extends Object { x = 1; constructor() { super(); } }",
             "class field with an explicit constructor",
         ),
         // Static *methods* and *fields* lower now (D-261); a static **block** does not — it runs
