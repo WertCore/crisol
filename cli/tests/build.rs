@@ -11751,3 +11751,23 @@ fn new_target() {
         "true",
     );
 }
+
+/// A private field or method at the end of an optional chain — `a?.#x`, `a?.#m()` (D-280).
+#[test]
+fn optional_chain_private_member() {
+    check(
+        "optional-chain-private-field",
+        "class C { #x = 7; static get(o) { return o?.#x; } } return C.get(new C());",
+        "7",
+    );
+    check(
+        "optional-chain-private-short-circuits",
+        "class C { #x = 7; static get(o) { return o?.#x; } } return C.get(null) === undefined;",
+        "true",
+    );
+    check(
+        "optional-chain-private-method",
+        "class C { #m() { return 42; } static run(o) { return o?.#m(); } } return C.run(new C());",
+        "42",
+    );
+}

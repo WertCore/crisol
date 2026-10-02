@@ -3843,7 +3843,11 @@ impl Lowering {
                 Some(oxc_ast::ast::MemberExpression::ComputedMemberExpression(member)) => {
                     self.chain_computed(member, short)
                 }
-                // A private field (`a?.#x`) or a TS-only element is not lowered.
+                // `a?.#x` — a private field at the end of a chain, keyed like any private read (D-280).
+                Some(oxc_ast::ast::MemberExpression::PrivateFieldExpression(member)) => {
+                    self.chain_private(member, short)
+                }
+                // A TS-only element (`foo?.bar!`) is not lowered.
                 _ => {
                     self.note("optional chain", chain.span.start);
                     self.placeholder()
@@ -3931,6 +3935,28 @@ impl Lowering {
         }
         let key = self.expression(&member.expression);
         let value = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+        self.propagate(value)
+    }
+
+    fn chain_private(
+        &mut self,
+        member: &oxc_ast::ast::PrivateFieldExpression<'_>,
+        short: BlockId,
+    ) -> ValueId {
+        let object = self.chain_expr(&member.object, short);
+        if member.optional {
+            self.short_circuit_if_nullish(object, short);
+        }
+        // The private name keeps its `#` as an ordinary property key, the same as a non-optional
+        // `this.#x` read (D-274/D-280).
+        let key = private_key(&member.field);
+        let value = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object,
+                key: PropertyKey::new(&key),
+            },
+        );
         self.propagate(value)
     }
 

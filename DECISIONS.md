@@ -7662,3 +7662,17 @@ was `new`ed. The chain should carry it unchanged, but `super()` lowers to a plai
 `new.target` as `undefined`; forwarding it needs a call that carries an explicit `new.target`, which
 the IR does not have yet. The newed class's own constructor — base or derived — sees it correctly,
 which is the common case.
+
+## D-280
+
+**A private member at the end of an optional chain — `a?.#x`, `a?.#m()`.**
+
+Status: Accepted
+
+The optional-chain lowering handled a static and a computed member but refused a private one, the
+last member shape it did not cover. `a?.#x` now lowers through a `chain_private` that mirrors
+`chain_static` — the base goes through the chain (so an earlier `?.` short-circuits), an own `?.`
+short-circuits on a nullish base, and the read is the `#`-kept key D-274 uses, so a private field at
+the end of a chain is the ordinary private read behind the chain's guard. `a?.#m()` falls out too,
+since a private-field callee already passes its receiver (D-274). A trailing TS non-null (`a?.b!`)
+stays refused, which is not JavaScript.
