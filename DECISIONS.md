@@ -7676,3 +7676,26 @@ short-circuits on a nullish base, and the read is the `#`-kept key D-274 uses, s
 the end of a chain is the ordinary private read behind the chain's guard. `a?.#m()` falls out too,
 since a private-field callee already passes its receiver (D-274). A trailing TS non-null (`a?.b!`)
 stays refused, which is not JavaScript.
+
+## D-281
+
+**`yield`/`await` in an object property value, a computed key, a spread source, and a `new` argument.**
+
+Status: Accepted
+
+The last common expression positions, after D-276/277. An object literal with a `yield` keeps the
+half-built object in a generator-local slot and adds each property after reloading it; a computed key
+is spilled across the value, and the key is taken through `value_expression` so `{ [yield k]: v }`
+lowers too. A `new` with a `yield` argument spills its callee and earlier arguments exactly as a call
+does. An accessor's value is a function literal, built synchronously, so only its *computed key* can
+suspend.
+
+**One bug this exposed and fixed:** `expression_may_yield` — which a call, binary, or array consults
+to decide whether to spill *its* operands — had no `ObjectExpression` arm, so `f({ a: yield 1 })` left
+the callee unspilled and produced malformed IR (a value used in the resume block its definition did
+not reach). Adding the arm makes an object with a `yield` compose inside every other spilling
+position.
+
+Only `f(...(yield xs))` — a `yield` as the *source of a spread call argument* — stays refused: that
+path gathers into an array through its own loop, which does not spill yet. It is the one remaining
+expression position, and refused rather than miscompiled.

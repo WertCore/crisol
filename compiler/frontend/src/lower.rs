@@ -3064,6 +3064,30 @@ impl Lowering {
                     );
                     return self.propagate(result);
                 }
+                // A `yield` among the arguments (fixed-arity) needs the callee and any earlier
+                // argument to survive the suspension, so each is spilled and read back, exactly as a
+                // call does (D-281). A spread with a `yield` stays refused.
+                if self.scope().generator.is_some()
+                    && new.arguments.iter().any(|argument| {
+                        argument
+                            .as_expression()
+                            .is_some_and(|expression| self.expression_may_yield(expression))
+                    })
+                {
+                    let callee_slot = self.spill(callee);
+                    let mut arg_slots = Vec::with_capacity(new.arguments.len());
+                    for argument in &new.arguments {
+                        if let Some(expression) = argument.as_expression() {
+                            let value = self.value_expression(expression);
+                            arg_slots.push(self.spill(value));
+                        }
+                    }
+                    let callee = self.reload(callee_slot);
+                    let args: Vec<ValueId> =
+                        arg_slots.iter().map(|slot| self.reload(*slot)).collect();
+                    let result = self.emit(Type::Object(None), Op::Construct { callee, args });
+                    return self.propagate(result);
+                }
                 let mut args = Vec::with_capacity(new.arguments.len());
                 for argument in &new.arguments {
                     if let Some(expression) = argument.as_expression() {
@@ -4663,8 +4687,30 @@ impl Lowering {
                     .as_expression()
                     .is_some_and(|expression| yields(self, expression)),
             }),
+            E::ObjectExpression(object) => self.object_may_yield(object),
             _ => false,
         }
+    }
+
+    /// Whether an object literal has a `yield`/`await` in a property value, a computed key, or a
+    /// spread source — the parts that are evaluated as the object is built (D-281). An accessor's
+    /// value is a function literal, built synchronously, so it is not one; its computed *key* is.
+    fn object_may_yield(&self, object: &oxc_ast::ast::ObjectExpression<'_>) -> bool {
+        object.properties.iter().any(|property| match property {
+            ObjectPropertyKind::ObjectProperty(property) => {
+                let value_yields = matches!(property.kind, oxc_ast::ast::PropertyKind::Init)
+                    && self.expression_may_yield(&property.value);
+                let key_yields = property.computed
+                    && property
+                        .key
+                        .as_expression()
+                        .is_some_and(|expression| self.expression_may_yield(expression));
+                value_yields || key_yields
+            }
+            ObjectPropertyKind::SpreadProperty(spread) => {
+                self.expression_may_yield(&spread.argument)
+            }
+        })
     }
 
     /// A value expression that may itself be a `yield` or an `await` — the right side of an
@@ -5642,6 +5688,117 @@ impl Lowering {
         // both are better than guessing now.
         let shape = crisol_value::Shapes::new().root();
         let result = self.emit(Type::Object(None), Op::CreateObject { shape });
+        // A `yield` in a value, a computed key, or a spread source leaves the half-built object live
+        // across the suspension, so it is kept in a generator-local slot and each property added
+        // after reloading it (D-281). A computed key is spilled too, so a value that yields does not
+        // lose it; the value just stored is used before the next property runs, so it never crosses a
+        // later suspension.
+        if self.scope().generator.is_some() && self.object_may_yield(object) {
+            let object_slot = self.spill(result);
+            for property in &object.properties {
+                match property {
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        let name = match &property.key {
+                            Key::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
+                            Key::StringLiteral(literal) => Some(literal.value.to_string()),
+                            _ => None,
+                        };
+                        match name {
+                            Some(name) => {
+                                let value = self.value_expression(&property.value);
+                                let result = self.reload(object_slot);
+                                let absent = self.placeholder();
+                                match property.kind {
+                                    oxc_ast::ast::PropertyKind::Init => {
+                                        self.emit_effect(Op::PropertyStore {
+                                            object: result,
+                                            key: PropertyKey::new(&name),
+                                            value,
+                                        });
+                                    }
+                                    oxc_ast::ast::PropertyKind::Get => {
+                                        self.emit_effect(Op::DefineAccessor {
+                                            object: result,
+                                            key: PropertyKey::new(&name),
+                                            getter: value,
+                                            setter: absent,
+                                        });
+                                    }
+                                    oxc_ast::ast::PropertyKind::Set => {
+                                        self.emit_effect(Op::DefineAccessor {
+                                            object: result,
+                                            key: PropertyKey::new(&name),
+                                            getter: absent,
+                                            setter: value,
+                                        });
+                                    }
+                                }
+                            }
+                            None => {
+                                // Through `value_expression`, not `property_key_value`, so a `yield`
+                                // in the key itself (`{ [yield k]: v }`) lowers rather than refuses.
+                                let key = match &property.key {
+                                    Key::NumericLiteral(literal) => self.emit(
+                                        Type::Number,
+                                        Op::Const(Constant::Number(literal.value)),
+                                    ),
+                                    other => match other.as_expression() {
+                                        Some(expression) => self.value_expression(expression),
+                                        None => {
+                                            self.note("property key", property.span.start);
+                                            continue;
+                                        }
+                                    },
+                                };
+                                let key_slot = self.spill(key);
+                                let value = self.value_expression(&property.value);
+                                let key = self.reload(key_slot);
+                                let result = self.reload(object_slot);
+                                let absent = self.placeholder();
+                                match property.kind {
+                                    oxc_ast::ast::PropertyKind::Init => {
+                                        self.emit_effect(Op::ComputedStore {
+                                            object: result,
+                                            key,
+                                            value,
+                                        });
+                                    }
+                                    oxc_ast::ast::PropertyKind::Get => {
+                                        self.emit_effect(Op::ComputedDefineAccessor {
+                                            object: result,
+                                            key,
+                                            getter: value,
+                                            setter: absent,
+                                        });
+                                    }
+                                    oxc_ast::ast::PropertyKind::Set => {
+                                        self.emit_effect(Op::ComputedDefineAccessor {
+                                            object: result,
+                                            key,
+                                            getter: absent,
+                                            setter: value,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ObjectPropertyKind::SpreadProperty(spread) => {
+                        let source = self.value_expression(&spread.argument);
+                        let result = self.reload(object_slot);
+                        let extended = self.emit(
+                            Type::Undefined,
+                            Op::ObjectExtend {
+                                object: result,
+                                source,
+                            },
+                        );
+                        self.propagate(extended);
+                    }
+                }
+            }
+            return self.reload(object_slot);
+        }
         for property in &object.properties {
             match property {
                 ObjectPropertyKind::ObjectProperty(property) => {

@@ -11771,3 +11771,46 @@ fn optional_chain_private_member() {
         "42",
     );
 }
+
+/// `yield` in an object property value, a computed key, a spread source, and a `new` argument —
+/// the object/new accumulators spilled across the suspension (D-281).
+#[test]
+fn yield_in_object_and_new() {
+    check(
+        "yield-as-object-value",
+        "function* g() { var o = { a: yield 1, b: 2 }; return o.a * 10 + o.b; } var it = g(); it.next(); return it.next(5).value;",
+        "52",
+    );
+    check(
+        "yield-on-two-object-values",
+        "function* g() { var o = { a: yield 1, b: yield 2 }; return o.a * 10 + o.b; } var it = g(); it.next(); it.next(5); return it.next(7).value;",
+        "57",
+    );
+    check(
+        "yield-in-computed-object-key",
+        "function* g() { var o = { [yield 'k']: 9 }; return o.k; } var it = g(); it.next(); return it.next('k').value;",
+        "9",
+    );
+    check(
+        "yield-in-object-spread-source",
+        "function* g() { var o = { ...(yield 1), z: 3 }; return o.a * 10 + o.z; } var it = g(); it.next(); return it.next({ a: 5 }).value;",
+        "53",
+    );
+    // The object is returned (built with a yield), which the D-278 rooting fix keeps under stress.
+    check(
+        "yield-object-returned",
+        "function* g() { return { a: yield 1, b: 2 }; } var it = g(); it.next(); var o = it.next(9).value; return o.a * 10 + o.b;",
+        "92",
+    );
+    // A yield as a constructor argument.
+    check(
+        "yield-as-new-argument",
+        "class C { constructor(v) { this.v = v; } } function* g() { return new C(yield 1).v; } var it = g(); it.next(); return it.next(42).value;",
+        "42",
+    );
+    check(
+        "yield-on-two-new-arguments",
+        "class C { constructor(a, b) { this.s = a + b; } } function* g() { return new C(yield 1, yield 2).s; } var it = g(); it.next(); it.next(10); return it.next(20).value;",
+        "30",
+    );
+}
