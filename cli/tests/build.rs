@@ -11679,3 +11679,30 @@ fn yield_in_conditional_logical_and_array() {
         "99",
     );
 }
+
+/// A generator that returns or yields a freshly built array or object keeps it under GC stress —
+/// `iterator_result` roots the value before allocating the result object (D-278).
+#[test]
+fn generator_result_roots_a_fresh_heap_value() {
+    check(
+        "generator-returns-array",
+        "function* g() { return [1, 2, 3]; } var a = g().next().value; return a[0] + a[1] + a[2];",
+        "6",
+    );
+    check(
+        "generator-returns-object",
+        "function* g() { return { x: 5, y: 7 }; } var o = g().next().value; return o.x + o.y;",
+        "12",
+    );
+    check(
+        "generator-yields-array",
+        "function* g() { yield [10, 20]; } var a = g().next().value; return a[0] + a[1];",
+        "30",
+    );
+    // The canonical yield-in-array, returning the array it builds (D-277 + D-278).
+    check(
+        "generator-returns-array-of-yields",
+        "function* g() { return [yield 1, yield 2]; } var it = g(); it.next(); it.next(10); var a = it.next(20).value; return a[0] * 10 + a[1];",
+        "120",
+    );
+}

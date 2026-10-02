@@ -4928,17 +4928,25 @@ fn is_generator(value: u64) -> bool {
 }
 
 /// An iterator result `{ value, done }`.
+///
+/// **`value` is rooted before the object is allocated.** It arrives in a register, which the
+/// collector does not scan (D-208), so allocating the result first collects it under stress — and
+/// a generator that yields or returns a freshly built array or object then wrapped a freed
+/// pointer, read back as `NaN` or `undefined`. The same ordering `crisol_make_generator` already
+/// keeps (D-278).
 fn iterator_result(value: u64, done: bool) -> u64 {
-    let object = crisol_create_object();
-    with_rooted(&[object, value], || {
-        if let Some(into) = handle_of(object) {
-            with_runtime(|runtime| {
-                runtime.define(into, "value", Value::from_bits(value));
-                runtime.define(into, "done", boolean(done));
-            });
-        }
-    });
-    object
+    with_rooted(&[value], || {
+        let object = crisol_create_object();
+        with_rooted(&[object], || {
+            if let Some(into) = handle_of(object) {
+                with_runtime(|runtime| {
+                    runtime.define(into, "value", Value::from_bits(value));
+                    runtime.define(into, "done", boolean(done));
+                });
+            }
+        });
+        object
+    })
 }
 
 /// `crisol_make_generator(body, this)` — the object a `function*` returns. The outer function

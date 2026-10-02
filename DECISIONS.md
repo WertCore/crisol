@@ -7624,3 +7624,19 @@ not touch: a generator that *returns or yields a freshly built array or object* 
 under GC stress (a value held in a generator local first is fine) — so these were verified by
 deriving a number from the result rather than returning the array, and the rooting bug is filed
 separately.
+
+## D-278
+
+**A generator's iterator result roots its value before allocating the result object.**
+
+Status: Accepted
+
+`iterator_result` built the `{ value, done }` object *first* and rooted `value` only afterwards, so
+under GC stress the allocation of the result object collected a `value` that was live only in a
+register — the collector does not scan those (D-208). A generator that returned or yielded a freshly
+built array or object therefore wrapped a freed pointer, which read back as `NaN` or `undefined`; a
+value that had been stored in a generator local first survived only because that store kept it
+reachable. Rooting `value` across the allocation — the ordering `crisol_make_generator` documents
+and already follows — fixes it, and with it the canonical `return [yield a, yield b]` that D-277
+could build but not return under stress. Primitives were never affected, since they are not heap
+references; this is why generators of numbers always passed.
