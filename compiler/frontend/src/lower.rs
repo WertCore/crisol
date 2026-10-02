@@ -4215,7 +4215,41 @@ impl Lowering {
                 }
             };
             let Some(key) = method.key.static_name() else {
-                self.note("computed method name", method.span.start);
+                // A computed method name (`[k]() {}`, `[Symbol.iterator]() {}`) installs through the
+                // computed path on the prototype, as an object literal's does (D-265). A computed
+                // *accessor* or a *static* computed member is still owed — `DefineAccessor` takes a
+                // `PropertyKey`, not a value, and a static one needs the not-yet-built constructor.
+                if method.r#static {
+                    self.note("computed method name", method.span.start);
+                    continue;
+                }
+                if matches!(
+                    method.kind,
+                    oxc_ast::ast::MethodDefinitionKind::Get
+                        | oxc_ast::ast::MethodDefinitionKind::Set
+                ) {
+                    self.note("computed accessor name", method.span.start);
+                    continue;
+                }
+                // The key is evaluated before the method value, the order the specification gives.
+                let Some(computed_key) = self.property_key_value(&method.key) else {
+                    self.note("computed method name", method.span.start);
+                    continue;
+                };
+                let (id, captures) = self.lower_function(
+                    &format!("{name}.<computed>"),
+                    &method.value.params,
+                    method.value.body.as_deref(),
+                    None,
+                    true,
+                    &[],
+                );
+                let closure = self.close_over(id, &captures);
+                self.emit_effect(Op::ComputedStore {
+                    object: prototype,
+                    key: computed_key,
+                    value: closure,
+                });
                 continue;
             };
             let method_name = key.to_string();

@@ -11158,3 +11158,33 @@ fn logical_member_assignment_and_new_spread() {
         "6",
     );
 }
+
+/// Computed class method names (D-265), including a well-known symbol that makes the class iterable.
+#[test]
+fn computed_class_method_names() {
+    check(
+        "computed-method-name",
+        "var k = \"m\"; class C { [k]() { return 8; } } return new C().m();",
+        "8",
+    );
+    check(
+        "computed-method-expression-key",
+        "class C { [\"a\" + \"b\"]() { return 5; } } return new C().ab();",
+        "5",
+    );
+    // A computed `[Symbol.iterator]` method makes instances iterable.
+    check(
+        "computed-symbol-iterator",
+        "class R { [Symbol.iterator]() { var i = 0; \
+         return { next() { return i < 3 ? { value: i++, done: false } : { done: true }; } }; } } \
+         var out = []; for (var x of new R()) out.push(x); return out.join(\",\");",
+        "0,1,2",
+    );
+    // A static-name method still installs as before.
+    check(
+        "static-name-method-coexists",
+        "var k = \"c\"; class C { a() { return 1; } [k]() { return 2; } } \
+         var o = new C(); return o.a() + o.c();",
+        "3",
+    );
+}

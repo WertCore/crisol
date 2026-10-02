@@ -7314,3 +7314,21 @@ exactly as a spread call's are — and it constructs through `Reflect.construct(
 new-target is the target, which is what `new` uses. That reads the `Reflect` global, so replacing
 `Reflect.construct` is observable — a narrow deviation taken deliberately over adding a whole
 `ConstructSpread` IR op (enum, codegen, runtime) for a form this rare.
+
+## D-265
+
+**Computed class method names.**
+
+Status: Accepted
+
+`class C { [k]() {} }` and, more usefully, `class R { [Symbol.iterator]() {} }` — which makes instances
+iterable — were refused. A computed instance method now evaluates its key (before the method value, the
+order the specification gives) and installs through `Op::ComputedStore` on the prototype, exactly as an
+object literal's computed method does. A symbol key stores under the symbol, so a class can define the
+well-known-symbol methods.
+
+What stays refused: a computed **accessor** name (`get [k]() {}`), because `DefineAccessor` carries a
+`PropertyKey`, not a value — the same gap object literals have; a **static** computed member, which
+needs the constructor that is not built until after the member loop; and a computed **field** name,
+whose key is evaluated once at definition but whose value runs per instance, which the field machinery
+does not thread yet.
