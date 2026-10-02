@@ -2988,6 +2988,15 @@ impl Lowering {
             Expression::UpdateExpression(update) => self.update(update),
             Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression),
             Expression::ChainExpression(chain) => self.chain(chain),
+            // `(a, b, c)` — evaluate each for its effects, answer the last (D-268).
+            Expression::SequenceExpression(sequence) => {
+                let mut result = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+                for expression in &sequence.expressions {
+                    result = self.expression(expression);
+                }
+                result
+            }
+            Expression::TaggedTemplateExpression(tagged) => self.tagged_template(tagged),
             other => {
                 self.note(expression_kind(other), 0);
                 self.placeholder()
@@ -4819,6 +4828,82 @@ impl Lowering {
             }
         }
         result
+    }
+
+    /// `` tag`a${x}b` `` — calls `tag(strings, x, …)` where `strings` is the array of cooked pieces
+    /// carrying a `raw` array of the uncooked ones (D-268). The template object is not frozen or
+    /// cached across evaluations — a recorded shortcut with no effect on a tag that only reads it.
+    fn tagged_template(&mut self, tagged: &oxc_ast::ast::TaggedTemplateExpression<'_>) -> ValueId {
+        // The tag is called like any other callee: a member tag passes its object as `this`.
+        let (callee, this_value) = match &tagged.tag {
+            Expression::StaticMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let callee = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object,
+                        key: PropertyKey::new(member.property.name.as_str()),
+                    },
+                );
+                (self.propagate(callee), object)
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                let callee = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+                (self.propagate(callee), object)
+            }
+            other => {
+                let callee = self.expression(other);
+                let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+                (callee, undefined)
+            }
+        };
+        // The cooked pieces — `undefined` where an escape is invalid, which a tag is allowed to see
+        // — and the raw pieces.
+        let cooked: Vec<ValueId> = tagged
+            .quasi
+            .quasis
+            .iter()
+            .map(|quasi| match &quasi.value.cooked {
+                Some(text) => {
+                    self.emit(Type::String, Op::Const(Constant::String(text.to_string())))
+                }
+                None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+            })
+            .collect();
+        let raw: Vec<ValueId> = tagged
+            .quasi
+            .quasis
+            .iter()
+            .map(|quasi| {
+                self.emit(
+                    Type::String,
+                    Op::Const(Constant::String(quasi.value.raw.to_string())),
+                )
+            })
+            .collect();
+        let strings = self.emit(Type::Object(None), Op::CreateArray { elements: cooked });
+        let raw_array = self.emit(Type::Object(None), Op::CreateArray { elements: raw });
+        self.emit_effect(Op::PropertyStore {
+            object: strings,
+            key: PropertyKey::new("raw"),
+            value: raw_array,
+        });
+        let mut args = Vec::with_capacity(tagged.quasi.expressions.len() + 1);
+        args.push(strings);
+        for expression in &tagged.quasi.expressions {
+            args.push(self.expression(expression));
+        }
+        let result = self.emit(
+            Type::Unknown,
+            Op::Call {
+                callee,
+                this_value,
+                args,
+            },
+        );
+        self.propagate(result)
     }
 
     /// A property key that has to be evaluated: `{[expr]: v}` or `{1: v}`.

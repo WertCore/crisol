@@ -7384,3 +7384,17 @@ outside an async body — and its *resolved values* are left to test262 in CI, a
 deliberately. Recorded shortcuts, the same the sync generator and async function already take: `yield x`
 does not `Await(x)` first, and a rejected await or a `.throw()` rejects the result rather than resuming
 an inner `catch`.
+
+## D-268
+
+**The comma operator and tagged templates.**
+
+Status: Accepted
+
+Two expression forms that fell through to the unsupported list, both common enough in test262 to matter.
+`(a, b, c)` evaluates each for its effects and answers the last. `` tag`a${x}b` `` calls `tag(strings,
+x, …)` where `strings` is the array of cooked pieces (`undefined` where an escape is invalid, which a
+tag is allowed to see) carrying a `raw` array of the uncooked ones — reusing `CreateArray` and an
+ordinary call, with a member tag passing its object as `this`. The template object is not frozen or
+cached across evaluations (every engine caches it per call site); a recorded shortcut with no effect on
+a tag that only reads it.

@@ -11265,3 +11265,40 @@ fn async_generators_and_for_await_of() {
         "ok",
     );
 }
+
+/// The comma operator and tagged templates (D-268).
+#[test]
+fn comma_operator_and_tagged_templates() {
+    check("comma-answers-last", "var x = (1, 2, 3); return x;", "3");
+    check(
+        "comma-runs-each",
+        "var a = 0; var x = (a = 5, a + 1); return a + \":\" + x;",
+        "5:6",
+    );
+    check(
+        "comma-in-for-clauses",
+        "var s = 0; for (var i = 0, j = 10; i < 3; i++, j--) s += j; return s;",
+        "27",
+    );
+    check(
+        "tagged-template-strings",
+        "function t(s) { return s[0] + \"|\" + s.length; } return t`hello`;",
+        "hello|1",
+    );
+    check(
+        "tagged-template-substitutions",
+        "function t(s, a, b) { return s[0] + a + s[1] + b + s[2]; } var x = 1, y = 2; \
+         return t`A${x}B${y}C`;",
+        "A1B2C",
+    );
+    check(
+        "tagged-template-raw",
+        "function t(s) { return s.raw[0].length + \":\" + s.raw[0].charCodeAt(1); } return t`a\\tb`;",
+        "4:92",
+    );
+    check(
+        "tagged-template-member-receiver",
+        "var o = { t(s) { return \"obj:\" + s[0]; } }; return o.t`hi`;",
+        "obj:hi",
+    );
+}
