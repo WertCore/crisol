@@ -422,34 +422,109 @@ impl Lowering {
     /// is what the specification applies. That is the same helper `i + 1` uses, so the two
     /// spellings cannot disagree.
     fn update(&mut self, update: &oxc_ast::ast::UpdateExpression<'_>) -> ValueId {
-        let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) =
-            &update.argument
-        else {
-            self.note(
-                "update of something other than a variable",
-                update.span.start,
-            );
-            return self.placeholder();
-        };
-
-        let slot = self.slot(identifier.name.as_str());
-        let before = self.read(slot);
-        let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
+        use oxc_ast::ast::SimpleAssignmentTarget as Target;
         let op = if matches!(update.operator, oxc_ast::ast::UpdateOperator::Increment) {
             BinaryOp::Add
         } else {
             BinaryOp::Subtract
         };
-        let after = self.emit(
-            Type::Unknown,
-            Op::Binary {
-                op,
-                left: before,
-                right: one,
-            },
-        );
-        self.write(slot, after);
-        if update.prefix { after } else { before }
+        // The step, `before (+/-) 1`. A plain `+ 1`, as the variable form has always used — right
+        // for the numeric counter that is nearly every `++`, with the same gap for a string or a
+        // BigInt operand that a variable's `++` has, so the two forms agree (D-275).
+        let step = |me: &mut Self, before: ValueId| -> ValueId {
+            let one = me.emit(Type::Number, Op::Const(Constant::Number(1.0)));
+            me.emit(
+                Type::Unknown,
+                Op::Binary {
+                    op,
+                    left: before,
+                    right: one,
+                },
+            )
+        };
+        // `++x` answers the new value, `x++` the old. A member target evaluates its object (and a
+        // computed key) once, so `a[i()]++` calls `i` a single time, and its load and store are
+        // propagated like any member access that can raise (D-275).
+        match &update.argument {
+            Target::AssignmentTargetIdentifier(identifier) => {
+                let slot = self.slot(identifier.name.as_str());
+                let before = self.read(slot);
+                let after = step(self, before);
+                self.write(slot, after);
+                if update.prefix { after } else { before }
+            }
+            Target::StaticMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = PropertyKey::new(member.property.name.as_str());
+                let before = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object,
+                        key: key.clone(),
+                    },
+                );
+                let before = self.propagate(before);
+                let after = step(self, before);
+                let stored = self.emit(
+                    Type::Unknown,
+                    Op::PropertyStore {
+                        object,
+                        key,
+                        value: after,
+                    },
+                );
+                self.propagate(stored);
+                if update.prefix { after } else { before }
+            }
+            Target::ComputedMemberExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = self.expression(&member.expression);
+                let before = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
+                let before = self.propagate(before);
+                let after = step(self, before);
+                let stored = self.emit(
+                    Type::Unknown,
+                    Op::ComputedStore {
+                        object,
+                        key,
+                        value: after,
+                    },
+                );
+                self.propagate(stored);
+                if update.prefix { after } else { before }
+            }
+            // `this.#x++` — the private field, keyed with its `#` kept (D-274/D-275).
+            Target::PrivateFieldExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = PropertyKey::new(&private_key(&member.field));
+                let before = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object,
+                        key: key.clone(),
+                    },
+                );
+                let before = self.propagate(before);
+                let after = step(self, before);
+                let stored = self.emit(
+                    Type::Unknown,
+                    Op::PropertyStore {
+                        object,
+                        key,
+                        value: after,
+                    },
+                );
+                self.propagate(stored);
+                if update.prefix { after } else { before }
+            }
+            _ => {
+                self.note(
+                    "update of something other than a variable or member",
+                    update.span.start,
+                );
+                self.placeholder()
+            }
+        }
     }
 
     /// `let`/`const`/`var`, which a `for` initialiser also uses.

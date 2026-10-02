@@ -7559,3 +7559,22 @@ slot the frontend has no op for yet.
 Two neighbours stay refused: `obj.#x++` (private update), which is the same gap as `obj.x++` for a
 *public* member — update of any member, not just a variable, is unsupported — and `a?.#x` (a private
 field at the end of an optional chain), a rare combination the chain lowering does not yet route.
+
+## D-275
+
+**`++` and `--` on a member target.**
+
+Status: Accepted
+
+`obj.x++`, `a[i]--`, and `this.#x++` were all refused — `update` only handled a bare variable, so a
+counter on an object, an array element, or a private field could not be stepped in place, which is
+most of what `++` is for outside a `for` header. It now handles a static member, a computed member,
+and a private field as well: read the current value, apply the step, write it back, and answer the
+old value for a postfix form or the new one for a prefix. A computed target evaluates its object and
+key once, so `a[i()]++` calls `i` a single time, and the load and store are propagated like any
+member access that can raise.
+
+The step stays a plain `+ 1`/`- 1`, the same the variable form has always used — so a numeric
+counter, which is nearly every `++`, is right, and a string or BigInt operand has the same coercion
+gap a variable's `++` already had rather than a new one. `super.x++` is still not handled; it is the
+rare case and `super` as a plain object does not lower.

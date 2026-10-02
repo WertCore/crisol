@@ -11559,3 +11559,41 @@ fn private_class_members() {
         "undefined",
     );
 }
+
+/// `++`/`--` on a member target — public, computed, or private (D-275).
+#[test]
+fn update_of_member_targets() {
+    // Postfix answers the old value, prefix the new; the store lands either way.
+    check(
+        "member-postfix-increment",
+        "var o = { n: 0 }; var r = o.n++; return r * 10 + o.n;",
+        "1",
+    );
+    check(
+        "member-prefix-increment",
+        "var o = { n: 0 }; var r = ++o.n; return r * 10 + o.n;",
+        "11",
+    );
+    check(
+        "member-decrement",
+        "var o = { n: 3 }; o.n--; return o.n;",
+        "2",
+    );
+    // A computed target evaluates its object and key once.
+    check(
+        "computed-update-evaluates-key-once",
+        "var calls = 0; function i() { calls++; return 0; } var a = [5]; a[i()]++; return calls * 100 + a[0];",
+        "106",
+    );
+    // A private field increments through the same path.
+    check(
+        "private-field-postfix-increment",
+        "class C { #x = 5; bump() { return this.#x++; } get() { return this.#x; } } var c = new C(); return c.bump() * 100 + c.get();",
+        "506",
+    );
+    check(
+        "private-field-prefix-increment",
+        "class C { #x = 5; bump() { return ++this.#x; } get() { return this.#x; } } var c = new C(); return c.bump() * 100 + c.get();",
+        "606",
+    );
+}
