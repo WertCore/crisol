@@ -11445,3 +11445,35 @@ fn class_name_is_bound_inside_methods() {
         "11",
     );
 }
+
+/// A field initialiser runs in the constructor, so it shares an outer variable's cell rather than
+/// copying it: a write through the initialiser persists, and a read sees the live value (D-272).
+#[test]
+fn field_initialisers_capture_outer_variables() {
+    // A direct write to an outer variable from the initialiser persists, and runs once per
+    // instance: 1 then 2.
+    check(
+        "field-initialiser-writes-outer",
+        "var n = 0; class C { x = ++n; } return new C().x + new C().x;",
+        "3",
+    );
+    check(
+        "field-initialiser-write-is-visible-outside",
+        "var log = 0; class C { x = (log = log + 1); } new C(); new C(); return log;",
+        "2",
+    );
+    // A read of a captured variable — here the class's own name, bound as a cell D-271 fills only
+    // after the constructor closes over it.
+    check(
+        "field-initialiser-reads-class-name",
+        "class C { static id = 42; tag = C.id; } return new C().tag;",
+        "42",
+    );
+    // A static field runs at class definition, in the enclosing scope, and still reads an outer
+    // variable correctly — the initialiser is not treated as captured.
+    check(
+        "static-field-reads-outer",
+        "var n = 5; class C { static s = n; } return C.s;",
+        "5",
+    );
+}

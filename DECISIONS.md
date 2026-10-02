@@ -7485,3 +7485,25 @@ shape as bugs already recorded rather than this one:
 - A forward reference between sibling classes (`class A { m() { return new B(); } } class B {}`)
   throws: unlike function declarations, class declarations are not hoisted, so `B`'s binding does
   not exist when `A`'s method is lowered. That wants class-name hoisting into a TDZ binding.
+
+## D-272
+
+**A field initialiser shares an outer variable's cell, rather than copying it.**
+
+Status: Accepted
+
+An instance field initialiser runs in the constructor, so `class C { x = ++n }` writes the outer
+`n` and `class C { x = C.id }` reads the class's own name — both through the *binding*, exactly as a
+closure body would. But the escape pass (which decides what is boxed in a shared cell) counted a
+name only when it appeared syntactically inside a function body, and a field initialiser is not
+one. So `n` was copied, its write landed in a dead copy, and the class name was read before D-271's
+cell was filled. Both read `undefined`/stale.
+
+The fix is one case in the escape pass: a **non-static** `PropertyDefinition` is walked with the
+depth raised, so names in its initialiser count as captured and get a cell the constructor shares.
+A static field runs at class definition in the enclosing scope, so it is left at the current depth.
+The computed key runs at definition in both cases; walking a non-static one a level too deep only
+over-approximates, costing a spare cell, which is the trade the pass already makes everywhere.
+
+This also closed the two field-initialiser gaps D-270 and D-271 had filed — the write-side (`x =
+++n`) and the read-of-class-name (`x = C.id`) were the same missing cell.

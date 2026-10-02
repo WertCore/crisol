@@ -143,6 +143,23 @@ impl<'a> Visit<'a> for Escape {
         oxc_ast_visit::walk::walk_update_expression(self, update);
     }
 
+    fn visit_property_definition(&mut self, property: &oxc_ast::ast::PropertyDefinition<'a>) {
+        // **An instance field initialiser runs in the constructor**, a function, so a name it
+        // mentions is captured there — even though the initialiser is not written inside a
+        // function body and so would otherwise be counted at the enclosing depth. `class C { x =
+        // n }` captures `n`, and `class C { x = C.id }` captures the class's own name. A *static*
+        // field runs at class definition, in the enclosing scope, so it is left at the current
+        // depth. The computed key runs at definition in both cases; walking it one level too deep
+        // only costs a spare cell, which the pass already trades for simplicity everywhere else.
+        if property.r#static {
+            oxc_ast_visit::walk::walk_property_definition(self, property);
+        } else {
+            self.depth += 1;
+            oxc_ast_visit::walk::walk_property_definition(self, property);
+            self.depth -= 1;
+        }
+    }
+
     fn visit_function_body(&mut self, body: &oxc_ast::ast::FunctionBody<'a>) {
         // The *body*, not the whole function, because `ScopeFlags` is not reachable from this
         // crate's dependencies and the body is where "inside a function" begins anyway.
