@@ -7532,3 +7532,30 @@ D-271 had accepted as a simplification.
 
 With this, the three class-binding follow-ups filed during D-271/D-272 are all closed; private
 fields and `yield` in expression position remain the open class/generator gaps.
+
+## D-274
+
+**Private fields and methods, modelled as properties keyed by the name with its `#` kept.**
+
+Status: Accepted
+
+`#x`, `this.#x`, `#x in obj`, private methods and accessors, and their static forms all lower now.
+A private member is an ordinary property whose key is the name with the `#` left on — `"#x"` — which
+a program cannot write as an identifier, so `obj.x`, `obj["x"]`, an object literal, and a public
+field of the bare name all miss it. Reads and writes (`this.#x`, `this.#x += 1`), a private method
+call (which passes its receiver, so `this.#a()` inside `#b` keeps its `this`), a private accessor
+pair, and `#x in obj` (asked as the ordinary `in` against that key) are each the ordinary property
+machinery with the mangled key — so private members reuse fields, methods, accessors, and the brand
+check already in place rather than a parallel store.
+
+What this does **not** model, and why it is acceptable for now: the key is a string, so `obj["#x"]`
+can forge access; the property is enumerable like every other, so a private field shows in `for-in`;
+and two classes that both declare `#x` share the key rather than owning distinct private names.
+Access is lexically confined to the declaring class in every case, so these show only under
+deliberate probing, not in the private state the feature exists for — the same kind of trade D-213
+made for accessor enumerability. A hard brand would need a non-enumerable, unforgeable per-class
+slot the frontend has no op for yet.
+
+Two neighbours stay refused: `obj.#x++` (private update), which is the same gap as `obj.x++` for a
+*public* member — update of any member, not just a variable, is unsupported — and `a?.#x` (a private
+field at the end of an optional chain), a rare combination the chain lowering does not yet route.

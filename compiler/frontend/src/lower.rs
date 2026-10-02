@@ -736,6 +736,20 @@ impl Lowering {
                 let outcome = self.emit(Type::Unknown, Op::ComputedStore { object, key, value });
                 self.propagate(outcome);
             }
+            // `this.#x = v` — a private field write, keyed the same as its read (D-274).
+            Target::PrivateFieldExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = private_key(&member.field);
+                let outcome = self.emit(
+                    Type::Unknown,
+                    Op::PropertyStore {
+                        object,
+                        key: PropertyKey::new(&key),
+                        value,
+                    },
+                );
+                self.propagate(outcome);
+            }
             Target::ArrayAssignmentTarget(array) => {
                 let iterated = self.emit(Type::Object(None), Op::Iterate { object: value });
                 let values = self.propagate(iterated);
@@ -2710,6 +2724,21 @@ impl Lowering {
                         let method = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
                         (method, object)
                     }
+                    // `this.#m()` is a method call too, so it passes its receiver — otherwise a
+                    // private method that calls another (`this.#a()` inside `#b`) would run with
+                    // `this` undefined (D-274).
+                    Expression::PrivateFieldExpression(member) => {
+                        let object = self.expression(&member.object);
+                        let key = private_key(&member.field);
+                        let method = self.emit(
+                            Type::Unknown,
+                            Op::PropertyLoad {
+                                object,
+                                key: PropertyKey::new(&key),
+                            },
+                        );
+                        (method, object)
+                    }
                     other => {
                         let callee = self.expression(other);
                         // A plain call passes `undefined` explicitly rather than omitting a
@@ -3045,6 +3074,35 @@ impl Lowering {
                 result
             }
             Expression::TaggedTemplateExpression(tagged) => self.tagged_template(tagged),
+            // `obj.#x` — a private field read. Modelled as an ordinary property keyed by the name
+            // with its `#` kept, which a program cannot write as an identifier (D-274).
+            Expression::PrivateFieldExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = private_key(&member.field);
+                let value = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object,
+                        key: PropertyKey::new(&key),
+                    },
+                );
+                self.propagate(value)
+            }
+            // `#x in obj` — the brand check, asked as the ordinary `in` against that key (D-274).
+            Expression::PrivateInExpression(expression) => {
+                let key = private_key(&expression.left);
+                let key = self.emit(Type::String, Op::Const(Constant::String(key)));
+                let object = self.expression(&expression.right);
+                let result = self.emit(
+                    Type::Bool,
+                    Op::Binary {
+                        op: BinaryOp::In,
+                        left: key,
+                        right: object,
+                    },
+                );
+                self.propagate(result)
+            }
             other => {
                 self.note(expression_kind(other), 0);
                 self.placeholder()
@@ -3353,6 +3411,40 @@ impl Lowering {
                     Op::ComputedStore {
                         object,
                         key,
+                        value: combined,
+                    },
+                );
+                self.propagate(outcome);
+                combined
+            }
+            // `this.#x += y` — read, combine, write, all keyed by the mangled name (D-274). The
+            // object is evaluated once, so a side-effecting receiver runs a single time.
+            oxc_ast::ast::AssignmentTarget::PrivateFieldExpression(member) => {
+                let object = self.expression(&member.object);
+                let key = private_key(&member.field);
+                let current = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object,
+                        key: PropertyKey::new(&key),
+                    },
+                );
+                let current = self.propagate(current);
+                let rhs = self.value_expression(&assignment.right);
+                let combined = self.emit(
+                    Type::Unknown,
+                    Op::Binary {
+                        op: binop,
+                        left: current,
+                        right: rhs,
+                    },
+                );
+                let combined = self.propagate(combined);
+                let outcome = self.emit(
+                    Type::Unknown,
+                    Op::PropertyStore {
+                        object,
+                        key: PropertyKey::new(&key),
                         value: combined,
                     },
                 );
@@ -4577,16 +4669,21 @@ impl Lowering {
         for element in &class.body.body {
             let method = match element {
                 oxc_ast::ast::ClassElement::MethodDefinition(method) => method,
-                // `x = 1;` / `static x = 1;` — an instance or static field, computed or not.
+                // `x = 1;` / `static x = 1;` / `#x = 1;` — an instance or static field, named,
+                // private, or computed. A private name keeps its `#` and is otherwise an ordinary
+                // named field (D-274).
                 oxc_ast::ast::ClassElement::PropertyDefinition(property) => {
-                    match property.key.static_name() {
-                        Some(key) if property.r#static => {
-                            static_fields
-                                .push((FieldKey::Named(key.to_string()), property.value.as_ref()));
+                    let named = property
+                        .key
+                        .static_name()
+                        .map(|key| key.to_string())
+                        .or_else(|| private_member_name(&property.key));
+                    match named {
+                        Some(name) if property.r#static => {
+                            static_fields.push((FieldKey::Named(name), property.value.as_ref()));
                         }
-                        Some(key) => {
-                            fields
-                                .push((FieldKey::Named(key.to_string()), property.value.as_ref()));
+                        Some(name) => {
+                            fields.push((FieldKey::Named(name), property.value.as_ref()));
                         }
                         // `[k] = v` / `static [k] = v` (and a numeric key, which is a name not
                         // known until coerced). The key is evaluated here, in source order, and
@@ -4616,7 +4713,14 @@ impl Lowering {
                     continue;
                 }
             };
-            let Some(key) = method.key.static_name() else {
+            // A method name, a private one (`#m() {}`, `get #x() {}`) keeping its `#` as an
+            // ordinary named member (D-274), or a computed one that falls to the `else`.
+            let named = method
+                .key
+                .static_name()
+                .map(|key| key.to_string())
+                .or_else(|| private_member_name(&method.key));
+            let Some(method_name) = named else {
                 // A computed member — `[k]() {}`, `get [k]() {}`, `static [k]() {}`. The key is
                 // evaluated here, in source order with the other members, whatever it lands on: a
                 // method goes through the computed store, an accessor through the computed accessor
@@ -4667,7 +4771,6 @@ impl Lowering {
                 }
                 continue;
             };
-            let method_name = key.to_string();
             if method_name == "constructor" && !method.r#static {
                 // Stashed, not lowered here: the fields it must run first are still being
                 // collected. Lowered once the loop finishes (D-263).
@@ -5286,6 +5389,29 @@ impl Lowering {
             }
         }
         result
+    }
+}
+
+/// The property key a private member maps to: its name with the `#` kept (D-274).
+///
+/// The `#` is deliberate. A JavaScript program cannot write `#x` as an ordinary property name, so
+/// a field stored under `"#x"` is one no `obj.x`, `obj["x"]`, or object literal can reach — which
+/// is most of what privacy asks for. What this does *not* model is a hard brand: `obj["#x"]` can
+/// still forge access, the field is enumerable like every other property this engine stores, and
+/// two classes that both declare `#x` share the key rather than owning distinct ones. Access is
+/// lexically confined to the declaring class either way, so those gaps show only under deliberate
+/// probing, not in the private state the feature is used for.
+fn private_key(field: &oxc_ast::ast::PrivateIdentifier<'_>) -> String {
+    format!("#{}", field.name)
+}
+
+/// The mangled key for a class member whose name is private (`#x`), or `None` for any other key —
+/// so a member's name resolves as "static name, else private name, else computed" (D-274).
+fn private_member_name(key: &oxc_ast::ast::PropertyKey<'_>) -> Option<String> {
+    if let oxc_ast::ast::PropertyKey::PrivateIdentifier(field) = key {
+        Some(private_key(field))
+    } else {
+        None
     }
 }
 

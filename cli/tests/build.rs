@@ -11505,3 +11505,57 @@ fn classes_reference_each_other_and_expressions_stay_scoped() {
         "undefined",
     );
 }
+
+/// Private fields, methods, accessors, and the `#x in obj` brand check (D-274).
+#[test]
+fn private_class_members() {
+    check(
+        "private-field-read-write",
+        "class C { #x = 1; get() { return this.#x; } set(v) { this.#x = v; } } var c = new C(); c.set(9); return c.get();",
+        "9",
+    );
+    check(
+        "private-field-compound-assignment",
+        "class C { #n = 10; inc() { this.#n += 5; return this.#n; } } return new C().inc();",
+        "15",
+    );
+    check(
+        "private-method",
+        "class C { #double(v) { return v * 2; } run() { return this.#double(21); } } return new C().run();",
+        "42",
+    );
+    // A private method calls another, which only works if the receiver is passed on.
+    check(
+        "private-method-calls-private",
+        "class C { #base = 100; #calc() { return this.#base + 1; } run() { return this.#calc(); } } return new C().run();",
+        "101",
+    );
+    check(
+        "private-accessor",
+        "class C { #v = 0; get #x() { return this.#v; } set #x(n) { this.#v = n; } store(n) { this.#x = n; } read() { return this.#x; } } var c = new C(); c.store(8); return c.read();",
+        "8",
+    );
+    // The brand check: present on an instance, absent on a plain object.
+    check(
+        "private-in-brand-check",
+        "class C { #x = 1; static has(o) { return #x in o; } } return C.has(new C()) && !C.has({});",
+        "true",
+    );
+    // Static private state, and a private field on a derived class alongside the base's.
+    check(
+        "static-private-field",
+        "class C { static #id = 42; static read() { return C.#id; } } return C.read();",
+        "42",
+    );
+    check(
+        "derived-private-fields",
+        "class A { #a = 1; getA() { return this.#a; } } class B extends A { #b = 2; getB() { return this.#b; } } var o = new B(); return o.getA() + o.getB();",
+        "3",
+    );
+    // A private field is not reachable as a public property of the same bare name.
+    check(
+        "private-field-not-public",
+        "class C { #x = 5; } return new C().x;",
+        "undefined",
+    );
+}
