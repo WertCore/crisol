@@ -7907,3 +7907,28 @@ things did not account for that:
 Together these fix the forms that pervade async code: `arr.forEach(x => sum += x)` inside an async
 function, `new Promise(resolve => { ... })` capturing `resolve`, and a value captured before an
 `await` and read after it — each verified to return the right result under GC stress.
+
+## D-292
+
+**A loop's own state survives a suspension in its body, and `for await` awaits each value.**
+
+Status: Accepted
+
+Two bugs made `await` inside a loop — and `for await` itself — wrong, both pre-existing and newly
+visible now that the runner runs async cases (D-288).
+
+A `for-of`/`for-in` loop keeps its list and position, and `for await` its iterator and last result,
+in compiler temporaries. `indexed_loop`, `lower_for_await_of`, and `async_iterator_method` wrote those
+with a raw `Op::Store` but read them with `self.read` — and inside a generator `self.read` redirects
+to the generator object while the raw store did not, so the two disagreed; and in any case a raw slot
+does not survive a suspension. Each now uses `self.write`/`self.read` throughout, so inside a generator
+the loop state lives on the generator object and survives. `for (x of xs) { await … }` kept only its
+first element before — one turn, then the lost list read as exhausted — and now runs to the end;
+`for await` ran zero turns (its iterator was lost immediately) and now iterates. Outside a generator
+the two lower to the same raw slot access as before, so nothing else changes.
+
+`for await` also now awaits each *value*, not only each iterator *result*. Falling back to a sync
+iterable's `[Symbol.iterator]` is `CreateAsyncFromSyncIterator`, which awaits every value it yields, so
+`for await (x of [p1, p2])` must bind the resolved values, not the promises (arithmetic on which gave
+`NaN`). Awaiting an already-settled value — a true async iterator's, or a plain one — passes it
+straight through, so the one path serves both a sync iterable and an async one.

@@ -12152,3 +12152,46 @@ fn async_arrow_functions() {
         "3\n0",
     );
 }
+
+/// A loop's own state — a `for-of`/`for-in` iterator and index — now lives on the generator object
+/// inside a generator, so it survives a suspension in the loop body: `for (x of xs) { await … }`
+/// keeps iterating rather than losing its place at the first `await`. And `for await` awaits each
+/// value, so a sync iterable of promises is seen resolved (D-292).
+#[test]
+fn loops_survive_a_suspension_in_the_body() {
+    check(
+        "for-of-await-in-body",
+        "async function f() { var s = 0; for (const x of [1, 2, 3]) { s += await Promise.resolve(x); } return s; } f().then(print); return 0;",
+        "6\n0",
+    );
+    check(
+        "for-in-await-in-body",
+        "async function f() { var o = { a: 1, b: 2 }; var k = ''; for (const key in o) { k += await Promise.resolve(key); } return k; } f().then(print); return 0;",
+        "ab\n0",
+    );
+    check(
+        "for-await-over-array",
+        "async function f() { var s = 0; for await (const x of [1, 2, 3]) { s += x; } return s; } f().then(print); return 0;",
+        "6\n0",
+    );
+    check(
+        "for-await-over-promises",
+        "async function f() { var s = 0; for await (const x of [Promise.resolve(1), Promise.resolve(2), Promise.resolve(3)]) { s += x; } return s; } f().then(print); return 0;",
+        "6\n0",
+    );
+    check(
+        "for-await-over-async-generator",
+        "async function* g() { yield 1; yield 2; yield 3; } async function f() { var s = 0; for await (const x of g()) { s += x; } return s; } f().then(print); return 0;",
+        "6\n0",
+    );
+    check(
+        "for-await-break-and-continue",
+        "async function f() { var s = 0; for await (const x of [1, 2, 3, 99]) { if (x === 2) continue; if (x > 3) break; s += x; } return s; } f().then(print); return 0;",
+        "4\n0",
+    );
+    check(
+        "plain-generator-for-of-yield-in-body",
+        "function* f() { for (const x of [1, 2, 3]) { yield x * 2; } } var it = f(); return it.next().value + it.next().value + it.next().value;",
+        "12",
+    );
+}

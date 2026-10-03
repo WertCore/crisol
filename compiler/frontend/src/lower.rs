@@ -1103,12 +1103,13 @@ impl Lowering {
             );
             return;
         }
+        // `self.write`/`self.read` throughout, not raw slot access: the iterator and the awaited
+        // result have to survive the `await` in the loop header, so inside the generator they live on
+        // the generator object. With raw slots the iterator was lost at the first `await` and the loop
+        // ran zero turns (D-292).
         let iterable = self.expression(&statement.right);
         let iterable_slot = self.temporary();
-        self.emit_effect(Op::Store {
-            slot: iterable_slot,
-            value: iterable,
-        });
+        self.write(iterable_slot, iterable);
         // `iterator = (iterable[Symbol.asyncIterator] ?? iterable[Symbol.iterator]).call(iterable)`.
         let method = self.async_iterator_method(iterable_slot);
         let iterable = self.read(iterable_slot);
@@ -1122,10 +1123,7 @@ impl Lowering {
         );
         let iterator = self.propagate(iterator);
         let iterator_slot = self.temporary();
-        self.emit_effect(Op::Store {
-            slot: iterator_slot,
-            value: iterator,
-        });
+        self.write(iterator_slot, iterator);
         let awaited_slot = self.temporary();
 
         let header = self.new_block();
@@ -1159,10 +1157,7 @@ impl Lowering {
         );
         let result = self.propagate(result);
         let awaited = self.yield_value(result, true);
-        self.emit_effect(Op::Store {
-            slot: awaited_slot,
-            value: awaited,
-        });
+        self.write(awaited_slot, awaited);
         let awaited = self.read(awaited_slot);
         let done = self.emit(
             Type::Unknown,
@@ -1206,6 +1201,12 @@ impl Lowering {
             },
         );
         let value = self.propagate(value);
+        // Await the value as well. A `for await` over a *sync* iterable awaits each value it yields —
+        // `CreateAsyncFromSyncIterator` — so `for await (x of [p1, p2])` binds the resolved values,
+        // not the promises (which would make `x` a pending promise and arithmetic on it `NaN`).
+        // Awaiting an already-settled value — a true async iterator's, or a plain one — passes it
+        // straight through (D-292).
+        let value = self.yield_value(value, true);
         self.bind_loop_variable(&statement.left, value);
         let labeled = self.enter_loop(exit, step);
         self.statement(&statement.body);
@@ -1240,10 +1241,7 @@ impl Lowering {
             },
         );
         let async_method = self.propagate(async_method);
-        self.emit_effect(Op::Store {
-            slot: result,
-            value: async_method,
-        });
+        self.write(result, async_method);
         let nullish = self.is_nullish(async_method);
         let fallback = self.new_block();
         let join = self.new_block();
@@ -1266,10 +1264,7 @@ impl Lowering {
             },
         );
         let sync_method = self.propagate(sync_method);
-        self.emit_effect(Op::Store {
-            slot: result,
-            value: sync_method,
-        });
+        self.write(result, sync_method);
         self.terminate(Terminator::Jump {
             target: join,
             args: Vec::new(),
@@ -1311,17 +1306,16 @@ impl Lowering {
         left: &oxc_ast::ast::ForStatementLeft<'_>,
         body_statement: &Statement<'_>,
     ) {
+        // `self.write`/`self.read`, not a raw `Op::Store`/`Op::Load`: inside a generator the loop's
+        // list and position then live on the generator object and survive a suspension in the body,
+        // so `for (x of xs) { await … }` keeps its place and keeps iterating rather than losing the
+        // list at the first `await` and stopping after one turn (D-292). Outside a generator both
+        // lower to exactly the raw slot access they replace.
         let list = self.temporary();
-        self.emit_effect(Op::Store {
-            slot: list,
-            value: subject,
-        });
+        self.write(list, subject);
         let position = self.temporary();
         let zero = self.emit(Type::Number, Op::Const(Constant::Number(0.0)));
-        self.emit_effect(Op::Store {
-            slot: position,
-            value: zero,
-        });
+        self.write(position, zero);
 
         let header = self.new_block();
         let body = self.new_block();
@@ -1333,7 +1327,7 @@ impl Lowering {
         });
 
         self.switch_to(header);
-        let held = self.emit(Type::Unknown, Op::Load { slot: list });
+        let held = self.read(list);
         let length = self.emit(
             Type::Unknown,
             Op::PropertyLoad {
@@ -1341,7 +1335,7 @@ impl Lowering {
                 key: PropertyKey::new("length"),
             },
         );
-        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let at = self.read(position);
         let more = self.emit(
             Type::Bool,
             Op::Compare {
@@ -1359,8 +1353,8 @@ impl Lowering {
         });
 
         self.switch_to(body);
-        let held = self.emit(Type::Unknown, Op::Load { slot: list });
-        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let held = self.read(list);
+        let at = self.read(position);
         let name = self.emit(
             Type::Unknown,
             Op::ComputedLoad {
@@ -1379,7 +1373,7 @@ impl Lowering {
         });
 
         self.switch_to(step);
-        let at = self.emit(Type::Unknown, Op::Load { slot: position });
+        let at = self.read(position);
         let one = self.emit(Type::Number, Op::Const(Constant::Number(1.0)));
         let next = self.emit(
             Type::Unknown,
@@ -1389,10 +1383,7 @@ impl Lowering {
                 right: one,
             },
         );
-        self.emit_effect(Op::Store {
-            slot: position,
-            value: next,
-        });
+        self.write(position, next);
         self.terminate(Terminator::Jump {
             target: header,
             args: Vec::new(),
