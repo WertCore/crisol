@@ -532,7 +532,12 @@ impl Heap {
         }
         match &mut cell.state {
             State::Live { object, .. } => {
-                object.elements = Some(vec![Value::UNDEFINED; length]);
+                // **A fresh array of a given length is all holes**, not `undefined` — `new Array(5)`
+                // and `a.length = 5` both leave the slots absent, and a method building a result
+                // fills the ones it sets and leaves the rest holes (D-286). A read of a hole is
+                // still `undefined`; what changes is that `in` and the hole-skipping methods now see
+                // it as absent.
+                object.elements = Some(vec![Value::EMPTY; length]);
                 true
             }
             State::Free => false,

@@ -7769,3 +7769,24 @@ Status: Accepted
 `debugger;` is a breakpoint hint with no runtime semantics, so it lowers to nothing — the same as the
 empty statement — rather than being refused as an unhandled statement. It appears in test262 files as
 an incidental no-op, and refusing it failed cases that have nothing to do with debugging.
+
+## D-286
+
+**A freshly created array of a given length is all holes.**
+
+Status: Accepted
+
+D-282 represented holes but left `new Array(n)` and `a.length = n` filling `undefined`, because
+`make_array` — the one array factory — initialised its element store with `undefined`. It now fills
+with `Value::EMPTY`, so a length-sized array starts all holes, which is what both of those produce in
+the specification. `new Array(n)`'s constructor dropped the `set_element(n - 1, undefined)` that only
+existed to force the length (`make_array` already sizes the store), and the two `a.length = n` grow
+paths fill the new tail with `EMPTY` rather than a trailing `undefined`.
+
+The factory is shared, so every method that builds a result starts from holes — but each fills the
+slots it sets (or truncates to what it kept), so a dense result stays dense: `map` fills the mapped
+indices and leaves source holes as holes; `filter`/`slice`/`concat`/`Array.from` populate every slot
+they keep. The two-element pair and one-element internal arrays set both slots before use. The full
+suite confirms no densely built array regressed. This closes the `new Array(n)` deviation D-282 noted.
+(Spread densifying a hole to `undefined` is *not* a deviation — iteration visits a hole as `undefined`
+by specification. The one that remains is `slice`/`concat`, which should *preserve* a hole they copy.)

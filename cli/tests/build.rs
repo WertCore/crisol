@@ -11951,3 +11951,47 @@ fn debugger_statement_is_a_noop() {
         "2",
     );
 }
+
+/// A freshly created array of a length is all holes — new Array(n) and a.length = n (D-286).
+#[test]
+fn fresh_array_of_length_is_holes() {
+    check("new-array-length", "return new Array(3).length;", "3");
+    check(
+        "new-array-is-holes",
+        "var a = new Array(3); return (0 in a) + ',' + (2 in a);",
+        "false,false",
+    );
+    check(
+        "new-array-read-undefined",
+        "return new Array(3)[0];",
+        "undefined",
+    );
+    check(
+        "new-array-forEach-skips",
+        "var a = new Array(3); var c = 0; a.forEach(function () { c++; }); return c;",
+        "0",
+    );
+    // new Array(1, 2, 3) is the element form — dense.
+    check(
+        "new-array-elements-dense",
+        "var a = new Array(1, 2, 3); return a.length + ',' + (0 in a);",
+        "3,true",
+    );
+    // length grow adds holes; truncation keeps what remains.
+    check(
+        "length-grow-adds-holes",
+        "var a = [1, 2]; a.length = 4; return (1 in a) + ',' + (2 in a) + ',' + a.length;",
+        "true,false,4",
+    );
+    check(
+        "length-truncate",
+        "var a = [1, 2, 3]; a.length = 1; return a.length + ',' + a[0];",
+        "1,1",
+    );
+    // Array.from with a length densifies (reads via Get), unchanged.
+    check(
+        "array-from-densifies",
+        "var a = Array.from({ length: 3 }); return (0 in a);",
+        "true",
+    );
+}

@@ -6529,18 +6529,9 @@ extern "C" fn construct_array(
                 reason = "range-checked immediately above"
             )]
             let length = length as usize;
-            return with_new_array(length, |array| {
-                // Filled with `undefined` where the specification says holes, which is the
-                // approximation array literals already make (D-133).
-                if length > 0 {
-                    with_runtime(|runtime| {
-                        runtime
-                            .heap
-                            .set_element(array, length - 1, Value::UNDEFINED);
-                    });
-                }
-                array.to_value().to_bits()
-            });
+            // `new Array(n)` is `n` holes — `make_array` now fills them (D-286), and the length is
+            // `n` because `make_array` sized the element store, so nothing more is written.
+            return with_new_array(length, |array| array.to_value().to_bits());
         }
     }
     let given: Vec<u64> = (0..argc as usize)
@@ -12142,9 +12133,7 @@ extern "C" fn object_define_property(
                     if wanted < count {
                         runtime.heap.truncate_elements(handle, wanted);
                     } else if wanted > count {
-                        runtime
-                            .heap
-                            .set_element(handle, wanted - 1, Value::UNDEFINED);
+                        runtime.heap.set_element(handle, wanted - 1, Value::EMPTY);
                     }
                 });
             }
@@ -15864,9 +15853,7 @@ pub unsafe extern "C" fn crisol_property_store(
                     // Growing fills with `undefined`, which is not what the specification
                     // says — those should be holes (D-64) — and is the same approximation
                     // array literals already make.
-                    runtime
-                        .heap
-                        .set_element(handle, wanted - 1, Value::UNDEFINED);
+                    runtime.heap.set_element(handle, wanted - 1, Value::EMPTY);
                 }
             });
         }
