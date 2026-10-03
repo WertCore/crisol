@@ -3696,7 +3696,17 @@ impl Lowering {
             oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
                 let slot = self.slot(identifier.name.as_str());
                 let current = self.read(slot);
+                // `s += await x` / `s += yield x`: the current value is live across the suspension
+                // the right side contains, so it is spilled and read back — the same rule a binary
+                // operand follows (D-289).
+                let spilled = (self.scope().generator.is_some()
+                    && self.expression_may_yield(&assignment.right))
+                .then(|| self.spill(current));
                 let rhs = self.value_expression(&assignment.right);
+                let current = match spilled {
+                    Some(slot) => self.reload(slot),
+                    None => current,
+                };
                 let combined = self.emit(
                     Type::Unknown,
                     Op::Binary {
@@ -3719,7 +3729,18 @@ impl Lowering {
                     },
                 );
                 let current = self.propagate(current);
+                // `o.x += await y`: the receiver and the loaded value are both live across the
+                // suspension on the right, so both are spilled and read back (D-289).
+                let spills = (self.scope().generator.is_some()
+                    && self.expression_may_yield(&assignment.right))
+                .then(|| (self.spill(object), self.spill(current)));
                 let rhs = self.value_expression(&assignment.right);
+                let (object, current) = match spills {
+                    Some((object_slot, current_slot)) => {
+                        (self.reload(object_slot), self.reload(current_slot))
+                    }
+                    None => (object, current),
+                };
                 let combined = self.emit(
                     Type::Unknown,
                     Op::Binary {
@@ -3745,7 +3766,20 @@ impl Lowering {
                 let key = self.expression(&member.expression);
                 let current = self.emit(Type::Unknown, Op::ComputedLoad { object, key });
                 let current = self.propagate(current);
+                // `o[k] += await v`: receiver, key, and loaded value all survive the suspension on
+                // the right (D-289).
+                let spills = (self.scope().generator.is_some()
+                    && self.expression_may_yield(&assignment.right))
+                .then(|| (self.spill(object), self.spill(key), self.spill(current)));
                 let rhs = self.value_expression(&assignment.right);
+                let (object, key, current) = match spills {
+                    Some((object_slot, key_slot, current_slot)) => (
+                        self.reload(object_slot),
+                        self.reload(key_slot),
+                        self.reload(current_slot),
+                    ),
+                    None => (object, key, current),
+                };
                 let combined = self.emit(
                     Type::Unknown,
                     Op::Binary {
@@ -3779,7 +3813,17 @@ impl Lowering {
                     },
                 );
                 let current = self.propagate(current);
+                // `this.#x += await v`: receiver and loaded value survive the suspension (D-289).
+                let spills = (self.scope().generator.is_some()
+                    && self.expression_may_yield(&assignment.right))
+                .then(|| (self.spill(object), self.spill(current)));
                 let rhs = self.value_expression(&assignment.right);
+                let (object, current) = match spills {
+                    Some((object_slot, current_slot)) => {
+                        (self.reload(object_slot), self.reload(current_slot))
+                    }
+                    None => (object, current),
+                };
                 let combined = self.emit(
                     Type::Unknown,
                     Op::Binary {
@@ -4840,6 +4884,36 @@ impl Lowering {
     /// not, so a `this` inside it resolves outward and becomes an ordinary capture (D-81) —
     /// which is exactly what the language specifies, and it falls out of the scope machinery
     /// rather than needing a rule of its own.
+    /// A class or object method's function, routed to the generator machinery when it is `async`,
+    /// `*`, or both — exactly as a `function` declaration is. The class member loop used to call
+    /// `lower_function` unconditionally, so `async m() { await x }`, `*g() { yield }`, and
+    /// `static async m()` refused `await`/`yield`; an object literal's methods already took this
+    /// path, so only class bodies were wrong (D-289).
+    fn lower_method(
+        &mut self,
+        name: &str,
+        function: &oxc_ast::ast::Function<'_>,
+    ) -> (FunctionId, Vec<String>) {
+        if function.generator || function.r#async {
+            self.lower_generator(
+                name,
+                &function.params,
+                function.body.as_deref(),
+                function.r#async,
+                function.r#async && function.generator,
+            )
+        } else {
+            self.lower_function(
+                name,
+                &function.params,
+                function.body.as_deref(),
+                None,
+                true,
+                &[],
+            )
+        }
+    }
+
     fn lower_function(
         &mut self,
         name: &str,
@@ -5220,14 +5294,8 @@ impl Lowering {
                     self.note("computed method name", method.span.start);
                     continue;
                 };
-                let (id, captures) = self.lower_function(
-                    &format!("{name}.<computed>"),
-                    &method.value.params,
-                    method.value.body.as_deref(),
-                    None,
-                    true,
-                    &[],
-                );
+                let (id, captures) =
+                    self.lower_method(&format!("{name}.<computed>"), &method.value);
                 let closure = self.close_over(id, &captures);
                 if method.r#static {
                     static_computed.push((computed_key, method.kind, closure));
@@ -5267,14 +5335,7 @@ impl Lowering {
                 constructor_method = Some(method);
                 continue;
             }
-            let (id, captures) = self.lower_function(
-                &format!("{name}.{method_name}"),
-                &method.value.params,
-                method.value.body.as_deref(),
-                None,
-                true,
-                &[],
-            );
+            let (id, captures) = self.lower_method(&format!("{name}.{method_name}"), &method.value);
             let closure = self.close_over(id, &captures);
             // A static method goes on the constructor, which is not built yet — collected and
             // installed below (D-261).

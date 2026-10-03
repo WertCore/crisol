@@ -10063,8 +10063,10 @@ fn an_async_function_returns_a_promise_and_await_suspends() {
          f(); return typeof f;",
         "function",
     );
-    // `await` is refused in a complex position rather than miscompiled (the same restriction the
-    // generator transform carries) — the program is reported unfaithful, so it does not build.
+    // `await` in a return position drives through the microtask queue like any other. It also
+    // works in every complex position now — call and spread arguments, binary operands, array and
+    // conditional branches, and a compound-assignment right side, each spilling its live operands
+    // across the suspension exactly as `yield` does (D-276 through D-289).
     check(
         "async-await-in-simple-return",
         "async function f() { return await 5; } return typeof f;",
@@ -12055,5 +12057,66 @@ fn print_and_async_values() {
         "test262-async-done-protocol",
         "function $DONE(e) { print(e ? 'FAIL' : 'Test262:AsyncTestComplete'); } async function t() { await Promise.resolve(1); $DONE(); } t(); return 0;",
         "Test262:AsyncTestComplete\n0",
+    );
+}
+
+/// `+=` (and other compound assignments) with an await/yield right side — the current value (and a
+/// member target's receiver/key) survive the suspension (D-289).
+#[test]
+fn compound_assignment_with_await() {
+    check(
+        "compound-await-identifier",
+        "async function f() { var s = 0; for (var i = 0; i < 3; i++) { s += await Promise.resolve(i); } print(s); } f(); return 0;",
+        "3\n0",
+    );
+    check(
+        "compound-await-static-member",
+        "async function f() { var o = { x: 10 }; o.x += await Promise.resolve(5); print(o.x); } f(); return 0;",
+        "15\n0",
+    );
+    check(
+        "compound-await-computed-member",
+        "async function f() { var a = [1, 2]; a[1] += await Promise.resolve(8); print(a[1]); } f(); return 0;",
+        "10\n0",
+    );
+    // Yield form, verified by stepping the generator.
+    check(
+        "compound-yield-identifier",
+        "function* g() { var s = 1; s += yield 0; return s; } var it = g(); it.next(); return it.next(40).value;",
+        "41",
+    );
+}
+
+/// A class body's `async`, generator, and `static async` methods go through the generator
+/// machinery, so `await` and `yield` work inside them exactly as in a `function` form — the member
+/// loop used to lower every method as a plain function (D-289).
+#[test]
+fn class_async_and_generator_methods() {
+    check(
+        "class-async-method",
+        "class C { async m() { return await Promise.resolve(5); } } new C().m().then(print); return 0;",
+        "5\n0",
+    );
+    check(
+        "class-static-async-method",
+        "class C { static async m() { return await Promise.resolve(7); } } C.m().then(print); return 0;",
+        "7\n0",
+    );
+    check(
+        "class-generator-method",
+        "class C { *g() { yield 10; yield 20; } } var it = new C().g(); print(it.next().value); print(it.next().value); return it.next().done ? 0 : 1;",
+        "10\n20\n0",
+    );
+    check(
+        "class-async-generator-method",
+        "class C { async *g() { yield 3; } } new C().g().next().then(function (r) { print(r.value); }); return 0;",
+        "3\n0",
+    );
+    // The private compound-assignment-await case (#47) is only reachable through a class async
+    // method, so it lands here: the receiver survives the suspension and `#n` ends at 1 + 9.
+    check(
+        "class-async-private-compound-await",
+        "class C { #n = 1; async go() { this.#n += await Promise.resolve(9); return this.#n; } } new C().go().then(print); return 0;",
+        "10\n0",
     );
 }

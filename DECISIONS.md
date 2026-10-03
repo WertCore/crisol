@@ -7844,3 +7844,31 @@ The staleness survived because the regression run before each commit was `cargo 
 `cargo test --workspace --all-features` surfaced it. The per-commit gate is now the workspace run,
 so a change in one crate that invalidates a sibling crate's test is caught before it is pushed, not
 a release later.
+
+## D-290
+
+**`await`/`yield` in a compound-assignment right side, and in class `async`/generator methods.**
+
+Status: Accepted
+
+Two forms still refused `await`/`yield` where the language allows them, and both are the same
+omission: a place the suspension machinery was not threaded through.
+
+A compound assignment (`s += await x`, `o.x += await y`, `a[i] += await z`) evaluates its target,
+then its right side, then combines them. When the right side suspends, the already-evaluated
+left-hand pieces — the current value, and a member target's receiver and computed key — are SSA
+temporaries, which do not survive a yield (only generator *locals*, kept on the generator object,
+do). Each of the four `compound_assignment` arms now spills those live values before lowering a
+right side that may suspend and reloads them after, exactly as the binary, call, and array positions
+already did (D-276 through D-283): the identifier arm spills the current value; the static-member arm
+the receiver and current; the computed-member arm the receiver, key, and current; the private-field
+arm the receiver and current.
+
+Class bodies lowered every method with `lower_function`, so `async m() { await x }`, `*g() { yield }`,
+and `static async m()` refused `await`/`yield` — while an object literal's methods, which take a
+different path, already worked. A `lower_method` helper now routes a class method through the
+generator machinery exactly when it is `async`, `*`, or both, the same test a `function` declaration
+applies; a getter, a setter, and the constructor are never `async` or generators, so they are
+unaffected. This also makes the private compound-await case reachable, since a private field appears
+only inside a class method — `this.#n += await p` lands in a class async method and the receiver
+survives the suspension.
