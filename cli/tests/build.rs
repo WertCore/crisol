@@ -11995,3 +11995,39 @@ fn fresh_array_of_length_is_holes() {
         "true",
     );
 }
+
+/// slice and concat preserve a hole they copy rather than densifying it to undefined (D-287).
+#[test]
+fn slice_and_concat_preserve_holes() {
+    check(
+        "slice-preserves-hole",
+        "var b = [1, , 3].slice(); return (1 in b) + ',' + b.length + ',' + b[2];",
+        "false,3,3",
+    );
+    check(
+        "slice-range-preserves",
+        "var b = [1, , 3, , 5].slice(1, 4); return (0 in b) + ',' + (2 in b) + ',' + b.length;",
+        "false,false,3",
+    );
+    check(
+        "concat-preserves-hole",
+        "var b = [1, , 3].concat([4]); return (1 in b) + ',' + b.length + ',' + b[3];",
+        "false,4,4",
+    );
+    check(
+        "concat-appends-non-array-whole",
+        "var b = [1, , 3].concat(9); return (1 in b) + ',' + b[3];",
+        "false,9",
+    );
+    // Dense slice/concat stay dense.
+    check(
+        "slice-dense-unchanged",
+        "var b = [1, 2, 3].slice(); return (0 in b) + ',' + (1 in b) + ',' + (2 in b);",
+        "true,true,true",
+    );
+    check(
+        "concat-dense-unchanged",
+        "return [1, 2].concat([3, 4], 5).join(',');",
+        "1,2,3,4,5",
+    );
+}

@@ -17709,6 +17709,11 @@ extern "C" fn array_slice(
         }
         with_new_array(taken, |result| {
             for offset in 0..taken {
+                // A hole is preserved, not copied as `undefined`: the result starts all holes
+                // (D-286), so skipping the source's hole leaves one here too (D-287).
+                if element_is_hole(this_value, start + offset) {
+                    continue;
+                }
                 let element = indexed_get(this_value, start + offset);
                 with_runtime(|runtime| {
                     runtime
@@ -17738,7 +17743,14 @@ extern "C" fn array_concat(
         let mut take = |value: u64| {
             if let Some((array, length)) = elements_of(value) {
                 for index in 0..length {
-                    flattened.push(element_at(array, index));
+                    // A hole in a spread array stays a hole in the result: push the marker, which
+                    // `array_of_values` turns back into a hole (D-287). A present element is pushed
+                    // as its value.
+                    if element_present(array, index) {
+                        flattened.push(element_at(array, index));
+                    } else {
+                        flattened.push(Value::EMPTY.to_bits());
+                    }
                 }
             } else {
                 flattened.push(value);

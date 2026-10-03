@@ -7790,3 +7790,17 @@ they keep. The two-element pair and one-element internal arrays set both slots b
 suite confirms no densely built array regressed. This closes the `new Array(n)` deviation D-282 noted.
 (Spread densifying a hole to `undefined` is *not* a deviation — iteration visits a hole as `undefined`
 by specification. The one that remains is `slice`/`concat`, which should *preserve* a hole they copy.)
+
+## D-287
+
+**`slice` and `concat` preserve a hole they copy.**
+
+Status: Accepted
+
+The last array-hole deviation D-286 named. `slice` copied a source hole as `undefined`; it now skips
+the copy, and since the result starts all holes (D-286) the slot stays a hole. `concat` flattens its
+arguments into a list and builds the result from it — it now pushes the hole marker for an absent
+element instead of `undefined`, and `array_of_values` turns that marker back into a hole. So
+`[1, , 3].slice()` and `[1, , 3].concat([4])` stay sparse. A dense array copies dense, and spread
+still densifies — correctly, because iteration visits a hole as `undefined` by specification. With
+this the array-hole model matches the specification in every operation; no deviation remains.
