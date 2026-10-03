@@ -12120,3 +12120,35 @@ fn class_async_and_generator_methods() {
         "10\n0",
     );
 }
+
+/// An async arrow — `async x => await y` — is an async function with lexical `this`: it goes through
+/// the generator machinery so `await` works, but captures the enclosing `this` and locals rather than
+/// binding its own, exactly as a plain arrow does (D-291).
+#[test]
+fn async_arrow_functions() {
+    check(
+        "async-arrow-concise",
+        "var f = async x => await Promise.resolve(x * 2); f(5).then(print); return 0;",
+        "10\n0",
+    );
+    check(
+        "async-arrow-block",
+        "var f = async (x) => { var y = await Promise.resolve(x); return y + 1; }; f(7).then(print); return 0;",
+        "8\n0",
+    );
+    check(
+        "async-arrow-lexical-this",
+        "var o = { v: 42, go() { return (async () => await Promise.resolve(this.v))(); } }; o.go().then(print); return 0;",
+        "42\n0",
+    );
+    check(
+        "async-arrow-capture",
+        "async function f() { var base = 10; var g = async x => base + await Promise.resolve(x); return await g(5); } f().then(print); return 0;",
+        "15\n0",
+    );
+    check(
+        "async-arrow-private-this",
+        "class C { #n = 3; m() { return (async () => await Promise.resolve(this.#n))(); } } new C().m().then(print); return 0;",
+        "3\n0",
+    );
+}

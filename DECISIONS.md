@@ -7872,3 +7872,38 @@ applies; a getter, a setter, and the constructor are never `async` or generators
 unaffected. This also makes the private compound-await case reachable, since a private field appears
 only inside a class method — `this.#n += await p` lands in a class async method and the receiver
 survives the suspension.
+
+## D-291
+
+**Async arrow functions, and a closure that captures a generator or async function's local.**
+
+Status: Accepted
+
+An async arrow — `async x => await y` — is an async function with lexical `this`. It now lowers
+through the generator machinery like any `async` form (so `await` works), but with the two things a
+plain arrow also has: it does not bind its own `this`, and it may have a concise expression body.
+`lower_generator` gained a `binds_this` flag — `false` for an arrow, so the outer stub does not
+declare `this` but resolves it outward and captures the enclosing one, which the body then sees under
+`GEN_THIS_KEY` exactly as a method's `this` does — and an `expression_body`, lowered as `return EXPR`
+(its `await` suspends first, via `value_expression` + `emit_return`). There is no `async *` arrow, so
+the async-generator flag is always false.
+
+Making that work surfaced an older, broader bug: **a closure could not capture a local or parameter
+of an enclosing generator or async function** — it read `undefined`, even a plain arrow, even before
+any `await`. Such a variable lives on the generator object so it survives a suspension, but three
+things did not account for that:
+
+- `close_over` read the capture from the variable's raw slot, which for a generator local holds
+  nothing. It now reads from the generator object — the value for a plain local, the cell for a
+  shared one.
+- A *shared* (mutated-and-captured) generator local needs its cell to survive a suspension too, and
+  to be the thing captured so a write stays visible. `make_cell` now stores that cell on the
+  generator object, and `read`/`write` go through it there, instead of in the raw slot the first
+  suspension would lose.
+- A generator body never ran the `hoist` pass, so a shared `var` in it was never given a cell at all
+  (a parameter was, which is why only `var`s broke). It now hoists like an ordinary body — which also
+  gives a generator correct `var`-before-declaration and nested-`function` hoisting.
+
+Together these fix the forms that pervade async code: `arr.forEach(x => sum += x)` inside an async
+function, `new Promise(resolve => { ... })` capturing `resolve`, and a value captured before an
+`await` and read after it — each verified to return the right result under GC stress.

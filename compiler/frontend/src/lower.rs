@@ -2082,8 +2082,10 @@ impl Lowering {
                     name,
                     &declaration.params,
                     declaration.body.as_deref(),
+                    None,
                     declaration.r#async,
                     declaration.r#async && declaration.generator,
+                    true,
                 )
             } else {
                 self.lower_function(
@@ -2180,13 +2182,26 @@ impl Lowering {
         if let Some(key) = self.gen_local_key(slot) {
             let this_slot = self.this_slot();
             let this = self.emit(Type::Unknown, Op::Load { slot: this_slot });
-            return self.emit(
+            let stored = self.emit(
                 Type::Unknown,
                 Op::PropertyLoad {
                     object: this,
                     key: PropertyKey::new(&key),
                 },
             );
+            // A *shared* generator local keeps its cell on the generator object — so the reference
+            // survives a suspension and a nested closure can capture it — and is read through the
+            // cell. A plain one keeps its value there directly (D-291).
+            if self.scope().cells.contains(&slot) {
+                return self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object: stored,
+                        key: PropertyKey::new(CELL_KEY),
+                    },
+                );
+            }
+            return stored;
         }
         let held = self.emit(Type::Unknown, Op::Load { slot });
         if self.scope().cells.contains(&slot) {
@@ -2207,6 +2222,24 @@ impl Lowering {
         if let Some(key) = self.gen_local_key(slot) {
             let this_slot = self.this_slot();
             let this = self.emit(Type::Unknown, Op::Load { slot: this_slot });
+            // A shared generator local stores through the cell kept on the generator object, so the
+            // write is seen by every closure holding that cell; a plain one stores its value there
+            // directly (D-291).
+            if self.scope().cells.contains(&slot) {
+                let cell = self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object: this,
+                        key: PropertyKey::new(&key),
+                    },
+                );
+                self.emit_effect(Op::PropertyStore {
+                    object: cell,
+                    key: PropertyKey::new(CELL_KEY),
+                    value,
+                });
+                return;
+            }
             self.emit_effect(Op::PropertyStore {
                 object: this,
                 key: PropertyKey::new(&key),
@@ -2260,7 +2293,21 @@ impl Lowering {
     fn make_cell(&mut self, slot: u32) {
         let shape = crisol_value::Shapes::new().root();
         let cell = self.emit(Type::Object(None), Op::CreateObject { shape });
-        self.emit_effect(Op::Store { slot, value: cell });
+        // A generator local lives on the generator object, not the raw slot — a cell kept in the slot
+        // would be lost at the first suspension. Put it where the local lives so it survives and a
+        // captured write through it stays visible (D-291). `gen_local_key` is set here already: the
+        // slot was `declare`d (which marks it) before this runs.
+        if let Some(key) = self.gen_local_key(slot) {
+            let this_slot = self.this_slot();
+            let this = self.emit(Type::Unknown, Op::Load { slot: this_slot });
+            self.emit_effect(Op::PropertyStore {
+                object: this,
+                key: PropertyKey::new(&key),
+                value: cell,
+            });
+        } else {
+            self.emit_effect(Op::Store { slot, value: cell });
+        }
         self.scope_mut().cells.insert(slot);
     }
 
@@ -3045,8 +3092,10 @@ impl Lowering {
                         &name,
                         &function.params,
                         function.body.as_deref(),
+                        None,
                         function.r#async,
                         function.r#async && function.generator,
+                        true,
                     )
                 } else {
                     self.lower_function(
@@ -3064,22 +3113,31 @@ impl Lowering {
                 // A concise body — `x => x + 1` — and a block body are distinct shapes in the
                 // AST, so the distinction is read off the type rather than reconstructed from
                 // a boolean plus a guess at the single statement inside.
-                let (id, names) = match (arrow.get_expression(), arrow.get_function_body()) {
-                    (Some(expression), _) => self.lower_function(
-                        "arrow",
-                        &arrow.params,
-                        None,
-                        Some(expression),
-                        false,
-                        &[],
-                    ),
-                    (None, Some(body)) => {
-                        self.lower_function("arrow", &arrow.params, Some(body), None, false, &[])
-                    }
+                let (block, expression) = match (arrow.get_expression(), arrow.get_function_body())
+                {
+                    (Some(expression), _) => (None, Some(expression)),
+                    (None, Some(body)) => (Some(body), None),
                     (None, None) => {
                         self.note("arrow with no body", arrow.span.start);
                         return self.placeholder();
                     }
+                };
+                let (id, names) = if arrow.r#async {
+                    // An async arrow is an async function with lexical `this`: the generator
+                    // machinery (so `await` works), `binds_this: false` (so a `this` inside resolves
+                    // outward and is captured, exactly as a plain arrow's), and never a generator —
+                    // there is no `async *` arrow (D-291).
+                    self.lower_generator(
+                        "arrow",
+                        &arrow.params,
+                        block,
+                        expression,
+                        true,
+                        false,
+                        false,
+                    )
+                } else {
+                    self.lower_function("arrow", &arrow.params, block, expression, false, &[])
                 };
                 self.close_over(id, &names)
             }
@@ -4264,16 +4322,34 @@ impl Lowering {
     /// (D-246). Locals and parameters live on that object, so a loop counter survives a `yield`; a
     /// `yield` is handled in statement or simple-assignment position, and refused elsewhere (where a
     /// compiler temporary could be live across the suspension).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "name, params, the two body shapes, and the three flags a generator/async/arrow \
+                  form varies over — bundling them into a struct would obscure the call sites"
+    )]
     fn lower_generator(
         &mut self,
         name: &str,
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+        // A concise arrow body — `async x => await y` — whose single expression is the return value.
+        // `None` for every block-bodied form; exactly one of `body`/`expression_body` is `Some`.
+        expression_body: Option<&Expression<'_>>,
         is_async: bool,
         is_async_generator: bool,
+        // `false` for an async arrow: it does not bind its own `this`, so the outer stub captures the
+        // enclosing `this` rather than reading an incoming argument — lexical `this`, like a plain
+        // arrow's (D-291). Every non-arrow form passes `true`.
+        binds_this: bool,
     ) -> (FunctionId, Vec<String>) {
-        let (body_id, body_captures) =
-            self.lower_generator_body(name, params, body, is_async, is_async_generator);
+        let (body_id, body_captures) = self.lower_generator_body(
+            name,
+            params,
+            body,
+            expression_body,
+            is_async,
+            is_async_generator,
+        );
 
         let index = self.functions.len();
         let mut outer = Function::new(name);
@@ -4296,8 +4372,13 @@ impl Lowering {
             finalizers: Vec::new(),
             labels: Vec::new(),
         });
-        let this_slot = self.declare("this");
-        self.functions[index].this_slot = Some(this_slot);
+        // A non-arrow declares `this` as slot 0, so codegen binds the incoming `this` argument to it.
+        // An async arrow does not: its `this` is lexical, so it is left to resolve outward and be
+        // captured when the stub reads it below (D-291).
+        if binds_this {
+            let this_slot = self.declare("this");
+            self.functions[index].this_slot = Some(this_slot);
+        }
         // The outer stub binds its parameters exactly as an ordinary function does — defaults
         // applied, patterns destructured, the rest gathered — into its own locals, then copies each
         // resulting binding onto the generator object for the body to read (D-259).
@@ -4361,8 +4442,11 @@ impl Lowering {
             self.collect_binding_names(&rest.rest.argument, &mut parameter_names);
         }
         // Build the generator object over the body closure and the caller's `this`, store each
-        // bound name on it under the key the body reads it by, and return it.
+        // bound name on it under the key the body reads it by, and return it. `slot("this")` reads
+        // the local the stub declared (a non-arrow), or resolves outward and captures the enclosing
+        // `this` (an async arrow) — either way it is the `this` the body sees under `GEN_THIS_KEY`.
         let body_closure = self.close_over(body_id, &body_captures);
+        let this_slot = self.slot("this");
         let this_value = self.read(this_slot);
         let generator = self.emit(
             Type::Object(None),
@@ -4428,6 +4512,7 @@ impl Lowering {
         name: &str,
         params: &oxc_ast::ast::FormalParameters<'_>,
         body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+        expression_body: Option<&Expression<'_>>,
         is_async: bool,
         is_async_generator: bool,
     ) -> (FunctionId, Vec<String>) {
@@ -4482,9 +4567,22 @@ impl Lowering {
         let start = self.new_block();
         self.switch_to(start);
         if let Some(body) = body {
+            // Hoist here, exactly as an ordinary function body does (D-291): a `var` read before its
+            // declaration is `undefined`, a nested `function` is visible above its own line, and — the
+            // reason this was missing mattered — a *shared* local is given its cell now, on the start
+            // path so it is made once. `make_cell` stores that cell on the generator object, so it
+            // survives a suspension and a closure can capture it; without the hoist a captured `var`
+            // read `undefined`. Runs in the start block, not the entry dispatch, so a resume skips it.
+            self.hoist(&body.statements);
             for statement in &body.statements {
                 self.statement(statement);
             }
+        } else if let Some(expression) = expression_body {
+            // A concise arrow body — `async x => EXPR` — is `return EXPR`: `value_expression` so a
+            // bare `await` in it suspends first, then `emit_return` finishes the generator with it
+            // (storing `GEN_RETURN_KEY` and signalling done) exactly as a `return` statement does.
+            let value = self.value_expression(expression);
+            self.emit_return(Some(value));
         }
         // Falling off the end finishes with `undefined`.
         if !self.scope().terminated {
@@ -4899,8 +4997,10 @@ impl Lowering {
                 name,
                 &function.params,
                 function.body.as_deref(),
+                None,
                 function.r#async,
                 function.r#async && function.generator,
+                true,
             )
         } else {
             self.lower_function(
@@ -5119,7 +5219,24 @@ impl Lowering {
                 // read two functions down is captured at each level, which is what makes a
                 // chain of closures work.
                 let slot = self.slot(name);
-                self.emit(Type::Unknown, Op::Load { slot })
+                // Capture from where the variable actually lives: a generator local is on the
+                // generator object (its raw slot holds nothing), everything else in its slot. Either
+                // way this yields the value for a plain variable and the *cell* for a shared one, so a
+                // write through the capture stays visible and a capture of a generator's local reads
+                // the value it holds rather than `undefined` (D-291).
+                if let Some(key) = self.gen_local_key(slot) {
+                    let this_slot = self.this_slot();
+                    let this = self.emit(Type::Unknown, Op::Load { slot: this_slot });
+                    self.emit(
+                        Type::Unknown,
+                        Op::PropertyLoad {
+                            object: this,
+                            key: PropertyKey::new(&key),
+                        },
+                    )
+                } else {
+                    self.emit(Type::Unknown, Op::Load { slot })
+                }
             })
             .collect();
         self.emit(Type::Object(None), Op::Closure { function, captures })
