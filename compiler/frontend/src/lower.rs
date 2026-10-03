@@ -298,6 +298,10 @@ const CELL_KEY: &str = "value";
 /// resume state, the value passed to `next`, the value `yield` produced, and the return value.
 const GEN_STATE_KEY: &str = "__genState";
 const GEN_SENT_KEY: &str = "__genSent";
+/// Set on a resume that is a *throw* rather than a value: a rejected `await` (D-249/D-292) or
+/// `generator.throw()`. The resume point raises the sent value instead of returning it, so an inner
+/// `try`/`catch` catches it (D-293). Must match `GEN_THROW` in the runtime.
+const GEN_THROW_KEY: &str = "__genThrow";
 const GEN_YIELDED_KEY: &str = "__genYielded";
 const GEN_RETURN_KEY: &str = "__genReturn";
 /// The caller's `this`, kept on the generator object because the body's own `this` is the object.
@@ -4716,13 +4720,75 @@ impl Lowering {
             .push((state, resume));
         self.switch_to(resume);
         let this = self.read(this_slot);
-        self.emit(
+        let sent = self.emit(
             Type::Unknown,
             Op::PropertyLoad {
                 object: this,
                 key: PropertyKey::new(GEN_SENT_KEY),
             },
-        )
+        );
+        // A resume may be a *throw* rather than a value — a rejected `await` or `generator.throw()`
+        // sets the flag on the generator object (D-293). Read and clear it; when it was set, raise the
+        // sent value *here*, at the suspension point, so the body's own `try`/`catch` catches it (and
+        // when nothing does, route it out as the body's result exactly as `propagate` would). A normal
+        // resume falls through to `cont` and returns the sent value, as before.
+        let this = self.read(this_slot);
+        let throwing = self.emit(
+            Type::Unknown,
+            Op::PropertyLoad {
+                object: this,
+                key: PropertyKey::new(GEN_THROW_KEY),
+            },
+        );
+        let this = self.read(this_slot);
+        let cleared = self.emit(Type::Bool, Op::Const(Constant::Bool(false)));
+        self.emit_effect(Op::PropertyStore {
+            object: this,
+            key: PropertyKey::new(GEN_THROW_KEY),
+            value: cleared,
+        });
+        let not_throwing = self.emit(
+            Type::Bool,
+            Op::Unary {
+                op: UnaryOp::Not,
+                operand: throwing,
+            },
+        );
+        let is_throwing = self.emit(
+            Type::Bool,
+            Op::Unary {
+                op: UnaryOp::Not,
+                operand: not_throwing,
+            },
+        );
+        let raise = self.new_block();
+        let cont = self.new_block();
+        self.terminate(Terminator::Branch {
+            condition: is_throwing,
+            then_block: raise,
+            then_args: Vec::new(),
+            else_block: cont,
+            else_args: Vec::new(),
+        });
+        self.switch_to(raise);
+        let signal = self.emit(
+            Type::Unknown,
+            Op::Unary {
+                op: UnaryOp::Throw,
+                operand: sent,
+            },
+        );
+        // Route through `propagate`, the same path a `throw` statement takes — an `is_exception`
+        // branch into the enclosing `catch`, or out of the body when none — rather than an outright
+        // jump to the handler. The signal is always the exception, so `propagate`'s non-exception
+        // continuation is unreachable; close it off into `cont` to keep the block terminated.
+        self.propagate(signal);
+        self.terminate(Terminator::Jump {
+            target: cont,
+            args: Vec::new(),
+        });
+        self.switch_to(cont);
+        sent
     }
 
     /// Lowers `yield* inner` at statement level (D-262): drains the iterable and yields each value.

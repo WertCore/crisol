@@ -4925,6 +4925,10 @@ const GENERATOR_BRAND: &str = "__generator";
 const GEN_STATE: &str = "__genState";
 const GEN_DONE: &str = "__genDone";
 const GEN_SENT: &str = "__genSent";
+/// Set before a resume that is a *throw* rather than a value: a rejected `await` or
+/// `generator.throw()`. The body's resume point reads it, raises `GEN_SENT`, and clears it, so an
+/// inner `try`/`catch` catches the throw (D-293). Must match `GEN_THROW_KEY` in the frontend.
+const GEN_THROW: &str = "__genThrow";
 const GEN_YIELDED: &str = "__genYielded";
 const GEN_RETURN: &str = "__genReturn";
 const GEN_THIS: &str = "__genThis";
@@ -5066,10 +5070,12 @@ extern "C" fn generator_return(
     iterator_result(value, true)
 }
 
-/// `%GeneratorPrototype%.throw(value)` — finishes the generator and throws `value`.
-///
-/// **A `try`/`catch` inside the generator does not catch it** (that needs the body resumed with the
-/// exception at the suspension point); this is the uncaught form.
+/// `%GeneratorPrototype%.throw(value)` — resumes the generator with `value` thrown at the point it
+/// suspended, so an enclosing `try`/`catch` in the body runs (D-293). If the body catches it the
+/// generator continues — yielding or returning as it would from any resume; if nothing catches it the
+/// throw propagates out and the generator finishes. A generator that is already finished, or that has
+/// not started (no `next` has run its body to a `yield`), has nothing to resume: it completes and the
+/// throw lands at the caller instead, as the specification's `suspendedStart`/completed cases require.
 extern "C" fn generator_throw(
     _closure: u64,
     this_value: u64,
@@ -5082,8 +5088,26 @@ extern "C" fn generator_throw(
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
-    set_generator_done(this_value);
-    crisol_throw(value)
+    let done = is_truthy(Value::from_bits(property_of(this_value, GEN_DONE)));
+    let started = Value::from_bits(property_of(this_value, GEN_STATE))
+        .as_number()
+        .is_some_and(|state| state != 0.0);
+    if done || !started {
+        set_generator_done(this_value);
+        return crisol_throw(value);
+    }
+    // Suspended at a `yield`: flag the resume as a throw and hand it the value, then step the body. Its
+    // resume point raises the value where its own handlers can catch it; `generator_resume` turns an
+    // uncaught throw into a finished generator and the exception signal.
+    if let Some(handle) = handle_of(this_value) {
+        with_rooted(&[this_value, value], || {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, GEN_THROW, boolean(true));
+                runtime.define_hidden(handle, GEN_SENT, Value::from_bits(value));
+            });
+        });
+    }
+    generator_resume(this_value)
 }
 
 // ============================== async / await ==============================
@@ -5205,13 +5229,18 @@ extern "C" fn async_resume_call(
     let settled = unsafe { argument(argc, argv, 0) };
     with_rooted(&[generator, promise, settled], || {
         if rejects {
-            // **A rejected await rejects the async result** rather than resuming the body's
-            // `try`/`catch` — resume-with-throw at the suspension point is deferred, the same
-            // limitation a generator's `throw` carries (it does not run an inner `catch`).
-            settle_promise(promise, settled, true);
-        } else {
-            async_drive(generator, promise, settled);
+            // A rejected await is thrown into the body *at the await*, so an enclosing `try`/`catch`
+            // runs (D-293): flag the resume as a throw, then drive. `async_drive` stores `settled` as
+            // the sent value and steps the body; its resume point raises it. If the body catches it,
+            // driving continues to the next await or the return; if nothing catches it the body
+            // finishes with an exception and `async_drive` rejects the result promise with it.
+            if let Some(handle) = handle_of(generator) {
+                with_rooted(&[generator], || {
+                    with_runtime(|runtime| runtime.define_hidden(handle, GEN_THROW, boolean(true)));
+                });
+            }
         }
+        async_drive(generator, promise, settled);
     });
     Value::UNDEFINED.to_bits()
 }

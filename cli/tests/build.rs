@@ -12195,3 +12195,45 @@ fn loops_survive_a_suspension_in_the_body() {
         "12",
     );
 }
+
+/// A rejected `await` is thrown into the async function at the await, so an enclosing `try`/`catch`
+/// catches it and the body continues; an uncaught one still rejects the result promise. The same
+/// resume-with-throw gives `generator.throw()` a `try`/`catch` inside the generator (D-293).
+#[test]
+fn a_rejected_await_and_generator_throw_reach_an_inner_catch() {
+    check(
+        "await-reject-caught",
+        "async function f() { try { await Promise.reject('boom'); return 'no'; } catch (e) { return 'caught:' + e; } } f().then(print); return 0;",
+        "caught:boom\n0",
+    );
+    check(
+        "await-reject-caught-then-continue",
+        "async function f() { var s = 0; try { s += await Promise.reject(10); } catch (e) { s += 2; } s += await Promise.resolve(3); return s; } f().then(print); return 0;",
+        "5\n0",
+    );
+    check(
+        "await-reject-finally-runs",
+        "async function f() { var s = ''; try { await Promise.reject('x'); } catch (e) { s += 'caught'; } finally { s = 'fin,' + s; } return s; } f().then(print); return 0;",
+        "fin,caught\n0",
+    );
+    check(
+        "await-reject-uncaught-rejects-promise",
+        "async function f() { await Promise.reject('bad'); return 'no'; } f().then(function (v) { print('OK:' + v); }, function (e) { print('REJ:' + e); }); return 0;",
+        "REJ:bad\n0",
+    );
+    check(
+        "await-reject-in-loop-each-caught",
+        "async function f() { var n = 0; for (var i = 0; i < 3; i++) { try { await Promise.reject(i); } catch (e) { n++; } } return n; } f().then(print); return 0;",
+        "3\n0",
+    );
+    check(
+        "generator-throw-caught-then-continues",
+        "function* g() { try { yield 1; } catch (e) { yield 'caught:' + e; } yield 'after'; } var it = g(); it.next(); return it.throw('boom').value + '/' + it.next().value;",
+        "caught:boom/after",
+    );
+    check(
+        "generator-throw-uncaught-propagates",
+        "function* g() { yield 1; } var it = g(); it.next(); try { it.throw('e'); return 'no'; } catch (err) { return 'threw:' + err; }",
+        "threw:e",
+    );
+}

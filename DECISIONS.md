@@ -7932,3 +7932,28 @@ iterable's `[Symbol.iterator]` is `CreateAsyncFromSyncIterator`, which awaits ev
 `for await (x of [p1, p2])` must bind the resolved values, not the promises (arithmetic on which gave
 `NaN`). Awaiting an already-settled value — a true async iterator's, or a plain one — passes it
 straight through, so the one path serves both a sync iterable and an async one.
+
+## D-293
+
+**A rejected `await`, and `generator.throw()`, resume the body with the throw at the suspension point.**
+
+Status: Accepted
+
+An `await` of a rejected promise, and `generator.throw(v)` on a suspended generator, used to settle the
+async result as rejected / finish the generator and throw at the caller — neither ran a `try`/`catch`
+*inside* the body (the D-249 caveat). Both now resume the body with the value thrown at the point it
+suspended, so an enclosing `catch` runs and the body continues from there.
+
+One flag carries it. The runtime sets `GEN_THROW` on the generator object before a resume that is a
+throw — `async_resume_call` on a rejected await, `generator_throw` on a `.throw()` — alongside the usual
+`GEN_SENT`. Each suspension point, on resume, reads and clears the flag; when it was set it raises the
+sent value through `propagate`, exactly as a `throw` statement does, so the body's own handler takes it
+(or, with none, it becomes the body's result). A normal resume reads the flag as absent and returns the
+sent value as before.
+
+`generator.throw()` on a generator that is finished, or not yet started (no `next` has run its body to a
+`yield`), has no suspension to resume: it completes the generator and throws at the caller, as the
+specification's completed/`suspendedStart` cases require. An uncaught throw — in either form — still
+propagates: the body finishes with the exception, which rejects the async result or re-throws out of
+`.throw()`. Verified across catch-and-continue, `finally`, a rejected `Promise.all`, a rethrow to an
+outer `try`, an `Error` object's `message`, and a loop that catches each turn — each under GC stress.
