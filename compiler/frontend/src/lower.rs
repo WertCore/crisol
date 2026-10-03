@@ -2670,6 +2670,9 @@ impl Lowering {
                 }
             }
             Statement::EmptyStatement(_) => {}
+            // `debugger;` is a breakpoint hint with no runtime effect — a no-op, like the empty
+            // statement above (D-285).
+            Statement::DebuggerStatement(_) => {}
             other => {
                 self.note(kind_of(other), 0);
             }

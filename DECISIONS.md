@@ -7759,3 +7759,13 @@ same way it already records `this_slot`, so the backend binds `incoming[2]` for 
 three-level chain carries the original target the whole way down. `super.m()` — a super *method*
 call, not a constructor call — is untouched; only the constructor `super()` forwards. This closes the
 last `new.target` gap D-279 filed.
+
+## D-285
+
+**The `debugger` statement lowers as a no-op.**
+
+Status: Accepted
+
+`debugger;` is a breakpoint hint with no runtime semantics, so it lowers to nothing — the same as the
+empty statement — rather than being refused as an unhandled statement. It appears in test262 files as
+an incidental no-op, and refusing it failed cases that have nothing to do with debugging.

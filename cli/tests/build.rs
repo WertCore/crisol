@@ -11940,3 +11940,14 @@ fn new_target_through_super() {
         "true",
     );
 }
+
+/// `debugger;` is a no-op — a breakpoint hint with no runtime effect (D-285).
+#[test]
+fn debugger_statement_is_a_noop() {
+    check("debugger-noop", "debugger; return 5;", "5");
+    check(
+        "debugger-between-statements",
+        "var x = 1; debugger; x = 2; return x;",
+        "2",
+    );
+}
