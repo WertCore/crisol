@@ -3001,14 +3001,33 @@ impl Lowering {
                             args.push(self.expression(expression));
                         }
                     }
-                    self.emit(
-                        Type::Unknown,
-                        Op::Call {
-                            callee,
-                            this_value,
-                            args,
-                        },
-                    )
+                    // `super(args)` forwards this frame's own `new.target`, so a base constructor
+                    // reached through it sees the derived class that was `new`ed rather than
+                    // `undefined` (D-284). Every other call passes the `undefined` a plain call does.
+                    if matches!(call.callee, Expression::Super(_)) {
+                        let new_target = match self.new_target_slot() {
+                            Some(slot) => self.read(slot),
+                            None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
+                        };
+                        self.emit(
+                            Type::Unknown,
+                            Op::SuperCall {
+                                callee,
+                                this_value,
+                                new_target,
+                                args,
+                            },
+                        )
+                    } else {
+                        self.emit(
+                            Type::Unknown,
+                            Op::Call {
+                                callee,
+                                this_value,
+                                args,
+                            },
+                        )
+                    }
                 };
                 self.propagate(result)
             }
@@ -5560,15 +5579,23 @@ impl Lowering {
         // initialises nothing.
         let this_slot = self.declare("this");
         self.functions[index].this_slot = Some(this_slot);
-        // `super()`: call the captured parent constructor with the `this` being built.
+        // `new.target` arrives the same way `this` does (incoming[2]); recorded so the backend
+        // binds it, and forwarded to the parent through `super` so a base constructor sees the
+        // derived class that was `new`ed (D-284).
+        let new_target_slot = self.declare(" newtarget");
+        self.functions[index].new_target_slot = Some(new_target_slot);
+        // `super()`: call the captured parent constructor with the `this` being built, passing on
+        // this frame's `new.target`.
         let super_slot = self.slot(" super");
         let super_ctor = self.read(super_slot);
         let this_value = self.read(this_slot);
+        let new_target = self.read(new_target_slot);
         let call = self.emit(
             Type::Unknown,
-            Op::Call {
+            Op::SuperCall {
                 callee: super_ctor,
                 this_value,
+                new_target,
                 args: Vec::new(),
             },
         );

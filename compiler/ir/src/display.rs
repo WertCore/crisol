@@ -98,6 +98,20 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
                 args.join(", ")
             )
         }
+        Op::SuperCall {
+            callee,
+            this_value,
+            new_target,
+            args,
+        } => {
+            let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+            write!(
+                f,
+                "super-call {callee}(this={this_value}, new.target={new_target}{}{})",
+                if args.is_empty() { "" } else { ", " },
+                args.join(", ")
+            )
+        }
         Op::CallSpread {
             callee,
             this_value,

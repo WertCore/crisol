@@ -11913,3 +11913,30 @@ fn yield_in_spread_call_argument() {
         "15",
     );
 }
+
+/// new.target flows through super() to a parent constructor — a base reached through a derived
+/// `new` sees the derived class, not undefined (D-284).
+#[test]
+fn new_target_through_super() {
+    check(
+        "new-target-parent-via-implicit-super",
+        "class A { constructor() { this.t = new.target === B; } } class B extends A {} return new B().t;",
+        "true",
+    );
+    check(
+        "new-target-parent-via-explicit-super",
+        "class A { constructor() { this.t = new.target; } } class B extends A { constructor() { super(); } } return new B().t === B;",
+        "true",
+    );
+    check(
+        "new-target-through-three-levels",
+        "class A { constructor() { this.t = new.target; } } class B extends A {} class C extends B {} return new C().t === C;",
+        "true",
+    );
+    // A base constructed directly still sees itself.
+    check(
+        "new-target-base-constructed-directly",
+        "class A { constructor() { this.t = new.target === A; } } return new A().t;",
+        "true",
+    );
+}

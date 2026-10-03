@@ -1767,6 +1767,20 @@ impl Lowering<'_> {
                 let undefined = self.undefined();
                 Some(self.call_through(callee, this_value, undefined, argc, argv))
             }
+            Op::SuperCall {
+                callee,
+                this_value,
+                new_target,
+                args,
+            } => {
+                let callee = self.value(*callee);
+                let this_value = self.value(*this_value);
+                // The explicit `new.target` this call forwards — the derived class reached `super`
+                // (D-284), rather than the `undefined` a plain call passes.
+                let new_target = self.value(*new_target);
+                let (argv, argc) = self.build_arguments(args);
+                Some(self.call_through(callee, this_value, new_target, argc, argv))
+            }
             Op::Construct { callee, args } => {
                 let callee = self.value(*callee);
                 // The receiver is allocated from `callee.prototype` before the constructor

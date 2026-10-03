@@ -355,6 +355,21 @@ pub enum Op {
         /// Its arguments.
         args: Vec<ValueId>,
     },
+    /// [`Op::Call`] that carries an explicit `new.target` — `super(args)` in a derived constructor.
+    /// A plain call forces `new.target` to `undefined`; a `super` call must pass on the one its own
+    /// frame received, so that a base constructor reached through `super()` sees the derived class
+    /// that was `new`ed rather than `undefined` (D-284). The receiver is the `this` being built, as
+    /// with any constructor call.
+    SuperCall {
+        /// The parent constructor.
+        callee: ValueId,
+        /// The receiver — the instance being constructed, shared down the chain.
+        this_value: ValueId,
+        /// The `new.target` to pass on: the current frame's own.
+        new_target: ValueId,
+        /// Its arguments.
+        args: Vec<ValueId>,
+    },
     /// Calls `callee` with `this_value` as the receiver and the elements of `arguments` (an
     /// array) spread as its arguments — `f(...xs)`. Separate from [`Op::Call`] (D-250) because the
     /// argument count is known only at runtime, so they arrive as one array the runtime unpacks
@@ -623,6 +638,7 @@ impl Op {
         matches!(
             self,
             Self::Call { .. }
+                | Self::SuperCall { .. }
                 | Self::CallSpread { .. }
                 // `+` reaches `ToPrimitive`, which calls `valueOf` or `toString` — user code,
                 // which can allocate. The other operators coerce primitives that already exist.
@@ -666,6 +682,16 @@ impl Op {
                 args,
             } => {
                 let mut all = vec![*callee, *this_value];
+                all.extend(args);
+                all
+            }
+            Self::SuperCall {
+                callee,
+                this_value,
+                new_target,
+                args,
+            } => {
+                let mut all = vec![*callee, *this_value, *new_target];
                 all.extend(args);
                 all
             }

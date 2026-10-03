@@ -7742,3 +7742,20 @@ locals, extends the array one argument at a time reloading it around each `yield
 array literal does (D-277) — and reads all three back before `CallSpread`. With this every place a
 `yield` or `await` can appear in an expression lowers; the corpus's refusal test no longer has a
 `yield` case to name.
+
+## D-284
+
+**`new.target` flows through `super()` to a parent constructor.**
+
+Status: Accepted
+
+D-279 left one position wrong: `new.target` in a *parent* constructor reached through `super()` read
+`undefined` rather than the derived class that was `new`ed, because `super()` lowered to a plain call
+and a plain call forces `new.target` to `undefined`. There is now an `Op::SuperCall` — a call that
+carries an explicit `new.target` — which `super(args)` and the implicit derived constructor emit,
+passing on the frame's own `new.target` (the derived constructor's `incoming[2]`). The implicit
+derived constructor, which `new B()` runs when `B` has no explicit one, gains a `new_target_slot` the
+same way it already records `this_slot`, so the backend binds `incoming[2]` for it to forward. A
+three-level chain carries the original target the whole way down. `super.m()` — a super *method*
+call, not a constructor call — is untouched; only the constructor `super()` forwards. This closes the
+last `new.target` gap D-279 filed.
