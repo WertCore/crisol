@@ -12031,3 +12031,29 @@ fn slice_and_concat_preserve_holes() {
         "1,2,3,4,5",
     );
 }
+
+/// The `print` global writes to stdout, and — through it — an awaited value settling in the
+/// microtask drain is observable, which is how async results are checked at all (D-288).
+#[test]
+fn print_and_async_values() {
+    check("print-string", "print('hello'); return 5;", "hello\n5");
+    check("print-number", "print(1 + 2); return 0;", "3\n0");
+    check("print-boolean", "print(1 < 2); return 0;", "true\n0");
+    // An awaited value prints from the drain, which runs before the entry point prints the result.
+    check(
+        "await-value-prints",
+        "async function f() { print(await Promise.resolve(42)); } f(); return 0;",
+        "42\n0",
+    );
+    check(
+        "await-chain-prints",
+        "async function f() { var x = await Promise.resolve(10); print(x + 5); } f(); return 0;",
+        "15\n0",
+    );
+    // The test262 async protocol end to end: an async body awaits and signals completion.
+    check(
+        "test262-async-done-protocol",
+        "function $DONE(e) { print(e ? 'FAIL' : 'Test262:AsyncTestComplete'); } async function t() { await Promise.resolve(1); $DONE(); } t(); return 0;",
+        "Test262:AsyncTestComplete\n0",
+    );
+}

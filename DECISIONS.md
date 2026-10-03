@@ -7804,3 +7804,23 @@ element instead of `undefined`, and `array_of_values` turns that marker back int
 `[1, , 3].slice()` and `[1, , 3].concat([4])` stay sparse. A dense array copies dense, and spread
 still densifies — correctly, because iteration visits a hole as `undefined` by specification. With
 this the array-hole model matches the specification in every operation; no deviation remains.
+
+## D-288
+
+**A `print` global, and the test262 runner runs async cases.**
+
+Status: Accepted
+
+The runner skipped every `async`-flagged case — yet async/await (D-249), async generators (D-267),
+and await-in-expression (D-276/281) were all built. Two things let those run and count. First, a
+`print` global: `doneprintHandle.js`'s `$DONE` calls `print`, which crisol did not have; it now maps
+to the same `ToString`-to-stdout the entry point's result print uses. Second, the runner no longer
+skips `async` — it assembles the case (the harness `includes`, `$DONE` among them, already prepend),
+builds it, runs it, and — because the entry point drains the microtask queue before exiting — reads
+the marker `$DONE` printed: passed iff `Test262:AsyncTestComplete` appears, failed on a
+`Test262:AsyncTestFailure` or no marker at all.
+
+`print` also made async *values* checkable for the first time: an awaited result settles in the drain,
+which no synchronous return could observe, so D-249's "values left to CI" caveat is now covered by
+local acceptance tests (`await Promise.resolve(42)` prints `42`). The module runner stays skipped
+until the module pipeline lands.

@@ -138,15 +138,16 @@ fn run_with_timeout(binary: &Path) -> std::io::Result<std::process::Output> {
 
 fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcome> {
     let metadata = parse(&std::fs::read_to_string(case).ok()?)?;
-    // Module and async cases need machinery no part of this pipeline has; counting them as
-    // refusals would inflate the refusal reasons with something never attempted.
-    if metadata
-        .flags
-        .iter()
-        .any(|flag| flag == "module" || flag == "async")
-    {
+    // A module case needs the module pipeline, which this runner does not drive yet; counting one
+    // as a refusal would inflate the reasons with something never attempted.
+    if metadata.flags.iter().any(|flag| flag == "module") {
         return None;
     }
+    // An **async** case runs now: its `doneprintHandle.js` include defines `$DONE`, which calls the
+    // `print` global (D-288), and the entry point drains the microtask queue before exiting — so the
+    // awaited work finishes and `$DONE` prints a completion or failure marker that `run_with_timeout`
+    // below reads. The protocol is "passed iff `Test262:AsyncTestComplete` was printed".
+    let is_async = metadata.flags.iter().any(|flag| flag == "async");
     let source = assemble(root, case, &metadata)?;
 
     let directory = work.join(format!("case{index}"));
@@ -159,6 +160,17 @@ fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcom
     let outcome = match crisol::build::build(&file, &binary, &runtime_archive()?) {
         Err(error) => Outcome::Refused(stage_of(&error)),
         Ok(()) => match run_with_timeout(&binary) {
+            // An async case passes only if `$DONE` printed the completion marker — exiting cleanly
+            // is not enough, since a case that scheduled nothing, or whose `$DONE(error)` reported a
+            // failure, also exits 0. A failure marker, or no marker at all, is a failed assertion.
+            Ok(output) if is_async => {
+                let out = String::from_utf8_lossy(&output.stdout);
+                if out.contains("Test262:AsyncTestComplete") {
+                    Outcome::Ran
+                } else {
+                    Outcome::Failed(async_reason(&out))
+                }
+            }
             Ok(output) if output.status.success() => Outcome::Ran,
             // Exit 1 is the entry point reporting an uncaught throw, which is exactly how a
             // case signals a failed assertion. Anything else — a signal, a panic — is ours.
@@ -215,6 +227,34 @@ fn thrown_reason(stderr: &str) -> String {
         .join(" ");
     if shape.is_empty() {
         trimmed.chars().take(60).collect()
+    } else {
+        shape
+    }
+}
+
+/// Why an async case failed, reduced to something worth counting. `$DONE(error)` prints
+/// `Test262:AsyncTestFailure:<error>`; no marker at all means it never completed — a scheduled
+/// continuation that threw, an `await` that never settled, or a `$DONE` never reached.
+fn async_reason(stdout: &str) -> String {
+    let Some(line) = stdout
+        .lines()
+        .find(|line| line.contains("Test262:AsyncTestFailure"))
+    else {
+        return "async did not complete".to_owned();
+    };
+    let after = line
+        .split("AsyncTestFailure:")
+        .nth(1)
+        .unwrap_or(line)
+        .trim()
+        .trim_start_matches("Test262Error: ");
+    let shape: String = after
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if shape.is_empty() {
+        "async failure".to_owned()
     } else {
         shape
     }

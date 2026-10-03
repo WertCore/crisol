@@ -1767,6 +1767,7 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("parseFloat", global_parse_float),
     ("isNaN", global_is_nan),
     ("isFinite", global_is_finite),
+    ("print", global_print),
     ("RegExp", make_regexp),
     ("Date", make_date_object),
     ("Map", make_map),
@@ -6050,6 +6051,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("global", "isNaN", 1),
     ("global", "parseFloat", 1),
     ("global", "parseInt", 2),
+    ("global", "print", 1),
     ("Array", "from", 1),
     ("Array", "isArray", 1),
     ("Array", "of", 0),
@@ -9055,6 +9057,23 @@ extern "C" fn global_is_nan(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = to_number(unsafe { argument(argc, argv, 0) });
     boolean(value.is_nan()).to_bits()
+}
+
+/// `print(value)` — writes `value` to stdout, the host hook test262's async harness
+/// (`doneprintHandle.js`) calls through `$DONE` to report completion, and a program uses to emit a
+/// result the way the final value is printed (D-288). The same `ToString` the entry point's print
+/// uses, so the two agree.
+extern "C" fn global_print(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    crisol_print(value);
+    Value::UNDEFINED.to_bits()
 }
 
 /// `isFinite(value)` — **coerces first**, unlike `Number.isFinite`.
