@@ -7728,3 +7728,17 @@ Two deviations remain, noted not hidden: `new Array(n)` fills `n` `undefined`s r
 `concat`, and spread *densify* a hole to `undefined` rather than preserving it. Both are graceful
 wrong answers in a corner, not crashes, and the common holes — literal, sparse, and the method
 semantics above — are right.
+
+## D-283
+
+**`yield`/`await` as the source of a spread call argument — the last expression position.**
+
+Status: Accepted
+
+`f(...(yield xs))`, and a `yield` in any argument beside a spread, were the one expression position
+still refused after D-281. The spread call gathers its arguments into an array through its own loop;
+it now, when an argument can suspend, spills the callee, the receiver, and that array into generator
+locals, extends the array one argument at a time reloading it around each `yield` — exactly as the
+array literal does (D-277) — and reads all three back before `CallSpread`. With this every place a
+`yield` or `await` can appear in an expression lowers; the corpus's refusal test no longer has a
+`yield` case to name.

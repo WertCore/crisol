@@ -11892,3 +11892,24 @@ fn array_holes() {
         "true,2,1",
     );
 }
+
+/// `yield` as the source of a spread call argument, and beside other spread/plain arguments — the
+/// last expression position, the gathered array spilled across the suspension (D-283).
+#[test]
+fn yield_in_spread_call_argument() {
+    check(
+        "yield-as-spread-source",
+        "function sum(a, b, c) { return a + b + c; } function* g() { return sum(...(yield 0)); } var it = g(); it.next(); return it.next([1, 2, 3]).value;",
+        "6",
+    );
+    check(
+        "yield-mixed-with-spread",
+        "function f(a, b, c) { return a * 100 + b * 10 + c; } function* g() { return f(yield 1, ...(yield 2)); } var it = g(); it.next(); it.next(7); return it.next([8, 9]).value;",
+        "789",
+    );
+    check(
+        "yield-after-spread",
+        "function f(a, b) { return a + b; } function* g() { return f(...[10], yield 2); } var it = g(); it.next(); return it.next(5).value;",
+        "15",
+    );
+}

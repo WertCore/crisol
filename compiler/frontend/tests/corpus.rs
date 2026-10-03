@@ -344,16 +344,11 @@ fn unfaithful_programs_are_reported_not_guessed() {
             "class C { static { } }",
             "class member that is not a method",
         ),
-        // `yield` as a call argument, a binary operand, a conditional or logical branch, an array
-        // element, an object value, or a `new` argument all lower now — the live operands are
-        // spilled across the suspension (D-276/277/281). As the source of a **spread** call
-        // argument (`f(...(yield xs))`) it does not: that path gathers into an array through its own
-        // loop, which does not spill yet, so it is refused rather than losing the gather across the
-        // resume.
-        (
-            "function* g() { f(...(yield 1)); }",
-            "yield in expression position",
-        ),
+        // `yield` in every expression position lowers now — call and spread-call arguments, binary
+        // operands, conditional and logical branches, array elements, object values, computed keys,
+        // and `new` arguments, each spilling its live operands across the suspension (D-276 through
+        // D-283). So no `yield` case is here any more; a static block remains the stand-in for a
+        // construct genuinely still refused.
     ];
 
     for (source, expected) in cases {

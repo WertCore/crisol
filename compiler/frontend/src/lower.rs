@@ -2897,6 +2897,67 @@ impl Lowering {
                     );
                     return self.propagate(result);
                 }
+                // A `yield` in a *spread* call's arguments — the source `f(...(yield xs))` or a
+                // plain argument beside a spread — keeps the callee, the receiver, and the array
+                // being gathered alive across the suspension, each spilled to a generator local and
+                // read back (D-283). The array is extended one argument at a time, reloaded around
+                // each `yield`, exactly as the array literal does (D-277).
+                if spread
+                    && self.scope().generator.is_some()
+                    && call.arguments.iter().any(|argument| match argument {
+                        oxc_ast::ast::Argument::SpreadElement(element) => {
+                            self.expression_may_yield(&element.argument)
+                        }
+                        other => other
+                            .as_expression()
+                            .is_some_and(|expression| self.expression_may_yield(expression)),
+                    })
+                {
+                    let callee_slot = self.spill(callee);
+                    let this_slot = self.spill(this_value);
+                    let array = self.emit(
+                        Type::Object(None),
+                        Op::CreateArray {
+                            elements: Vec::new(),
+                        },
+                    );
+                    let array_slot = self.spill(array);
+                    for argument in &call.arguments {
+                        if let oxc_ast::ast::Argument::SpreadElement(element) = argument {
+                            let value = self.value_expression(&element.argument);
+                            let array = self.reload(array_slot);
+                            let extended = self.emit(
+                                Type::Undefined,
+                                Op::ArrayExtend {
+                                    array,
+                                    value,
+                                    spread: true,
+                                },
+                            );
+                            self.propagate(extended);
+                        } else if let Some(expression) = argument.as_expression() {
+                            let value = self.value_expression(expression);
+                            let array = self.reload(array_slot);
+                            self.emit_effect(Op::ArrayExtend {
+                                array,
+                                value,
+                                spread: false,
+                            });
+                        }
+                    }
+                    let callee = self.reload(callee_slot);
+                    let this_value = self.reload(this_slot);
+                    let array = self.reload(array_slot);
+                    let result = self.emit(
+                        Type::Unknown,
+                        Op::CallSpread {
+                            callee,
+                            this_value,
+                            arguments: array,
+                        },
+                    );
+                    return self.propagate(result);
+                }
                 let result = if spread {
                     let array = self.emit(
                         Type::Object(None),
