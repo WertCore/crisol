@@ -61,6 +61,11 @@ pub enum BuildError {
         /// What the linker said.
         message: String,
     },
+    /// A module graph could not be resolved or parsed (D-294).
+    Module {
+        /// What went wrong.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -85,6 +90,7 @@ impl std::fmt::Display for BuildError {
             }
             Self::Codegen { message } => write!(f, "cannot generate code: {message}"),
             Self::Link { message } => write!(f, "cannot link: {message}"),
+            Self::Module { message } => write!(f, "cannot build the module graph: {message}"),
         }
     }
 }
@@ -107,6 +113,34 @@ pub fn build(source: &Path, output: &Path, runtime: &Path) -> Result<(), BuildEr
             messages: error.errors,
         })?;
 
+    compile_and_link(&lowered, output, runtime, true)
+}
+
+/// Compiles an ES module and everything it statically imports to a native executable at `output`
+/// (D-294). The whole graph lowers to one program — a driver that runs each module in dependency
+/// order — so code generation and linking are exactly the single-file path's.
+///
+/// # Errors
+///
+/// [`BuildError`], naming the stage that stopped.
+pub fn build_modules(entry: &Path, output: &Path, runtime: &Path) -> Result<(), BuildError> {
+    let lowered = crisol_frontend::lower_modules(entry).map_err(|error| BuildError::Module {
+        message: error.to_string(),
+    })?;
+    // A module program has no completion value — the driver returns `undefined` — so the entry does not
+    // print its result, only drains the microtask queue (an async module settles there).
+    compile_and_link(&lowered, output, runtime, false)
+}
+
+/// Verifies, generates code for, and links a lowered program — shared by the single-file and module
+/// paths, which differ only in how they produce the [`crisol_frontend::Lowered`] and whether the
+/// entry prints the program's result (a script's last value; a module has none).
+fn compile_and_link(
+    lowered: &crisol_frontend::Lowered,
+    output: &Path,
+    runtime: &Path,
+    print_result: bool,
+) -> Result<(), BuildError> {
     if !lowered.is_faithful() {
         // Refused rather than compiled, because a program that silently omits what the
         // compiler did not understand is worse than one that does not build (D-59).
@@ -141,7 +175,7 @@ pub fn build(source: &Path, output: &Path, runtime: &Path) -> Result<(), BuildEr
         message: error.to_string(),
     })?;
 
-    link(&object, output, runtime)
+    link(&object, output, runtime, print_result)
 }
 
 /// The triple this build is running on.
@@ -158,7 +192,12 @@ const fn host_triple() -> &'static str {
 }
 
 /// Links the object, a C entry point and the runtime into an executable.
-fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> {
+fn link(
+    object: &[u8],
+    output: &Path,
+    runtime: &Path,
+    print_result: bool,
+) -> Result<(), BuildError> {
     let directory = output.parent().unwrap_or(Path::new(".")).to_path_buf();
     let object_path = directory.join("crisol-program.o");
     let entry_path = directory.join("crisol-entry.c");
@@ -216,12 +255,19 @@ fn link(object: &[u8], output: &Path, runtime: &Path) -> Result<(), BuildError> 
                      crisol_report_uncaught();\n\
                      return 1;\n\
                  }}\n\
-                 crisol_print(result);\n\
+                 {print}\
                  return 0;\n\
              }}\n",
             undefined = crisol_value::Value::UNDEFINED.to_bits(),
             slots = crisol_codegen::ARGV_MIN_SLOTS,
             exception = crisol_value::Value::EXCEPTION.to_bits(),
+            // A script prints its completion value; a module has none (its driver returns `undefined`),
+            // so it only drains and checks for an uncaught throw (D-294).
+            print = if print_result {
+                "crisol_print(result);\n                 "
+            } else {
+                ""
+            },
         ),
     )
     .map_err(|error| BuildError::Link {

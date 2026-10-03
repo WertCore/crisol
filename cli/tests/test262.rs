@@ -296,6 +296,7 @@ fn stage_of(error: &crisol::build::BuildError) -> String {
             format!("codegen: {reason}")
         }
         crisol::build::BuildError::Unreadable { .. } => "unreadable".to_owned(),
+        crisol::build::BuildError::Module { .. } => "module graph".to_owned(),
     }
 }
 

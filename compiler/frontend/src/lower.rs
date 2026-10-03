@@ -119,6 +119,307 @@ pub fn lower(name: &str, source: &str) -> Result<Lowered, ParseFailed> {
     Ok(lowering.finish())
 }
 
+/// What went wrong resolving or parsing a module graph (D-294).
+#[derive(Debug)]
+pub enum ModuleError {
+    /// A file could not be read or canonicalised.
+    Io(String, String),
+    /// A module did not parse.
+    Parse {
+        /// The file.
+        path: String,
+        /// What the parser said.
+        errors: Vec<String>,
+    },
+    /// An `import`/`export … from` specifier did not resolve to a file.
+    Unresolved {
+        /// The file that asked.
+        importer: String,
+        /// What it asked for.
+        specifier: String,
+        /// Why it did not resolve.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(path, message) => write!(f, "{path}: {message}"),
+            Self::Parse { path, errors } => {
+                write!(f, "{path} did not parse:\n  {}", errors.join("\n  "))
+            }
+            Self::Unresolved {
+                importer,
+                specifier,
+                reason,
+            } => write!(
+                f,
+                "{importer} imports {specifier:?}, which did not resolve: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModuleError {}
+
+/// Lowers an ES module and everything it statically imports into one program (D-294).
+///
+/// Every module in the graph becomes an *init* function; the synthetic entry (`crisol_program`,
+/// function 0) builds a registry — one exports object per module — and calls each init in dependency
+/// order, passing the registry. Imports read from it, exports write into it. Every module lowers into
+/// one pass, so their `FunctionId`s are already sequential and nothing renumbers closures.
+///
+/// # Errors
+///
+/// When the entry or a reachable module cannot be read, parsed, or when a specifier does not resolve.
+pub fn lower_modules(entry: &std::path::Path) -> Result<Lowered, ModuleError> {
+    use std::path::{Path, PathBuf};
+
+    let entry = entry
+        .canonicalize()
+        .map_err(|error| ModuleError::Io(entry.display().to_string(), error.to_string()))?;
+
+    // Discover the graph breadth-first, giving each module a stable index. Processing indices in order
+    // and only ever appending new ones keeps `sources`/`spec_maps`/`edges` aligned with `paths`.
+    let mut index_of: HashMap<PathBuf, u32> = HashMap::new();
+    let mut paths: Vec<PathBuf> = vec![entry.clone()];
+    index_of.insert(entry, 0);
+    let mut sources: Vec<String> = Vec::new();
+    let mut spec_maps: Vec<HashMap<String, u32>> = Vec::new();
+    let mut edges: Vec<Vec<u32>> = Vec::new();
+
+    let mut head = 0;
+    while head < paths.len() {
+        let path = paths[head].clone();
+        let source = std::fs::read_to_string(&path)
+            .map_err(|error| ModuleError::Io(path.display().to_string(), error.to_string()))?;
+        let directory = path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let mut map = HashMap::new();
+        let mut deps = Vec::new();
+        for specifier in module_specifiers(&source).map_err(|errors| ModuleError::Parse {
+            path: path.display().to_string(),
+            errors,
+        })? {
+            let resolved = directory.join(&specifier).canonicalize().map_err(|error| {
+                ModuleError::Unresolved {
+                    importer: path.display().to_string(),
+                    specifier: specifier.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let index = *index_of.entry(resolved.clone()).or_insert_with(|| {
+                let next = u32::try_from(paths.len()).unwrap_or(u32::MAX);
+                paths.push(resolved);
+                next
+            });
+            map.insert(specifier, index);
+            if !deps.contains(&index) {
+                deps.push(index);
+            }
+        }
+        sources.push(source);
+        spec_maps.push(map);
+        edges.push(deps);
+        head += 1;
+    }
+
+    // Post-order over the edges from the entry: a module's dependencies come before it, which is the
+    // order they must be evaluated in. Iterative, since a deep import chain should not overflow.
+    let mut order = Vec::with_capacity(paths.len());
+    let mut visited = vec![false; paths.len()];
+    let mut stack = vec![(0_u32, 0_usize)];
+    visited[0] = true;
+    while let Some((module, next)) = stack.pop() {
+        let children = &edges[module as usize];
+        if next < children.len() {
+            stack.push((module, next + 1));
+            let child = children[next];
+            if !visited[child as usize] {
+                visited[child as usize] = true;
+                stack.push((child, 0));
+            }
+        } else {
+            order.push(module);
+        }
+    }
+
+    // Lower every module into one lowering (function 0 reserved for the driver), then build the driver.
+    let mut lowering = Lowering::new("crisol_program");
+    let mut init_ids = Vec::with_capacity(paths.len());
+    for index in 0..paths.len() {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, &sources[index], SourceType::mjs()).parse();
+        if !parsed.diagnostics.is_empty() {
+            return Err(ModuleError::Parse {
+                path: paths[index].display().to_string(),
+                errors: parsed.diagnostics.iter().map(ToString::to_string).collect(),
+            });
+        }
+        lowering.shared = crate::escape::shared_variables(&parsed.program);
+        let name = format!("crisol_module_{index}");
+        let id = lowering.lower_module(
+            &name,
+            &parsed.program,
+            u32::try_from(index).unwrap_or(u32::MAX),
+            &spec_maps[index],
+        );
+        init_ids.push(id);
+    }
+    lowering.build_module_driver(&init_ids, &order);
+    Ok(lowering.finish())
+}
+
+/// The module specifiers an ES module statically names — every `import` and `export … from`. Parsed as
+/// a module, so `import`/`export` are syntax rather than errors; the order does not matter, only the set.
+fn module_specifiers(source: &str) -> Result<Vec<String>, Vec<String>> {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+    if !parsed.diagnostics.is_empty() {
+        return Err(parsed.diagnostics.iter().map(ToString::to_string).collect());
+    }
+    Ok(parsed
+        .module_record
+        .requested_modules
+        .keys()
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// One name a module exports, and where its value comes from (D-294).
+enum ExportEntry {
+    /// `export const x` / `export { x }` / `export { x as y }` — a local binding, under its export name.
+    Local { exported: String, local: String },
+    /// `export { x as y } from 'm'` — module `from`'s export `imported`, under `exported`.
+    Reexport {
+        exported: String,
+        from: u32,
+        imported: String,
+    },
+    /// `export * as ns from 'm'` — module `from`'s whole exports object, under `exported`.
+    ReexportNamespace { exported: String, from: u32 },
+    /// `export * from 'm'` — every own export of module `from` (except `default`, by spec).
+    Star { from: u32 },
+}
+
+/// Collects every name a module body exports, ahead of lowering, so each can be snapshot at the end.
+fn collect_exports(
+    statements: &[Statement<'_>],
+    specifiers: &HashMap<String, u32>,
+) -> Vec<ExportEntry> {
+    let mut exports = Vec::new();
+    for statement in statements {
+        match statement {
+            // `export const x = …` / `export function f …` / `export class C …`.
+            Statement::ExportDeclaration(declaration) => {
+                for name in declaration_names(&declaration.declaration) {
+                    exports.push(ExportEntry::Local {
+                        exported: name.clone(),
+                        local: name,
+                    });
+                }
+            }
+            // `export { a, b as c }` — local bindings under their export names.
+            Statement::ExportNamedDeclaration(declaration) => {
+                for specifier in &declaration.specifiers {
+                    exports.push(ExportEntry::Local {
+                        exported: module_export_name(&specifier.exported),
+                        local: module_export_name(&specifier.local),
+                    });
+                }
+            }
+            // `export { x as y } from 'm'` — re-export another module's binding.
+            Statement::ExportFromDeclaration(declaration) => {
+                if let Some(&from) = specifiers.get(declaration.source.value.as_str()) {
+                    for specifier in &declaration.specifiers {
+                        exports.push(ExportEntry::Reexport {
+                            exported: module_export_name(&specifier.exported),
+                            from,
+                            imported: module_export_name(&specifier.local),
+                        });
+                    }
+                }
+            }
+            // `export * from 'm'` / `export * as ns from 'm'`.
+            Statement::ExportAllDeclaration(declaration) => {
+                if let Some(&from) = specifiers.get(declaration.source.value.as_str()) {
+                    match &declaration.exported {
+                        Some(exported) => exports.push(ExportEntry::ReexportNamespace {
+                            exported: module_export_name(exported),
+                            from,
+                        }),
+                        None => exports.push(ExportEntry::Star { from }),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    exports
+}
+
+/// The names a declaration binds — every declarator of a `var`/`let`/`const`, or a function/class name.
+fn declaration_names(declaration: &oxc_ast::ast::Declaration<'_>) -> Vec<String> {
+    use oxc_ast::ast::Declaration as D;
+    let mut names = Vec::new();
+    match declaration {
+        D::VariableDeclaration(variable) => {
+            for declarator in &variable.declarations {
+                pattern_names(&declarator.id, &mut names);
+            }
+        }
+        D::FunctionDeclaration(function) => {
+            if let Some(id) = &function.id {
+                names.push(id.name.to_string());
+            }
+        }
+        D::ClassDeclaration(class) => {
+            if let Some(id) = &class.id {
+                names.push(id.name.to_string());
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
+/// Every name a binding pattern introduces — an identifier, or each binding of a destructuring one.
+fn pattern_names(pattern: &oxc_ast::ast::BindingPattern<'_>, into: &mut Vec<String>) {
+    use oxc_ast::ast::BindingPattern as P;
+    match pattern {
+        P::BindingIdentifier(identifier) => into.push(identifier.name.to_string()),
+        P::AssignmentPattern(assignment) => pattern_names(&assignment.left, into),
+        P::ObjectPattern(object) => {
+            for property in &object.properties {
+                pattern_names(&property.value, into);
+            }
+            if let Some(rest) = &object.rest {
+                pattern_names(&rest.argument, into);
+            }
+        }
+        P::ArrayPattern(array) => {
+            for element in array.elements.iter().flatten() {
+                pattern_names(element, into);
+            }
+            if let Some(rest) = &array.rest {
+                pattern_names(&rest.argument, into);
+            }
+        }
+    }
+}
+
+/// A `ModuleExportName` as a string — an identifier or a string-literal export name.
+fn module_export_name(name: &oxc_ast::ast::ModuleExportName<'_>) -> String {
+    use oxc_ast::ast::ModuleExportName as N;
+    match name {
+        N::IdentifierName(identifier) => identifier.name.to_string(),
+        N::IdentifierReference(identifier) => identifier.name.to_string(),
+        N::StringLiteral(literal) => literal.value.to_string(),
+    }
+}
+
 /// One function being lowered.
 struct Scope {
     /// Index into [`Lowering::functions`].
@@ -284,7 +585,32 @@ struct Lowering {
     /// Hands out distinct names for the generator-local slots a `yield` in expression position
     /// spills its live operands into (D-276). Module-wide, so two generators never collide.
     spill_counter: u32,
+    /// Set while lowering an ES module's body (D-294): this module's index into the registry, used to
+    /// store its exports. `None` for a script, where `export` is a syntax error the parser already
+    /// rejected.
+    module_index: Option<u32>,
+    /// The bindings this module imports, by local name. Each read of the name becomes a load from the
+    /// exporting module's slot in the registry rather than a variable or global (D-294). Lowering-wide
+    /// (not per-scope) so a nested function in the module sees the same imports; cleared between
+    /// modules.
+    module_imports: HashMap<String, ModuleImport>,
 }
+
+/// What a local name bound by an `import` refers to in another module (D-294).
+#[derive(Clone)]
+enum ModuleImport {
+    /// `import { x } from 'm'` / `import { y as x } from 'm'` — the module's index and the exported name.
+    Named(u32, String),
+    /// `import x from 'm'` — the module's `default` export.
+    Default(u32),
+    /// `import * as x from 'm'` — the module's whole exports object.
+    Namespace(u32),
+}
+
+/// The grammar-illegal name the module registry is bound under, so a module body and any nested
+/// function in it reach it by ordinary capture. A module init takes it as its one parameter; the
+/// driver passes the same object to every module (D-294).
+const MODULE_REGISTRY: &str = " registry";
 
 /// The property a cell keeps its value in.
 ///
@@ -344,6 +670,8 @@ impl Lowering {
                 labels: Vec::new(),
             }],
             unsupported: Vec::new(),
+            module_index: None,
+            module_imports: HashMap::new(),
         };
         // The program is a function body, so it has a `this` — `undefined` in a module, the
         // global object in a script. Binding it here means a top-level arrow captures it
@@ -361,6 +689,376 @@ impl Lowering {
             functions: self.functions,
             unsupported: self.unsupported,
         }
+    }
+
+    // ============================== ES modules (D-294) ==============================
+    //
+    // A module graph compiles to one program: each module's body becomes an *init* function, and the
+    // synthetic entry (`crisol_program`, function 0) builds a shared registry object — one slot per
+    // module, holding that module's exports — then calls each init in dependency order, passing the
+    // registry. An init reads its imports from the registry and writes its exports into its own slot.
+    // Lowering every module into one `Lowering` means their `FunctionId`s are already sequential, so
+    // nothing has to renumber closures across modules.
+
+    /// `registry[index]` — module `index`'s exports object. The registry is the init's one parameter,
+    /// read by name so a nested function in the module captures it rather than needing it threaded.
+    fn module_slot(&mut self, index: u32) -> ValueId {
+        let registry_slot = self.slot(MODULE_REGISTRY);
+        let registry = self.read(registry_slot);
+        let key = self.emit(Type::Number, Op::Const(Constant::Number(f64::from(index))));
+        self.emit(
+            Type::Object(None),
+            Op::ComputedLoad {
+                object: registry,
+                key,
+            },
+        )
+    }
+
+    /// If `name` is a binding this module imported, the value it reads now — a live load from the
+    /// exporting module's exports object (D-294).
+    fn module_import_read(&mut self, name: &str) -> Option<ValueId> {
+        let import = self.module_imports.get(name).cloned()?;
+        let value = match import {
+            ModuleImport::Namespace(index) => self.module_slot(index),
+            ModuleImport::Default(index) => {
+                let exports = self.module_slot(index);
+                self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object: exports,
+                        key: PropertyKey::new("default"),
+                    },
+                )
+            }
+            ModuleImport::Named(index, export) => {
+                let exports = self.module_slot(index);
+                self.emit(
+                    Type::Unknown,
+                    Op::PropertyLoad {
+                        object: exports,
+                        key: PropertyKey::new(&export),
+                    },
+                )
+            }
+        };
+        Some(value)
+    }
+
+    /// Reads a binding by name as an expression would — an import through the registry, otherwise a
+    /// local slot. Used to snapshot an exported local into the exports object.
+    fn read_binding(&mut self, name: &str) -> ValueId {
+        if let Some(value) = self.module_import_read(name) {
+            return value;
+        }
+        let slot = self.slot(name);
+        self.read(slot)
+    }
+
+    /// `registry[module_index].name = value` — records one export (D-294).
+    fn store_export(&mut self, name: &str, value: ValueId) {
+        let index = self.module_index.expect("only while lowering a module");
+        let exports = self.module_slot(index);
+        self.emit_effect(Op::PropertyStore {
+            object: exports,
+            key: PropertyKey::new(name),
+            value,
+        });
+    }
+
+    /// Lowers one module's body into its init function and returns that function's id (D-294).
+    /// `index` is its registry slot; `specifiers` maps each module specifier it names to that module's
+    /// index. The init takes the registry as its one parameter and binds `this` to `undefined`.
+    fn lower_module(
+        &mut self,
+        name: &str,
+        program: &Program<'_>,
+        index: u32,
+        specifiers: &HashMap<String, u32>,
+    ) -> FunctionId {
+        let fidx = self.functions.len();
+        let mut function = Function::new(name);
+        function.id = FunctionId(u32::try_from(fidx).unwrap_or(u32::MAX));
+        let entry = function.entry;
+        self.functions.push(function);
+        self.scopes.push(Scope {
+            function: fidx,
+            current: entry,
+            terminated: false,
+            slots: HashMap::new(),
+            next_slot: 0,
+            captures: Vec::new(),
+            cells: std::collections::HashSet::new(),
+            breaks: Vec::new(),
+            handlers: Vec::new(),
+            continues: Vec::new(),
+            generator: None,
+            value_types: Vec::new(),
+            finalizers: Vec::new(),
+            labels: Vec::new(),
+        });
+        // `this` is slot 0 and `undefined` in a module — the driver calls the init with no `this`.
+        let this_slot = self.declare("this");
+        self.functions[fidx].this_slot = Some(this_slot);
+        self.binds_new_target.push(fidx);
+        // The registry is the single parameter; the driver passes the same object to every init.
+        let registry_slot = self.declare(MODULE_REGISTRY);
+        self.functions[fidx].parameters = vec![registry_slot];
+
+        let previous_index = self.module_index.replace(index);
+        let previous_imports = std::mem::take(&mut self.module_imports);
+        // Register every import first: a statement above an `import`'s own line may still read the name.
+        for statement in &program.body {
+            if let Statement::ImportDeclaration(declaration) = statement {
+                self.register_imports(declaration, specifiers);
+            }
+        }
+        let exports = collect_exports(&program.body, specifiers);
+        self.hoist(&program.body);
+        for statement in &program.body {
+            self.module_statement(statement);
+        }
+        // Snapshot each export after the body runs. **Deviation (D-294): bindings are snapshot, not
+        // live** — an importer runs after this module in dependency order so it sees the final value;
+        // only a mutation observed across modules after the fact would differ.
+        for entry in &exports {
+            match entry {
+                ExportEntry::Local { exported, local } => {
+                    let value = self.read_binding(local);
+                    self.store_export(exported, value);
+                }
+                ExportEntry::Reexport {
+                    exported,
+                    from,
+                    imported,
+                } => {
+                    let source = self.module_slot(*from);
+                    let value = self.emit(
+                        Type::Unknown,
+                        Op::PropertyLoad {
+                            object: source,
+                            key: PropertyKey::new(imported),
+                        },
+                    );
+                    self.store_export(exported, value);
+                }
+                ExportEntry::ReexportNamespace { exported, from } => {
+                    let namespace = self.module_slot(*from);
+                    self.store_export(exported, namespace);
+                }
+                ExportEntry::Star { from } => {
+                    let own = self.module_slot(index);
+                    let source = self.module_slot(*from);
+                    self.emit_effect(Op::ObjectExtend {
+                        object: own,
+                        source,
+                    });
+                }
+            }
+        }
+        if !self.scope().terminated {
+            self.terminate(Terminator::Return(None));
+        }
+        self.binds_new_target.pop();
+        self.module_index = previous_index;
+        self.module_imports = previous_imports;
+        let scope = self.scopes.pop().expect("just pushed");
+        let slots: Vec<u32> = scope.captures.iter().map(|(_, slot)| *slot).collect();
+        self.functions[fidx].captures = slots;
+        FunctionId(u32::try_from(fidx).unwrap_or(u32::MAX))
+    }
+
+    /// One statement of a module body: `import` is a no-op (registered already), an `export` lowers its
+    /// payload (its names are snapshot at the module's end), and everything else lowers normally.
+    fn module_statement(&mut self, statement: &Statement<'_>) {
+        match statement {
+            // Bind nothing to run now — their names are snapshot, or their namespaces copied, once the
+            // body has (D-294).
+            Statement::ImportDeclaration(_)
+            | Statement::ExportNamedDeclaration(_)
+            | Statement::ExportFromDeclaration(_)
+            | Statement::ExportAllDeclaration(_) => {}
+            Statement::ExportDeclaration(declaration) => {
+                self.module_declaration(&declaration.declaration);
+            }
+            Statement::ExportDefaultDeclaration(declaration) => {
+                self.lower_export_default(declaration);
+            }
+            other => self.statement(other),
+        }
+    }
+
+    /// Lowers the declaration an `export` wraps — `export const x = …`, `export function f …`,
+    /// `export class C …` — exactly as the bare declaration would, so its binding exists for the
+    /// end-of-module snapshot (a function/class name is already made by `hoist`).
+    fn module_declaration(&mut self, declaration: &oxc_ast::ast::Declaration<'_>) {
+        use oxc_ast::ast::Declaration as D;
+        match declaration {
+            D::VariableDeclaration(variable) => self.variable_declaration(variable),
+            D::FunctionDeclaration(function) => {
+                // `export function f` is wrapped in an `ExportDeclaration`, so `hoist` — which scans for
+                // a bare `FunctionDeclaration` — never lowered it; do it here. (A forward reference to an
+                // exported function, before its line, is the one thing this misses.)
+                if let Some(id) = &function.id {
+                    let name = id.name.to_string();
+                    let (fid, captures) = if function.generator || function.r#async {
+                        self.lower_generator(
+                            &name,
+                            &function.params,
+                            function.body.as_deref(),
+                            None,
+                            function.r#async,
+                            function.r#async && function.generator,
+                            true,
+                        )
+                    } else {
+                        self.lower_function(
+                            &name,
+                            &function.params,
+                            function.body.as_deref(),
+                            None,
+                            true,
+                            &[],
+                        )
+                    };
+                    let closure = self.close_over(fid, &captures);
+                    let slot = self.declare(&name);
+                    self.write(slot, closure);
+                }
+            }
+            D::ClassDeclaration(class) => {
+                let name = class
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "anonymous".to_owned(), |id| id.name.to_string());
+                let reuse = class
+                    .id
+                    .as_ref()
+                    .and_then(|_| self.scope().slots.get(&name).copied());
+                let _ = self.class(class, &name, reuse, false);
+            }
+            _ => self.note("exported declaration", 0),
+        }
+    }
+
+    /// `export default <expr | function | class>` — evaluate it and store it as the `default` export.
+    fn lower_export_default(&mut self, declaration: &oxc_ast::ast::ExportDefaultDeclaration<'_>) {
+        use oxc_ast::ast::ExportDefaultDeclarationKind as K;
+        let value = match &declaration.declaration {
+            K::FunctionDeclaration(function) => {
+                let name = function
+                    .id
+                    .as_ref()
+                    .map_or("default", |id| id.name.as_str());
+                let (id, captures) = if function.generator || function.r#async {
+                    self.lower_generator(
+                        name,
+                        &function.params,
+                        function.body.as_deref(),
+                        None,
+                        function.r#async,
+                        function.r#async && function.generator,
+                        true,
+                    )
+                } else {
+                    self.lower_function(
+                        name,
+                        &function.params,
+                        function.body.as_deref(),
+                        None,
+                        true,
+                        &[],
+                    )
+                };
+                self.close_over(id, &captures)
+            }
+            K::ClassDeclaration(class) => {
+                let name = class
+                    .id
+                    .as_ref()
+                    .map_or_else(|| "default".to_owned(), |id| id.name.to_string());
+                self.class(class, &name, None, true)
+            }
+            other => match other.as_expression() {
+                Some(expression) => self.value_expression(expression),
+                None => self.placeholder(),
+            },
+        };
+        self.store_export("default", value);
+    }
+
+    /// Records every binding an `import` introduces, so a later read of the name loads from the
+    /// exporting module's registry slot (D-294). A bare `import 'm'` for its side effects binds nothing.
+    fn register_imports(
+        &mut self,
+        declaration: &oxc_ast::ast::ImportDeclaration<'_>,
+        specifiers: &HashMap<String, u32>,
+    ) {
+        use oxc_ast::ast::ImportDeclarationSpecifier as S;
+        let Some(&from) = specifiers.get(declaration.source.value.as_str()) else {
+            return;
+        };
+        let Some(specs) = &declaration.specifiers else {
+            return;
+        };
+        for spec in specs {
+            match spec {
+                S::ImportSpecifier(specifier) => {
+                    self.module_imports.insert(
+                        specifier.local.name.to_string(),
+                        ModuleImport::Named(from, module_export_name(&specifier.imported)),
+                    );
+                }
+                S::ImportDefaultSpecifier(specifier) => {
+                    self.module_imports.insert(
+                        specifier.local.name.to_string(),
+                        ModuleImport::Default(from),
+                    );
+                }
+                S::ImportNamespaceSpecifier(specifier) => {
+                    self.module_imports.insert(
+                        specifier.local.name.to_string(),
+                        ModuleImport::Namespace(from),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Builds the driver — function 0, `crisol_program` — from the modules' init ids and the order to
+    /// run them in (D-294): make the registry and one exports object per module, then call each init in
+    /// dependency order with the registry.
+    fn build_module_driver(&mut self, init_ids: &[FunctionId], order: &[u32]) {
+        let shape = crisol_value::Shapes::new().root();
+        let registry = self.emit(Type::Object(None), Op::CreateObject { shape });
+        let registry_slot = self.declare(MODULE_REGISTRY);
+        self.write(registry_slot, registry);
+        for index in 0..init_ids.len() {
+            let exports = self.emit(Type::Object(None), Op::CreateObject { shape });
+            let registry = self.read(registry_slot);
+            #[expect(clippy::cast_precision_loss, reason = "a module count is tiny")]
+            let key = self.emit(Type::Number, Op::Const(Constant::Number(index as f64)));
+            self.emit_effect(Op::ComputedStore {
+                object: registry,
+                key,
+                value: exports,
+            });
+        }
+        for &index in order {
+            let callee = self.close_over(init_ids[index as usize], &[]);
+            let registry = self.read(registry_slot);
+            let undefined = self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+            let result = self.emit(
+                Type::Unknown,
+                Op::Call {
+                    callee,
+                    this_value: undefined,
+                    args: vec![registry],
+                },
+            );
+            self.propagate(result);
+        }
+        self.terminate(Terminator::Return(None));
     }
 
     fn scope(&self) -> &Scope {
@@ -2746,6 +3444,12 @@ impl Lowering {
             Expression::Identifier(identifier) => {
                 if identifier.name == "undefined" {
                     return self.emit(Type::Undefined, Op::Const(Constant::Undefined));
+                }
+                // An imported binding is a live read from the exporting module's exports object in the
+                // registry, not a variable or a global (D-294). Checked before `resolves` because an
+                // import is never a local slot, and before the global load so it does not look missing.
+                if let Some(value) = self.module_import_read(identifier.name.as_str()) {
+                    return value;
                 }
                 // `arguments` resolves to a binding that does not exist until it is asked
                 // for, so the check has to admit it — otherwise the first mention falls

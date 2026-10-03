@@ -7957,3 +7957,34 @@ specification's completed/`suspendedStart` cases require. An uncaught throw — 
 propagates: the body finishes with the exception, which rejects the async result or re-throws out of
 `.throw()`. Verified across catch-and-continue, `finally`, a rejected `Promise.all`, a rethrow to an
 outer `try`, an `Error` object's `message`, and a loop that catches each turn — each under GC stress.
+
+## D-294
+
+**ES modules: a graph of `import`/`export` files compiles to one program (compiler support).**
+
+Status: Accepted
+
+A module graph now lowers to a single program. Each module's body becomes an *init* function; the
+synthetic entry (`crisol_program`, function 0) builds a registry — one exports object per module — and
+calls each init in dependency order, passing the registry. An init reads its imports from the registry
+and writes its exports into its own slot. **Every module lowers into one `Lowering`**, so the
+`FunctionId`s come out sequential and nothing renumbers closures across modules — the one mechanical
+trap a multi-unit compile usually carries just does not arise.
+
+`lower_modules(entry)` discovers the graph breadth-first (relative specifiers, canonicalised), orders it
+post-order (dependencies first), and lowers each module with `lower_module`: the registry is the init's
+one parameter — reached by the grammar-illegal name `" registry"`, so a nested function captures it like
+any outer binding; `this` is `undefined`, as a module's is; an imported name resolves at every read,
+nested functions included, to `registry[from].name` rather than a slot or a global; and the exports are
+snapshot into `registry[index]` after the body runs. Every form is handled: `export const/function/
+class`, `export { a as b }`, `export default`, `export { x } from`, `export *`, and `export * as ns`;
+`import` named, default, and namespace. `build_modules` reuses the single-file code generation and link,
+with the entry *not* printing a completion value (a module has none) but still draining the microtask
+queue, so an `await` inside a module settles.
+
+**Deviations, recorded not hidden.** Bindings are *snapshot* at a module's end, not live — correct for
+an acyclic graph, since an importer runs after its dependencies; wrong only for a value mutated and then
+observed across modules, and for a circular import (the snapshot runs too late). `export *` copies with
+`ObjectExtend`, which includes `default`, which the specification omits. A forward reference to an
+exported function, above its own line, is not hoisted. The test262 runner still skips `module`-flagged
+cases; assembling the harness as a module is the next step.

@@ -12237,3 +12237,127 @@ fn a_rejected_await_and_generator_throw_reach_an_inner_catch() {
         "threw:e",
     );
 }
+
+/// Builds an ES module graph (`files`, entered at `entry`) and runs it, asserting its stdout — the
+/// module analogue of [`check`], exercising `build_modules` (D-294). A module program has no completion
+/// value, so nothing trails the output.
+fn check_modules(name: &str, files: &[(&str, &str)], entry: &str, expected: &str) {
+    let Some(runtime) = runtime() else {
+        return;
+    };
+    let directory = std::env::temp_dir().join(format!("crisol-modules-{name}"));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    for (file, source) in files {
+        std::fs::write(directory.join(file), source).expect("write a module");
+    }
+    let binary = directory.join("main");
+    crisol::build::build_modules(&directory.join(entry), &binary, &runtime)
+        .unwrap_or_else(|error| panic!("{name} should build: {error}"));
+    assert_eq!(execute(name, &binary, false), expected, "{name}");
+    assert_eq!(
+        execute(name, &binary, true),
+        expected,
+        "{name} under GC stress"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// ES modules: a graph of `import`/`export` files compiles to one program whose driver runs each module
+/// in dependency order (D-294). Covers named/default/namespace imports, every export form, re-exports,
+/// transitive dependencies, evaluation order, and `await` inside a module.
+#[test]
+fn es_modules() {
+    check_modules(
+        "named-default-function",
+        &[
+            (
+                "dep.js",
+                "export const x = 1; export const y = 2; export default 10; export function f() { return 5; }",
+            ),
+            (
+                "main.js",
+                "import def, { x, y, f } from './dep.js'; print(x + y + def + f());",
+            ),
+        ],
+        "main.js",
+        "18",
+    );
+    check_modules(
+        "namespace-import",
+        &[
+            ("dep.js", "export const a = 3; export const b = 4;"),
+            (
+                "main.js",
+                "import * as ns from './dep.js'; print(ns.a + ns.b);",
+            ),
+        ],
+        "main.js",
+        "7",
+    );
+    check_modules(
+        "transitive-and-reexport",
+        &[
+            ("base.js", "export const v = 7;"),
+            (
+                "mid.js",
+                "export { v } from './base.js'; export const w = 8;",
+            ),
+            ("main.js", "import { v, w } from './mid.js'; print(v + w);"),
+        ],
+        "main.js",
+        "15",
+    );
+    check_modules(
+        "export-star",
+        &[
+            ("base.js", "export const a = 1; export const b = 2;"),
+            ("mid.js", "export * from './base.js'; export const c = 3;"),
+            (
+                "main.js",
+                "import { a, b, c } from './mid.js'; print(a + b + c);",
+            ),
+        ],
+        "main.js",
+        "6",
+    );
+    check_modules(
+        "class-and-rename",
+        &[
+            (
+                "dep.js",
+                "export class C { m() { return 42; } } const q = 9; export { q as nine };",
+            ),
+            (
+                "main.js",
+                "import { C, nine } from './dep.js'; print(new C().m() + nine);",
+            ),
+        ],
+        "main.js",
+        "51",
+    );
+    check_modules(
+        "evaluation-order",
+        &[
+            ("dep.js", "print('dep'); export const z = 1;"),
+            (
+                "main.js",
+                "import { z } from './dep.js'; print('main' + z);",
+            ),
+        ],
+        "main.js",
+        "dep\nmain1",
+    );
+    check_modules(
+        "await-in-module",
+        &[
+            ("dep.js", "export const base = 40;"),
+            (
+                "main.js",
+                "import { base } from './dep.js'; async function go() { return base + await Promise.resolve(2); } go().then(print);",
+            ),
+        ],
+        "main.js",
+        "42",
+    );
+}
