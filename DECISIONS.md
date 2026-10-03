@@ -7824,3 +7824,23 @@ the marker `$DONE` printed: passed iff `Test262:AsyncTestComplete` appears, fail
 which no synchronous return could observe, so D-249's "values left to CI" caveat is now covered by
 local acceptance tests (`await Promise.resolve(42)` prints `42`). The module runner stays skipped
 until the module pipeline lands.
+
+## D-289
+
+**A grown array's gap reads as a hole at the store layer (stale test and comment corrected).**
+
+Status: Accepted
+
+D-282 made `set_element` fill a gap past the end with the `EMPTY` hole marker rather than `undefined`,
+and `make_array` start every element as `EMPTY`. A `crisol-gc` unit test —
+`writing_past_the_end_grows_the_array` — still asserted the gap read back as `Value::UNDEFINED`, and
+`set_element`'s doc comment still described the old "fills with undefined, not quite the spec"
+behaviour the inline comment already contradicted. Both now match the code: the raw store holds
+`EMPTY`, and a JS-visible read is what maps a hole to `undefined` (the abi `element_at` layer), not
+the store accessor the test exercises.
+
+The staleness survived because the regression run before each commit was `cargo test -p crisol
+--test build` — the acceptance suite — which never compiles the `crisol-gc` test binary. Running
+`cargo test --workspace --all-features` surfaced it. The per-commit gate is now the workspace run,
+so a change in one crate that invalidates a sibling crate's test is caught before it is pushed, not
+a release later.

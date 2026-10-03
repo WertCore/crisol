@@ -713,8 +713,9 @@ fn writing_past_the_end_grows_the_array() {
     assert_eq!(heap.element(array.handle(), 3), Some(Value::TRUE));
     assert_eq!(
         heap.element(array.handle(), 2),
-        Some(Value::UNDEFINED),
-        "the gap is filled, not left holding whatever was there"
+        Some(Value::EMPTY),
+        "the gap is a hole — the EMPTY marker in the store, not `undefined` and not whatever was \
+         there before (D-282). A JS-visible read maps it to `undefined`; this is the raw store."
     );
 }
 

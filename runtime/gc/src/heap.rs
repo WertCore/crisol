@@ -605,10 +605,11 @@ impl Heap {
 
     /// Writes an element, growing the array if `index` is past the end.
     ///
-    /// Growing is what `a[5] = 1` on a three-element array does, and the gap fills with
-    /// `undefined`. That is not quite the specification — the gap should be *holes*, which
-    /// `in` and `forEach` treat differently from `undefined` (D-64) — and it is recorded there
-    /// rather than pretended away here.
+    /// Growing is what `a[5] = 1` on a three-element array does, and the skipped indices become
+    /// *holes* — the `EMPTY` marker, which `in`, `hasOwnProperty`, enumeration, and the methods
+    /// that skip holes tell apart from a slot holding `undefined` (D-282). A JS-visible read of a
+    /// hole still answers `undefined`; the distinction lives in the store, not in what `a[4]`
+    /// evaluates to.
     pub fn set_element(&self, handle: GcRef, index: usize, value: Value) -> bool {
         let mut cells = self.cells.borrow_mut();
         let Some(cell) = cells.get_mut(handle.slot() as usize) else {
