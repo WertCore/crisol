@@ -8058,3 +8058,65 @@ anonymous property value (`{ m() {} }`, `{ a: () => 1 }`) take their binding's n
 `crisol_name_closure` does idempotently (overwrite in place, not a duplicate slot). A named function
 expression keeps its own name. Deviations: a getter/setter's name is the bare key rather than `"get x"`,
 and NamedEvaluation through a plain assignment (`o.x = () => {}`) is not inferred.
+
+## D-299
+
+**`Promise.all`/`race`/`allSettled`/`any` accept any iterable, not only an array.**
+
+Status: Accepted
+
+The combinators are specified over the iterator protocol, so a `Set`, a generator, a string, or a
+user-defined iterator are all valid inputs. `combine_promises` read the argument by index — a `length`
+and `[0]`, `[1]`, … — which quietly made `Promise.all(aSet)` an empty-input fulfilment rather than a
+wait on the set's promises. It now drains the argument once with `crisol_iterate` before the existing
+index loop: that returns a real array for every iterable (and the value itself for an array, so an array
+pays no copy), and a non-iterable raises — propagated exactly as the old array-like length check did.
+The resolved value preserves iteration order. Confirmed by acceptance over a set, a generator, a string,
+and `allSettled`/`race`, plus the non-iterable `TypeError`, under GC stress. Not addressed here: the
+combinators still resolve each entry through the internal `promise_resolve` rather than the receiver's
+`C.resolve`, so a subclass that overrides `resolve` is not yet honoured.
+
+## D-300
+
+**`new Map(iterable)` and `new Set(iterable)` drain their argument instead of ignoring it.**
+
+Status: Accepted
+
+The constructors made an empty collection and dropped the argument entirely, so `new Map([["a", 1]])`
+and `new Set([1, 2])` — the usual way both are built — produced something empty. They now drain the
+argument through `crisol_iterate` and insert each element with the existing `map_set`/`set_add`, so the
+insertion-order and SameValueZero-dedup rules are the single implementation both the constructor and the
+method share. A map requires every entry to be an object it can read `"0"`/`"1"` off (per
+*AddEntriesFromIterable*, a non-object entry is a `TypeError`); a set takes each value as-is. A nullish
+argument is the empty collection, so `new Map()` and `new Map(undefined)` agree. The argument is rooted
+at entry — before `new_collection` allocates — because it is often a throwaway array literal the caller
+no longer holds, which a collect-on-every-allocation run would otherwise reclaim before the drain (the
+same discipline `make_weakref` documents). Confirmed by acceptance over arrays, a generator, a string,
+dedup, and the non-object-entry `TypeError`, under GC stress.
+
+## D-301
+
+**`Object.fromEntries` drains the iterator protocol, not an array by index.**
+
+Status: Accepted
+
+`fromEntries` read its source with `elements_of` + `element_at`, so `Object.fromEntries(aMap)` — the
+natural inverse of a thing that is not an array — returned `{}`. It now drains the source with
+`crisol_iterate` and reads each entry's `"0"`/`"1"` with a general `Get` (so a non-array pair works
+too), raising on a non-iterable as the specification's `GetIterator` does. The key is coerced with the
+same `to_text` the previous code used, so string and number keys behave as before; symbol keys, which
+that coercion does not produce, remain unhandled. Confirmed by acceptance round-tripping a `Map` and a
+generator of pairs, plus the non-iterable `TypeError`, under GC stress.
+
+## D-302
+
+**`new WeakMap(iterable)` and `new WeakSet(iterable)` drain their argument too.**
+
+Status: Accepted
+
+For consistency with D-300, the weak constructors no longer ignore their iterable. The drain is the same
+`fill_collection`, given a `weak` flag that routes the insert through `weakmap_set`/`weakset_add` —
+which additionally reject a key that cannot be held weakly, so `new WeakMap([[1, 2]])` is the `TypeError`
+the method already gives for `set(1, 2)`. A weak map still requires each entry to be an object. The one
+drain now serves `Map`, `Set`, `WeakMap`, and `WeakSet` alike. Confirmed by acceptance populating a weak
+map and set from an iterable and rejecting a primitive key, under GC stress.

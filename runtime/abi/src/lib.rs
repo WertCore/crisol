@@ -2521,26 +2521,110 @@ fn new_collection(prototype: Option<GcRef>, is_set: bool) -> u64 {
     object
 }
 
-/// `new Map()`.
+/// Fills a freshly-built `Map` or `Set` from its constructor's iterable argument (D-300).
+///
+/// **The argument is drained, not ignored.** `new Map([[k, v], …])` and `new Set([v, …])` are
+/// the common way these are built, so the previous behaviour — making an empty collection and
+/// dropping the argument — was wrong for most real uses. A nullish argument is the empty
+/// collection (`new Map()` and `new Map(undefined)` agree); anything else must be iterable, and
+/// a map additionally requires every entry to be an object it can read `"0"` and `"1"` off, per
+/// *AddEntriesFromIterable*. Draining once up front reuses [`map_set`] and [`set_add`] so the
+/// insertion-order and SameValueZero-dedup rules are the single implementation both paths share.
+///
+/// Returns the collection, or a propagated exception if the input is not iterable, a map entry
+/// is not an object, or reading an entry's key or value throws. `weak` routes the insert through
+/// [`weakmap_set`]/[`weakset_add`], which additionally reject a key that cannot be held weakly —
+/// so the one drain serves `Map`, `Set`, `WeakMap`, and `WeakSet` alike (D-302).
+fn fill_collection(collection: u64, iterable: u64, is_map: bool, weak: bool) -> u64 {
+    if Value::from_bits(iterable).is_undefined() || iterable == Value::NULL.to_bits() {
+        return collection;
+    }
+    with_rooted(&[collection, iterable], || {
+        let items = crisol_iterate(iterable);
+        if Value::from_bits(items).is_exception() {
+            return items;
+        }
+        with_rooted(&[collection, items], || {
+            let length = match indexed_length(items) {
+                Ok(length) => length,
+                Err(thrown) => return thrown,
+            };
+            for index in 0..length {
+                let item = indexed_get(items, index);
+                if Value::from_bits(item).is_exception() {
+                    return item;
+                }
+                let outcome = with_rooted(&[collection, items, item], || {
+                    if is_map {
+                        if Value::from_bits(item).kind() != crisol_value::Kind::Object {
+                            return raise("a map entry must be an object", "TypeError");
+                        }
+                        let key = indexed_get(item, 0);
+                        if Value::from_bits(key).is_exception() {
+                            return key;
+                        }
+                        let value = with_rooted(&[collection, item, key], || indexed_get(item, 1));
+                        if Value::from_bits(value).is_exception() {
+                            return value;
+                        }
+                        let args = [key, value];
+                        let add: extern "C" fn(u64, u64, u64, u64, *const u64) -> u64 =
+                            if weak { weakmap_set } else { map_set };
+                        with_rooted(&[collection, key, value], || {
+                            add(0, collection, 0, 2, args.as_ptr())
+                        })
+                    } else {
+                        let args = [item];
+                        let add: extern "C" fn(u64, u64, u64, u64, *const u64) -> u64 =
+                            if weak { weakset_add } else { set_add };
+                        with_rooted(&[collection, item], || {
+                            add(0, collection, 0, 1, args.as_ptr())
+                        })
+                    }
+                });
+                if Value::from_bits(outcome).is_exception() {
+                    return outcome;
+                }
+            }
+            collection
+        })
+    })
+}
+
+/// `new Map(iterable?)`.
 extern "C" fn make_map(
     _closure: u64,
     _this_value: u64,
     _new_target: u64,
-    _argc: u64,
-    _argv: *const u64,
+    argc: u64,
+    argv: *const u64,
 ) -> u64 {
-    new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get), false)
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let iterable = unsafe { argument(argc, argv, 0) };
+    // **Rooted before the first allocation, not after.** `new_collection` allocates, so under
+    // collect-on-every-allocation the argument — often a throwaway array literal the caller no
+    // longer holds — is freed between entry and the drain unless it is pinned here first.
+    with_rooted(&[iterable], || {
+        let collection = new_collection(MAP_PROTOTYPE.with(std::cell::Cell::get), false);
+        fill_collection(collection, iterable, true, false)
+    })
 }
 
-/// `new Set()`.
+/// `new Set(iterable?)`.
 extern "C" fn make_set(
     _closure: u64,
     _this_value: u64,
     _new_target: u64,
-    _argc: u64,
-    _argv: *const u64,
+    argc: u64,
+    argv: *const u64,
 ) -> u64 {
-    new_collection(SET_PROTOTYPE.with(std::cell::Cell::get), true)
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let iterable = unsafe { argument(argc, argv, 0) };
+    // Rooted before `new_collection` allocates, as in `make_map`.
+    with_rooted(&[iterable], || {
+        let collection = new_collection(SET_PROTOTYPE.with(std::cell::Cell::get), true);
+        fill_collection(collection, iterable, false, false)
+    })
 }
 
 /// A global that exists so its `prototype` can be reached, but cannot be called.
@@ -2640,26 +2724,41 @@ fn weak_remove_entry(array: GcRef, length: usize, at: usize, stride: usize) {
     });
 }
 
-/// `new WeakMap()`. The optional iterable argument is ignored, as `new Map()`'s is.
+/// `new WeakMap(iterable?)` — drains its argument like `new Map()`, through the weak insert that
+/// also rejects a key that cannot be held weakly (D-302).
 extern "C" fn make_weakmap(
     _closure: u64,
     _this_value: u64,
     _new_target: u64,
-    _argc: u64,
-    _argv: *const u64,
+    argc: u64,
+    argv: *const u64,
 ) -> u64 {
-    new_weak_collection(WEAKMAP_PROTOTYPE.with(std::cell::Cell::get), WEAKMAP_BRAND)
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let iterable = unsafe { argument(argc, argv, 0) };
+    // Rooted before `new_weak_collection` allocates, as in `make_map`/`make_weakref`.
+    with_rooted(&[iterable], || {
+        let collection =
+            new_weak_collection(WEAKMAP_PROTOTYPE.with(std::cell::Cell::get), WEAKMAP_BRAND);
+        fill_collection(collection, iterable, true, true)
+    })
 }
 
-/// `new WeakSet()`. The optional iterable argument is ignored, as `new Set()`'s is.
+/// `new WeakSet(iterable?)` — drains its argument like `new Set()`, through the weak insert.
 extern "C" fn make_weakset(
     _closure: u64,
     _this_value: u64,
     _new_target: u64,
-    _argc: u64,
-    _argv: *const u64,
+    argc: u64,
+    argv: *const u64,
 ) -> u64 {
-    new_weak_collection(WEAKSET_PROTOTYPE.with(std::cell::Cell::get), WEAKSET_BRAND)
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let iterable = unsafe { argument(argc, argv, 0) };
+    // Rooted before `new_weak_collection` allocates, as in `make_map`/`make_weakref`.
+    with_rooted(&[iterable], || {
+        let collection =
+            new_weak_collection(WEAKSET_PROTOTYPE.with(std::cell::Cell::get), WEAKSET_BRAND);
+        fill_collection(collection, iterable, false, true)
+    })
 }
 
 /// `new WeakRef(target)` — throws unless `target` can be held weakly.
@@ -7399,6 +7498,16 @@ fn combine_promises(argc: u64, argv: *const u64, how: Combine) -> u64 {
     // SAFETY: the caller guarantees `argc` readable values at `argv`.
     let list = unsafe { argument(argc, argv, 0) };
     let result = with_rooted(&[list], new_promise_object);
+    // **Accept any iterable, not only an array-like.** `Promise.all` and its siblings are
+    // specified over the iterator protocol, so a `Set`, a generator, a bare string, or a
+    // user-defined iterator are all valid inputs. Draining once up front keeps the rest of the
+    // combinator — which indexes — unchanged: `crisol_iterate` returns a real array for every
+    // iterable and the value itself for an array (so an array pays no copy). A non-iterable
+    // raises, and we propagate that exactly as the old array-like length check did (D-299).
+    let list = with_rooted(&[list, result], || crisol_iterate(list));
+    if Value::from_bits(list).is_exception() {
+        return list;
+    }
     with_rooted(&[list, result], || {
         let length = match indexed_length(list) {
             Ok(length) => length,
@@ -14063,27 +14172,53 @@ extern "C" fn object_from_entries(
         let source = unsafe { argument(argc, argv, 0) };
         let object = crisol_create_object();
         with_rooted(&[object, source], || {
-            let Some((pairs, length)) = elements_of(source) else {
-                return;
-            };
-            let Some(handle) = handle_of(object) else {
-                return;
-            };
-            for index in 0..length {
-                let pair = element_at(pairs, index);
-                let Some((entry, _)) = elements_of(pair) else {
-                    continue;
-                };
-                let Some(name) = to_text(element_at(entry, 0)) else {
-                    continue;
-                };
-                let value = element_at(entry, 1);
-                with_runtime(|runtime| {
-                    runtime.define(handle, &name, Value::from_bits(value));
-                });
+            // **Drained through the iterator protocol, not read by index (D-301).** The inverse
+            // of `Object.entries` is most useful on things that are not arrays —
+            // `Object.fromEntries(aMap)` and `Object.fromEntries(url.searchParams)` are the point
+            // — and an entry is read with a general `Get` of `"0"`/`"1"`, so a non-array pair
+            // works too. A non-iterable source raises, as the specification's `GetIterator` does.
+            let entries = crisol_iterate(source);
+            if Value::from_bits(entries).is_exception() {
+                return entries;
             }
-        });
-        object
+            with_rooted(&[object, entries], || {
+                let Some(handle) = handle_of(object) else {
+                    return object;
+                };
+                let length = match indexed_length(entries) {
+                    Ok(length) => length,
+                    Err(thrown) => return thrown,
+                };
+                for index in 0..length {
+                    let pair = indexed_get(entries, index);
+                    if Value::from_bits(pair).is_exception() {
+                        return pair;
+                    }
+                    let outcome = with_rooted(&[object, entries, pair], || {
+                        let key = indexed_get(pair, 0);
+                        if Value::from_bits(key).is_exception() {
+                            return key;
+                        }
+                        let value = with_rooted(&[object, pair, key], || indexed_get(pair, 1));
+                        if Value::from_bits(value).is_exception() {
+                            return value;
+                        }
+                        if let Some(name) = to_text(key) {
+                            with_rooted(&[object, key, value], || {
+                                with_runtime(|runtime| {
+                                    runtime.define(handle, &name, Value::from_bits(value));
+                                });
+                            });
+                        }
+                        object
+                    });
+                    if Value::from_bits(outcome).is_exception() {
+                        return outcome;
+                    }
+                }
+                object
+            })
+        })
     })
 }
 

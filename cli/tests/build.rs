@@ -989,6 +989,62 @@ fn a_map_or_set_method_rejects_a_wrong_receiver() {
     );
 }
 
+/// `new Map(iterable)` and `new Set(iterable)` drain their argument rather than ignore it, which
+/// is how both are most often built (D-300). A map reads `"0"`/`"1"` off each entry and requires
+/// the entry to be an object; a set takes every value as-is. Any iterable works, not only an
+/// array, and both dedup by SameValueZero keeping first-insertion order.
+#[test]
+fn maps_and_sets_build_from_an_iterable() {
+    check(
+        "map-from-array-of-entries",
+        "let m = new Map([[\"a\", 1], [\"b\", 2]]); \
+         return m.get(\"a\") + \",\" + m.get(\"b\") + \",\" + m.size;",
+        "1,2,2",
+    );
+    // A later entry with the same key overwrites, and does not grow the map.
+    check(
+        "map-from-entries-dedups-by-key",
+        "let m = new Map([[1, \"x\"], [1, \"y\"]]); return m.get(1) + \",\" + m.size;",
+        "y,1",
+    );
+    // Any iterable, not only an array — here a generator of entries.
+    check(
+        "map-from-a-generator",
+        "function* g() { yield [\"k\", 9]; } let m = new Map(g()); \
+         return m.get(\"k\") + \",\" + m.size;",
+        "9,1",
+    );
+    // A non-object entry is a TypeError, per AddEntriesFromIterable.
+    check(
+        "map-from-non-object-entry-throws",
+        "try { new Map([1, 2]); return \"no-throw\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A nullish argument is simply the empty map, like `new Map()`.
+    check(
+        "map-from-undefined-is-empty",
+        "return new Map().size + \",\" + new Map(undefined).size + \",\" + new Map(null).size;",
+        "0,0,0",
+    );
+    check(
+        "set-from-array",
+        "let s = new Set([3, 1, 2]); return s.has(1) + \",\" + s.has(9) + \",\" + s.size;",
+        "true,false,3",
+    );
+    // A set dedups by SameValueZero, keeping one of each value.
+    check(
+        "set-from-array-dedups",
+        "let s = new Set([5, 5, 6, 5]); return s.size;",
+        "2",
+    );
+    // A string is iterable by code point, so a set of its characters drops the repeat.
+    check(
+        "set-from-a-string",
+        "let s = new Set(\"abca\"); return s.size + \",\" + s.has(\"a\") + \",\" + s.has(\"z\");",
+        "3,true,false",
+    );
+}
+
 /// The `Math` methods that are not one plain `f64` call: the bit-level `clz32`/`imul`/`fround`
 /// and the hyperbolic/`expm1`/`log1p` family (D-255).
 #[test]
@@ -1055,6 +1111,24 @@ fn weak_collections_have_their_synchronous_surface() {
     check(
         "weakset-add-primitive-throws",
         "try { new WeakSet().add(3); return 1; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The constructors drain their iterable like `Map`/`Set`, through the weak insert (D-302).
+    check(
+        "weakmap-from-entries",
+        "var k = {}; var m = new WeakMap([[k, 9]]); return m.get(k) + \",\" + m.has({});",
+        "9,false",
+    );
+    check(
+        "weakset-from-array",
+        "var a = {}, b = {}; var s = new WeakSet([a, b]); \
+         return s.has(a) + \",\" + s.has(b) + \",\" + s.has({});",
+        "true,true,false",
+    );
+    // A non-weak-able key is rejected by the same check `set` enforces.
+    check(
+        "weakmap-from-primitive-key-throws",
+        "try { new WeakMap([[1, 2]]); return \"no-throw\"; } catch (e) { return e.name; }",
         "TypeError",
     );
     // WeakRef holds strongly, so `deref` always answers the target here.
@@ -6844,6 +6918,26 @@ fn entries_and_from_entries_are_inverses() {
         "let o = {a: 1, b: 2}; return Object.fromEntries(Object.entries(o)).a;",
         "1",
     );
+    // `fromEntries` drains the iterator protocol, so a `Map` — not an array — round-trips (D-301).
+    check(
+        "from-entries-of-a-map",
+        "let m = new Map([[\"x\", 1], [\"y\", 2]]); let o = Object.fromEntries(m); \
+         return o.x + \",\" + o.y;",
+        "1,2",
+    );
+    // Any iterable of pairs works, here a generator.
+    check(
+        "from-entries-of-a-generator",
+        "function* g() { yield [\"a\", 10]; yield [\"b\", 20]; } \
+         return Object.fromEntries(g()).b;",
+        "20",
+    );
+    // A non-iterable source is a TypeError, as `GetIterator` throws.
+    check(
+        "from-entries-of-a-non-iterable-throws",
+        "try { Object.fromEntries(5); return \"no-throw\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
 }
 
 /// **`Object.is` is neither `===` nor SameValueZero.** It is the only one of the three that
@@ -10558,6 +10652,58 @@ fn the_promise_combinators_fold_a_list() {
          Promise.any([]).catch(function () {}); \
          return \"built\";",
         "built",
+    );
+}
+
+/// The combinators are specified over the iterator protocol, not array indices, so a `Set`, a
+/// generator, or a bare string are all valid inputs and a non-iterable rejects (D-299). The
+/// resolved value preserves *iteration* order, which is why these assert on `join`.
+#[test]
+fn promise_combinators_accept_any_iterable() {
+    // A `Set` — resolved values follow insertion order.
+    check(
+        "promise-all-over-a-set",
+        "Promise.all(new Set([Promise.resolve(1), Promise.resolve(2)])) \
+             .then(function (v) { print(v.join(\",\")); }); \
+         return 0;",
+        "1,2\n0",
+    );
+    // A generator — a one-shot iterator with no length at all.
+    check(
+        "promise-all-over-a-generator",
+        "function* g() { yield Promise.resolve(\"a\"); yield Promise.resolve(\"b\"); } \
+         Promise.all(g()).then(function (v) { print(v.join(\",\")); }); \
+         return 0;",
+        "a,b\n0",
+    );
+    // A string is iterable by code point, and each point is wrapped by `Promise.resolve`.
+    check(
+        "promise-all-over-a-string",
+        "Promise.all(\"xy\").then(function (v) { print(v.join(\",\")); }); return 0;",
+        "x,y\n0",
+    );
+    // `race` settles with whichever of the iterated promises settles first; attachment follows
+    // iteration order, so the first-inserted already-resolved promise wins.
+    check(
+        "promise-race-over-a-set",
+        "Promise.race(new Set([Promise.resolve(\"first\"), Promise.resolve(\"second\")])) \
+             .then(function (v) { print(v); }); \
+         return 0;",
+        "first\n0",
+    );
+    // `allSettled` reports one record per iterated entry, in order.
+    check(
+        "promise-allsettled-over-a-set",
+        "Promise.allSettled(new Set([Promise.resolve(1), Promise.reject(2)])) \
+             .then(function (v) { print(v[0].status + \",\" + v[1].status); }); \
+         return 0;",
+        "fulfilled,rejected\n0",
+    );
+    // A non-iterable is a `TypeError`, raised where the old array-like length check raised.
+    check(
+        "promise-all-rejects-a-non-iterable",
+        "try { Promise.all(5); return \"no-throw\"; } catch (e) { return e.name; }",
+        "TypeError",
     );
 }
 
