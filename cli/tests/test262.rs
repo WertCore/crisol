@@ -87,9 +87,19 @@ fn assemble(root: &Path, case: &Path, metadata: &Metadata) -> Option<String> {
         return Some(body);
     }
     let mut source = String::new();
+    // An `async`-flagged case calls `$DONE` to report completion but does not list the harness file
+    // that defines it — a test262 runner always adds `doneprintHandle.js` for such a case. Without it
+    // `$DONE` is an undefined global and every async case throws a `ReferenceError` instead of running
+    // (D-296).
+    let done_handle = metadata
+        .flags
+        .iter()
+        .any(|flag| flag == "async")
+        .then(|| "doneprintHandle.js".to_owned());
     for include in ["assert.js", "sta.js"]
         .iter()
         .map(|name| (*name).to_owned())
+        .chain(done_handle)
         .chain(metadata.includes.iter().cloned())
     {
         let path = root.join("harness").join(&include);

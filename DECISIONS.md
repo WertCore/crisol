@@ -8009,3 +8009,20 @@ microtask queue, exactly as for a script), a sync case passes on a clean exit, a
 throw — a failed assertion. Verified end to end on a synthetic case: a module importing a sibling
 `_FIXTURE.js`, harness prepended, runs its `assert.sameValue` and exits 0. The corpus pass count now
 includes modules; the actual run is CI's, since the runner needs a `CRISOL_TEST262_ROOT` checkout.
+
+## D-296
+
+**The test262 runner injects `doneprintHandle.js` for async cases.**
+
+Status: Accepted
+
+An `async`-flagged case calls `$DONE(err)` to report completion or failure but — by test262 convention —
+does not list the harness file that defines it; the runner is expected to add `doneprintHandle.js`.
+`assemble` did not, so `$DONE` was an undefined global and an async case threw a `ReferenceError` the
+instant it referenced `$DONE`, counting as a failure rather than running. `assemble` now prepends
+`doneprintHandle.js` whenever the case is `async`, alongside the always-present `assert.js`/`sta.js`.
+Confirmed against the corpus: cases that reported "`$DONE` is not defined" or "async did not complete"
+now print `Test262:AsyncTestComplete` and pass (e.g. `Promise/all/S25.4.4.1_A2.2_T1`). A runner change
+only — no compiler or runtime change — so the acceptance suite is unaffected; the gain is in CI's async
+count. (Lesson: running the full corpus locally to validate fills the disk — validate with a handful of
+cases and let CI measure.)
