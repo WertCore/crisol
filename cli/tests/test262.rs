@@ -138,17 +138,17 @@ fn run_with_timeout(binary: &Path) -> std::io::Result<std::process::Output> {
 
 fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcome> {
     let metadata = parse(&std::fs::read_to_string(case).ok()?)?;
-    // A module case needs the module pipeline, which this runner does not drive yet; counting one
-    // as a refusal would inflate the reasons with something never attempted.
-    if metadata.flags.iter().any(|flag| flag == "module") {
-        return None;
-    }
-    // An **async** case runs now: its `doneprintHandle.js` include defines `$DONE`, which calls the
-    // `print` global (D-288), and the entry point drains the microtask queue before exiting — so the
-    // awaited work finishes and `$DONE` prints a completion or failure marker that `run_with_timeout`
-    // below reads. The protocol is "passed iff `Test262:AsyncTestComplete` was printed".
+    // Both **async** and **module** cases run now (D-288, D-295). An async case's `doneprintHandle.js`
+    // include defines `$DONE`, which calls the `print` global, and the entry point drains the microtask
+    // queue before exiting — so the awaited work finishes and `$DONE` prints a completion or failure
+    // marker that `judge` reads. The protocol is "passed iff `Test262:AsyncTestComplete` was printed".
     let is_async = metadata.flags.iter().any(|flag| flag == "async");
+    let is_module = metadata.flags.iter().any(|flag| flag == "module");
     let source = assemble(root, case, &metadata)?;
+
+    if is_module {
+        return Some(attempt_module(case, &source, is_async, work, index));
+    }
 
     let directory = work.join(format!("case{index}"));
     let _ = std::fs::remove_dir_all(&directory);
@@ -159,29 +159,64 @@ fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcom
 
     let outcome = match crisol::build::build(&file, &binary, &runtime_archive()?) {
         Err(error) => Outcome::Refused(stage_of(&error)),
-        Ok(()) => match run_with_timeout(&binary) {
-            // An async case passes only if `$DONE` printed the completion marker — exiting cleanly
-            // is not enough, since a case that scheduled nothing, or whose `$DONE(error)` reported a
-            // failure, also exits 0. A failure marker, or no marker at all, is a failed assertion.
-            Ok(output) if is_async => {
-                let out = String::from_utf8_lossy(&output.stdout);
-                if out.contains("Test262:AsyncTestComplete") {
-                    Outcome::Ran
-                } else {
-                    Outcome::Failed(async_reason(&out))
-                }
-            }
-            Ok(output) if output.status.success() => Outcome::Ran,
-            // Exit 1 is the entry point reporting an uncaught throw, which is exactly how a
-            // case signals a failed assertion. Anything else — a signal, a panic — is ours.
-            Ok(output) if output.status.code() == Some(1) => {
-                Outcome::Failed(thrown_reason(&String::from_utf8_lossy(&output.stderr)))
-            }
-            _ => Outcome::Crashed,
-        },
+        Ok(()) => judge(&binary, is_async),
     };
     let _ = std::fs::remove_dir_all(&directory);
     Some(outcome)
+}
+
+/// Runs a built case and turns its exit and output into an [`Outcome`] — shared by the script and
+/// module paths. An async case passes only if `$DONE` printed the completion marker (exiting cleanly is
+/// not enough: a case that scheduled nothing, or reported `$DONE(error)`, also exits 0); a sync case
+/// passes on a clean exit; exit 1 is the entry reporting an uncaught throw, which is how a failed
+/// assertion signals; anything else — a signal, a panic — is ours.
+fn judge(binary: &Path, is_async: bool) -> Outcome {
+    match run_with_timeout(binary) {
+        Ok(output) if is_async => {
+            let out = String::from_utf8_lossy(&output.stdout);
+            if out.contains("Test262:AsyncTestComplete") {
+                Outcome::Ran
+            } else {
+                Outcome::Failed(async_reason(&out))
+            }
+        }
+        Ok(output) if output.status.success() => Outcome::Ran,
+        Ok(output) if output.status.code() == Some(1) => {
+            Outcome::Failed(thrown_reason(&String::from_utf8_lossy(&output.stderr)))
+        }
+        _ => Outcome::Crashed,
+    }
+}
+
+/// Runs a `module`-flagged case (D-295). The assembled harness-plus-test is written **beside the test**
+/// so its relative `import`s resolve to the sibling fixtures, and compiled with `build_modules`; the
+/// build artifacts (object, entry, binary) go under the work directory instead, so the checkout is left
+/// as it was but for the single temp entry, which is removed after.
+fn attempt_module(case: &Path, source: &str, is_async: bool, work: &Path, index: usize) -> Outcome {
+    let Some(directory) = case.parent() else {
+        return Outcome::Crashed;
+    };
+    let entry = directory.join(format!("__crisol_case_{index}.js"));
+    if std::fs::write(&entry, source).is_err() {
+        return Outcome::Crashed;
+    }
+    let build_dir = work.join(format!("module{index}"));
+    let _ = std::fs::remove_dir_all(&build_dir);
+    let outcome = (|| {
+        std::fs::create_dir_all(&build_dir).ok()?;
+        let binary = build_dir.join("main");
+        let runtime = runtime_archive()?;
+        Some(
+            match crisol::build::build_modules(&entry, &binary, &runtime) {
+                Err(error) => Outcome::Refused(stage_of(&error)),
+                Ok(()) => judge(&binary, is_async),
+            },
+        )
+    })()
+    .unwrap_or(Outcome::Crashed);
+    let _ = std::fs::remove_file(&entry);
+    let _ = std::fs::remove_dir_all(&build_dir);
+    outcome
 }
 
 /// Which built-in a case is testing, from its path.

@@ -7988,3 +7988,24 @@ observed across modules, and for a circular import (the snapshot runs too late).
 `ObjectExtend`, which includes `default`, which the specification omits. A forward reference to an
 exported function, above its own line, is not hoisted. The test262 runner still skips `module`-flagged
 cases; assembling the harness as a module is the next step.
+
+## D-295
+
+**The test262 runner runs `module`-flagged cases.**
+
+Status: Accepted
+
+With the module pipeline in place (D-294), the runner no longer skips `module` cases. A module case
+assembles exactly as any other — the harness (`assert.js`, `sta.js`, its includes) ahead of the test —
+and that whole source is written as one module **beside the test**, so its relative `import`s resolve to
+the sibling `_FIXTURE.js` modules, and compiled with `build_modules`. The build artifacts go under the
+work directory rather than the checkout, and the one temp entry is removed after. The harness's
+`var`/`function` declarations become the module's own top-level bindings, which the test's assertions
+read; an `import` is hoisted above them, so a fixture's value is in hand before the assertions run.
+
+Judging is shared with the script path, factored into `judge`: an async case passes only if
+`Test262:AsyncTestComplete` was printed (its `$DONE` calls the `print` global and the entry drains the
+microtask queue, exactly as for a script), a sync case passes on a clean exit, and exit 1 is a reported
+throw — a failed assertion. Verified end to end on a synthetic case: a module importing a sibling
+`_FIXTURE.js`, harness prepended, runs its `assert.sameValue` and exits 0. The corpus pass count now
+includes modules; the actual run is CI's, since the runner needs a `CRISOL_TEST262_ROOT` checkout.
