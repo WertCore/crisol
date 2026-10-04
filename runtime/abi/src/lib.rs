@@ -12245,9 +12245,13 @@ extern "C" fn object_define_property(
         let has_getter = is_callable(getter) || own_property(descriptor, "get").is_some();
         let has_setter = is_callable(setter) || own_property(descriptor, "set").is_some();
         let is_accessor = has_getter || has_setter;
-        if is_accessor && has_value {
+        // **A data field is `value` *or* `writable`.** `ToPropertyDescriptor` rejects an accessor
+        // descriptor that also carries either — `{ set, writable }` and `{ get, writable }` are as
+        // invalid as `{ get, value }`, and checking only `value` let the first two through (D-297).
+        let has_writable = own_property(descriptor, "writable").is_some();
+        if is_accessor && (has_value || has_writable) {
             return raise(
-                "a descriptor cannot have both a value and an accessor",
+                "a descriptor cannot have both a data field and an accessor",
                 "TypeError",
             );
         }
@@ -16569,6 +16573,66 @@ pub extern "C" fn crisol_create_closure(function: u64, captures: u64) -> u64 {
         runtime.define_linking(prototype.handle(), "constructor", closure.to_value());
         closure.to_value().to_bits()
     })
+}
+
+/// Stamps a freshly made closure with its `.length` and `.name` (D-298) — each a non-enumerable,
+/// non-writable, configurable own data property, `length` defined first so it precedes `name` in the
+/// own-key order the specification fixes. `length` is a number and `name` a string, both computed by
+/// the frontend from the source; a user function had neither before this.
+#[unsafe(no_mangle)]
+pub extern "C" fn crisol_name_closure(closure: u64, name: u64, length: u64) {
+    let Some(handle) = handle_of(closure) else {
+        return;
+    };
+    with_rooted(&[closure, name, length], || {
+        with_runtime(|runtime| {
+            for (key_name, value) in [("length", length), ("name", name)] {
+                let key = PropertyKey::new(key_name);
+                // Overwrite the property in place when it is already present — a NamedEvaluation
+                // rename (`{ m() {} }`) names the closure a second time, and re-adding the key would
+                // transition to a shape with a duplicate slot the reader never sees (D-298).
+                let existing = {
+                    let shapes = runtime.shapes.borrow();
+                    runtime
+                        .heap
+                        .shape_of(handle)
+                        .and_then(|current| shapes.lookup(current, &key))
+                };
+                let slot = match existing {
+                    Some(slot) => slot,
+                    None => {
+                        let (target, slot, width) = {
+                            let mut shapes = runtime.shapes.borrow_mut();
+                            let current = runtime
+                                .heap
+                                .shape_of(handle)
+                                .unwrap_or_else(|| shapes.root());
+                            let target = shapes.add(current, &key);
+                            match shapes.lookup(target, &key) {
+                                Some(slot) => (target, slot, shapes.len(target) as usize),
+                                None => continue,
+                            }
+                        };
+                        runtime.heap.transition(handle, target, width);
+                        slot
+                    }
+                };
+                runtime
+                    .heap
+                    .set(handle, slot.index(), Value::from_bits(value));
+                runtime.heap.set_attributes(
+                    handle,
+                    slot.index(),
+                    crisol_value::Attributes {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                    },
+                );
+            }
+        });
+    });
 }
 
 /// Writes one of a closure's captured values.

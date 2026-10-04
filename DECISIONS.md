@@ -8026,3 +8026,35 @@ now print `Test262:AsyncTestComplete` and pass (e.g. `Promise/all/S25.4.4.1_A2.2
 only — no compiler or runtime change — so the acceptance suite is unaffected; the gain is in CI's async
 count. (Lesson: running the full corpus locally to validate fills the disk — validate with a handful of
 cases and let CI measure.)
+
+## D-297
+
+**`ToPropertyDescriptor` rejects an accessor combined with `writable`, not only with `value`.**
+
+Status: Accepted
+
+A property descriptor is invalid when it carries both an accessor field (`get`/`set`) and a data field,
+and a data field is `value` *or* `writable`. The check tested only `value`, so `{ set, writable }` and
+`{ get, writable }` slipped through and defined a property instead of throwing — the test262
+`ToPropertyDescriptor` cases (`15.2.3.6-3-4` and kin) expect a `TypeError`. It now also notes whether
+the descriptor carries `writable` and throws for either data field. Valid accessor and data descriptors
+are unaffected, confirmed by acceptance.
+
+## D-298
+
+**A function carries `.length` and `.name`.**
+
+Status: Accepted
+
+A user function had neither property, so every test262 case checking a callback's or a declared
+function's arity or name failed. Each is now a non-enumerable, non-writable, configurable own property,
+`length` before `name`. The frontend records two values on each lowered function: `arity` (the
+formal-parameter count before the first default or rest — ExpectedArgumentCount) and `js_name` (empty
+for an anonymous function or arrow, the class name for a constructor, the bare method name for a
+method). `close_over` stamps them with a new `Op::NameClosure`, lowered to `crisol_name_closure`, which
+defines the two properties with the right attributes. **NamedEvaluation** is covered where the name
+comes from the binding: `var f = function () {}`, `const g = () => {}`, and an object method or
+anonymous property value (`{ m() {} }`, `{ a: () => 1 }`) take their binding's name — re-stamping, which
+`crisol_name_closure` does idempotently (overwrite in place, not a duplicate slot). A named function
+expression keeps its own name. Deviations: a getter/setter's name is the bare key rather than `"get x"`,
+and NamedEvaluation through a plain assignment (`o.x = () => {}`) is not inferred.

@@ -12361,3 +12361,57 @@ fn es_modules() {
         "42",
     );
 }
+
+/// `ToPropertyDescriptor` rejects a descriptor that mixes an accessor field with a data field — and a
+/// data field is `value` *or* `writable`, so `{ get, writable }` and `{ set, writable }` throw a
+/// `TypeError` as surely as `{ get, value }` does (D-297).
+#[test]
+fn a_descriptor_mixing_accessor_and_writable_is_rejected() {
+    check(
+        "define-accessor-plus-writable",
+        "function r(f) { try { f(); return 'no-throw'; } catch (e) { return e.name; } } \
+         return r(function () { Object.defineProperty({}, 'x', { set: function () {}, writable: false }); }) + ',' + \
+                r(function () { Object.defineProperty({}, 'x', { get: function () {}, writable: true }); }) + ',' + \
+                r(function () { Object.defineProperty({}, 'x', { get: function () {}, value: 1 }); });",
+        "TypeError,TypeError,TypeError",
+    );
+    // A valid accessor and a valid data descriptor are still accepted.
+    check(
+        "define-valid-descriptors-unaffected",
+        "var o = {}; Object.defineProperty(o, 'g', { get: function () { return 7; } }); \
+         Object.defineProperty(o, 'd', { value: 5, writable: true }); return o.g + o.d;",
+        "12",
+    );
+}
+
+/// A user function now carries `.length` (its parameter count before the first default or rest) and
+/// `.name` (declared, method, class, or NamedEvaluation-inferred), each a non-enumerable, non-writable,
+/// configurable own property — a user function had neither before (D-298).
+#[test]
+fn a_function_has_length_and_name() {
+    check(
+        "function-length",
+        "function f(a, b, c) {} function g(a, b = 1, c) {} function h(...r) {} \
+         return f.length + ',' + g.length + ',' + h.length + ',' + ((x, y) => 0).length;",
+        "3,1,0,2",
+    );
+    check(
+        "function-name-forms",
+        "function d() {} var v = function () {}; const w = (x) => x; var n = function named() {}; \
+         var o = { m() {}, a: () => 1 }; class C { cm() {} } \
+         return d.name + ',' + v.name + ',' + w.name + ',' + n.name + ',' + o.m.name + ',' + o.a.name + ',' + C.name + ',' + new C().cm.name;",
+        "d,v,w,named,m,a,C,cm",
+    );
+    check(
+        "function-name-descriptor-and-keys",
+        "function f(a) {} var d = Object.getOwnPropertyDescriptor(f, 'name'); \
+         return d.writable + ',' + d.enumerable + ',' + d.configurable + ',[' + Object.keys(f).join(',') + ']';",
+        "false,false,true,[]",
+    );
+    // An anonymous function expression and an arrow with no binding have an empty name.
+    check(
+        "anonymous-function-empty-name",
+        "return '[' + (function () {}).name + '],[' + (() => 0).name + ']';",
+        "[],[]",
+    );
+}

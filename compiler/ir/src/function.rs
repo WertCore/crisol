@@ -547,6 +547,17 @@ pub enum Op {
         /// The new prototype.
         prototype: ValueId,
     },
+    /// Stamps a freshly made closure with its JavaScript-visible `name` and `length`, each a
+    /// non-enumerable, non-writable, configurable own property (D-298). Emitted right after
+    /// [`Op::Closure`]; `name` is a string and `length` a number the frontend computed from the source.
+    NameClosure {
+        /// The closure to name.
+        closure: ValueId,
+        /// Its `.name`.
+        name: ValueId,
+        /// Its `.length`.
+        length: ValueId,
+    },
     /// Builds the generator object a `function*` returns: an object carrying the state-machine
     /// `body` closure and the caller's `this_value`, with `%GeneratorPrototype%` and the initial
     /// resume state. The outer function stores the parameters on it and returns it; the body runs
@@ -661,6 +672,7 @@ impl Op {
                 | Self::Closure { .. }
                 | Self::Await { .. }
                 | Self::MakeGenerator { .. }
+                | Self::NameClosure { .. }
         )
     }
 
@@ -705,6 +717,11 @@ impl Op {
             | Self::Iterate { object } => vec![*object],
             Self::PropertyStore { object, value, .. } => vec![*object, *value],
             Self::SetPrototype { object, prototype } => vec![*object, *prototype],
+            Self::NameClosure {
+                closure,
+                name,
+                length,
+            } => vec![*closure, *name, *length],
             Self::MakeGenerator { body, this_value } => vec![*body, *this_value],
             Self::DefineAccessor {
                 object,
@@ -841,6 +858,13 @@ pub struct Block {
 pub struct Function {
     /// For the text dump.
     pub name: String,
+    /// The JavaScript-visible `.name` of the function the user gets — `""` for an anonymous function
+    /// or arrow, the bare method name for a method, the class name for a constructor (D-298). Distinct
+    /// from `name`, which is a debug label like `"C.m"` or `"arrow"`.
+    pub js_name: String,
+    /// The JavaScript-visible `.length`: the count of formal parameters before the first one with a
+    /// default or a rest parameter (ECMAScript ExpectedArgumentCount) (D-298).
+    pub arity: u32,
     /// Slots that receive the arguments, in declaration order.
     ///
     /// Slots rather than block parameters because locals live in slots until `mem2reg`
@@ -910,6 +934,8 @@ impl Function {
         Self {
             id: FunctionId(0),
             name: name.to_owned(),
+            js_name: String::new(),
+            arity: 0,
             parameters: Vec::new(),
             this_slot: None,
             arguments_slot: None,

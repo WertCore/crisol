@@ -150,16 +150,19 @@ let r = f(); function f() { return 1; }
 function hoisted-function {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const "f"
+    v2: number = const 0.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
     store $1, v0
-    v1: unknown = load $1
-    v2: undefined = const undefined
-    v3: unknown = call v1(this=v2)  ; safepoint []
-    v4: bool = is-exception v3
-    branch v4 -> bb1, bb2
+    v3: unknown = load $1
+    v4: undefined = const undefined
+    v5: unknown = call v3(this=v4)  ; safepoint []
+    v6: bool = is-exception v5
+    branch v6 -> bb1, bb2
 bb1:
-    return v3
+    return v5
 bb2:
-    store $2, v3
+    store $2, v5
     return
 }
 function f {
@@ -1410,6 +1413,12 @@ let f = (x) => x;
 function arrow-concise-body {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const ""
+    v2: number = const 1.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
+    v3: string = const "f"
+    v4: number = const 1.0
+    name-closure v0 name=v3 length=v4  ; safepoint []
     store $1, v0
     return
 }
@@ -1426,6 +1435,12 @@ let f = (x) => { return x; };
 function arrow-block-body {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const ""
+    v2: number = const 1.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
+    v3: string = const "f"
+    v4: number = const 1.0
+    name-closure v0 name=v3 length=v4  ; safepoint []
     store $1, v0
     return
 }
@@ -1442,6 +1457,12 @@ let f = () => 1;
 function arrow-no-parameters {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const ""
+    v2: number = const 0.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
+    v3: string = const "f"
+    v4: number = const 0.0
+    name-closure v0 name=v3 length=v4  ; safepoint []
     store $1, v0
     return
 }
@@ -1458,6 +1479,12 @@ let f = function (a, b) { return a; };
 function function-expression {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const ""
+    v2: number = const 2.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
+    v3: string = const "f"
+    v4: number = const 2.0
+    name-closure v0 name=v3 length=v4  ; safepoint []
     store $1, v0
     return
 }
@@ -1477,6 +1504,12 @@ bb0:  ; entry
     store $1, v0
     v1: unknown = load $1
     v2: object = closure @1 [v1]  ; safepoint []
+    v3: string = const ""
+    v4: number = const 0.0
+    name-closure v2 name=v3 length=v4  ; safepoint []
+    v5: string = const "f"
+    v6: number = const 0.0
+    name-closure v2 name=v5 length=v6  ; safepoint []
     store $2, v2
     return
 }
@@ -1495,6 +1528,12 @@ bb0:  ; entry
     v0: number = const 1.0
     store $1, v0
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const ""
+    v3: number = const 1.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
+    v4: string = const "f"
+    v5: number = const 1.0
+    name-closure v1 name=v4 length=v5  ; safepoint []
     store $2, v1
     return
 }
@@ -1513,6 +1552,12 @@ bb0:  ; entry
     v0: number = const 1.0
     store $1, v0
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const ""
+    v3: number = const 0.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
+    v4: string = const "f"
+    v5: number = const 0.0
+    name-closure v1 name=v4 length=v5  ; safepoint []
     store $2, v1
     return
 }
@@ -1537,6 +1582,12 @@ bb0:  ; entry
     v2: unknown = load $1
     v3: unknown = load $2
     v4: object = closure @1 [v2, v3]  ; safepoint []
+    v5: string = const ""
+    v6: number = const 0.0
+    name-closure v4 name=v5 length=v6  ; safepoint []
+    v7: string = const "f"
+    v8: number = const 0.0
+    name-closure v4 name=v7 length=v8  ; safepoint []
     store $3, v4
     return
 }
@@ -1563,6 +1614,12 @@ bb0:  ; entry
     store $1, v0
     v1: unknown = load $1
     v2: object = closure @1 [v1]  ; safepoint []
+    v3: string = const ""
+    v4: number = const 0.0
+    name-closure v2 name=v3 length=v4  ; safepoint []
+    v5: string = const "f"
+    v6: number = const 0.0
+    name-closure v2 name=v5 length=v6  ; safepoint []
     store $2, v2
     return
 }
@@ -1570,6 +1627,9 @@ function arrow captures [$0] {
 bb0:  ; entry
     v0: unknown = load $0
     v1: object = closure @2 [v0]  ; safepoint []
+    v2: string = const ""
+    v3: number = const 0.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     return v1
 }
 function arrow captures [$0] {
@@ -1585,6 +1645,12 @@ let f = () => { let a = 1; };
 function a-function-that-runs-off-the-end-returns-undefined {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const ""
+    v2: number = const 0.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
+    v3: string = const "f"
+    v4: number = const 0.0
+    name-closure v0 name=v3 length=v4  ; safepoint []
     store $1, v0
     return
 }
@@ -1644,6 +1710,12 @@ let f = function () { return () => this; };
 function an-arrow-captures-this {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const ""
+    v2: number = const 0.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
+    v3: string = const "f"
+    v4: number = const 0.0
+    name-closure v0 name=v3 length=v4  ; safepoint []
     store $1, v0
     return
 }
@@ -1651,6 +1723,9 @@ function anonymous {
 bb0:  ; entry
     v0: unknown = load $0
     v1: object = closure @2 [v0]  ; safepoint []
+    v2: string = const ""
+    v3: number = const 0.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     return v1
 }
 function arrow captures [$0] {
@@ -1666,6 +1741,12 @@ let f = function () { return this; };
 function a-function-binds-its-own-this {
 bb0:  ; entry
     v0: object = closure @1 []  ; safepoint []
+    v1: string = const ""
+    v2: number = const 0.0
+    name-closure v0 name=v1 length=v2  ; safepoint []
+    v3: string = const "f"
+    v4: number = const 0.0
+    name-closure v0 name=v3 length=v4  ; safepoint []
     store $1, v0
     return
 }
@@ -1694,6 +1775,9 @@ function class-with-a-constructor {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const "C"
+    v3: number = const 1.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     set v1."prototype" = v0  ; safepoint []
     store $1, v1
     return
@@ -1719,10 +1803,16 @@ function class-with-a-method {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const "m"
+    v3: number = const 0.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     set v0."m" = v1  ; safepoint []
-    v2: object = closure @2 []  ; safepoint []
-    set v2."prototype" = v0  ; safepoint []
-    store $1, v2
+    v4: object = closure @2 []  ; safepoint []
+    v5: string = const "C"
+    v6: number = const 0.0
+    name-closure v4 name=v5 length=v6  ; safepoint []
+    set v4."prototype" = v0  ; safepoint []
+    store $1, v4
     return
 }
 function C.m {
@@ -1743,10 +1833,16 @@ function class-with-both {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const "m"
+    v3: number = const 0.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     set v0."m" = v1  ; safepoint []
-    v2: object = closure @2 []  ; safepoint []
-    set v2."prototype" = v0  ; safepoint []
-    store $1, v2
+    v4: object = closure @2 []  ; safepoint []
+    v5: string = const "C"
+    v6: number = const 1.0
+    name-closure v4 name=v5 length=v6  ; safepoint []
+    set v4."prototype" = v0  ; safepoint []
+    store $1, v4
     return
 }
 function C.m {
@@ -1781,6 +1877,9 @@ function class-with-no-constructor-still-has-one {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const "C"
+    v3: number = const 0.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     set v1."prototype" = v0  ; safepoint []
     store $1, v1
     return
@@ -1798,16 +1897,19 @@ function new-expression {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const "C"
+    v3: number = const 0.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     set v1."prototype" = v0  ; safepoint []
     store $1, v1
-    v2: unknown = load $1
-    v3: object = new v2()  ; safepoint []
-    v4: bool = is-exception v3
-    branch v4 -> bb1, bb2
+    v4: unknown = load $1
+    v5: object = new v4()  ; safepoint []
+    v6: bool = is-exception v5
+    branch v6 -> bb1, bb2
 bb1:
-    return v3
+    return v5
 bb2:
-    store $2, v3
+    store $2, v5
     return
 }
 function C.constructor {
@@ -1823,17 +1925,20 @@ function new-with-arguments {
 bb0:  ; entry
     v0: object = object #0  ; safepoint []
     v1: object = closure @1 []  ; safepoint []
+    v2: string = const "C"
+    v3: number = const 1.0
+    name-closure v1 name=v2 length=v3  ; safepoint []
     set v1."prototype" = v0  ; safepoint []
     store $1, v1
-    v2: unknown = load $1
-    v3: number = const 1.0
-    v4: object = new v2(v3)  ; safepoint []
-    v5: bool = is-exception v4
-    branch v5 -> bb1, bb2
+    v4: unknown = load $1
+    v5: number = const 1.0
+    v6: object = new v4(v5)  ; safepoint []
+    v7: bool = is-exception v6
+    branch v7 -> bb1, bb2
 bb1:
-    return v4
+    return v6
 bb2:
-    store $2, v4
+    store $2, v6
     return
 }
 function C.constructor($1) {

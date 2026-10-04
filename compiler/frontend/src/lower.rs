@@ -410,6 +410,46 @@ fn pattern_names(pattern: &oxc_ast::ast::BindingPattern<'_>, into: &mut Vec<Stri
     }
 }
 
+/// A function's ECMAScript `.length` from its parameter list: the count of parameters before the first
+/// one with a default value, with a rest parameter not counted (ExpectedArgumentCount) (D-298).
+fn arity_of(params: &oxc_ast::ast::FormalParameters<'_>) -> u32 {
+    let count = params
+        .items
+        .iter()
+        .take_while(|param| param.initializer.is_none())
+        .count();
+    u32::try_from(count).unwrap_or(0)
+}
+
+/// If `expression` is an anonymous function or an arrow — the values ECMAScript NamedEvaluation names
+/// from the binding or property they are assigned to — its `.length`, so the inferred name can be
+/// stamped onto it (D-298). A *named* function expression keeps its own name, so it is not one.
+fn anonymous_function_arity(expression: &Expression<'_>) -> Option<u32> {
+    match expression {
+        Expression::FunctionExpression(function) if function.id.is_none() => {
+            Some(arity_of(&function.params))
+        }
+        Expression::ArrowFunctionExpression(arrow) => Some(arity_of(&arrow.params)),
+        _ => None,
+    }
+}
+
+/// A function's JavaScript-visible `.name` from the debug label the lowering gave it (D-298): empty for
+/// an arrow or anonymous function, the class name for a constructor (`"C.constructor"` → `"C"`), empty
+/// for a computed member (its name is set at runtime), and the bare method name otherwise (`"C.m"` →
+/// `"m"`). A plain declared function's label already is its name.
+fn js_name_of(debug: &str) -> String {
+    match debug {
+        "arrow" | "anonymous" => String::new(),
+        other => match other.rsplit_once('.') {
+            Some((prefix, "constructor")) => prefix.to_owned(),
+            Some((_, "<computed>")) => String::new(),
+            Some((_, method)) => method.to_owned(),
+            None => other.to_owned(),
+        },
+    }
+}
+
 /// A `ModuleExportName` as a string — an identifier or a string-literal export name.
 fn module_export_name(name: &oxc_ast::ast::ModuleExportName<'_>) -> String {
     use oxc_ast::ast::ModuleExportName as N;
@@ -1256,6 +1296,25 @@ impl Lowering {
                     Some(init) => self.value_expression(init),
                     None => self.emit(Type::Undefined, Op::Const(Constant::Undefined)),
                 };
+                // `var f = function () {}` / `const g = () => {}` — the anonymous function takes the
+                // declared name as its `.name`, NamedEvaluation (D-298).
+                if let Some(arity) = declarator
+                    .init
+                    .as_ref()
+                    .and_then(|init| anonymous_function_arity(init))
+                {
+                    let name_value = self.emit(
+                        Type::String,
+                        Op::Const(Constant::String(identifier.name.to_string())),
+                    );
+                    let length =
+                        self.emit(Type::Number, Op::Const(Constant::Number(f64::from(arity))));
+                    self.emit_effect(Op::NameClosure {
+                        closure: value,
+                        name: name_value,
+                        length,
+                    });
+                }
                 if hoisted {
                     // The binding already exists, from the hoist. `slot` finds it; `declare`
                     // would make a second one and leave every reader of the first looking at
@@ -5053,6 +5112,9 @@ impl Lowering {
         let index = self.functions.len();
         let mut outer = Function::new(name);
         outer.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        // The user's closure is this outer stub, so `.length`/`.name` go on it (D-298).
+        outer.arity = arity_of(params);
+        outer.js_name = js_name_of(name);
         let entry = outer.entry;
         self.functions.push(outer);
         self.scopes.push(Scope {
@@ -5792,6 +5854,9 @@ impl Lowering {
         // position, so a missed one fails the build instead of producing a closure that runs
         // whichever function happens to be first.
         function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        // The JS-visible `.length` and `.name` the runtime stamps on the closure (D-298).
+        function.arity = arity_of(params);
+        function.js_name = js_name_of(name);
         let entry = function.entry;
         self.functions.push(function);
         self.scopes.push(Scope {
@@ -6000,7 +6065,19 @@ impl Lowering {
                 }
             })
             .collect();
-        self.emit(Type::Object(None), Op::Closure { function, captures })
+        let closure = self.emit(Type::Object(None), Op::Closure { function, captures });
+        // Stamp the closure with its `.length` and `.name` (D-298). Read from the function the frontend
+        // just lowered; a user function had neither property before this.
+        let js_name = self.functions[function.index() as usize].js_name.clone();
+        let arity = self.functions[function.index() as usize].arity;
+        let name = self.emit(Type::String, Op::Const(Constant::String(js_name)));
+        let length = self.emit(Type::Number, Op::Const(Constant::Number(f64::from(arity))));
+        self.emit_effect(Op::NameClosure {
+            closure,
+            name,
+            length,
+        });
+        closure
     }
 
     /// Lowers a class to the two objects it is made of.
@@ -6414,6 +6491,8 @@ impl Lowering {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
         function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        // An implicit constructor's `.name` is the class name and its `.length` is zero (D-298).
+        function.js_name = name.to_owned();
         let entry = function.entry;
         self.functions.push(function);
         self.scopes.push(Scope {
@@ -6498,6 +6577,8 @@ impl Lowering {
         let index = self.functions.len();
         let mut function = Function::new(&format!("{name}.constructor"));
         function.id = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        // An implicit constructor's `.name` is the class name and its `.length` is zero (D-298).
+        function.js_name = name.to_owned();
         let entry = function.entry;
         self.functions.push(function);
         self.scopes.push(Scope {
@@ -6745,6 +6826,25 @@ impl Lowering {
                                 let absent = self.placeholder();
                                 match property.kind {
                                     oxc_ast::ast::PropertyKind::Init => {
+                                        // A method shorthand or an anonymous function/arrow value takes
+                                        // the property name as its `.name` — NamedEvaluation (D-298).
+                                        if let Some(arity) =
+                                            anonymous_function_arity(&property.value)
+                                        {
+                                            let name_value = self.emit(
+                                                Type::String,
+                                                Op::Const(Constant::String(name.clone())),
+                                            );
+                                            let length = self.emit(
+                                                Type::Number,
+                                                Op::Const(Constant::Number(f64::from(arity))),
+                                            );
+                                            self.emit_effect(Op::NameClosure {
+                                                closure: value,
+                                                name: name_value,
+                                                length,
+                                            });
+                                        }
                                         self.emit_effect(Op::PropertyStore {
                                             object: result,
                                             key: PropertyKey::new(&name),
@@ -6854,6 +6954,23 @@ impl Lowering {
                             // function, and nothing said so (D-213).
                             match property.kind {
                                 oxc_ast::ast::PropertyKind::Init => {
+                                    // A method shorthand or an anonymous function/arrow value takes the
+                                    // property name as its `.name` — NamedEvaluation (D-298).
+                                    if let Some(arity) = anonymous_function_arity(&property.value) {
+                                        let name_value = self.emit(
+                                            Type::String,
+                                            Op::Const(Constant::String(name.clone())),
+                                        );
+                                        let length = self.emit(
+                                            Type::Number,
+                                            Op::Const(Constant::Number(f64::from(arity))),
+                                        );
+                                        self.emit_effect(Op::NameClosure {
+                                            closure: value,
+                                            name: name_value,
+                                            length,
+                                        });
+                                    }
                                     self.emit_effect(Op::PropertyStore {
                                         object: result,
                                         key: PropertyKey::new(&name),

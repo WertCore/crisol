@@ -155,6 +155,13 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::SetPrototype { object, prototype } => {
             write!(f, "set-prototype {object} <- {prototype}")
         }
+        Op::NameClosure {
+            closure,
+            name,
+            length,
+        } => {
+            write!(f, "name-closure {closure} name={name} length={length}")
+        }
         Op::MakeGenerator { body, this_value } => {
             write!(f, "make-generator {body} this={this_value}")
         }
