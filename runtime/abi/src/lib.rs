@@ -6365,6 +6365,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Promise", "race", 1),
     ("Promise", "reject", 1),
     ("Promise", "resolve", 1),
+    ("Promise", "withResolvers", 0),
     ("Promise.prototype", "catch", 1),
     ("Promise.prototype", "finally", 1),
     ("Promise.prototype", "then", 2),
@@ -6397,6 +6398,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Set.prototype", "has", 1),
     ("String", "fromCharCode", 1),
     ("String", "fromCodePoint", 1),
+    ("String", "raw", 1),
     ("String.prototype", "at", 1),
     ("String.prototype", "charAt", 1),
     ("String.prototype", "charCodeAt", 1),
@@ -7473,6 +7475,42 @@ extern "C" fn promise_reject(
     let promise = with_rooted(&[reason], new_promise_object);
     settle_promise(promise, reason, true);
     promise
+}
+
+/// `Promise.withResolvers()` — a pending promise and the two functions that settle it, returned
+/// together as `{ promise, resolve, reject }` (D-304).
+///
+/// The same `new_settling_function` the constructor hands its executor, only exposed instead of
+/// passed inward — which is the whole point of the method: it lets code resolve a promise from
+/// outside the executor without the `let resolve; new Promise(r => resolve = r)` dance. The three
+/// are ordinary enumerable data properties, as `CreateDataPropertyOrThrow` makes them. Like the
+/// combinators, this uses the intrinsic promise rather than the receiver `this` as its
+/// constructor, so a subclass's `withResolvers` still answers a base promise.
+extern "C" fn promise_with_resolvers(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    let promise = new_promise_object();
+    with_rooted(&[promise], || {
+        let resolve = new_settling_function(promise, false);
+        let reject = with_rooted(&[promise, resolve], || new_settling_function(promise, true));
+        with_rooted(&[promise, resolve, reject], || {
+            let result = crisol_create_object();
+            with_rooted(&[result, promise, resolve, reject], || {
+                if let Some(handle) = handle_of(result) {
+                    with_runtime(|runtime| {
+                        runtime.define(handle, "promise", Value::from_bits(promise));
+                        runtime.define(handle, "resolve", Value::from_bits(resolve));
+                        runtime.define(handle, "reject", Value::from_bits(reject));
+                    });
+                }
+                result
+            })
+        })
+    })
 }
 
 /// Which way a combinator folds a list of promises.
@@ -9382,6 +9420,66 @@ extern "C" fn number_is_nan(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = Value::from_bits(unsafe { argument(argc, argv, 0) });
     boolean(value.as_number().is_some_and(f64::is_nan)).to_bits()
+}
+
+/// `String.raw(template, …substitutions)` — the raw-string tag (D-303).
+///
+/// It reads `template.raw` and walks it, appending each raw segment as text and, between
+/// segments, the matching substitution — `String.raw\`a${1}b\`` is `"a1b"`. A segment or
+/// substitution is run through `ToString` (a symbol throws); a position with no substitution
+/// contributes the empty string, not `"undefined"`, which is the detail a naive `argument` read
+/// gets wrong. The accumulator is a Rust `String`, unaffected by any collection a `ToString` that
+/// calls user code might trigger; the template and the arguments are rooted across that call.
+extern "C" fn string_raw(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let template = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above — roots the template and every substitution before anything allocates.
+    let live = unsafe { live_values(template, argc, argv) };
+    with_rooted(&live, || {
+        let key = "raw";
+        // SAFETY: `key` is a live Rust string; `template.raw` is a general property get.
+        let raw = unsafe { crisol_property_load(template, key.as_ptr(), key.len() as u64) };
+        if Value::from_bits(raw).is_exception() {
+            return raw;
+        }
+        with_rooted(&[raw], || {
+            let length = match walk_length(raw) {
+                Ok(length) => length,
+                Err(thrown) => return thrown,
+            };
+            let mut result = String::new();
+            for index in 0..length {
+                let segment = indexed_get(raw, index);
+                if Value::from_bits(segment).is_exception() {
+                    return segment;
+                }
+                let Some(text) = to_text(segment) else {
+                    return raise(
+                        "String.raw: a template segment is not a string",
+                        "TypeError",
+                    );
+                };
+                result.push_str(&text);
+                // A substitution sits between two segments; `substitutions[index]` is `argv[index
+                // + 1]`. One that was not passed contributes the empty string.
+                if index + 1 < length && (index as u64) + 1 < argc {
+                    // SAFETY: bounds-checked against `argc` on the line above.
+                    let substitution = unsafe { argument(argc, argv, index + 1) };
+                    let Some(text) = to_text(substitution) else {
+                        return raise("String.raw: a substitution is not a string", "TypeError");
+                    };
+                    result.push_str(&text);
+                }
+            }
+            new_string(&result)
+        })
+    })
 }
 
 /// `String.fromCharCode(…)` — code *units*, so a surrogate pair takes two arguments.
@@ -11553,6 +11651,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Number", "parseInt", global_parse_int),
     ("String", "fromCharCode", string_from_char_code),
     ("String", "fromCodePoint", string_from_code_point),
+    ("String", "raw", string_raw),
     ("JSON", "parse", json_parse),
     ("JSON", "stringify", json_stringify),
     ("Object", "getOwnPropertyDescriptor", object_own_descriptor),
@@ -11628,6 +11727,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Promise", "any", promise_any),
     ("Promise", "resolve", promise_resolve),
     ("Promise", "reject", promise_reject),
+    ("Promise", "withResolvers", promise_with_resolvers),
     ("Reflect", "get", reflect_get),
     ("Reflect", "set", reflect_set),
     ("Reflect", "has", reflect_has),

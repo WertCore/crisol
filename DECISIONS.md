@@ -8120,3 +8120,35 @@ which additionally reject a key that cannot be held weakly, so `new WeakMap([[1,
 the method already gives for `set(1, 2)`. A weak map still requires each entry to be an object. The one
 drain now serves `Map`, `Set`, `WeakMap`, and `WeakSet` alike. Confirmed by acceptance populating a weak
 map and set from an iterable and rejecting a primitive key, under GC stress.
+
+## D-303
+
+**`String.raw` is present.**
+
+Status: Accepted
+
+The raw-string tag was missing, so `String.raw` was `undefined` and every test262 case covering it
+failed. It now reads `template.raw`, walks it with `ToLength(raw.length)`, and appends each segment's
+text interleaved with the substitutions — ``String.raw`a${1}b` `` is `"a1b"`, and a raw backslash
+survives (``String.raw`a\nb` `` is four characters, where the cooked form is three), which is the whole
+reason the tag exists. A segment or substitution goes through `ToString`; a position with no substitution
+contributes the empty string rather than `"undefined"` — the detail a naive `argument` read gets wrong —
+and a symbol is a `TypeError`. The accumulator is a Rust `String`, so a collection triggered by a
+`ToString` that runs user code cannot disturb it, and the template and arguments are rooted across it.
+Registered with `length` 1 and `name` `"raw"`. Confirmed by acceptance — the tagged form, a direct call,
+a missing substitution, an empty template, and the backslash case — under GC stress.
+
+## D-304
+
+**`Promise.withResolvers()` is present.**
+
+Status: Accepted
+
+The ES2024 convenience returning `{ promise, resolve, reject }` was missing. It builds a pending promise
+with `new_promise_object` and the same `new_settling_function` resolve/reject the constructor hands its
+executor, only exposed as three enumerable data properties instead of passed inward — which is what lets
+code settle a promise from outside an executor without the `let resolve; new Promise(r => resolve = r)`
+dance. Registered with `length` 0 and `name` `"withResolvers"`. Like the combinators it uses the
+intrinsic promise rather than the receiver `this` as its constructor, so a subclass's `withResolvers`
+still answers a base promise — the species limitation noted in D-299. Confirmed by acceptance: the shape,
+resolving from outside, and rejecting to `catch`, under GC stress.

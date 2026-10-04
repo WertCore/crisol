@@ -7064,6 +7064,31 @@ fn string_statics_build_from_code_units_and_points() {
         "return String.fromCodePoint(128512).length;",
         "2",
     );
+    // `String.raw` interleaves the template's raw segments with the substitutions (D-303).
+    check("raw-tagged", "return String.raw`a${1}b${2}c`;", "a1b2c");
+    check(
+        "raw-called-directly",
+        "return String.raw({ raw: [\"x\", \"y\", \"z\"] }, 10, 20);",
+        "x10y20z",
+    );
+    // A position with no substitution contributes the empty string, not `\"undefined\"`.
+    check(
+        "raw-missing-substitution",
+        "return String.raw({ raw: [\"one\", \"two\"] });",
+        "onetwo",
+    );
+    check("raw-empty-template", "return String.raw({ raw: [] });", "");
+    // A raw backslash survives, which is the whole reason the tag exists.
+    check(
+        "raw-keeps-backslashes",
+        "return String.raw`a\\nb`;",
+        "a\\nb",
+    );
+    check(
+        "raw-length-and-name",
+        "return String.raw.length + \",\" + String.raw.name;",
+        "1,raw",
+    );
 }
 
 /// **`Date.UTC` answers a time value, not a date** — and a lone argument is a year.
@@ -10652,6 +10677,39 @@ fn the_promise_combinators_fold_a_list() {
          Promise.any([]).catch(function () {}); \
          return \"built\";",
         "built",
+    );
+}
+
+/// `Promise.withResolvers()` hands back a pending promise and the two functions that settle it,
+/// so a promise can be resolved from outside its executor (D-304).
+#[test]
+fn promise_with_resolvers_exposes_the_settling_functions() {
+    check(
+        "with-resolvers-shape",
+        "var w = Promise.withResolvers(); \
+         return (typeof w.promise) + \",\" + (typeof w.resolve) + \",\" + (typeof w.reject);",
+        "object,function,function",
+    );
+    check(
+        "with-resolvers-length-and-name",
+        "return Promise.withResolvers.length + \",\" + Promise.withResolvers.name;",
+        "0,withResolvers",
+    );
+    // Resolving from outside settles the promise its handler then observes.
+    check(
+        "with-resolvers-resolve",
+        "var w = Promise.withResolvers(); \
+         w.promise.then(function (v) { print(\"ok:\" + v); }); \
+         w.resolve(7); return 0;",
+        "ok:7\n0",
+    );
+    // And rejecting routes to `catch`.
+    check(
+        "with-resolvers-reject",
+        "var w = Promise.withResolvers(); \
+         w.promise.catch(function (e) { print(\"no:\" + e); }); \
+         w.reject(9); return 0;",
+        "no:9\n0",
     );
 }
 
