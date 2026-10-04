@@ -4,10 +4,11 @@
 
 #![doc(html_root_url = "https://docs.rs/crisol-frontend/0.0.0")]
 
+mod escape;
 mod graph;
 mod loader;
 mod lower;
 
 pub use graph::{ModuleGraph, ModuleId};
 pub use loader::{Loader, Request, Unresolved};
-pub use lower::{Lowered, ParseFailed, Unsupported, lower};
+pub use lower::{Lowered, ModuleError, ParseFailed, Unsupported, lower, lower_modules};

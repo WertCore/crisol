@@ -42,6 +42,9 @@ pub struct Flags {
     pub dot_all: bool,
     /// `u` — Unicode mode.
     pub unicode: bool,
+    /// `v` — Unicode-sets mode: set operations in character classes and properties of strings.
+    /// Mutually exclusive with `u`.
+    pub unicode_sets: bool,
     /// `y` — anchor the match **at** `lastIndex` rather than searching from it.
     pub sticky: bool,
     /// `d` — report capture group indices.
@@ -66,6 +69,7 @@ impl Flags {
                 'm' => &mut flags.multiline,
                 's' => &mut flags.dot_all,
                 'u' => &mut flags.unicode,
+                'v' => &mut flags.unicode_sets,
                 'y' => &mut flags.sticky,
                 'd' => &mut flags.has_indices,
                 _ => return Err(letter),
@@ -74,6 +78,11 @@ impl Flags {
                 return Err(letter);
             }
             *slot = true;
+        }
+        // **`u` and `v` are mutually exclusive**, a `SyntaxError` the specification names
+        // explicitly — `v` is a different dialect of the same mode, not an addition to it.
+        if flags.unicode && flags.unicode_sets {
+            return Err('v');
         }
         Ok(flags)
     }
@@ -93,6 +102,7 @@ impl Flags {
             (self.multiline, 'm'),
             (self.dot_all, 's'),
             (self.unicode, 'u'),
+            (self.unicode_sets, 'v'),
             (self.sticky, 'y'),
         ] {
             if set {
@@ -147,6 +157,7 @@ impl JsRegExp {
             multiline: flags.multiline,
             dot_all: flags.dot_all,
             unicode: flags.unicode,
+            unicode_sets: flags.unicode_sets,
             ..RegressFlags::default()
         };
         let regex = Regex::with_flags(pattern, regress_flags).map_err(|error| error.to_string())?;
