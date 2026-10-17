@@ -10907,11 +10907,25 @@ fn promise_combinators_accept_any_iterable() {
          return 0;",
         "fulfilled,rejected\n0",
     );
-    // A non-iterable is a `TypeError`, raised where the old array-like length check raised.
+    // A non-iterable argument rejects the returned promise (IfAbruptRejectPromise), rather than
+    // throwing out of the combinator (D-307).
     check(
         "promise-all-rejects-a-non-iterable",
-        "try { Promise.all(5); return \"no-throw\"; } catch (e) { return e.name; }",
-        "TypeError",
+        "Promise.all(5).then(function () { print(\"ok\"); }, function (e) { print(\"no:\" + e.name); }); \
+         return 0;",
+        "no:TypeError\n0",
+    );
+    // An iterator whose step throws mid-drain also rejects rather than throwing (D-307).
+    check(
+        "promise-all-rejects-a-throwing-iterator",
+        "var it = { [Symbol.iterator]: function () { \
+             var n = 0; \
+             return { next: function () { n = n + 1; if (n > 1) throw new TypeError(\"boom\"); \
+                 return { value: Promise.resolve(1), done: false }; } }; \
+         } }; \
+         Promise.allSettled(it).then(function () { print(\"ok\"); }, function (e) { print(\"no:\" + e.message); }); \
+         return 0;",
+        "no:boom\n0",
     );
 }
 

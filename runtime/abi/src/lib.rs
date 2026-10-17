@@ -7611,7 +7611,15 @@ fn combine_promises(argc: u64, argv: *const u64, how: Combine) -> u64 {
     // raises, and we propagate that exactly as the old array-like length check did (D-299).
     let list = with_rooted(&[list, result], || crisol_iterate(list));
     if Value::from_bits(list).is_exception() {
-        return list;
+        // **IfAbruptRejectPromise (D-307).** A non-iterable argument, or an iterator whose step
+        // throws while draining, rejects the returned promise rather than throwing out of the
+        // combinator — `Promise.all(5)` and `Promise.allSettled(throwingIterable)` answer a
+        // rejected promise, which is what a caller's `.catch` is there to receive.
+        let reason = crisol_pending_exception();
+        return with_rooted(&[result, reason], || {
+            settle_promise(result, reason, true);
+            result
+        });
     }
     with_rooted(&[list, result], || {
         let length = match indexed_length(list) {

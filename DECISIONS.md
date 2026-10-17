@@ -8198,3 +8198,19 @@ is linked, from a third native table appended after the helper table so the `.le
 still self-adjust; `length` 1, `name` `"from"`. Confirmed by acceptance — wrapping a raw iterator and
 mapping it, draining an array and an array iterator, a string by code point, and the non-iterable
 `TypeError` — under GC stress.
+
+## D-307
+
+**The Promise combinators reject, rather than throw, when the argument cannot be iterated.**
+
+Status: Accepted
+
+`Promise.all`/`race`/`allSettled`/`any` apply *IfAbruptRejectPromise* to a failure while obtaining or
+stepping the iterator: a non-iterable argument, or an iterator whose `next` throws mid-drain, settles the
+returned promise as **rejected** — it does not throw out of the combinator. `combine_promises` returned
+the exception from its `crisol_iterate` drain (the D-299 behaviour), which surfaced as a synchronous
+throw; it now takes the pending exception and rejects `result`, so `Promise.all(5).catch(f)` and
+`Promise.allSettled(throwingIterable).catch(f)` receive the reason. This is the deviation a corpus census
+surfaced as an `allSettled` "crash" (a non-zero exit from the uncaught throw). Confirmed by acceptance —
+a non-iterable and a throwing iterator both route to the rejection handler; the array-input paths are
+unchanged.
