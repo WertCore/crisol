@@ -652,6 +652,8 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(SET_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(SYMBOL_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BOOLEAN_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ARRAY_BUFFER_PROTOTYPE.with(std::cell::Cell::get));
@@ -734,6 +736,16 @@ thread_local! {
     static SYMBOL_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
     /// The prototype every array iterator inherits from.
     static ARRAY_ITERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%Iterator.prototype%` (D-305) — the single object the iterator-helper methods
+    /// (`map`/`filter`/`take`/`drop`/`flatMap`/`reduce`/`toArray`/`forEach`/`some`/`every`/`find`)
+    /// and `[Symbol.iterator]` live on, and that every built-in iterator prototype (array
+    /// iterator, generator) inherits from, so `[].values().map(f)` and `gen().take(2)` work.
+    static ITERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%IteratorHelperPrototype%` (D-305) — the prototype of the lazy iterator a helper returns;
+    /// holds the single `next`/`return` that step a `map`/`filter`/`take`/`drop`/`flatMap` chain.
+    static ITERATOR_HELPER_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// The prototype every number inherits from.
     static NUMBER_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
@@ -1793,6 +1805,7 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("WeakSet", make_weakset),
     ("WeakRef", make_weakref),
     ("FinalizationRegistry", make_finalization_registry),
+    ("Iterator", make_iterator),
 ];
 
 /// The eleven typed-array constructor names, in [`ELEMENT_KINDS`] order.
@@ -1941,6 +1954,25 @@ const WEAK_NATIVES: &[(&str, Native)] = &[
     ("register", finreg_register),
     ("unregister", finreg_unregister),
 ];
+/// `%Iterator.prototype%`'s helper methods (D-305) — the lazy ones first, then the eager ones.
+const ITERATOR_PROTOTYPE_NATIVES: &[(&str, Native)] = &[
+    ("map", iterator_map),
+    ("filter", iterator_filter),
+    ("take", iterator_take),
+    ("drop", iterator_drop),
+    ("flatMap", iterator_flat_map),
+    ("reduce", iterator_reduce),
+    ("toArray", iterator_to_array),
+    ("forEach", iterator_for_each),
+    ("some", iterator_some),
+    ("every", iterator_every),
+    ("find", iterator_find),
+];
+/// `%IteratorHelperPrototype%`'s `next`/`return` (D-305).
+const ITERATOR_HELPER_NATIVES: &[(&str, Native)] = &[
+    ("next", iterator_helper_next),
+    ("return", iterator_helper_return),
+];
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -1956,6 +1988,18 @@ const FINREG_UNREGISTER: usize = 9;
 /// [`crisol_closure_code`] order. Shared by the build and the dispatch so they cannot drift.
 fn weak_natives_base() -> usize {
     typed_natives_base() + TYPED_NATIVES.len() + GENERATOR_NATIVES.len() + BIGINT_NATIVES.len()
+}
+
+/// The global index at which [`ITERATOR_PROTOTYPE_NATIVES`] begins — appended after every other
+/// table, so earlier indices never move (D-305). Shared by the build and [`crisol_closure_code`].
+fn iterator_prototype_natives_base() -> usize {
+    weak_natives_base() + WEAK_NATIVES.len()
+}
+
+/// The global index at which [`ITERATOR_HELPER_NATIVES`] begins — right after
+/// [`ITERATOR_PROTOTYPE_NATIVES`] (D-305).
+fn iterator_helper_natives_base() -> usize {
+    iterator_prototype_natives_base() + ITERATOR_PROTOTYPE_NATIVES.len()
 }
 
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
@@ -6434,6 +6478,20 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("BigInt", "asUintN", 2),
     ("Symbol", "for", 1),
     ("Symbol", "keyFor", 1),
+    ("global", "Iterator", 0),
+    ("Iterator.prototype", "map", 1),
+    ("Iterator.prototype", "filter", 1),
+    ("Iterator.prototype", "take", 1),
+    ("Iterator.prototype", "drop", 1),
+    ("Iterator.prototype", "flatMap", 1),
+    ("Iterator.prototype", "reduce", 1),
+    ("Iterator.prototype", "toArray", 0),
+    ("Iterator.prototype", "forEach", 1),
+    ("Iterator.prototype", "some", 1),
+    ("Iterator.prototype", "every", 1),
+    ("Iterator.prototype", "find", 1),
+    ("Iterator Helper", "next", 0),
+    ("Iterator Helper", "return", 0),
 ];
 
 /// The arity the specification gives `owner.name`, if it gives one.
@@ -14674,6 +14732,82 @@ impl Runtime {
             self.define_keyed(prototype, &key, function.to_value());
         }
 
+        // **`%Iterator.prototype%` and the helper machinery (D-305).** One shared object carries
+        // the iterator-helper methods; every built-in iterator prototype reparents onto it, so
+        // `[].values().map(f)` and a generator's `.take(2)` reach the helpers. A lazy helper
+        // answers an object inheriting `%IteratorHelperPrototype%`, whose `next` steps the chain.
+        {
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            // `%Iterator.prototype%`, inheriting `Object.prototype`, rooted through its cell before
+            // the methods allocate — the discipline every prototype builder here follows.
+            let iterator_prototype = scope.alloc(shape, 0);
+            ITERATOR_PROTOTYPE.with(|cell| cell.set(Some(iterator_prototype.handle())));
+            self.inherit_from_object(iterator_prototype.handle());
+            let base = iterator_prototype_natives_base();
+            for (index, (name, _)) in ITERATOR_PROTOTYPE_NATIVES.iter().enumerate() {
+                let method = self.native_function(base + index);
+                self.define_method(
+                    iterator_prototype.handle(),
+                    "Iterator.prototype",
+                    name,
+                    method.to_value(),
+                );
+            }
+            // `[Symbol.iterator]` returns `this`, so every iterator that inherits here is its own
+            // iterable — the one definition the reparented prototypes now share.
+            let self_index =
+                NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ITERATOR_SELF;
+            let iterator_self = self.native_function(self_index);
+            self.define_keyed(iterator_prototype.handle(), &key, iterator_self.to_value());
+
+            // `%IteratorHelperPrototype%` inherits from `%Iterator.prototype%` and holds the one
+            // `next`/`return` that step every lazy helper.
+            let helper_prototype = scope.alloc(shape, 0);
+            ITERATOR_HELPER_PROTOTYPE.with(|cell| cell.set(Some(helper_prototype.handle())));
+            self.heap
+                .set_prototype(helper_prototype.handle(), Some(iterator_prototype.handle()));
+            let helper_base = iterator_helper_natives_base();
+            for (index, (name, _)) in ITERATOR_HELPER_NATIVES.iter().enumerate() {
+                let method = self.native_function(helper_base + index);
+                self.define_method(
+                    helper_prototype.handle(),
+                    "Iterator Helper",
+                    name,
+                    method.to_value(),
+                );
+            }
+
+            // **Reparent the built-in iterator prototypes onto `%Iterator.prototype%`** — where the
+            // specification puts the helpers. The acceptance regression is the guard that this
+            // chain change leaves every existing array-iterator and generator working.
+            if let Some(array_iterator) = ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+                self.heap
+                    .set_prototype(array_iterator, Some(iterator_prototype.handle()));
+            }
+            if let Some(generator) = GENERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+                self.heap
+                    .set_prototype(generator, Some(iterator_prototype.handle()));
+            }
+
+            // Link the `Iterator` global to `%Iterator.prototype%` now that the prototype exists —
+            // `build_globals` ran before this function, so it could not (D-305).
+            if let Some(globals) = GLOBALS.with(std::cell::Cell::get)
+                && let Some(constructor) = self.global_object(globals, "Iterator")
+            {
+                self.define_hidden(
+                    constructor,
+                    "prototype",
+                    iterator_prototype.handle().to_value(),
+                );
+                self.define_linking(
+                    iterator_prototype.handle(),
+                    "constructor",
+                    constructor.to_value(),
+                );
+            }
+        }
+
         // **An async generator is its own async-iterator** — `for await` reaches its `next` through
         // `[Symbol.asyncIterator]`, which answers `this` (D-267).
         if let Some(prototype) = ASYNC_GENERATOR_PROTOTYPE.with(std::cell::Cell::get) {
@@ -15072,6 +15206,9 @@ impl Runtime {
                 "FinalizationRegistry",
                 FINALIZATION_REGISTRY_PROTOTYPE.with(std::cell::Cell::get),
             ),
+            // `Iterator` is linked in `build_symbol_keyed_methods`, not here: its prototype is built
+            // there (it needs the well-known `Symbol.iterator`, made inside this function), which
+            // runs after this loop — so the link is deferred to where both sides exist (D-305).
         ] {
             if let (Some(constructor), Some(prototype)) =
                 (self.global_object(globals.handle(), name), cell)
@@ -18693,7 +18830,15 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + BIGINT_NATIVES.len();
-        return WEAK_NATIVES
+        if let Some((_, function)) = WEAK_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + WEAK_NATIVES.len();
+        if let Some((_, function)) = ITERATOR_PROTOTYPE_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + ITERATOR_PROTOTYPE_NATIVES.len();
+        return ITERATOR_HELPER_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
@@ -20648,6 +20793,736 @@ fn drain_iterator(iterator: u64) -> u64 {
         }
         array.to_value().to_bits()
     })
+}
+
+// ============================== Iterator helpers (D-305) ==============================
+//
+// The ES2025 `Iterator` object: a shared `%Iterator.prototype%` carrying the helper methods, which
+// every built-in iterator prototype (array iterator, generator) inherits from — so `[].values()`,
+// a generator, and a helper's own result all answer `map`/`filter`/`take`/`drop`/`flatMap`
+// (lazy) and `reduce`/`toArray`/`forEach`/`some`/`every`/`find` (eager). The lazy helpers return
+// an object inheriting `%IteratorHelperPrototype%`, whose single `next` steps a chain recorded in
+// the object's own non-enumerable slots — state the collector sees because it lives in properties.
+// `Iterator.from` and the async helpers are not implemented yet.
+
+/// A lazy helper's kind, stored on the helper as a number but dispatched as a small integer tag.
+const IH_MAP: u8 = 0;
+const IH_FILTER: u8 = 1;
+const IH_TAKE: u8 = 2;
+const IH_DROP: u8 = 3;
+const IH_FLATMAP: u8 = 4;
+
+/// Which transform a helper applies.
+const IH_KIND: &str = "__ihKind";
+/// The iterator a helper pulls from.
+const IH_SOURCE: &str = "__ihSource";
+/// The callback a `map`/`filter`/`flatMap` helper runs (`undefined` for `take`/`drop`).
+const IH_FUNC: &str = "__ihFunc";
+/// The remaining count for `take`, or the still-to-skip count for `drop`.
+const IH_LIMIT: &str = "__ihLimit";
+/// The zero-based index handed to the callback.
+const IH_COUNTER: &str = "__ihCounter";
+/// A `flatMap` helper's current inner iterator, or `undefined` between inners.
+const IH_INNER: &str = "__ihInner";
+/// Set once a helper is exhausted or closed, so a later `next` is inert.
+const IH_DONE: &str = "__ihDone";
+
+/// One step of the iterator protocol: calls `iterator.next()` and reads the result (D-305).
+///
+/// `Ok(None)` is exhaustion, `Ok(Some(value))` a produced value, and `Err(thrown)` a propagated
+/// exception. `next` is re-read each step, matching [`drain_iterator`].
+fn iterator_step(iterator: u64) -> Result<Option<u64>, u64> {
+    let advance = property_of(iterator, "next");
+    if !is_callable(advance) {
+        return Err(raise("an iterator needs a `next` method", "TypeError"));
+    }
+    let outcome = with_rooted(&[iterator, advance], || call_value(advance, iterator, &[]));
+    if Value::from_bits(outcome).is_exception() {
+        return Err(outcome);
+    }
+    if handle_of(outcome).is_none() {
+        return Err(raise("an iterator step must be an object", "TypeError"));
+    }
+    let done = with_rooted(&[iterator, outcome], || property_of(outcome, "done"));
+    if Value::from_bits(done).is_exception() {
+        return Err(done);
+    }
+    if is_truthy(Value::from_bits(done)) {
+        return Ok(None);
+    }
+    let value = with_rooted(&[iterator, outcome], || property_of(outcome, "value"));
+    if Value::from_bits(value).is_exception() {
+        return Err(value);
+    }
+    Ok(Some(value))
+}
+
+/// `IteratorClose` — calls `iterator.return()` if it has one, so a source can clean up when a
+/// consumer stops early. Returns `return`'s own throw for the caller to surface.
+fn iterator_close(iterator: u64) -> Option<u64> {
+    let ret = property_of(iterator, "return");
+    if Value::from_bits(ret).is_nullish() || !is_callable(ret) {
+        return None;
+    }
+    let outcome = with_rooted(&[iterator, ret], || call_value(ret, iterator, &[]));
+    Value::from_bits(outcome).is_exception().then_some(outcome)
+}
+
+/// Whether `this_value` can be the receiver of an iterator-helper method: it must be an object.
+fn require_iterator_receiver(this_value: u64, method: &str) -> Option<u64> {
+    if handle_of(this_value).is_none() {
+        return Some(raise(
+            &format!("Iterator.prototype.{method} requires an object receiver"),
+            "TypeError",
+        ));
+    }
+    None
+}
+
+/// Sets one of a helper's non-enumerable state slots, overwriting in place.
+fn set_helper_slot(helper: u64, name: &str, value: u64) {
+    if let Some(handle) = handle_of(helper) {
+        with_runtime(|runtime| runtime.define_hidden(handle, name, Value::from_bits(value)));
+    }
+}
+
+/// `Iterator.prototype.toArray` — drains the iterator into an array (D-305).
+extern "C" fn iterator_to_array(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_iterator_receiver(this_value, "toArray") {
+        return thrown;
+    }
+    with_rooted(&[this_value], || {
+        with_new_array(0, |array| {
+            let mut count = 0usize;
+            loop {
+                match with_rooted(&[this_value], || iterator_step(this_value)) {
+                    Err(thrown) => return thrown,
+                    Ok(None) => break,
+                    Ok(Some(value)) => {
+                        with_rooted(&[this_value, value], || {
+                            with_runtime(|runtime| {
+                                runtime
+                                    .heap
+                                    .set_element(array, count, Value::from_bits(value));
+                            });
+                        });
+                        count += 1;
+                    }
+                }
+            }
+            array.to_value().to_bits()
+        })
+    })
+}
+
+/// `Iterator.prototype.forEach` — runs `fn(value, index)` for each value (D-305).
+extern "C" fn iterator_for_each(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_iterator_receiver(this_value, "forEach") {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if !is_callable(callback) {
+        return raise("Iterator.prototype.forEach needs a function", "TypeError");
+    }
+    with_rooted(&[this_value, callback], || {
+        let mut index = 0usize;
+        loop {
+            match with_rooted(&[this_value, callback], || iterator_step(this_value)) {
+                Err(thrown) => return thrown,
+                Ok(None) => return Value::UNDEFINED.to_bits(),
+                Ok(Some(value)) => {
+                    let args = [value, index_value(index)];
+                    let outcome = with_rooted(&[this_value, callback, value], || {
+                        call_value(callback, Value::UNDEFINED.to_bits(), &args)
+                    });
+                    if Value::from_bits(outcome).is_exception() {
+                        iterator_close(this_value);
+                        return outcome;
+                    }
+                    index += 1;
+                }
+            }
+        }
+    })
+}
+
+/// `Iterator.prototype.reduce` — folds the iterator left-to-right (D-305).
+extern "C" fn iterator_reduce(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_iterator_receiver(this_value, "reduce") {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let reducer = unsafe { argument(argc, argv, 0) };
+    if !is_callable(reducer) {
+        return raise("Iterator.prototype.reduce needs a function", "TypeError");
+    }
+    let has_initial = argc >= 2;
+    // SAFETY: as above.
+    let initial = unsafe { argument(argc, argv, 1) };
+    with_rooted(&[this_value, reducer, initial], || {
+        let mut accumulator = initial;
+        let mut index = 0usize;
+        if !has_initial {
+            match with_rooted(&[this_value, reducer], || iterator_step(this_value)) {
+                Err(thrown) => return thrown,
+                Ok(None) => {
+                    return raise(
+                        "Iterator.prototype.reduce of an empty iterator with no initial value",
+                        "TypeError",
+                    );
+                }
+                Ok(Some(value)) => {
+                    accumulator = value;
+                    index = 1;
+                }
+            }
+        }
+        loop {
+            match with_rooted(&[this_value, reducer, accumulator], || {
+                iterator_step(this_value)
+            }) {
+                Err(thrown) => return thrown,
+                Ok(None) => return accumulator,
+                Ok(Some(value)) => {
+                    let args = [accumulator, value, index_value(index)];
+                    let outcome = with_rooted(&[this_value, reducer, accumulator, value], || {
+                        call_value(reducer, Value::UNDEFINED.to_bits(), &args)
+                    });
+                    if Value::from_bits(outcome).is_exception() {
+                        iterator_close(this_value);
+                        return outcome;
+                    }
+                    accumulator = outcome;
+                    index += 1;
+                }
+            }
+        }
+    })
+}
+
+/// The shared body of `some`/`every`/`find`: each walks the iterator running a predicate, and
+/// closes it the moment the answer is settled. `want` is the predicate result that settles it
+/// early (`true` for `some`/`find`, `false` for `every`); `on_hit` turns the settling step into
+/// the method's answer, and `exhausted` is the answer when nothing settled it.
+fn iterator_search(
+    this_value: u64,
+    predicate: u64,
+    method: &str,
+    want: bool,
+    on_hit: impl Fn(u64) -> u64,
+    exhausted: u64,
+) -> u64 {
+    if let Some(thrown) = require_iterator_receiver(this_value, method) {
+        return thrown;
+    }
+    if !is_callable(predicate) {
+        return raise(
+            &format!("Iterator.prototype.{method} needs a function"),
+            "TypeError",
+        );
+    }
+    with_rooted(&[this_value, predicate], || {
+        let mut index = 0usize;
+        loop {
+            match with_rooted(&[this_value, predicate], || iterator_step(this_value)) {
+                Err(thrown) => return thrown,
+                Ok(None) => return exhausted,
+                Ok(Some(value)) => {
+                    let args = [value, index_value(index)];
+                    let verdict = with_rooted(&[this_value, predicate, value], || {
+                        call_value(predicate, Value::UNDEFINED.to_bits(), &args)
+                    });
+                    if Value::from_bits(verdict).is_exception() {
+                        iterator_close(this_value);
+                        return verdict;
+                    }
+                    if is_truthy(Value::from_bits(verdict)) == want {
+                        let answer = on_hit(value);
+                        if let Some(thrown) = iterator_close(this_value) {
+                            return thrown;
+                        }
+                        return answer;
+                    }
+                    index += 1;
+                }
+            }
+        }
+    })
+}
+
+/// `Iterator.prototype.some` — `true` at the first value the predicate accepts (D-305).
+extern "C" fn iterator_some(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let predicate = unsafe { argument(argc, argv, 0) };
+    iterator_search(
+        this_value,
+        predicate,
+        "some",
+        true,
+        |_| Value::TRUE.to_bits(),
+        Value::FALSE.to_bits(),
+    )
+}
+
+/// `Iterator.prototype.every` — `false` at the first value the predicate rejects (D-305).
+extern "C" fn iterator_every(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let predicate = unsafe { argument(argc, argv, 0) };
+    iterator_search(
+        this_value,
+        predicate,
+        "every",
+        false,
+        |_| Value::FALSE.to_bits(),
+        Value::TRUE.to_bits(),
+    )
+}
+
+/// `Iterator.prototype.find` — the first value the predicate accepts, else `undefined` (D-305).
+extern "C" fn iterator_find(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let predicate = unsafe { argument(argc, argv, 0) };
+    iterator_search(
+        this_value,
+        predicate,
+        "find",
+        true,
+        |value| value,
+        Value::UNDEFINED.to_bits(),
+    )
+}
+
+/// Builds a lazy iterator-helper object: an object inheriting `%IteratorHelperPrototype%` whose
+/// non-enumerable slots record the chain its `next` will step.
+fn make_iterator_helper(source: u64, kind: u8, func: u64, limit: f64) -> u64 {
+    with_rooted(&[source, func], || {
+        let helper = crisol_create_object();
+        with_rooted(&[helper, source, func], || {
+            if let Some(handle) = handle_of(helper) {
+                with_runtime(|runtime| {
+                    if let Some(prototype) = ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get) {
+                        runtime.heap.set_prototype(handle, Some(prototype));
+                    }
+                    runtime.define_hidden(handle, IH_KIND, Value::number(f64::from(kind)));
+                    runtime.define_hidden(handle, IH_SOURCE, Value::from_bits(source));
+                    runtime.define_hidden(handle, IH_FUNC, Value::from_bits(func));
+                    runtime.define_hidden(handle, IH_LIMIT, Value::number(limit));
+                    runtime.define_hidden(handle, IH_COUNTER, Value::number(0.0));
+                    runtime.define_hidden(handle, IH_INNER, Value::UNDEFINED);
+                    runtime.define_hidden(handle, IH_DONE, Value::FALSE);
+                });
+            }
+            helper
+        })
+    })
+}
+
+/// `ToIntegerOrInfinity` with the `take`/`drop` guard: the limit must not be `NaN` and must not be
+/// negative, or it is a `RangeError`. Returns the integer part (or `f64::INFINITY`).
+fn helper_limit(argument: u64, method: &str) -> Result<f64, u64> {
+    let number = coerce_number(argument)?;
+    if number.is_nan() {
+        return Err(raise(
+            &format!("Iterator.prototype.{method} needs a non-negative limit"),
+            "RangeError",
+        ));
+    }
+    let integer = number.trunc();
+    if integer < 0.0 {
+        return Err(raise(
+            &format!("Iterator.prototype.{method} needs a non-negative limit"),
+            "RangeError",
+        ));
+    }
+    Ok(integer)
+}
+
+/// The shared body of `map`/`filter`/`flatMap`: validate the receiver and callback, then build the
+/// lazy helper of the right `kind`.
+fn iterator_lazy_with_callback(this_value: u64, callback: u64, method: &str, kind: u8) -> u64 {
+    if let Some(thrown) = require_iterator_receiver(this_value, method) {
+        return thrown;
+    }
+    if !is_callable(callback) {
+        return raise(
+            &format!("Iterator.prototype.{method} needs a function"),
+            "TypeError",
+        );
+    }
+    make_iterator_helper(this_value, kind, callback, 0.0)
+}
+
+/// `Iterator.prototype.map` (D-305).
+extern "C" fn iterator_map(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    iterator_lazy_with_callback(this_value, callback, "map", IH_MAP)
+}
+
+/// `Iterator.prototype.filter` (D-305).
+extern "C" fn iterator_filter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    iterator_lazy_with_callback(this_value, callback, "filter", IH_FILTER)
+}
+
+/// `Iterator.prototype.flatMap` (D-305).
+extern "C" fn iterator_flat_map(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    iterator_lazy_with_callback(this_value, callback, "flatMap", IH_FLATMAP)
+}
+
+/// `Iterator.prototype.take` — at most `limit` values (D-305).
+extern "C" fn iterator_take(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_iterator_receiver(this_value, "take") {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let limit = unsafe { argument(argc, argv, 0) };
+    let limit = match with_rooted(&[this_value], || helper_limit(limit, "take")) {
+        Ok(limit) => limit,
+        Err(thrown) => return thrown,
+    };
+    make_iterator_helper(this_value, IH_TAKE, Value::UNDEFINED.to_bits(), limit)
+}
+
+/// `Iterator.prototype.drop` — skips the first `limit` values (D-305).
+extern "C" fn iterator_drop(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if let Some(thrown) = require_iterator_receiver(this_value, "drop") {
+        return thrown;
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let limit = unsafe { argument(argc, argv, 0) };
+    let limit = match with_rooted(&[this_value], || helper_limit(limit, "drop")) {
+        Ok(limit) => limit,
+        Err(thrown) => return thrown,
+    };
+    make_iterator_helper(this_value, IH_DROP, Value::UNDEFINED.to_bits(), limit)
+}
+
+/// `GetIteratorFlattenable` for `flatMap`: the mapped value must be an object, and its iterator is
+/// `value[Symbol.iterator]()` when it has one, or the value itself when it is already an iterator.
+fn iterator_flattenable(value: u64) -> Result<u64, u64> {
+    if handle_of(value).is_none() {
+        return Err(raise(
+            "Iterator.prototype.flatMap expects each mapped value to be an object",
+            "TypeError",
+        ));
+    }
+    let Some(key) = iterator_key() else {
+        return Ok(value);
+    };
+    let method = symbol_property_load(value, &key);
+    if Value::from_bits(method).is_nullish() {
+        return Ok(value);
+    }
+    if !is_callable(method) {
+        return Err(raise(
+            "Iterator.prototype.flatMap: [Symbol.iterator] is not callable",
+            "TypeError",
+        ));
+    }
+    let iterator = with_rooted(&[value, method], || call_value(method, value, &[]));
+    if Value::from_bits(iterator).is_exception() {
+        return Err(iterator);
+    }
+    if handle_of(iterator).is_none() {
+        return Err(raise(
+            "Iterator.prototype.flatMap: [Symbol.iterator]() did not return an object",
+            "TypeError",
+        ));
+    }
+    Ok(iterator)
+}
+
+/// `%IteratorHelperPrototype%.next` — the one step shared by every lazy helper, dispatching on the
+/// recorded `kind` (D-305). State lives in the helper's own slots, so it survives across calls and
+/// the collector traces it.
+extern "C" fn iterator_helper_next(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise("not an Iterator Helper", "TypeError");
+    }
+    with_rooted(&[this_value], || {
+        if is_truthy(Value::from_bits(property_of(this_value, IH_DONE))) {
+            return iterator_result(Value::UNDEFINED.to_bits(), true);
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the kind is a 0-4 tag this engine wrote"
+        )]
+        let kind = Value::from_bits(property_of(this_value, IH_KIND))
+            .as_number()
+            .unwrap_or(0.0) as u8;
+        let source = property_of(this_value, IH_SOURCE);
+        let func = property_of(this_value, IH_FUNC);
+        with_rooted(&[this_value, source, func], || {
+            helper_step(this_value, source, func, kind)
+        })
+    })
+}
+
+/// Marks a helper exhausted and closes its source, answering a done result.
+fn helper_finish(this_value: u64, source: u64) -> u64 {
+    set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+    iterator_close(source);
+    iterator_result(Value::UNDEFINED.to_bits(), true)
+}
+
+/// Runs the callback a `map`/`filter`/`flatMap` helper holds; on a throw it finishes the helper
+/// (closing the source) and hands back the exception.
+fn helper_call(this_value: u64, source: u64, func: u64, value: u64) -> Result<u64, u64> {
+    let index = Value::from_bits(property_of(this_value, IH_COUNTER))
+        .as_number()
+        .unwrap_or(0.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a step index"
+    )]
+    let args = [value, index_value(index as usize)];
+    let outcome = with_rooted(&[this_value, source, func, value], || {
+        call_value(func, Value::UNDEFINED.to_bits(), &args)
+    });
+    if Value::from_bits(outcome).is_exception() {
+        helper_finish(this_value, source);
+        return Err(outcome);
+    }
+    set_helper_slot(this_value, IH_COUNTER, Value::number(index + 1.0).to_bits());
+    Ok(outcome)
+}
+
+/// One step of a lazy helper, by kind.
+fn helper_step(this_value: u64, source: u64, func: u64, kind: u8) -> u64 {
+    match kind {
+        IH_FILTER => loop {
+            match iterator_step(source) {
+                Err(thrown) => {
+                    set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                    return thrown;
+                }
+                Ok(None) => return helper_finish(this_value, source),
+                Ok(Some(value)) => match helper_call(this_value, source, func, value) {
+                    Err(thrown) => return thrown,
+                    Ok(verdict) => {
+                        if is_truthy(Value::from_bits(verdict)) {
+                            return iterator_result(value, false);
+                        }
+                    }
+                },
+            }
+        },
+        IH_TAKE => {
+            let remaining = Value::from_bits(property_of(this_value, IH_LIMIT))
+                .as_number()
+                .unwrap_or(0.0);
+            if remaining <= 0.0 {
+                return helper_finish(this_value, source);
+            }
+            match iterator_step(source) {
+                Err(thrown) => {
+                    set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                    thrown
+                }
+                Ok(None) => helper_finish(this_value, source),
+                Ok(Some(value)) => {
+                    set_helper_slot(
+                        this_value,
+                        IH_LIMIT,
+                        Value::number(remaining - 1.0).to_bits(),
+                    );
+                    iterator_result(value, false)
+                }
+            }
+        }
+        IH_DROP => {
+            let mut remaining = Value::from_bits(property_of(this_value, IH_LIMIT))
+                .as_number()
+                .unwrap_or(0.0);
+            while remaining > 0.0 {
+                match iterator_step(source) {
+                    Err(thrown) => {
+                        set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                        return thrown;
+                    }
+                    Ok(None) => return helper_finish(this_value, source),
+                    Ok(Some(_)) => remaining -= 1.0,
+                }
+            }
+            set_helper_slot(this_value, IH_LIMIT, Value::number(0.0).to_bits());
+            match iterator_step(source) {
+                Err(thrown) => {
+                    set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                    thrown
+                }
+                Ok(None) => helper_finish(this_value, source),
+                Ok(Some(value)) => iterator_result(value, false),
+            }
+        }
+        IH_FLATMAP => loop {
+            let inner = property_of(this_value, IH_INNER);
+            if !Value::from_bits(inner).is_undefined() {
+                match with_rooted(&[this_value, source, func, inner], || iterator_step(inner)) {
+                    Err(thrown) => {
+                        set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                        iterator_close(source);
+                        return thrown;
+                    }
+                    Ok(None) => set_helper_slot(this_value, IH_INNER, Value::UNDEFINED.to_bits()),
+                    Ok(Some(value)) => return iterator_result(value, false),
+                }
+            }
+            match iterator_step(source) {
+                Err(thrown) => {
+                    set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                    return thrown;
+                }
+                Ok(None) => return helper_finish(this_value, source),
+                Ok(Some(value)) => {
+                    let mapped = match helper_call(this_value, source, func, value) {
+                        Err(thrown) => return thrown,
+                        Ok(mapped) => mapped,
+                    };
+                    match with_rooted(&[this_value, source, func, mapped], || {
+                        iterator_flattenable(mapped)
+                    }) {
+                        Err(thrown) => {
+                            helper_finish(this_value, source);
+                            return thrown;
+                        }
+                        Ok(inner) => set_helper_slot(this_value, IH_INNER, inner),
+                    }
+                }
+            }
+        },
+        // `IH_MAP` and any unrecognised kind.
+        _ => match iterator_step(source) {
+            Err(thrown) => {
+                set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                thrown
+            }
+            Ok(None) => helper_finish(this_value, source),
+            Ok(Some(value)) => match helper_call(this_value, source, func, value) {
+                Err(thrown) => thrown,
+                Ok(mapped) => iterator_result(mapped, false),
+            },
+        },
+    }
+}
+
+/// `%IteratorHelperPrototype%.return` — closes the helper and its source (D-305).
+extern "C" fn iterator_helper_return(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise("not an Iterator Helper", "TypeError");
+    }
+    with_rooted(&[this_value], || {
+        if !is_truthy(Value::from_bits(property_of(this_value, IH_DONE))) {
+            let source = property_of(this_value, IH_SOURCE);
+            set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+            with_rooted(&[this_value, source], || iterator_close(source));
+        }
+        iterator_result(Value::UNDEFINED.to_bits(), true)
+    })
+}
+
+/// `Iterator()` — the abstract constructor: it exists so `Iterator.prototype` and the helpers are
+/// reachable, but it cannot be instantiated directly (D-305).
+extern "C" fn make_iterator(
+    _closure: u64,
+    _this_value: u64,
+    new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    // Direct `Iterator()` / `new Iterator()` is a `TypeError`; only a subclass (a different
+    // new.target) could reach the ordinary-object path, which this engine does not build here.
+    if Value::from_bits(new_target).is_undefined() {
+        return raise("Iterator is abstract and cannot be called", "TypeError");
+    }
+    raise(
+        "Iterator is abstract and cannot be constructed directly",
+        "TypeError",
+    )
 }
 
 /// A named property of `object`, read as a value.

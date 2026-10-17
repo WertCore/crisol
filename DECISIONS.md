@@ -8152,3 +8152,29 @@ dance. Registered with `length` 0 and `name` `"withResolvers"`. Like the combina
 intrinsic promise rather than the receiver `this` as its constructor, so a subclass's `withResolvers`
 still answers a base promise — the species limitation noted in D-299. Confirmed by acceptance: the shape,
 resolving from outside, and rejecting to `catch`, under GC stress.
+
+## D-305
+
+**The iterator helpers — `Iterator` and a shared `%Iterator.prototype%`.**
+
+Status: Accepted
+
+ES2025's iterator helpers were absent — `Iterator` was `undefined`, so every `built-ins/Iterator/*`
+case failed. This adds a single `%Iterator.prototype%` carrying the eager terminals
+`reduce`/`toArray`/`forEach`/`some`/`every`/`find` and the lazy `map`/`filter`/`take`/`drop`/`flatMap`,
+plus `[Symbol.iterator]` (returns `this`). The array-iterator and generator prototypes **reparent onto
+it** — the one chain change the spec prescribes — so `[1, 2, 3].values().map(f).toArray()` and
+`gen().take(2)` reach the helpers through inheritance. A lazy helper answers an object inheriting a new
+`%IteratorHelperPrototype%`, whose single `next` steps the recorded chain; its `kind`/`source`/`callback`/
+`limit`/`counter`/`inner`/`done` live in the helper's own non-enumerable slots, so the state survives
+across calls and the collector traces it (no separate rooting needed). The eager terminals step the
+source directly and run `IteratorClose` the moment the answer is settled, so `some`/`every`/`find` stop
+early and a `take` over an endless generator terminates. `Iterator` itself is the abstract constructor:
+a direct `Iterator()` or `new Iterator()` is a `TypeError`. Its `prototype` is linked in
+`build_symbol_keyed_methods`, not `build_globals`, because the prototype is built there — it needs the
+well-known `Symbol.iterator`, which is made after `build_globals` runs — so the link is deferred to where
+both sides exist. The two new native tables are appended after every other table, so the `.len()`-computed
+dispatch offsets self-adjust. **Deferred:** `Iterator.from` (the valid-iterator wrapper), the async
+iterator helpers, and the `[Symbol.toStringTag]` accessor. Confirmed by acceptance — every helper, a
+lazy filter→map→take chain, early-close, an infinite-source `take`, a generator inheriting the helpers,
+and `.length`/`.name` — under GC stress.

@@ -6804,6 +6804,117 @@ fn an_array_iterator_walks_and_then_stops() {
     );
 }
 
+/// The ES2025 iterator helpers (D-305): a shared `%Iterator.prototype%` the array iterator and
+/// generators inherit, carrying lazy `map`/`filter`/`take`/`drop`/`flatMap` and eager
+/// `reduce`/`toArray`/`forEach`/`some`/`every`/`find`. The lazy ones are observed through `toArray`.
+#[test]
+fn iterators_have_their_helpers() {
+    check(
+        "iterator-global-is-a-function",
+        "return typeof Iterator;",
+        "function",
+    );
+    // The abstract constructor cannot be built directly.
+    check(
+        "iterator-is-abstract",
+        "try { new Iterator(); return \"no-throw\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Lazy helpers, drained with toArray.
+    check(
+        "iterator-map",
+        "return [1, 2, 3].values().map(function (x) { return x * 2; }).toArray().join(\",\");",
+        "2,4,6",
+    );
+    check(
+        "iterator-filter",
+        "return [1, 2, 3, 4].values().filter(function (x) { return x % 2 === 0; }).toArray().join(\",\");",
+        "2,4",
+    );
+    check(
+        "iterator-take",
+        "return [1, 2, 3, 4, 5].values().take(2).toArray().join(\",\");",
+        "1,2",
+    );
+    check(
+        "iterator-drop",
+        "return [1, 2, 3, 4, 5].values().drop(2).toArray().join(\",\");",
+        "3,4,5",
+    );
+    check(
+        "iterator-flatmap",
+        "return [[1, 2], [3, 4]].values().flatMap(function (x) { return x; }).toArray().join(\",\");",
+        "1,2,3,4",
+    );
+    // A chain of lazy helpers pulls lazily — each value flows through filter, then map, then take.
+    check(
+        "iterator-chain",
+        "return [1, 2, 3, 4, 5, 6].values() \
+             .filter(function (x) { return x % 2 === 0; }) \
+             .map(function (x) { return x * 10; }) \
+             .take(2).toArray().join(\",\");",
+        "20,40",
+    );
+    // `take` over an endless generator terminates, which is the point of laziness.
+    check(
+        "iterator-take-is-lazy",
+        "function* nat() { var i = 0; while (true) { yield i; i = i + 1; } } \
+         return nat().take(4).toArray().join(\",\");",
+        "0,1,2,3",
+    );
+    // Eager terminals.
+    check(
+        "iterator-reduce-with-initial",
+        "return [1, 2, 3].values().reduce(function (a, b) { return a + b; }, 10);",
+        "16",
+    );
+    check(
+        "iterator-reduce-no-initial",
+        "return [1, 2, 3].values().reduce(function (a, b) { return a + b; });",
+        "6",
+    );
+    check(
+        "iterator-reduce-empty-throws",
+        "try { [].values().reduce(function (a, b) { return a + b; }); return \"no\"; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "iterator-some",
+        "return [1, 2, 3].values().some(function (x) { return x > 2; });",
+        "true",
+    );
+    check(
+        "iterator-every",
+        "return [1, 2, 3].values().every(function (x) { return x > 2; });",
+        "false",
+    );
+    check(
+        "iterator-find",
+        "return [1, 2, 3].values().find(function (x) { return x > 1; });",
+        "2",
+    );
+    check(
+        "iterator-foreach",
+        "var sum = 0; [1, 2, 3].values().forEach(function (x) { sum = sum + x; }); return sum;",
+        "6",
+    );
+    // A generator inherits the helpers too, through the shared prototype.
+    check(
+        "generator-has-helpers",
+        "function* g() { yield 1; yield 2; yield 3; } \
+         return g().map(function (x) { return x * 10; }).toArray().join(\",\");",
+        "10,20,30",
+    );
+    // `.length`/`.name` are the specified ones.
+    check(
+        "iterator-helper-length-and-name",
+        "return Iterator.prototype.map.length + \",\" + Iterator.prototype.map.name \
+             + \",\" + Iterator.prototype.toArray.length;",
+        "1,map,0",
+    );
+}
+
 #[test]
 fn keys_and_entries_walk_positions_and_pairs() {
     check("keys-first", "return [7, 8].keys().next().value;", "0");
