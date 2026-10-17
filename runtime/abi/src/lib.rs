@@ -8957,6 +8957,28 @@ fn define_accessor(this_value: u64, argc: u64, argv: *const u64, as_getter: bool
     })
 }
 
+/// Stamps a literal's or class body's accessor with its specification name — `"get x"` on the
+/// getter, `"set x"` on the setter (D-320). An accessor function is always anonymous, so there is
+/// never a name to preserve; `NamedEvaluation` gives it this one when the accessor is defined. Done
+/// only here, not on the `defineProperty`/`__defineGetter__` path, where the function keeps whatever
+/// name it arrived with. `define_named` is the function-property attribute set exactly — not
+/// writable, not enumerable, configurable.
+fn name_accessor(getter: u64, setter: u64, key: &str) {
+    for (function, prefix) in [(getter, "get"), (setter, "set")] {
+        if !is_callable(function) {
+            continue;
+        }
+        let named = with_rooted(&[getter, setter], || new_string(&format!("{prefix} {key}")));
+        with_rooted(&[getter, setter, named], || {
+            if let Some(handle) = handle_of(function) {
+                with_runtime(|runtime| {
+                    runtime.define_named(handle, "name", Value::from_bits(named));
+                });
+            }
+        });
+    }
+}
+
 /// `{get x() {…}}` and `{set x(v) {…}}` — an accessor from a literal or a class body.
 ///
 /// **Not a property holding a function.** A getter is *called* on read and a data property is
@@ -8985,6 +9007,9 @@ pub unsafe extern "C" fn crisol_define_accessor(
         return Value::UNDEFINED.to_bits();
     };
     with_rooted(&[object, getter, setter], || {
+        // The accessor functions are named `"get x"`/`"set x"` before anything else, while both are
+        // still rooted here and before the descriptor allocation (D-320).
+        name_accessor(getter, setter, &name);
         let descriptor = crisol_create_object();
         let named = with_rooted(&[descriptor, getter, setter], || new_string(&name));
         with_rooted(&[descriptor, getter, setter, named], || {

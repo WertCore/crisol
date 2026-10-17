@@ -8462,3 +8462,23 @@ bound function stacks the prefix and keeps reducing the length (`q.bind(null,1).
 `"bound bound q"` of length one). Confirmed by acceptance under GC stress. **Deviation:** a getter's or
 setter's `name` is still empty rather than `"get x"`/`"set x"` — that is a separate fix in the frontend's
 accessor lowering, not the runtime, and is left for its own decision.
+
+## D-320
+
+**An accessor is named `"get x"` / `"set x"`.**
+
+Status: Accepted
+
+The deviation D-321 left: a getter or setter from an object literal or a class body read back with an
+empty `name`. An accessor function is always anonymous, so `NamedEvaluation` is the only name it ever
+gets — `"get "` or `"set "` before the property key. The fix turned out to belong in the runtime, not the
+frontend as D-321 guessed: `crisol_define_accessor` is the single entry both the literal and the class
+forms reach (via `Op::DefineAccessor`), and it already holds the key and the anonymous functions. It now
+stamps the name there, with `define_named` for the function-property attributes (not writable, not
+enumerable, configurable). Crucially this is *not* done on the `Object.defineProperty` / `__defineGetter__`
+path (`define_accessor`), where the supplied function keeps whatever name it already had — so
+`Object.defineProperty(o, "x", {get: named})` leaves `named.name` alone, as the specification requires.
+Confirmed by acceptance under GC stress (a literal's getter/setter, a class's prototype and static
+getters, and a `defineProperty` getter that keeps its own name). **Deviation:** a *computed* accessor
+(`{get [k]() {…}}`) is not named yet — that path (`crisol_computed_define_accessor`) must render the key,
+including the bracketed form a symbol takes, which is left for when computed-method naming is done too.

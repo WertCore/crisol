@@ -191,6 +191,38 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **An accessor is named `"get x"` / `"set x"`** (D-320). A getter or setter from an object literal
+/// or a class body is anonymous, so `NamedEvaluation` gives it a name built from `"get "`/`"set "` and
+/// the property key — where before it had an empty name.
+#[test]
+fn an_accessor_is_named_get_or_set() {
+    // Object literal.
+    check(
+        "accessor-name-object-literal",
+        "var o = { get x() { return 1; }, set x(v) {} }; \
+         var d = Object.getOwnPropertyDescriptor(o, 'x'); \
+         return d.get.name + ',' + d.set.name;",
+        "get x,set x",
+    );
+    // Class body — a prototype accessor and a static one.
+    check(
+        "accessor-name-class",
+        "class C { get y() { return 1; } set y(v) {} static get z() { return 2; } } \
+         var d = Object.getOwnPropertyDescriptor(C.prototype, 'y'); \
+         var s = Object.getOwnPropertyDescriptor(C, 'z'); \
+         return d.get.name + ',' + d.set.name + ',' + s.get.name;",
+        "get y,set y,get z",
+    );
+    // A `defineProperty` accessor keeps its own name — the naming is only for literal/class forms.
+    check(
+        "accessor-name-defineproperty-keeps-own",
+        "function myGetter() { return 1; } \
+         var o = {}; Object.defineProperty(o, 'x', { get: myGetter, configurable: true }); \
+         return Object.getOwnPropertyDescriptor(o, 'x').get.name;",
+        "myGetter",
+    );
+}
+
 /// **A bound function is named and sized** (D-321). `Function.prototype.bind` returns a function whose
 /// `name` is `"bound "` before the target's and whose `length` is the target's less the bound
 /// arguments, floored at zero — both with the function-property attributes (not writable, not
