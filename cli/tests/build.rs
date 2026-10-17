@@ -1116,6 +1116,16 @@ fn maps_and_sets_build_from_an_iterable() {
         "let s = new Set(\"abca\"); return s.size + \",\" + s.has(\"a\") + \",\" + s.has(\"z\");",
         "3,true,false",
     );
+    // The drain is shared, so a step result whose `done` getter throws surfaces that error here
+    // too — the constructor raises it rather than crashing on the unchecked read (D-319).
+    check(
+        "set-from-a-throwing-done-iterator",
+        "var step = {}; Object.defineProperty(step, \"done\", { get: function () { throw new RangeError(\"nope\"); } }); \
+         Object.defineProperty(step, \"value\", { get: function () { return 1; } }); \
+         var it = { [Symbol.iterator]: function () { return { next: function () { return step; } }; } }; \
+         try { new Set(it); return \"no-throw\"; } catch (e) { return e.name + \":\" + e.message; }",
+        "RangeError:nope",
+    );
 }
 
 /// The `Math` methods that are not one plain `f64` call: the bit-level `clz32`/`imul`/`fround`
@@ -11208,6 +11218,19 @@ fn promise_combinators_accept_any_iterable() {
              return { next: function () { n = n + 1; if (n > 1) throw new TypeError(\"boom\"); \
                  return { value: Promise.resolve(1), done: false }; } }; \
          } }; \
+         Promise.allSettled(it).then(function () { print(\"ok\"); }, function (e) { print(\"no:\" + e.message); }); \
+         return 0;",
+        "no:boom\n0",
+    );
+    // And the step result's own `done` *getter* can throw. Its exception used to be read as a
+    // boolean and the drain ran on past it — a crash, not a rejection; now it rejects (D-319).
+    check(
+        "promise-allsettled-rejects-a-throwing-done",
+        "var err = new Error(\"boom\"); \
+         var step = {}; \
+         Object.defineProperty(step, \"done\", { get: function () { throw err; } }); \
+         Object.defineProperty(step, \"value\", { get: function () { return 1; } }); \
+         var it = { [Symbol.iterator]: function () { return { next: function () { return step; } }; } }; \
          Promise.allSettled(it).then(function () { print(\"ok\"); }, function (e) { print(\"no:\" + e.message); }); \
          return 0;",
         "no:boom\n0",

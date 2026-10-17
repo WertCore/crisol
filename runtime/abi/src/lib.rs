@@ -21134,7 +21134,16 @@ fn drain_iterator(iterator: u64) -> u64 {
             if handle_of(outcome).is_none() {
                 return raise("an iterator step must be an object", "TypeError");
             }
-            if is_truthy(Value::from_bits(property_of(outcome, "done"))) {
+            // **A `done` getter can throw**, and the throw is the answer — propagated, not fed to
+            // `is_truthy`, which would read the exception's bits as a boolean and drain on past it.
+            // Rooted across the call because the getter is user code that may allocate (the `value`
+            // read below already is). A throwing `done` is how `Promise.allSettled` over a poisoned
+            // iterator rejects rather than crashing.
+            let done = with_rooted(&[iterator, outcome], || property_of(outcome, "done"));
+            if Value::from_bits(done).is_exception() {
+                return done;
+            }
+            if is_truthy(Value::from_bits(done)) {
                 break;
             }
             let item = with_rooted(&[iterator, outcome], || property_of(outcome, "value"));

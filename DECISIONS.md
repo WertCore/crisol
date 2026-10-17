@@ -8421,3 +8421,25 @@ fast path is preserved: an array nobody has run `defineProperty` over has no sid
 in a single step with no per-element walk. Confirmed by acceptance under GC stress. **Deviation:** `pop`,
 `shift`, and `splice` deleting an individual non-configurable element still drop it rather than throwing
 (`DeletePropertyOrThrow`); only the length-shrink path consults configurability so far.
+
+## D-319
+
+**A throwing `done` getter is propagated, not read as a boolean.**
+
+Status: Accepted
+
+`drain_iterator` — the shared drain behind `Promise.all`/`allSettled`/`race`/`any`, the `Map`/`Set`/
+`WeakMap`/`WeakSet` constructors, and `Object.fromEntries` — read the step result's `done` with a bare
+`is_truthy(property_of(outcome, "done"))`, checking neither for an exception nor rooting across the call.
+A `done` *getter* that throws therefore had its exception's bits interpreted as a boolean and the drain ran
+on past it — which, with a poisoned iterator, was a crash rather than the rejection the specification
+requires (`Promise.allSettled` over such an iterator must reject with the thrown error). The read now
+mirrors the one for `value` directly below it, and the newer `iterator_step` helper (D-305): rooted across
+the getter (user code that may allocate), checked for `is_exception()`, and returned as the answer when it
+threw. So the combinators reject and the collection constructors raise, with the iterator's own error.
+Confirmed by acceptance under GC stress (an `allSettled` and a `new Set` over an iterator whose `done`
+getter throws). **Not fixed here (the other three census crashes, all one architectural limit):** crisol's
+arrays are dense, so a length near `2^32` (`a.length = 4294967295`, `Object.defineProperties(a, {length:
+{value: 2^32-2}})`) tries to materialise billions of slots, and `reduceRight` over an array-like whose
+`length` is near `2^53` walks a clamped-but-still-four-billion range — both need a sparse representation,
+which is a larger change than a conformance fix.
