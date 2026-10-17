@@ -7144,6 +7144,26 @@ fn async_iterators_have_toarray() {
         "try { AsyncIterator.from(5); return \"no-throw\"; } catch (e) { return e.name; }",
         "TypeError",
     );
+    // `Array.fromAsync` awaits each value of an iterable and resolves with the array (D-316).
+    check(
+        "array-fromasync-promises",
+        "Array.fromAsync([Promise.resolve(1), Promise.resolve(2), 3]) \
+             .then(function (a) { print(\"fa:\" + a.join(\",\")); }); return 0;",
+        "fa:1,2,3\n0",
+    );
+    check(
+        "array-fromasync-async-gen",
+        "async function* ag() { yield 10; yield 20; } \
+         Array.fromAsync(ag()).then(function (a) { print(\"fag:\" + a.join(\",\")); }); return 0;",
+        "fag:10,20\n0",
+    );
+    // With a map function, whose result is awaited.
+    check(
+        "array-fromasync-mapfn",
+        "Array.fromAsync([1, 2, 3], function (x) { return x * 2; }) \
+             .then(function (a) { print(\"fam:\" + a.join(\",\")); }); return 0;",
+        "fam:2,4,6\n0",
+    );
 }
 
 #[test]

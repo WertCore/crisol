@@ -8362,3 +8362,20 @@ over an array (then `map`), over an async generator (returned unwrapped), and th
 `TypeError`, under GC stress. **With this the iterator helpers — sync and async — are complete:
 `Iterator`/`AsyncIterator` globals, both prototypes with all eleven helpers each, `from` on both, and the
 `[Symbol.toStringTag]`s.**
+
+## D-316
+
+**`Array.fromAsync` — an array from an async (or sync) iterable.**
+
+Status: Accepted
+
+The async sibling of `Array.from`: it returns a promise that drains the source, **awaiting each value**
+(and, with a map function, awaiting its result) before collecting, then resolves with the array. State
+lives in a bag the reactions share; the drive is pull → step → await value → (await mapper) → collect →
+pull, settling when the source is done, rejecting on any fault or a non-callable map function
+(*IfAbruptRejectPromise*). It reuses `async_from_iterator` (D-315) to obtain the source's async or sync
+iterator — so `Array.fromAsync([Promise.resolve(1), 2])`, `Array.fromAsync(asyncGen())`, and a map
+function all work. Registered as an `Array` static with `length` 1. Confirmed by acceptance: an array of
+promises, an async generator, and the map-function form, under GC stress. **Deviation:** a non-iterable
+array-like source (`{ length, 0: … }`) is not handled yet — it rejects rather than index-walking; the
+iterable path (the common case, and all previously-failing since the method was absent) is a strict gain.

@@ -2030,6 +2030,10 @@ const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
     async_helper_flatmap_mapped,
     async_helper_inner_step,
     async_iterator_from,
+    from_async_step,
+    from_async_value,
+    from_async_mapped,
+    from_async_reject,
 ];
 /// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_DRAIN_STEP: usize = 0;
@@ -2066,6 +2070,14 @@ const ASYNC_HELPER_INNER_STEP: usize = 15;
 /// Index of [`async_iterator_from`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`] (a static, installed
 /// on the `AsyncIterator` constructor).
 const ASYNC_ITERATOR_FROM: usize = 16;
+/// Index of [`from_async_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const FROM_ASYNC_STEP: usize = 17;
+/// Index of [`from_async_value`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const FROM_ASYNC_VALUE: usize = 18;
+/// Index of [`from_async_mapped`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const FROM_ASYNC_MAPPED: usize = 19;
+/// Index of [`from_async_reject`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const FROM_ASYNC_REJECT: usize = 20;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -6336,6 +6348,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("global", "parseInt", 2),
     ("global", "print", 1),
     ("Array", "from", 1),
+    ("Array", "fromAsync", 1),
     ("Array", "isArray", 1),
     ("Array", "of", 0),
     ("Array.prototype", "at", 1),
@@ -11873,6 +11886,7 @@ const NAMESPACE_NATIVES: &[(&str, &str, Native)] = &[
     ("Object", "groupBy", object_group_by),
     ("Array", "isArray", array_is_array),
     ("Array", "from", array_from),
+    ("Array", "fromAsync", array_from_async),
     ("Symbol", "for", symbol_for),
     ("Symbol", "keyFor", symbol_key_for),
     ("BigInt", "asIntN", bigint_as_int_n),
@@ -23405,6 +23419,272 @@ extern "C" fn async_iterator_from(
                 return iterator;
             }
             make_async_iterator_helper(iterator, AH_WRAP, Value::UNDEFINED.to_bits(), 0.0)
+        })
+    })
+}
+
+// `Array.fromAsync` (D-316): drains an async/sync iterable, awaiting each value (and, if given, the
+// mapper's result), and resolves with the array. State lives in a bag the reactions share, as the
+// async search/drain do. Array-like (non-iterable) sources are not handled yet.
+
+/// `Array.fromAsync` state-bag slots.
+const AF_ITER: &str = "__afIter";
+const AF_MAP: &str = "__afMap";
+const AF_ACC: &str = "__afAcc";
+const AF_INDEX: &str = "__afIndex";
+const AF_RESULT: &str = "__afResult";
+/// The bag a `fromAsync` reaction carries.
+const AF_STATE: &str = "__afState";
+
+/// Pulls `iterator.next()` for `Array.fromAsync`, routing the step to its step reaction.
+fn from_async_pull(bag: u64) {
+    let iterator = property_of(bag, AF_ITER);
+    let result = property_of(bag, AF_RESULT);
+    with_rooted(&[bag, iterator, result], || {
+        let base = async_iterator_internal_natives_base();
+        let step = with_rooted(&[bag, iterator, result], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + FROM_ASYNC_STEP)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        let reject = with_rooted(&[bag, iterator, result, step], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + FROM_ASYNC_REJECT)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        with_rooted(&[bag, iterator, result, step, reject], || {
+            set_bag(step, AF_STATE, bag);
+            set_bag(reject, AF_STATE, bag);
+            let advance = property_of(iterator, "next");
+            if !is_callable(advance) {
+                let reason = raise_value("an async iterator needs a `next` method", "TypeError");
+                with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                return;
+            }
+            let outcome = with_rooted(&[iterator, advance], || call_value(advance, iterator, &[]));
+            if Value::from_bits(outcome).is_exception() {
+                let reason = crisol_pending_exception();
+                with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                return;
+            }
+            with_rooted(&[result, step, reject, outcome], || {
+                let awaited = as_promise(outcome);
+                with_rooted(&[awaited, step, reject], || {
+                    promise_then(awaited, step, reject, false);
+                });
+            });
+        });
+    });
+}
+
+/// Appends `value` to a `fromAsync` accumulator and pulls the next source value.
+fn from_async_collect(bag: u64, value: u64) {
+    let acc = property_of(bag, AF_ACC);
+    with_rooted(&[bag, acc, value], || {
+        if let Some(handle) = handle_of(acc) {
+            let count = indexed_length(acc).unwrap_or(0);
+            with_runtime(|runtime| runtime.heap.set_element(handle, count, Value::from_bits(value)));
+        }
+        let index = Value::from_bits(property_of(bag, AF_INDEX))
+            .as_number()
+            .unwrap_or(0.0);
+        set_bag(bag, AF_INDEX, Value::number(index + 1.0).to_bits());
+        with_rooted(&[bag], || from_async_pull(bag));
+    });
+}
+
+/// `Array.fromAsync`'s step reaction: a resolved `{ value, done }`. Awaits the value (then the
+/// mapper, if any), or resolves with the array when done.
+extern "C" fn from_async_step(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let step = unsafe { argument(argc, argv, 0) };
+    let bag = property_of(closure, AF_STATE);
+    let result = property_of(bag, AF_RESULT);
+    with_rooted(&[bag, step, result], || {
+        if handle_of(step).is_none() {
+            let reason = raise_value("an async iterator step must be an object", "TypeError");
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return Value::UNDEFINED.to_bits();
+        }
+        if is_truthy(Value::from_bits(property_of(step, "done"))) {
+            let acc = property_of(bag, AF_ACC);
+            with_rooted(&[result, acc], || settle_promise(result, acc, false));
+            return Value::UNDEFINED.to_bits();
+        }
+        let value = with_rooted(&[bag, step], || property_of(step, "value"));
+        // Await the value, then route to the value reaction (which maps or collects).
+        let base = async_iterator_internal_natives_base();
+        let on_value = with_rooted(&[bag, result, value], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + FROM_ASYNC_VALUE)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        let reject = with_rooted(&[bag, result, value, on_value], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + FROM_ASYNC_REJECT)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        with_rooted(&[bag, result, value, on_value, reject], || {
+            set_bag(on_value, AF_STATE, bag);
+            set_bag(reject, AF_STATE, bag);
+            let awaited = as_promise(value);
+            with_rooted(&[awaited, on_value, reject], || {
+                promise_then(awaited, on_value, reject, false);
+            });
+        });
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// `Array.fromAsync`'s value reaction: the awaited value. Applies the mapper (awaited) or collects.
+extern "C" fn from_async_value(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let value = unsafe { argument(argc, argv, 0) };
+    let bag = property_of(closure, AF_STATE);
+    let mapper = property_of(bag, AF_MAP);
+    with_rooted(&[bag, value, mapper], || {
+        if !is_callable(mapper) {
+            from_async_collect(bag, value);
+            return Value::UNDEFINED.to_bits();
+        }
+        let result = property_of(bag, AF_RESULT);
+        let index = Value::from_bits(property_of(bag, AF_INDEX))
+            .as_number()
+            .unwrap_or(0.0);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a step index")]
+        let args = [value, index_value(index as usize)];
+        let mapped = with_rooted(&[bag, value, mapper], || {
+            call_value(mapper, Value::UNDEFINED.to_bits(), &args)
+        });
+        if Value::from_bits(mapped).is_exception() {
+            let reason = crisol_pending_exception();
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return Value::UNDEFINED.to_bits();
+        }
+        // The mapper's result is awaited before collection.
+        let base = async_iterator_internal_natives_base();
+        let on_mapped = with_rooted(&[bag, result, mapped], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + FROM_ASYNC_MAPPED)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        let reject = with_rooted(&[bag, result, mapped, on_mapped], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + FROM_ASYNC_REJECT)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        with_rooted(&[bag, result, mapped, on_mapped, reject], || {
+            set_bag(on_mapped, AF_STATE, bag);
+            set_bag(reject, AF_STATE, bag);
+            let awaited = as_promise(mapped);
+            with_rooted(&[awaited, on_mapped, reject], || {
+                promise_then(awaited, on_mapped, reject, false);
+            });
+        });
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// `Array.fromAsync`'s post-map reaction: collect the awaited mapped value.
+extern "C" fn from_async_mapped(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let mapped = unsafe { argument(argc, argv, 0) };
+    let bag = property_of(closure, AF_STATE);
+    with_rooted(&[bag, mapped], || from_async_collect(bag, mapped));
+    Value::UNDEFINED.to_bits()
+}
+
+/// `Array.fromAsync`'s rejection reaction.
+extern "C" fn from_async_reject(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let reason = unsafe { argument(argc, argv, 0) };
+    let bag = property_of(closure, AF_STATE);
+    let result = property_of(bag, AF_RESULT);
+    with_rooted(&[result, reason], || settle_promise(result, reason, true));
+    Value::UNDEFINED.to_bits()
+}
+
+/// `Array.fromAsync(items, mapFn?)` — a promise for the array of `items`' values, each awaited (and
+/// mapped, awaiting the mapper) (D-316). Iterable sources only; array-like is not handled yet.
+extern "C" fn array_from_async(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let items = unsafe { argument(argc, argv, 0) };
+    // SAFETY: as above.
+    let mapper = unsafe { argument(argc, argv, 1) };
+    if !Value::from_bits(mapper).is_undefined() && !is_callable(mapper) {
+        return rejected_promise("Array.fromAsync: the map function is not callable", "TypeError");
+    }
+    with_rooted(&[items, mapper], || {
+        let iterator = match async_from_iterator(items) {
+            Ok(iterator) => iterator,
+            Err(_) => {
+                return rejected_promise(
+                    "Array.fromAsync requires an async or sync iterable",
+                    "TypeError",
+                );
+            }
+        };
+        with_rooted(&[iterator, mapper], || {
+            let result = new_promise_object();
+            let acc = with_rooted(&[iterator, mapper, result], || crisol_create_array(0));
+            let bag = with_rooted(&[iterator, mapper, result, acc], || crisol_create_object());
+            with_rooted(&[iterator, mapper, result, acc, bag], || {
+                set_bag(bag, AF_ITER, iterator);
+                set_bag(bag, AF_MAP, mapper);
+                set_bag(bag, AF_ACC, acc);
+                set_bag(bag, AF_INDEX, Value::number(0.0).to_bits());
+                set_bag(bag, AF_RESULT, result);
+                from_async_pull(bag);
+            });
+            result
         })
     })
 }
