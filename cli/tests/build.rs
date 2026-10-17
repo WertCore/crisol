@@ -6913,6 +6913,45 @@ fn iterators_have_their_helpers() {
              + \",\" + Iterator.prototype.toArray.length;",
         "1,map,0",
     );
+    // `Iterator.from` wraps a foreign iterator (one with `next` but no `[Symbol.iterator]`) so it
+    // gains the helpers (D-306).
+    check(
+        "iterator-from-wraps-a-raw-iterator",
+        "var raw = { i: 0, next: function () { \
+             return this.i < 3 ? { value: this.i++, done: false } : { value: undefined, done: true }; \
+         } }; \
+         return Iterator.from(raw).map(function (x) { return x * 2; }).toArray().join(\",\");",
+        "0,2,4",
+    );
+    // An iterable is drained through its `[Symbol.iterator]`.
+    check(
+        "iterator-from-an-array",
+        "return Iterator.from([5, 6, 7]).toArray().join(\",\");",
+        "5,6,7",
+    );
+    // An already-valid iterator (an array iterator) is returned unwrapped and still works.
+    check(
+        "iterator-from-an-array-iterator",
+        "var it = [1, 2].values(); return Iterator.from(it).toArray().join(\",\");",
+        "1,2",
+    );
+    // A string is accepted and iterated by code point.
+    check(
+        "iterator-from-a-string",
+        "return Iterator.from(\"ab\").toArray().join(\",\");",
+        "a,b",
+    );
+    // A non-iterable primitive is a TypeError.
+    check(
+        "iterator-from-a-number-throws",
+        "try { Iterator.from(5); return \"no-throw\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "iterator-from-length-and-name",
+        "return Iterator.from.length + \",\" + Iterator.from.name;",
+        "1,from",
+    );
 }
 
 #[test]

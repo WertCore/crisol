@@ -1973,6 +1973,8 @@ const ITERATOR_HELPER_NATIVES: &[(&str, Native)] = &[
     ("next", iterator_helper_next),
     ("return", iterator_helper_return),
 ];
+/// The `Iterator` constructor's statics (D-306).
+const ITERATOR_STATIC_NATIVES: &[(&str, Native)] = &[("from", iterator_from)];
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -2000,6 +2002,12 @@ fn iterator_prototype_natives_base() -> usize {
 /// [`ITERATOR_PROTOTYPE_NATIVES`] (D-305).
 fn iterator_helper_natives_base() -> usize {
     iterator_prototype_natives_base() + ITERATOR_PROTOTYPE_NATIVES.len()
+}
+
+/// The global index at which [`ITERATOR_STATIC_NATIVES`] begins — right after
+/// [`ITERATOR_HELPER_NATIVES`] (D-306).
+fn iterator_static_natives_base() -> usize {
+    iterator_helper_natives_base() + ITERATOR_HELPER_NATIVES.len()
 }
 
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
@@ -6479,6 +6487,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Symbol", "for", 1),
     ("Symbol", "keyFor", 1),
     ("global", "Iterator", 0),
+    ("Iterator", "from", 1),
     ("Iterator.prototype", "map", 1),
     ("Iterator.prototype", "filter", 1),
     ("Iterator.prototype", "take", 1),
@@ -14805,6 +14814,9 @@ impl Runtime {
                     "constructor",
                     constructor.to_value(),
                 );
+                // `Iterator.from` — a static on the constructor (D-306).
+                let from = self.native_function(iterator_static_natives_base());
+                self.define_method(constructor, "Iterator", "from", from.to_value());
             }
         }
 
@@ -18838,7 +18850,11 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + ITERATOR_PROTOTYPE_NATIVES.len();
-        return ITERATOR_HELPER_NATIVES
+        if let Some((_, function)) = ITERATOR_HELPER_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + ITERATOR_HELPER_NATIVES.len();
+        return ITERATOR_STATIC_NATIVES
             .get(native.wrapping_sub(offset))
             .map_or(fallback, |(_, function)| *function as *const u8);
     }
@@ -20811,6 +20827,8 @@ const IH_FILTER: u8 = 1;
 const IH_TAKE: u8 = 2;
 const IH_DROP: u8 = 3;
 const IH_FLATMAP: u8 = 4;
+/// A passthrough wrapper — `Iterator.from` over a foreign iterator yields its values unchanged (D-306).
+const IH_WRAP: u8 = 5;
 
 /// Which transform a helper applies.
 const IH_KIND: &str = "__ihKind";
@@ -21469,6 +21487,15 @@ fn helper_step(this_value: u64, source: u64, func: u64, kind: u8) -> u64 {
                 }
             }
         },
+        // A `from` wrapper passes each value through unchanged.
+        IH_WRAP => match iterator_step(source) {
+            Err(thrown) => {
+                set_helper_slot(this_value, IH_DONE, Value::TRUE.to_bits());
+                thrown
+            }
+            Ok(None) => helper_finish(this_value, source),
+            Ok(Some(value)) => iterator_result(value, false),
+        },
         // `IH_MAP` and any unrecognised kind.
         _ => match iterator_step(source) {
             Err(thrown) => {
@@ -21523,6 +21550,99 @@ extern "C" fn make_iterator(
         "Iterator is abstract and cannot be constructed directly",
         "TypeError",
     )
+}
+
+/// Whether `%Iterator.prototype%` is anywhere in `object`'s prototype chain — i.e. `object` is
+/// already a valid Iterator and `Iterator.from` can return it unwrapped (D-306).
+fn inherits_iterator_prototype(object: u64) -> bool {
+    let Some(target) = ITERATOR_PROTOTYPE.with(std::cell::Cell::get) else {
+        return false;
+    };
+    let Some(mut current) = handle_of(object) else {
+        return false;
+    };
+    with_runtime(|runtime| {
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let Some(parent) = runtime.heap.prototype_of(current) else {
+                return false;
+            };
+            if parent == target {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    })
+}
+
+/// `GetIteratorFlattenable` for `Iterator.from`, which accepts a string as well as an object: the
+/// iterator is `source[Symbol.iterator]()` when there is one, or `source` itself when it is already
+/// an iterator (D-306).
+fn iterator_record_for_from(source: u64) -> Result<u64, u64> {
+    let value = Value::from_bits(source);
+    if value.is_nullish() {
+        return Err(raise(
+            "Iterator.from requires an iterable or iterator",
+            "TypeError",
+        ));
+    }
+    // An object or a string reaches a `[Symbol.iterator]`; no other primitive does.
+    if handle_of(source).is_none() && value.kind() != crisol_value::Kind::String {
+        return Err(raise(
+            "Iterator.from requires an object, an iterable, or a string",
+            "TypeError",
+        ));
+    }
+    let Some(key) = iterator_key() else {
+        return Ok(source);
+    };
+    let method = symbol_property_load(source, &key);
+    if Value::from_bits(method).is_nullish() {
+        // No `[Symbol.iterator]` — `source` is taken to be an iterator already.
+        return Ok(source);
+    }
+    if !is_callable(method) {
+        return Err(raise(
+            "Iterator.from: [Symbol.iterator] is not callable",
+            "TypeError",
+        ));
+    }
+    let iterator = with_rooted(&[source, method], || call_value(method, source, &[]));
+    if Value::from_bits(iterator).is_exception() {
+        return Err(iterator);
+    }
+    if handle_of(iterator).is_none() {
+        return Err(raise(
+            "Iterator.from: [Symbol.iterator]() did not return an object",
+            "TypeError",
+        ));
+    }
+    Ok(iterator)
+}
+
+/// `Iterator.from(source)` — a valid Iterator for `source`, wrapping a foreign iterator so it gains
+/// the helper methods, or returning it unchanged when it already has them (D-306).
+extern "C" fn iterator_from(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let source = unsafe { argument(argc, argv, 0) };
+    with_rooted(&[source], || {
+        let iterator = match iterator_record_for_from(source) {
+            Ok(iterator) => iterator,
+            Err(thrown) => return thrown,
+        };
+        with_rooted(&[iterator], || {
+            if inherits_iterator_prototype(iterator) {
+                return iterator;
+            }
+            make_iterator_helper(iterator, IH_WRAP, Value::UNDEFINED.to_bits(), 0.0)
+        })
+    })
 }
 
 /// A named property of `object`, read as a value.

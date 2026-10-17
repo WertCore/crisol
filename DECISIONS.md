@@ -8178,3 +8178,23 @@ dispatch offsets self-adjust. **Deferred:** `Iterator.from` (the valid-iterator 
 iterator helpers, and the `[Symbol.toStringTag]` accessor. Confirmed by acceptance — every helper, a
 lazy filter→map→take chain, early-close, an infinite-source `take`, a generator inheriting the helpers,
 and `.length`/`.name` — under GC stress.
+
+## D-306
+
+**`Iterator.from` — a valid Iterator for any iterable, iterator, or string.**
+
+Status: Accepted
+
+The `Iterator` constructor gained its one static, completing the iterator-helper surface begun in D-305.
+`Iterator.from(obj)` runs `GetIteratorFlattenable` (strings allowed, unlike the `flatMap` variant):
+`obj[Symbol.iterator]()` when there is one, or `obj` itself when it is already an iterator, raising a
+`TypeError` for a non-iterable non-string primitive. If the resulting iterator already inherits
+`%Iterator.prototype%` — an array iterator, a generator, another helper — it is returned untouched;
+otherwise it is wrapped so `Iterator.from(foreign).map(f)` works. The wrapper reuses the D-305 helper
+machinery with a new passthrough kind `IH_WRAP`, so no second prototype or dispatch path is needed — a
+deviation from the spec's distinct `%WrapForValidIteratorPrototype%` (the wrapper reports as an Iterator
+Helper), accepted for the reuse. `from` is a static on the constructor, installed where the constructor
+is linked, from a third native table appended after the helper table so the `.len()`-computed offsets
+still self-adjust; `length` 1, `name` `"from"`. Confirmed by acceptance — wrapping a raw iterator and
+mapping it, draining an array and an array iterator, a string by code point, and the non-iterable
+`TypeError` — under GC stress.
