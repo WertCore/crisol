@@ -7124,6 +7124,26 @@ fn async_iterators_have_toarray() {
              .then(function (a) { print(\"fma:\" + a.join(\",\")); }); return 0;",
         "fma:1,-1,2,-2\n0",
     );
+    // `AsyncIterator.from` wraps a sync iterable so the async helpers apply (D-315).
+    check(
+        "async-iterator-from-array",
+        "AsyncIterator.from([1, 2, 3]).map(function (x) { return x * 2; }).toArray() \
+             .then(function (a) { print(\"af:\" + a.join(\",\")); }); return 0;",
+        "af:2,4,6\n0",
+    );
+    // `from` returns an already-valid async iterator (an async generator) unwrapped.
+    check(
+        "async-iterator-from-async-gen",
+        "async function* ag() { yield 5; yield 6; } \
+         AsyncIterator.from(ag()).toArray().then(function (a) { print(\"ag:\" + a.join(\",\")); }); return 0;",
+        "ag:5,6\n0",
+    );
+    // A non-iterable is a TypeError.
+    check(
+        "async-iterator-from-number-throws",
+        "try { AsyncIterator.from(5); return \"no-throw\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
 }
 
 #[test]

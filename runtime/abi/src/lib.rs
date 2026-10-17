@@ -2029,6 +2029,7 @@ const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
     async_helper_filter_verdict,
     async_helper_flatmap_mapped,
     async_helper_inner_step,
+    async_iterator_from,
 ];
 /// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_DRAIN_STEP: usize = 0;
@@ -2062,6 +2063,9 @@ const ASYNC_HELPER_FILTER_VERDICT: usize = 13;
 const ASYNC_HELPER_FLATMAP_MAPPED: usize = 14;
 /// Index of [`async_helper_inner_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_HELPER_INNER_STEP: usize = 15;
+/// Index of [`async_iterator_from`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`] (a static, installed
+/// on the `AsyncIterator` constructor).
+const ASYNC_ITERATOR_FROM: usize = 16;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -6601,6 +6605,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Iterator Helper", "next", 0),
     ("Iterator Helper", "return", 0),
     ("global", "AsyncIterator", 0),
+    ("AsyncIterator", "from", 1),
     ("AsyncIterator.prototype", "toArray", 0),
     ("AsyncIterator.prototype", "forEach", 1),
     ("AsyncIterator.prototype", "reduce", 1),
@@ -15049,6 +15054,10 @@ impl Runtime {
             {
                 self.define_hidden(constructor, "prototype", async_proto.handle().to_value());
                 self.define_linking(async_proto.handle(), "constructor", constructor.to_value());
+                // `AsyncIterator.from` — a static on the constructor (D-315).
+                let from = self
+                    .native_function(async_iterator_internal_natives_base() + ASYNC_ITERATOR_FROM);
+                self.define_method(constructor, "AsyncIterator", "from", from.to_value());
             }
 
             // `%AsyncIteratorHelperPrototype%` inherits `%AsyncIterator.prototype%` (so a helper
@@ -22572,6 +22581,8 @@ const AH_TAKE: u8 = 1;
 const AH_FILTER: u8 = 2;
 const AH_DROP: u8 = 3;
 const AH_FLATMAP: u8 = 4;
+/// A passthrough wrapper — `AsyncIterator.from` over a foreign iterator yields values unchanged.
+const AH_WRAP: u8 = 5;
 /// A lazy async helper's recorded state.
 const AH_KIND: &str = "__ahKind";
 const AH_SOURCE: &str = "__ahSource";
@@ -22804,6 +22815,14 @@ extern "C" fn async_helper_step(
             return Value::UNDEFINED.to_bits();
         }
         let value = with_rooted(&[helper, step], || property_of(step, "value"));
+        if async_helper_kind(helper) == AH_WRAP {
+            // `AsyncIterator.from`'s wrapper passes each value through unchanged.
+            let produced = with_rooted(&[result, value], || iterator_result(value, false));
+            with_rooted(&[result, produced], || {
+                settle_promise(result, produced, false)
+            });
+            return Value::UNDEFINED.to_bits();
+        }
         if async_helper_kind(helper) == AH_TAKE {
             let remaining = Value::from_bits(property_of(helper, AH_LIMIT))
                 .as_number()
@@ -23298,6 +23317,96 @@ extern "C" fn async_iterator_flat_map(
         );
     }
     make_async_iterator_helper(this_value, AH_FLATMAP, callback, 0.0)
+}
+
+/// Whether `%AsyncIterator.prototype%` is in `object`'s prototype chain (D-315).
+fn inherits_async_iterator_prototype(object: u64) -> bool {
+    let Some(target) = ASYNC_ITERATOR_PROTOTYPE.with(std::cell::Cell::get) else {
+        return false;
+    };
+    let Some(mut current) = handle_of(object) else {
+        return false;
+    };
+    with_runtime(|runtime| {
+        for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+            let Some(parent) = runtime.heap.prototype_of(current) else {
+                return false;
+            };
+            if parent == target {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    })
+}
+
+/// `GetIteratorFlattenable` for `AsyncIterator.from`: the source's `[Symbol.asyncIterator]()`, else
+/// its `[Symbol.iterator]()`, else the source itself when it is already an iterator. Errors are
+/// exception-tagged so the caller throws them synchronously (D-315).
+fn async_from_iterator(source: u64) -> Result<u64, u64> {
+    let value = Value::from_bits(source);
+    if value.is_nullish() {
+        return Err(raise(
+            "AsyncIterator.from requires an iterable or iterator",
+            "TypeError",
+        ));
+    }
+    if handle_of(source).is_none() && value.kind() != crisol_value::Kind::String {
+        return Err(raise(
+            "AsyncIterator.from requires an object, an iterable, or a string",
+            "TypeError",
+        ));
+    }
+    let async_method = well_known_symbol("asyncIterator")
+        .and_then(|symbol| key_of(Value::from_bits(symbol)))
+        .map(|key| symbol_property_load(source, &key))
+        .filter(|method| is_callable(*method));
+    let method = match async_method {
+        Some(method) => Some(method),
+        None => iterator_key()
+            .map(|key| symbol_property_load(source, &key))
+            .filter(|method| is_callable(*method)),
+    };
+    let Some(method) = method else {
+        return Ok(source);
+    };
+    let iterator = with_rooted(&[source, method], || call_value(method, source, &[]));
+    if Value::from_bits(iterator).is_exception() {
+        return Err(iterator);
+    }
+    if handle_of(iterator).is_none() {
+        return Err(raise(
+            "AsyncIterator.from: [Symbol.asyncIterator]() did not return an object",
+            "TypeError",
+        ));
+    }
+    Ok(iterator)
+}
+
+/// `AsyncIterator.from(source)` — a valid async iterator for `source`, wrapping a foreign one so it
+/// gains the async helpers, or returning it unchanged when it already has them (D-315).
+extern "C" fn async_iterator_from(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let source = unsafe { argument(argc, argv, 0) };
+    with_rooted(&[source], || {
+        let iterator = match async_from_iterator(source) {
+            Ok(iterator) => iterator,
+            Err(thrown) => return thrown,
+        };
+        with_rooted(&[iterator], || {
+            if inherits_async_iterator_prototype(iterator) {
+                return iterator;
+            }
+            make_async_iterator_helper(iterator, AH_WRAP, Value::UNDEFINED.to_bits(), 0.0)
+        })
+    })
 }
 
 /// `%AsyncIterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Async Iterator"` (D-309).

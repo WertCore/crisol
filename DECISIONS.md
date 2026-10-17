@@ -8343,3 +8343,22 @@ inner and re-pull the outer). The outer/inner pulls reuse `async_helper_pull`/`a
 Confirmed by acceptance: `flatMap` over an array inner (`[x, x*10]`) and over an async-generator inner,
 under GC stress. **The async iterator helpers now match the sync set — only `AsyncIterator.from` and
 `Iterator.concat`-style extras remain.**
+
+## D-315
+
+**`AsyncIterator.from` — the async counterpart of `Iterator.from`.**
+
+Status: Accepted
+
+The last piece: a valid async iterator for any source. `GetIteratorFlattenable` prefers the source's
+`[Symbol.asyncIterator]()`, falls back to `[Symbol.iterator]()` (a sync iterable — an array, a string's
+chars — is accepted and stepped the same way, since the wrapper awaits each `next()` result), and treats
+a source with neither as already an iterator; a nullish or non-object non-string source throws. If the
+resulting iterator already inherits `%AsyncIterator.prototype%` (an async generator, another helper) it
+is returned untouched; otherwise it is wrapped with a new passthrough helper kind `AH_WRAP` that yields
+each value unchanged, so `AsyncIterator.from(syncIterable).map(f)` works. `from` is a static on the
+`AsyncIterator` constructor, installed where the constructor is linked. Confirmed by acceptance: `from`
+over an array (then `map`), over an async generator (returned unwrapped), and the non-iterable
+`TypeError`, under GC stress. **With this the iterator helpers — sync and async — are complete:
+`Iterator`/`AsyncIterator` globals, both prototypes with all eleven helpers each, `from` on both, and the
+`[Symbol.toStringTag]`s.**
