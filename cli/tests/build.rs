@@ -7056,6 +7056,35 @@ fn async_iterators_have_toarray() {
          nat().some(function (x) { return x >= 3; }).then(function (r) { print(\"inf:\" + r); }); return 0;",
         "inf:true\n0",
     );
+    // Lazy `map` (awaiting the mapper) and `take`, observed through `toArray` (D-312).
+    check(
+        "async-iterator-map",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().map(function (x) { return x * 10; }).toArray().then(function (a) { print(\"m:\" + a.join(\",\")); }); \
+         return 0;",
+        "m:10,20,30\n0",
+    );
+    check(
+        "async-iterator-take",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().take(2).toArray().then(function (a) { print(\"t:\" + a.join(\",\")); }); return 0;",
+        "t:1,2\n0",
+    );
+    // `take` over an endless async generator terminates — the proof it is lazy.
+    check(
+        "async-iterator-take-is-lazy",
+        "async function* nat() { var i = 0; while (true) { yield i; i = i + 1; } } \
+         nat().take(3).toArray().then(function (a) { print(\"inf:\" + a.join(\",\")); }); return 0;",
+        "inf:0,1,2\n0",
+    );
+    // A lazy chain: map then take.
+    check(
+        "async-iterator-map-take-chain",
+        "async function* ag() { yield 1; yield 2; yield 3; yield 4; } \
+         ag().map(function (x) { return x * 2; }).take(2).toArray().then(function (a) { print(\"c:\" + a.join(\",\")); }); \
+         return 0;",
+        "c:2,4\n0",
+    );
 }
 
 #[test]

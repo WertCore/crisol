@@ -8289,3 +8289,23 @@ deviation). Three more reactions join `ASYNC_ITERATOR_INTERNAL_NATIVES`. Confirm
 `some`/`every`/`find` over a three-value async generator, **and `some` over an endless one terminating
 early** (the proof the short-circuit is real), under GC stress. Still deferred: the lazy async helpers
 (`map`/`filter`/`take`/`drop`/`flatMap`) and `AsyncIterator.from`.
+
+## D-312
+
+**The lazy async helpers begin — `AsyncIterator.prototype.map` and `take`.**
+
+Status: Accepted
+
+The async counterpart of the lazy sync helpers (D-305). A new `%AsyncIteratorHelperPrototype%` — which
+inherits `%AsyncIterator.prototype%`, so a helper also has the terminals — carries one async `next`:
+it pulls `source.next()` once, awaits it, and resolves a promise of `{ value, done }`. `map` additionally
+awaits the mapper's result before yielding it; `take` counts down and closes the source when the limit is
+reached. Both do exactly one `source.next()` per step (no re-pull loop), which is why they land first:
+`take` over an endless async generator terminates, the proof the helper is lazy. State (kind, source,
+callback, limit, counter, done) lives in the helper's own slots; each `next` builds fresh step/reject
+reactions carrying the helper and the pending result promise. `map`/`take` throw synchronously on a bad
+receiver or argument (they return a helper, not a promise). Five reactions and the `next`/`return`
+methods join `ASYNC_ITERATOR_INTERNAL_NATIVES`; `%AsyncIteratorHelperPrototype%` is built beside
+`%AsyncIterator.prototype%`. Confirmed by acceptance — `map`, `take`, an endless-source `take`, and a
+`map`→`take` chain — under GC stress. Still deferred: `filter`/`drop`/`flatMap` (they re-pull across
+async hops) and `AsyncIterator.from`.

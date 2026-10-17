@@ -655,6 +655,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ASYNC_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(ASYNC_ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BOOLEAN_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ARRAY_BUFFER_PROTOTYPE.with(std::cell::Cell::get));
@@ -751,6 +752,10 @@ thread_local! {
     /// `%AsyncIterator.prototype%` (D-309) — the async counterpart of `%Iterator.prototype%`, where
     /// the async iterator helpers live and that every async generator inherits from.
     static ASYNC_ITERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%AsyncIteratorHelperPrototype%` (D-312) — the prototype of a lazy async helper; its one
+    /// async `next` steps the recorded chain, resolving a promise of `{ value, done }`.
+    static ASYNC_ITERATOR_HELPER_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// The prototype every number inherits from.
     static NUMBER_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
@@ -1998,6 +2003,8 @@ const ASYNC_ITERATOR_NATIVES: &[(&str, Native)] = &[
     ("some", async_iterator_some),
     ("every", async_iterator_every),
     ("find", async_iterator_find),
+    ("map", async_iterator_map),
+    ("take", async_iterator_take),
 ];
 /// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309..D-311): the
 /// two drain reactions, the `[Symbol.toStringTag]` getter, the `forEach`/`reduce` processors, and
@@ -2011,6 +2018,11 @@ const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
     async_search_step,
     async_search_verdict,
     async_search_reject,
+    async_helper_next,
+    async_helper_return,
+    async_helper_step,
+    async_helper_reject,
+    async_helper_map_applied,
 ];
 /// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_DRAIN_STEP: usize = 0;
@@ -2028,6 +2040,16 @@ const ASYNC_SEARCH_STEP: usize = 5;
 const ASYNC_SEARCH_VERDICT: usize = 6;
 /// Index of [`async_search_reject`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_SEARCH_REJECT: usize = 7;
+/// Index of [`async_helper_next`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_NEXT: usize = 8;
+/// Index of [`async_helper_return`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_RETURN: usize = 9;
+/// Index of [`async_helper_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_STEP: usize = 10;
+/// Index of [`async_helper_reject`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_REJECT: usize = 11;
+/// Index of [`async_helper_map_applied`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_MAP_APPLIED: usize = 12;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -6573,6 +6595,10 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("AsyncIterator.prototype", "some", 1),
     ("AsyncIterator.prototype", "every", 1),
     ("AsyncIterator.prototype", "find", 1),
+    ("AsyncIterator.prototype", "map", 1),
+    ("AsyncIterator.prototype", "take", 1),
+    ("Async Iterator Helper", "next", 0),
+    ("Async Iterator Helper", "return", 0),
 ];
 
 /// The arity the specification gives `owner.name`, if it gives one.
@@ -15009,6 +15035,23 @@ impl Runtime {
                 self.define_hidden(constructor, "prototype", async_proto.handle().to_value());
                 self.define_linking(async_proto.handle(), "constructor", constructor.to_value());
             }
+
+            // `%AsyncIteratorHelperPrototype%` inherits `%AsyncIterator.prototype%` (so a helper
+            // gains the terminals) and holds the one async `next`/`return` that step it (D-312).
+            let helper_proto = scope.alloc(shape, 0);
+            ASYNC_ITERATOR_HELPER_PROTOTYPE.with(|cell| cell.set(Some(helper_proto.handle())));
+            self.heap
+                .set_prototype(helper_proto.handle(), Some(async_proto.handle()));
+            let internal = async_iterator_internal_natives_base();
+            for (name, offset) in [("next", ASYNC_HELPER_NEXT), ("return", ASYNC_HELPER_RETURN)] {
+                let method = self.native_function(internal + offset);
+                self.define_method(
+                    helper_proto.handle(),
+                    "Async Iterator Helper",
+                    name,
+                    method.to_value(),
+                );
+            }
         }
 
         // **A string answers `Symbol.iterator` with a code-point iterator.** `[...s]` already
@@ -22501,6 +22544,345 @@ extern "C" fn async_iterator_find(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let predicate = unsafe { argument(argc, argv, 0) };
     async_iterator_search(this_value, predicate, AS_FIND, "find")
+}
+
+// The lazy async helpers (D-312): `map`/`take` so far. Each returns an object inheriting
+// `%AsyncIteratorHelperPrototype%`, whose async `next` resolves a promise of `{ value, done }` by
+// pulling the source once, awaiting it (and, for `map`, awaiting the mapper), then settling. State
+// lives in the helper's own slots; `map`/`take` each do exactly one `source.next()` per step.
+
+/// A lazy async helper's kind.
+const AH_MAP: u8 = 0;
+const AH_TAKE: u8 = 1;
+/// A lazy async helper's recorded state.
+const AH_KIND: &str = "__ahKind";
+const AH_SOURCE: &str = "__ahSource";
+const AH_FUNC: &str = "__ahFunc";
+const AH_LIMIT: &str = "__ahLimit";
+const AH_COUNTER: &str = "__ahCounter";
+const AH_DONE: &str = "__ahDone";
+/// Carried on an async-helper `next` reaction.
+const AH_HELPER: &str = "__ahHelper";
+const AH_RESULT: &str = "__ahResult";
+
+/// Reads a lazy async helper's `AH_KIND` tag as a small integer.
+fn async_helper_kind(helper: u64) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the kind is a small tag this engine wrote"
+    )]
+    let kind = Value::from_bits(property_of(helper, AH_KIND))
+        .as_number()
+        .unwrap_or(0.0) as u8;
+    kind
+}
+
+/// Builds a lazy async helper object inheriting `%AsyncIteratorHelperPrototype%`.
+fn make_async_iterator_helper(source: u64, kind: u8, func: u64, limit: f64) -> u64 {
+    with_rooted(&[source, func], || {
+        let helper = crisol_create_object();
+        with_rooted(&[helper, source, func], || {
+            if let Some(handle) = handle_of(helper) {
+                with_runtime(|runtime| {
+                    if let Some(prototype) =
+                        ASYNC_ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get)
+                    {
+                        runtime.heap.set_prototype(handle, Some(prototype));
+                    }
+                    runtime.define_hidden(handle, AH_KIND, Value::number(f64::from(kind)));
+                    runtime.define_hidden(handle, AH_SOURCE, Value::from_bits(source));
+                    runtime.define_hidden(handle, AH_FUNC, Value::from_bits(func));
+                    runtime.define_hidden(handle, AH_LIMIT, Value::number(limit));
+                    runtime.define_hidden(handle, AH_COUNTER, Value::number(0.0));
+                    runtime.define_hidden(handle, AH_DONE, Value::FALSE);
+                });
+            }
+            helper
+        })
+    })
+}
+
+/// A finished `{ value: undefined, done: true }`, already wrapped in a resolved promise.
+fn async_done_result() -> u64 {
+    let done = iterator_result(Value::UNDEFINED.to_bits(), true);
+    with_rooted(&[done], || as_promise(done))
+}
+
+/// Builds the `next`/reject reactions a helper step needs, carrying the helper and result promise.
+fn async_helper_reactions(helper: u64, result: u64) -> (u64, u64) {
+    let base = async_iterator_internal_natives_base();
+    let step = with_rooted(&[helper, result], || {
+        with_runtime(|runtime| {
+            runtime
+                .native_function(base + ASYNC_HELPER_STEP)
+                .to_value()
+                .to_bits()
+        })
+    });
+    let reject = with_rooted(&[helper, result, step], || {
+        with_runtime(|runtime| {
+            runtime
+                .native_function(base + ASYNC_HELPER_REJECT)
+                .to_value()
+                .to_bits()
+        })
+    });
+    with_rooted(&[helper, result, step, reject], || {
+        set_bag(step, AH_HELPER, helper);
+        set_bag(step, AH_RESULT, result);
+        set_bag(reject, AH_RESULT, result);
+    });
+    (step, reject)
+}
+
+/// `%AsyncIteratorHelperPrototype%.next` — one step of a lazy async helper (D-312).
+extern "C" fn async_helper_next(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return rejected_promise("not an Async Iterator Helper", "TypeError");
+    }
+    with_rooted(&[this_value], || {
+        if is_truthy(Value::from_bits(property_of(this_value, AH_DONE))) {
+            return async_done_result();
+        }
+        let kind = async_helper_kind(this_value);
+        let source = property_of(this_value, AH_SOURCE);
+        if kind == AH_TAKE {
+            let remaining = Value::from_bits(property_of(this_value, AH_LIMIT))
+                .as_number()
+                .unwrap_or(0.0);
+            if remaining <= 0.0 {
+                set_bag(this_value, AH_DONE, Value::TRUE.to_bits());
+                with_rooted(&[this_value, source], || iterator_close(source));
+                return async_done_result();
+            }
+        }
+        with_rooted(&[this_value, source], || {
+            let result = new_promise_object();
+            let (step, reject) = with_rooted(&[this_value, source, result], || {
+                async_helper_reactions(this_value, result)
+            });
+            with_rooted(&[this_value, source, result, step, reject], || {
+                let advance = property_of(source, "next");
+                if !is_callable(advance) {
+                    let reason =
+                        raise_value("an async iterator needs a `next` method", "TypeError");
+                    with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                    return result;
+                }
+                let outcome = with_rooted(&[source, advance], || call_value(advance, source, &[]));
+                if Value::from_bits(outcome).is_exception() {
+                    let reason = crisol_pending_exception();
+                    with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                    return result;
+                }
+                with_rooted(&[result, step, reject, outcome], || {
+                    let awaited = as_promise(outcome);
+                    with_rooted(&[awaited, step, reject], || {
+                        promise_then(awaited, step, reject, false);
+                    });
+                });
+                result
+            })
+        })
+    })
+}
+
+/// A helper step's reaction: the resolved `source.next()` result. Maps (awaiting the mapper) or
+/// takes, settling the pending `next` promise.
+extern "C" fn async_helper_step(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let step = unsafe { argument(argc, argv, 0) };
+    let helper = property_of(closure, AH_HELPER);
+    let result = property_of(closure, AH_RESULT);
+    with_rooted(&[helper, step, result], || {
+        if handle_of(step).is_none() {
+            let reason = raise_value("an async iterator step must be an object", "TypeError");
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return Value::UNDEFINED.to_bits();
+        }
+        if is_truthy(Value::from_bits(property_of(step, "done"))) {
+            set_bag(helper, AH_DONE, Value::TRUE.to_bits());
+            let done = iterator_result(Value::UNDEFINED.to_bits(), true);
+            with_rooted(&[result, done], || settle_promise(result, done, false));
+            return Value::UNDEFINED.to_bits();
+        }
+        let value = with_rooted(&[helper, step], || property_of(step, "value"));
+        if async_helper_kind(helper) == AH_TAKE {
+            let remaining = Value::from_bits(property_of(helper, AH_LIMIT))
+                .as_number()
+                .unwrap_or(0.0);
+            set_bag(helper, AH_LIMIT, Value::number(remaining - 1.0).to_bits());
+            let produced = with_rooted(&[result, value], || iterator_result(value, false));
+            with_rooted(&[result, produced], || {
+                settle_promise(result, produced, false)
+            });
+            return Value::UNDEFINED.to_bits();
+        }
+        // `map`: await the mapper's result, then yield it.
+        let func = property_of(helper, AH_FUNC);
+        let counter = Value::from_bits(property_of(helper, AH_COUNTER))
+            .as_number()
+            .unwrap_or(0.0);
+        set_bag(helper, AH_COUNTER, Value::number(counter + 1.0).to_bits());
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a step index"
+        )]
+        let args = [value, index_value(counter as usize)];
+        let mapped = with_rooted(&[helper, result, value, func], || {
+            call_value(func, Value::UNDEFINED.to_bits(), &args)
+        });
+        if Value::from_bits(mapped).is_exception() {
+            let reason = crisol_pending_exception();
+            set_bag(helper, AH_DONE, Value::TRUE.to_bits());
+            with_rooted(&[helper, result, reason], || {
+                iterator_close(property_of(helper, AH_SOURCE));
+                settle_promise(result, reason, true);
+            });
+            return Value::UNDEFINED.to_bits();
+        }
+        let base = async_iterator_internal_natives_base();
+        let applied = with_rooted(&[result, mapped], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + ASYNC_HELPER_MAP_APPLIED)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        let reject = with_rooted(&[result, mapped, applied], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + ASYNC_HELPER_REJECT)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        with_rooted(&[result, mapped, applied, reject], || {
+            set_bag(applied, AH_RESULT, result);
+            set_bag(reject, AH_RESULT, result);
+            let awaited = as_promise(mapped);
+            with_rooted(&[awaited, applied, reject], || {
+                promise_then(awaited, applied, reject, false);
+            });
+        });
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// `map`'s post-await reaction: the mapper's awaited result is the yielded value.
+extern "C" fn async_helper_map_applied(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let mapped = unsafe { argument(argc, argv, 0) };
+    let result = property_of(closure, AH_RESULT);
+    with_rooted(&[result, mapped], || {
+        let produced = iterator_result(mapped, false);
+        with_rooted(&[result, produced], || {
+            settle_promise(result, produced, false)
+        });
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+/// A helper step's rejection reaction.
+extern "C" fn async_helper_reject(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let reason = unsafe { argument(argc, argv, 0) };
+    let result = property_of(closure, AH_RESULT);
+    with_rooted(&[result, reason], || settle_promise(result, reason, true));
+    Value::UNDEFINED.to_bits()
+}
+
+/// `%AsyncIteratorHelperPrototype%.return` — closes the helper and its source (D-312).
+extern "C" fn async_helper_return(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return rejected_promise("not an Async Iterator Helper", "TypeError");
+    }
+    with_rooted(&[this_value], || {
+        if !is_truthy(Value::from_bits(property_of(this_value, AH_DONE))) {
+            set_bag(this_value, AH_DONE, Value::TRUE.to_bits());
+            let source = property_of(this_value, AH_SOURCE);
+            with_rooted(&[this_value, source], || iterator_close(source));
+        }
+        async_done_result()
+    })
+}
+
+/// `AsyncIterator.prototype.map(fn)` — lazy; the mapper's result is awaited (D-312).
+extern "C" fn async_iterator_map(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if handle_of(this_value).is_none() {
+        return raise(
+            "AsyncIterator.prototype.map requires an object receiver",
+            "TypeError",
+        );
+    }
+    if !is_callable(callback) {
+        return raise("AsyncIterator.prototype.map needs a function", "TypeError");
+    }
+    make_async_iterator_helper(this_value, AH_MAP, callback, 0.0)
+}
+
+/// `AsyncIterator.prototype.take(limit)` — lazy; at most `limit` values (D-312).
+extern "C" fn async_iterator_take(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise(
+            "AsyncIterator.prototype.take requires an object receiver",
+            "TypeError",
+        );
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let limit = unsafe { argument(argc, argv, 0) };
+    let limit = match with_rooted(&[this_value], || helper_limit(limit, "take")) {
+        Ok(limit) => limit,
+        Err(thrown) => return thrown,
+    };
+    make_async_iterator_helper(this_value, AH_TAKE, Value::UNDEFINED.to_bits(), limit)
 }
 
 /// `%AsyncIterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Async Iterator"` (D-309).
