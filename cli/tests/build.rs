@@ -233,6 +233,37 @@ fn a_non_writable_length_refuses_resizes() {
     );
 }
 
+/// **Shrinking an array stops at a non-configurable element.** `ArraySetLength` deletes from the top
+/// down and halts at the first element it may not remove, leaving `length` one past it. A plain
+/// assignment keeps whatever length that leaves without complaint; `Object.defineProperty` reports
+/// the blocked shrink as a `TypeError`, but only after the deletions it could make (D-318).
+#[test]
+fn shrinking_stops_at_a_non_configurable_element() {
+    // `a.length = 1` would delete index 1, which is non-configurable: the shrink stops there, the
+    // length settles at 2, and the assignment itself does not throw.
+    check(
+        "truncate-stops-at-non-configurable",
+        "var a=[1,2,3]; Object.defineProperty(a,'1',{value:22,configurable:false}); a.length=1; \
+         return a.join(',') + '/' + a.length;",
+        "1,22/2",
+    );
+    // The same shrink through `defineProperty` is a failed `[[DefineOwnProperty]]`, which is a
+    // `TypeError` there — raised after the deletions above the blocked element have happened.
+    check(
+        "define-length-blocked-shrink-throws",
+        "var a=[1,2,3]; Object.defineProperty(a,'1',{value:22,configurable:false}); \
+         try { Object.defineProperty(a,'length',{value:1}); return 'no-throw'; } \
+         catch (e) { return e.name + '/' + a.join(',') + '/' + a.length; }",
+        "TypeError/1,22/2",
+    );
+    // An unrestricted array still truncates in full — the fast path that skips the per-element walk.
+    check(
+        "truncate-unrestricted-full",
+        "var a=[1,2,3,4,5]; a.length=2; return a.join(',') + '/' + a.length;",
+        "1,2/2",
+    );
+}
+
 #[test]
 fn a_program_with_no_return_prints_undefined() {
     check("empty", "let a = 1;", "undefined");

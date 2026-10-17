@@ -12586,6 +12586,10 @@ extern "C" fn object_define_property(
             let given = unsafe {
                 crisol_property_load(descriptor, read_value.as_ptr(), read_value.len() as u64)
             };
+            // Whether a non-configurable element stopped a shrink partway. Set below and thrown at
+            // the end rather than here, so the `writable: false` the same descriptor may carry is
+            // still applied first — `ArraySetLength` sets the writability before it returns false.
+            let mut blocked = false;
             if Value::from_bits(given).kind() != crisol_value::Kind::Undefined {
                 // **`ToNumber`, which runs `valueOf`/`toString`** — a length given as an object
                 // that coerces to a number is coerced through them, not read as `NaN`. `to_number`
@@ -12608,13 +12612,13 @@ extern "C" fn object_define_property(
                     reason = "range-checked immediately above"
                 )]
                 let wanted = wanted as usize;
-                with_runtime(|runtime| {
-                    if wanted < count {
-                        runtime.heap.truncate_elements(handle, wanted);
-                    } else if wanted > count {
-                        runtime.heap.set_element(handle, wanted - 1, Value::EMPTY);
-                    }
-                });
+                if wanted < count {
+                    blocked = truncate_respecting_rules(target, handle, count, wanted) != wanted;
+                } else if wanted > count {
+                    with_runtime(|runtime| {
+                        runtime.heap.set_element(handle, wanted - 1, Value::EMPTY)
+                    });
+                }
             }
             // `writable: false` on a length is remembered separately, because there is no slot
             // to hang an attribute on — the length is derived, so its permissions must be too.
@@ -12622,6 +12626,14 @@ extern "C" fn object_define_property(
                 with_runtime(|runtime| {
                     runtime.define_hidden(handle, FIXED_LENGTH, Value::number(1.0));
                 });
+            }
+            // A blocked shrink is a failed `[[DefineOwnProperty]]`, which `Object.defineProperty`
+            // surfaces as a `TypeError` — after the length and writability it managed to apply.
+            if blocked {
+                return raise(
+                    "cannot delete a non-configurable array element",
+                    "TypeError",
+                );
             }
             return target;
         }
@@ -16544,16 +16556,17 @@ pub unsafe extern "C" fn crisol_property_store(
                 reason = "checked finite and non-negative just above"
             )]
             let wanted = wanted as usize;
-            with_runtime(|runtime| {
-                if wanted < count {
-                    runtime.heap.truncate_elements(handle, wanted);
-                } else if wanted > count {
-                    // Growing fills with `undefined`, which is not what the specification
-                    // says — those should be holes (D-64) — and is the same approximation
-                    // array literals already make.
-                    runtime.heap.set_element(handle, wanted - 1, Value::EMPTY);
-                }
-            });
+            if wanted < count {
+                // A non-configurable element stops the shrink partway; an ordinary assignment
+                // takes whatever length that leaves without complaint (`ArraySetLength` returns
+                // false, which a non-strict `[[Set]]` swallows).
+                truncate_respecting_rules(object, handle, count, wanted);
+            } else if wanted > count {
+                // Growing fills with `undefined`, which is not what the specification
+                // says — those should be holes (D-64) — and is the same approximation
+                // array literals already make.
+                with_runtime(|runtime| runtime.heap.set_element(handle, wanted - 1, Value::EMPTY));
+            }
         }
         return Value::UNDEFINED.to_bits();
     }
@@ -17930,6 +17943,34 @@ fn indexed_delete(value: u64, index: usize) {
 ///
 /// A real array's is derived from its elements and cannot be assigned here, so this only has
 /// work to do for everything else — which is exactly where the corpus looks.
+/// Shrink a dense array's elements to `wanted`, the way `ArraySetLength` does: from the top down,
+/// stopping at the first non-configurable element and leaving `length` one past it. Returns the
+/// length actually reached, which a caller compares against `wanted` to tell a full shrink from a
+/// blocked one. The fast path is the whole point — an array nobody has run `defineProperty` over has
+/// no per-element rules, so it truncates in a single step with no walk and no per-element lookup.
+fn truncate_respecting_rules(object: u64, handle: GcRef, count: usize, wanted: usize) -> usize {
+    if wanted >= count {
+        return count;
+    }
+    if own_property(object, ELEMENT_RULES).is_none() {
+        with_runtime(|runtime| runtime.heap.truncate_elements(handle, wanted));
+        return wanted;
+    }
+    // A restricted array: walk down from the top and let the first non-configurable element be the
+    // floor. A hole has no rule and is freely deletable, so the walk passes through it.
+    let mut floor = wanted;
+    let mut index = count;
+    while index > wanted {
+        index -= 1;
+        if !element_rule(object, index).configurable {
+            floor = index + 1;
+            break;
+        }
+    }
+    with_runtime(|runtime| runtime.heap.truncate_elements(handle, floor));
+    floor
+}
+
 fn indexed_set_length(value: u64, length: usize) {
     if elements_of(value).is_some() {
         return;

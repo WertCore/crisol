@@ -8401,3 +8401,23 @@ rare marker is present, so the ordinary array hot path is unchanged. Confirmed b
 stress. **Deviation:** an *array-like* (non-array) object with a non-writable `"length"` data property is
 not covered — the marker is set only on real arrays; the methods there resize as before. `splice` raises
 up front rather than after shifting the tail, which a program cannot observe on an array it cannot resize.
+
+## D-318
+
+**Shrinking an array stops at a non-configurable element.**
+
+Status: Accepted
+
+`ArraySetLength` does not blindly drop elements: shrinking deletes from the top down and halts at the
+first element it may not remove, leaving `length` one past it. Crisol does carry per-element attributes on
+a dense array (the `__elementRules` side table, read by `element_rule`), so a non-configurable element is
+representable — the truncation simply ignored them. `truncate_respecting_rules` now walks down from the
+old length, lets the first non-configurable element be the floor, and truncates to there. A plain
+`a.length = n` assignment keeps whatever length that leaves without complaint (a non-strict `[[Set]]`
+swallows the `false` that `ArraySetLength` returns); `Object.defineProperty(a, "length", …)` surfaces the
+blocked shrink as a `TypeError`, but only after the deletions above the blocked element have happened, and
+after any `writable: false` on the same descriptor has been applied — the order `ArraySetLength` uses. The
+fast path is preserved: an array nobody has run `defineProperty` over has no side table, so it truncates
+in a single step with no per-element walk. Confirmed by acceptance under GC stress. **Deviation:** `pop`,
+`shift`, and `splice` deleting an individual non-configurable element still drop it rather than throwing
+(`DeletePropertyOrThrow`); only the length-shrink path consults configurability so far.
