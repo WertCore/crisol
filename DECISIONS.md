@@ -8325,3 +8325,21 @@ over an endless async generator both re-pulls past the odd numbers and short-cir
 `nat().filter(even).take(3)` resolves `[0, 2, 4]` rather than hanging. Confirmed by acceptance: `filter`,
 `drop`, and that `filter`→`take` chain, under GC stress. The async iterator helpers are now complete
 except `flatMap` (nested async iteration) and `AsyncIterator.from`.
+
+## D-314
+
+**Lazy async `flatMap` — nested async iteration.**
+
+Status: Accepted
+
+The last lazy async helper, and the only one that nests. A `flatMap` helper holds a current inner
+iterator (`AH_INNER`): `next` drains that inner first, and only when it is exhausted pulls the outer
+source for the next value. The step awaits the mapper, then `GetIteratorFlattenable` turns its result
+into the inner — the mapped value's `[Symbol.asyncIterator]()` if it has one, else its
+`[Symbol.iterator]()`, so both an async-generator inner and a plain array inner flatten (a sync inner's
+`next()` result is simply awaited like any other). Two reactions join the set: one receiving the awaited
+mapper result (installs the inner and pulls it) and one stepping the inner (yield a value, or clear the
+inner and re-pull the outer). The outer/inner pulls reuse `async_helper_pull`/`async_helper_inner_pull`.
+Confirmed by acceptance: `flatMap` over an array inner (`[x, x*10]`) and over an async-generator inner,
+under GC stress. **The async iterator helpers now match the sync set — only `AsyncIterator.from` and
+`Iterator.concat`-style extras remain.**

@@ -7107,6 +7107,23 @@ fn async_iterators_have_toarray() {
              .then(function (a) { print(\"ft:\" + a.join(\",\")); }); return 0;",
         "ft:0,2,4\n0",
     );
+    // `flatMap` flattens each mapped iterable — an array inner (D-314).
+    check(
+        "async-iterator-flatmap-array",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().flatMap(function (x) { return [x, x * 10]; }).toArray() \
+             .then(function (a) { print(\"fm:\" + a.join(\",\")); }); return 0;",
+        "fm:1,10,2,20,3,30\n0",
+    );
+    // `flatMap` over an async-generator inner.
+    check(
+        "async-iterator-flatmap-async-inner",
+        "async function* ag() { yield 1; yield 2; } \
+         async function* inner(x) { yield x; yield -x; } \
+         ag().flatMap(function (x) { return inner(x); }).toArray() \
+             .then(function (a) { print(\"fma:\" + a.join(\",\")); }); return 0;",
+        "fma:1,-1,2,-2\n0",
+    );
 }
 
 #[test]

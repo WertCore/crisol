@@ -2007,6 +2007,7 @@ const ASYNC_ITERATOR_NATIVES: &[(&str, Native)] = &[
     ("take", async_iterator_take),
     ("filter", async_iterator_filter),
     ("drop", async_iterator_drop),
+    ("flatMap", async_iterator_flat_map),
 ];
 /// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309..D-311): the
 /// two drain reactions, the `[Symbol.toStringTag]` getter, the `forEach`/`reduce` processors, and
@@ -2026,6 +2027,8 @@ const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
     async_helper_reject,
     async_helper_map_applied,
     async_helper_filter_verdict,
+    async_helper_flatmap_mapped,
+    async_helper_inner_step,
 ];
 /// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_DRAIN_STEP: usize = 0;
@@ -2055,6 +2058,10 @@ const ASYNC_HELPER_REJECT: usize = 11;
 const ASYNC_HELPER_MAP_APPLIED: usize = 12;
 /// Index of [`async_helper_filter_verdict`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_HELPER_FILTER_VERDICT: usize = 13;
+/// Index of [`async_helper_flatmap_mapped`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_FLATMAP_MAPPED: usize = 14;
+/// Index of [`async_helper_inner_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_INNER_STEP: usize = 15;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -6604,6 +6611,7 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("AsyncIterator.prototype", "take", 1),
     ("AsyncIterator.prototype", "filter", 1),
     ("AsyncIterator.prototype", "drop", 1),
+    ("AsyncIterator.prototype", "flatMap", 1),
     ("Async Iterator Helper", "next", 0),
     ("Async Iterator Helper", "return", 0),
 ];
@@ -22563,6 +22571,7 @@ const AH_MAP: u8 = 0;
 const AH_TAKE: u8 = 1;
 const AH_FILTER: u8 = 2;
 const AH_DROP: u8 = 3;
+const AH_FLATMAP: u8 = 4;
 /// A lazy async helper's recorded state.
 const AH_KIND: &str = "__ahKind";
 const AH_SOURCE: &str = "__ahSource";
@@ -22575,6 +22584,8 @@ const AH_HELPER: &str = "__ahHelper";
 const AH_RESULT: &str = "__ahResult";
 /// Carried on a `filter` verdict reaction: the value to yield if the predicate kept it.
 const AH_VALUE: &str = "__ahValue";
+/// A `flatMap` helper's current inner iterator, or `undefined` between inners.
+const AH_INNER: &str = "__ahInner";
 
 /// Reads a lazy async helper's `AH_KIND` tag as a small integer.
 fn async_helper_kind(helper: u64) -> u8 {
@@ -22606,6 +22617,7 @@ fn make_async_iterator_helper(source: u64, kind: u8, func: u64, limit: f64) -> u
                     runtime.define_hidden(handle, AH_FUNC, Value::from_bits(func));
                     runtime.define_hidden(handle, AH_LIMIT, Value::number(limit));
                     runtime.define_hidden(handle, AH_COUNTER, Value::number(0.0));
+                    runtime.define_hidden(handle, AH_INNER, Value::UNDEFINED);
                     runtime.define_hidden(handle, AH_DONE, Value::FALSE);
                 });
             }
@@ -22675,11 +22687,66 @@ extern "C" fn async_helper_next(
             }
         }
         let result = new_promise_object();
+        // `flatMap` drains the current inner iterator before pulling the outer source again.
+        if kind == AH_FLATMAP && !Value::from_bits(property_of(this_value, AH_INNER)).is_undefined()
+        {
+            with_rooted(&[this_value, result], || {
+                async_helper_inner_pull(this_value, result)
+            });
+            return result;
+        }
         with_rooted(&[this_value, result], || {
             async_helper_pull(this_value, result)
         });
         result
     })
+}
+
+/// Pulls `inner.next()` for a `flatMap` helper, routing the step to its inner-step reaction (D-314).
+fn async_helper_inner_pull(helper: u64, result: u64) {
+    let inner = property_of(helper, AH_INNER);
+    with_rooted(&[helper, inner, result], || {
+        let base = async_iterator_internal_natives_base();
+        let step = with_rooted(&[helper, inner, result], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + ASYNC_HELPER_INNER_STEP)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        let reject = with_rooted(&[helper, inner, result, step], || {
+            with_runtime(|runtime| {
+                runtime
+                    .native_function(base + ASYNC_HELPER_REJECT)
+                    .to_value()
+                    .to_bits()
+            })
+        });
+        with_rooted(&[helper, inner, result, step, reject], || {
+            set_bag(step, AH_HELPER, helper);
+            set_bag(step, AH_RESULT, result);
+            set_bag(reject, AH_RESULT, result);
+            let advance = property_of(inner, "next");
+            if !is_callable(advance) {
+                let reason = raise_value("an async iterator needs a `next` method", "TypeError");
+                with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                return;
+            }
+            let outcome = with_rooted(&[inner, advance], || call_value(advance, inner, &[]));
+            if Value::from_bits(outcome).is_exception() {
+                let reason = crisol_pending_exception();
+                with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                return;
+            }
+            with_rooted(&[result, step, reject, outcome], || {
+                let awaited = as_promise(outcome);
+                with_rooted(&[awaited, step, reject], || {
+                    promise_then(awaited, step, reject, false);
+                });
+            });
+        });
+    });
 }
 
 /// Pulls `source.next()` and routes the resolved step to the helper's step reaction (or a fault to
@@ -22819,6 +22886,60 @@ extern "C" fn async_helper_step(
                     });
                 },
             );
+            return Value::UNDEFINED.to_bits();
+        }
+        if async_helper_kind(helper) == AH_FLATMAP {
+            // Await the mapper, then flatten its result: the mapped value's iterator becomes the
+            // inner the helper drains before pulling the outer source again.
+            let mapper = property_of(helper, AH_FUNC);
+            let counter = Value::from_bits(property_of(helper, AH_COUNTER))
+                .as_number()
+                .unwrap_or(0.0);
+            set_bag(helper, AH_COUNTER, Value::number(counter + 1.0).to_bits());
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a step index"
+            )]
+            let args = [value, index_value(counter as usize)];
+            let mapped = with_rooted(&[helper, result, value, mapper], || {
+                call_value(mapper, Value::UNDEFINED.to_bits(), &args)
+            });
+            if Value::from_bits(mapped).is_exception() {
+                let reason = crisol_pending_exception();
+                set_bag(helper, AH_DONE, Value::TRUE.to_bits());
+                with_rooted(&[helper, result, reason], || {
+                    iterator_close(property_of(helper, AH_SOURCE));
+                    settle_promise(result, reason, true);
+                });
+                return Value::UNDEFINED.to_bits();
+            }
+            let base = async_iterator_internal_natives_base();
+            let on_mapped = with_rooted(&[helper, result, mapped], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .native_function(base + ASYNC_HELPER_FLATMAP_MAPPED)
+                        .to_value()
+                        .to_bits()
+                })
+            });
+            let reject = with_rooted(&[helper, result, mapped, on_mapped], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .native_function(base + ASYNC_HELPER_REJECT)
+                        .to_value()
+                        .to_bits()
+                })
+            });
+            with_rooted(&[helper, result, mapped, on_mapped, reject], || {
+                set_bag(on_mapped, AH_HELPER, helper);
+                set_bag(on_mapped, AH_RESULT, result);
+                set_bag(reject, AH_RESULT, result);
+                let awaited = as_promise(mapped);
+                with_rooted(&[awaited, on_mapped, reject], || {
+                    promise_then(awaited, on_mapped, reject, false);
+                });
+            });
             return Value::UNDEFINED.to_bits();
         }
         // `map`: await the mapper's result, then yield it.
@@ -23047,6 +23168,136 @@ extern "C" fn async_iterator_drop(
         Err(thrown) => return thrown,
     };
     make_async_iterator_helper(this_value, AH_DROP, Value::UNDEFINED.to_bits(), limit)
+}
+
+/// `GetIteratorFlattenable` for an async `flatMap`: the mapped value's iterator — its
+/// `[Symbol.asyncIterator]()` when it has one, else its `[Symbol.iterator]()` (a sync iterable is
+/// allowed and stepped the same way, since `next()` results are awaited) (D-314).
+fn get_async_flattenable(value: u64) -> Result<u64, u64> {
+    if handle_of(value).is_none() {
+        return Err(raise_value(
+            "AsyncIterator.prototype.flatMap expects each mapped value to be an object",
+            "TypeError",
+        ));
+    }
+    let method = well_known_symbol("asyncIterator")
+        .and_then(|symbol| key_of(Value::from_bits(symbol)))
+        .map(|key| symbol_property_load(value, &key))
+        .filter(|method| is_callable(*method));
+    let method = match method {
+        Some(method) => method,
+        None => {
+            let Some(key) = iterator_key() else {
+                return Ok(value);
+            };
+            let sync = symbol_property_load(value, &key);
+            if !is_callable(sync) {
+                return Ok(value);
+            }
+            sync
+        }
+    };
+    let iterator = with_rooted(&[value, method], || call_value(method, value, &[]));
+    if Value::from_bits(iterator).is_exception() {
+        return Err(crisol_pending_exception());
+    }
+    if handle_of(iterator).is_none() {
+        return Err(raise_value(
+            "AsyncIterator.prototype.flatMap: the iterator is not an object",
+            "TypeError",
+        ));
+    }
+    Ok(iterator)
+}
+
+/// `flatMap`'s post-await reaction: the mapper's awaited result is flattened into the inner iterator.
+extern "C" fn async_helper_flatmap_mapped(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let mapped = unsafe { argument(argc, argv, 0) };
+    let helper = property_of(closure, AH_HELPER);
+    let result = property_of(closure, AH_RESULT);
+    with_rooted(&[helper, result, mapped], || {
+        match get_async_flattenable(mapped) {
+            Ok(inner) => {
+                set_bag(helper, AH_INNER, inner);
+                with_rooted(&[helper, result], || {
+                    async_helper_inner_pull(helper, result)
+                });
+            }
+            Err(reason) => {
+                set_bag(helper, AH_DONE, Value::TRUE.to_bits());
+                with_rooted(&[helper, result, reason], || {
+                    iterator_close(property_of(helper, AH_SOURCE));
+                    settle_promise(result, reason, true);
+                });
+            }
+        }
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+/// `flatMap`'s inner-step reaction: yield an inner value, or clear the inner and pull the outer.
+extern "C" fn async_helper_inner_step(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let step = unsafe { argument(argc, argv, 0) };
+    let helper = property_of(closure, AH_HELPER);
+    let result = property_of(closure, AH_RESULT);
+    with_rooted(&[helper, step, result], || {
+        if handle_of(step).is_none() {
+            let reason = raise_value("an async iterator step must be an object", "TypeError");
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return Value::UNDEFINED.to_bits();
+        }
+        if is_truthy(Value::from_bits(property_of(step, "done"))) {
+            // Inner exhausted — pull the outer source for the next mapped value.
+            set_bag(helper, AH_INNER, Value::UNDEFINED.to_bits());
+            with_rooted(&[helper, result], || async_helper_pull(helper, result));
+            return Value::UNDEFINED.to_bits();
+        }
+        let value = with_rooted(&[helper, step, result], || property_of(step, "value"));
+        let produced = with_rooted(&[result, value], || iterator_result(value, false));
+        with_rooted(&[result, produced], || {
+            settle_promise(result, produced, false)
+        });
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// `AsyncIterator.prototype.flatMap(fn)` — lazy; each mapped value is flattened (D-314).
+extern "C" fn async_iterator_flat_map(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if handle_of(this_value).is_none() {
+        return raise(
+            "AsyncIterator.prototype.flatMap requires an object receiver",
+            "TypeError",
+        );
+    }
+    if !is_callable(callback) {
+        return raise(
+            "AsyncIterator.prototype.flatMap needs a function",
+            "TypeError",
+        );
+    }
+    make_async_iterator_helper(this_value, AH_FLATMAP, callback, 0.0)
 }
 
 /// `%AsyncIterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Async Iterator"` (D-309).
