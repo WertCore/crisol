@@ -11694,6 +11694,44 @@ extern "C" fn function_bind(
             with_runtime(|runtime| {
                 runtime.define_hidden(handle, BOUND_ARGS, Value::from_bits(held));
             });
+            // **A bound function is named and sized** (D-321). Its `length` is the target's own
+            // less the bound arguments, never below zero; its `name` is `"bound "` before the
+            // target's. Both take the function-property attributes — not writable, not enumerable,
+            // configurable — which `define_named` is exactly. A target without a numeric `length`
+            // contributes zero, and one without a string `name` contributes the empty string, so
+            // the result is still `bound ` with nothing after it, as the specification says.
+            let target_length = {
+                let key = "length".to_owned();
+                // SAFETY: `key` is a live Rust string and `this_value` is rooted.
+                let value =
+                    unsafe { crisol_property_load(this_value, key.as_ptr(), key.len() as u64) };
+                Value::from_bits(value)
+                    .as_number()
+                    .filter(|number| number.is_finite())
+                    .map_or(0.0, |number| number.trunc().max(0.0))
+            };
+            #[expect(clippy::cast_precision_loss, reason = "a bound-argument count")]
+            let bound_length = (target_length - leading.len() as f64).max(0.0);
+            let target_name = {
+                let key = "name".to_owned();
+                // SAFETY: as above.
+                let value =
+                    unsafe { crisol_property_load(this_value, key.as_ptr(), key.len() as u64) };
+                if Value::from_bits(value).kind() == crisol_value::Kind::String {
+                    text_of(value)
+                        .map(|text| text.to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            };
+            let named = with_rooted(&[bound], || new_string(&format!("bound {target_name}")));
+            with_rooted(&[bound, named], || {
+                with_runtime(|runtime| {
+                    runtime.define_named(handle, "name", Value::from_bits(named));
+                    runtime.define_named(handle, "length", Value::number(bound_length));
+                });
+            });
             bound
         })
     })

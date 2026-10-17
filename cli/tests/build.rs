@@ -191,6 +191,40 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **A bound function is named and sized** (D-321). `Function.prototype.bind` returns a function whose
+/// `name` is `"bound "` before the target's and whose `length` is the target's less the bound
+/// arguments, floored at zero — both with the function-property attributes (not writable, not
+/// enumerable, configurable), where before it had neither property at all.
+#[test]
+fn a_bound_function_is_named_and_sized() {
+    check(
+        "bound-name-and-length",
+        "function p(a, b, c) {} \
+         var b0 = p.bind(null); \
+         var b1 = p.bind(null, 1); \
+         var b3 = p.bind(null, 1, 2, 3); \
+         return b0.name + '/' + b0.length + ' ' + b1.name + '/' + b1.length \
+              + ' ' + b3.name + '/' + b3.length;",
+        "bound p/3 bound p/2 bound p/0",
+    );
+    // Binding twice stacks the prefix, and the length keeps falling.
+    check(
+        "bound-twice",
+        "function q(a, b) {} var bb = q.bind(null, 1).bind(null); \
+         return bb.name + '/' + bb.length;",
+        "bound bound q/1",
+    );
+    // `name` and `length` are configurable but not writable — assignment is a silent no-op, a
+    // redefine is allowed.
+    check(
+        "bound-name-attributes",
+        "function f(a) {} var b = f.bind(null); \
+         var d = Object.getOwnPropertyDescriptor(b, 'name'); \
+         return d.writable + ',' + d.enumerable + ',' + d.configurable;",
+        "false,false,true",
+    );
+}
+
 /// **A non-writable `length` refuses every resize.** Pinning an array's length with
 /// `Object.defineProperty(a, "length", {writable: false})` turns each length-changing operation into
 /// the no-op or `TypeError` the specification requires: an index past the end does not grow it, and

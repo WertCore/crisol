@@ -8443,3 +8443,22 @@ arrays are dense, so a length near `2^32` (`a.length = 4294967295`, `Object.defi
 {value: 2^32-2}})`) tries to materialise billions of slots, and `reduceRight` over an array-like whose
 `length` is near `2^53` walks a clamped-but-still-four-billion range — both need a sparse representation,
 which is a larger change than a conformance fix.
+
+## D-321
+
+**A bound function is named and sized.**
+
+Status: Accepted
+
+`Function.prototype.bind` built a callable that carried its target, bound `this`, and leading arguments,
+but gave it no `name` and no `length` — both read back `undefined`, where a program (and a swathe of
+test262) expects `"bound f"` and a number. It now stamps them before returning: `length` is the target's
+own `length` (read as a property, a non-numeric or absent one counting as zero) less the count of bound
+arguments and floored at zero; `name` is `"bound "` prepended to the target's `name` (a non-string one
+counting as empty, so a nameless target yields `"bound "`). Both go on with `define_named`, which is the
+function-property attribute set exactly — not writable, not enumerable, configurable — so `b.name = "x"`
+is a silent no-op and `Object.defineProperty(b, "name", …)` works, matching an ordinary function. Binding a
+bound function stacks the prefix and keeps reducing the length (`q.bind(null,1).bind(null)` is
+`"bound bound q"` of length one). Confirmed by acceptance under GC stress. **Deviation:** a getter's or
+setter's `name` is still empty rather than `"get x"`/`"set x"` — that is a separate fix in the frontend's
+accessor lowering, not the runtime, and is left for its own decision.
