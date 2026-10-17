@@ -191,6 +191,48 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **A non-writable `length` refuses every resize.** Pinning an array's length with
+/// `Object.defineProperty(a, "length", {writable: false})` turns each length-changing operation into
+/// the no-op or `TypeError` the specification requires: an index past the end does not grow it, and
+/// `push`/`pop`/`shift`/`unshift`/`splice` raise rather than resize it — each of those ends by
+/// writing `length` with the Throw flag, and a refused write is where it throws (D-317).
+#[test]
+fn a_non_writable_length_refuses_resizes() {
+    // An index past the end cannot grow a pinned array — silently, the way a non-strict write is.
+    check(
+        "fixed-length-index-no-grow",
+        "var a=[1,2,3]; Object.defineProperty(a,'length',{writable:false}); a[5]=9; \
+         return a.length + '/' + (5 in a);",
+        "3/false",
+    );
+    // `push` adds, which grows `length`, so on a pinned array it is a `TypeError` and the array is
+    // left as it was.
+    check(
+        "fixed-length-push-throws",
+        "var a=[1,2,3]; Object.defineProperty(a,'length',{writable:false}); \
+         try { a.push(4); return 'no-throw'; } catch (e) { return e.name + '/' + a.length; }",
+        "TypeError/3",
+    );
+    // So is every other resizer — `pop`, `shift`, `unshift`, `splice` each change the length.
+    check(
+        "fixed-length-mutators-throw",
+        "function lock(){ var a=[1,2,3]; Object.defineProperty(a,'length',{writable:false}); return a; }\
+         function t(f){ try { f(); return 'ok'; } catch (e) { return e.name; } }\
+         return [t(function(){lock().pop();}), t(function(){lock().shift();}), \
+                 t(function(){lock().unshift(0);}), t(function(){lock().splice(1,1);})].join(',');",
+        "TypeError,TypeError,TypeError,TypeError",
+    );
+    // A call that would not change the length is the same-value write the specification permits:
+    // `push()` with no arguments, and `pop()` on an array that is already empty.
+    check(
+        "fixed-length-noop-resizers-pass",
+        "var a=[1,2,3]; Object.defineProperty(a,'length',{writable:false}); a.push(); \
+         var b=[]; Object.defineProperty(b,'length',{writable:false}); b.pop(); \
+         return a.length + '/' + b.length;",
+        "3/0",
+    );
+}
+
 #[test]
 fn a_program_with_no_return_prints_undefined() {
     check("empty", "let a = 1;", "undefined");

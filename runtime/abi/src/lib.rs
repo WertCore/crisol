@@ -1407,6 +1407,17 @@ extern "C" fn array_splice(
         count.min(length - start)
     };
 
+    // A splice that removes and inserts different counts changes `length`, which a non-writable
+    // length refuses. Raised up front, so the array is left whole; the specification writes the
+    // length last, after shifting the tail, but a program cannot observe the difference on an
+    // array it could not resize — the removed-array it would have built is discarded on the throw.
+    if length_resize_refused(this_value, removing != (argc as usize).saturating_sub(2)) {
+        return raise(
+            "cannot resize an array with a non-writable length",
+            "TypeError",
+        );
+    }
+
     // SAFETY: as above.
     let live = unsafe { live_values(this_value, argc, argv) };
     with_rooted(&live, || {
@@ -12445,7 +12456,11 @@ fn store_element(object: u64, index: usize, value: u64) -> bool {
     let refused = if index < count {
         !element_rule(object, index).writable
     } else {
-        !is_extensible(object)
+        // **An index past the end has to grow `length`**, so a non-writable length refuses it
+        // just as a non-extensible object does — `[1,2,3]` with its length pinned does not become
+        // `[1,2,3,,,9]` on `a[5] = 9`. Silently here; `push`, which writes `length` with the
+        // Throw flag, raises instead (see `length_resize_refused`).
+        !is_extensible(object) || own_flag(object, FIXED_LENGTH)
     };
     if refused {
         // Handled, and silently — outside strict mode, as every other refused write is.
@@ -18209,6 +18224,17 @@ extern "C" fn array_reduce(
 }
 
 /// `Array.prototype.push` — appends, and answers the new length.
+/// **A resize of a non-writable-length array is a `TypeError`.** Every length-changing method
+/// (`push`, `pop`, `shift`, `unshift`, `splice`) finishes by writing `length` with the Throw flag,
+/// so one that would change the length on a locked array throws *before* it touches anything —
+/// matching the specification's order, where the refused write is the first observable step and the
+/// elements are left as they were. `changes_length` is false for the no-ops the specification lets
+/// through as a same-value write (`push()`/`unshift()` with no arguments, `pop()`/`shift()` on an
+/// empty array), which succeed. Only a real array carries the marker, so array-likes are unaffected.
+fn length_resize_refused(this_value: u64, changes_length: bool) -> bool {
+    changes_length && own_flag(this_value, FIXED_LENGTH)
+}
+
 extern "C" fn array_push(
     _closure: u64,
     this_value: u64,
@@ -18223,6 +18249,12 @@ extern "C" fn array_push(
             Ok(length) => length,
             Err(thrown) => return thrown,
         };
+        if length_resize_refused(this_value, argc > 0) {
+            return raise(
+                "cannot add to an array with a non-writable length",
+                "TypeError",
+            );
+        }
         for position in 0..argc as usize {
             // SAFETY: as above.
             let value = unsafe { argument(argc, argv, position) };
@@ -18562,6 +18594,12 @@ extern "C" fn array_pop(
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
+    if length_resize_refused(this_value, length > 0) {
+        return raise(
+            "cannot shorten an array with a non-writable length",
+            "TypeError",
+        );
+    }
     if length == 0 {
         indexed_set_length(this_value, 0);
         return Value::UNDEFINED.to_bits();
@@ -18591,6 +18629,12 @@ extern "C" fn array_shift(
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
+    if length_resize_refused(this_value, length > 0) {
+        return raise(
+            "cannot shorten an array with a non-writable length",
+            "TypeError",
+        );
+    }
     if length == 0 {
         indexed_set_length(this_value, 0);
         return Value::UNDEFINED.to_bits();
@@ -18638,6 +18682,12 @@ extern "C" fn array_unshift(
         Err(thrown) => return thrown,
     };
     let added = argc as usize;
+    if length_resize_refused(this_value, added > 0) {
+        return raise(
+            "cannot grow an array with a non-writable length",
+            "TypeError",
+        );
+    }
     if added == 0 {
         // **Still written back.** `unshift()` with nothing sets `length` to what it already
         // was, and on a receiver that refuses the write that is where it throws.
@@ -23489,7 +23539,11 @@ fn from_async_collect(bag: u64, value: u64) {
     with_rooted(&[bag, acc, value], || {
         if let Some(handle) = handle_of(acc) {
             let count = indexed_length(acc).unwrap_or(0);
-            with_runtime(|runtime| runtime.heap.set_element(handle, count, Value::from_bits(value)));
+            with_runtime(|runtime| {
+                runtime
+                    .heap
+                    .set_element(handle, count, Value::from_bits(value))
+            });
         }
         let index = Value::from_bits(property_of(bag, AF_INDEX))
             .as_number()
@@ -23575,7 +23629,11 @@ extern "C" fn from_async_value(
         let index = Value::from_bits(property_of(bag, AF_INDEX))
             .as_number()
             .unwrap_or(0.0);
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a step index")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a step index"
+        )]
         let args = [value, index_value(index as usize)];
         let mapped = with_rooted(&[bag, value, mapper], || {
             call_value(mapper, Value::UNDEFINED.to_bits(), &args)
@@ -23660,7 +23718,10 @@ extern "C" fn array_from_async(
     // SAFETY: as above.
     let mapper = unsafe { argument(argc, argv, 1) };
     if !Value::from_bits(mapper).is_undefined() && !is_callable(mapper) {
-        return rejected_promise("Array.fromAsync: the map function is not callable", "TypeError");
+        return rejected_promise(
+            "Array.fromAsync: the map function is not callable",
+            "TypeError",
+        );
     }
     with_rooted(&[items, mapper], || {
         let iterator = match async_from_iterator(items) {

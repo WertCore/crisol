@@ -8379,3 +8379,25 @@ function all work. Registered as an `Array` static with `length` 1. Confirmed by
 promises, an async generator, and the map-function form, under GC stress. **Deviation:** a non-iterable
 array-like source (`{ length, 0: … }`) is not handled yet — it rejects rather than index-walking; the
 iterable path (the common case, and all previously-failing since the method was absent) is a strict gain.
+
+## D-317
+
+**A non-writable array `length` refuses every resize.**
+
+Status: Accepted
+
+An array's `length` is its element count, not a stored property — there is no slot to hang `[[Writable]]`
+on — so when `Object.defineProperty(a, "length", {writable: false})` pins it, the fact is recorded in a
+hidden `__fixedLength` marker (this already existed, as did the check on the `a.length = n` assignment
+path). What was missing was every *other* way to resize: an index past the end (`a[5] = 9`), and the
+methods `push`/`pop`/`shift`/`unshift`/`splice`. The index store now refuses to grow a pinned array the
+same way a non-extensible object refuses a new slot — silently, as a non-strict write. The methods each
+raise a `TypeError`: the specification has them finish by writing `length` with the Throw flag, so a call
+that would change the length on a pinned array throws, and it throws *before* touching anything, leaving
+the array whole. A call that would **not** change the length — `push()`/`unshift()` with no arguments,
+`pop()`/`shift()` on an empty array — is the same-value write the specification allows, and passes. The
+guard (`length_resize_refused`) is one marker probe, taken only by the resizing methods and only when a
+rare marker is present, so the ordinary array hot path is unchanged. Confirmed by acceptance under GC
+stress. **Deviation:** an *array-like* (non-array) object with a non-writable `"length"` data property is
+not covered — the marker is set only on real arrays; the methods there resize as before. `splice` raises
+up front rather than after shifting the tail, which a program cannot observe on an array it cannot resize.
