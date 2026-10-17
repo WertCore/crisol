@@ -8214,3 +8214,18 @@ throw; it now takes the pending exception and rejects `result`, so `Promise.all(
 surfaced as an `allSettled` "crash" (a non-zero exit from the uncaught throw). Confirmed by acceptance —
 a non-iterable and a throwing iterator both route to the rejection handler; the array-input paths are
 unchanged.
+
+## D-308
+
+**`%Iterator.prototype%` and `%IteratorHelperPrototype%` carry `[Symbol.toStringTag]`.**
+
+Status: Accepted
+
+`Object.prototype.toString.call` named an iterator helper `"[object Object]"` because neither prototype
+had a `[Symbol.toStringTag]`. Each now has a getter — `"Iterator"` on `%Iterator.prototype%` and
+`"Iterator Helper"` on `%IteratorHelperPrototype%` — installed as accessors the way `%TypedArray%`'s tag
+is, so `Object.prototype.toString.call(gen().map(f))` reads `"[object Iterator Helper]"` and the bare
+prototype reads `"[object Iterator]"`. The two getters live in the `ITERATOR_STATIC_NATIVES` bucket
+(indices after `from`), keeping the single appended table. Deviation: the specification makes
+`%Iterator.prototype%`'s tag a get/set accessor (the setter ignores prototype writes); this is get-only,
+matching the engine's other tag getters. Confirmed by acceptance under GC stress.

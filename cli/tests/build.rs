@@ -6952,6 +6952,17 @@ fn iterators_have_their_helpers() {
         "return Iterator.from.length + \",\" + Iterator.from.name;",
         "1,from",
     );
+    // `[Symbol.toStringTag]` names the prototype and a helper (D-308).
+    check(
+        "iterator-prototype-tostringtag",
+        "return Object.prototype.toString.call(Iterator.prototype);",
+        "[object Iterator]",
+    );
+    check(
+        "iterator-helper-tostringtag",
+        "return Object.prototype.toString.call([1, 2].values().map(function (x) { return x; }));",
+        "[object Iterator Helper]",
+    );
 }
 
 #[test]

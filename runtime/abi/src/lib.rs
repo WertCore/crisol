@@ -1973,8 +1973,17 @@ const ITERATOR_HELPER_NATIVES: &[(&str, Native)] = &[
     ("next", iterator_helper_next),
     ("return", iterator_helper_return),
 ];
-/// The `Iterator` constructor's statics (D-306).
-const ITERATOR_STATIC_NATIVES: &[(&str, Native)] = &[("from", iterator_from)];
+/// The `Iterator` constructor's static (D-306) plus the two `[Symbol.toStringTag]` getters the
+/// prototypes carry (D-308) — one dispatch bucket, appended last so no earlier index moves.
+const ITERATOR_STATIC_NATIVES: &[(&str, Native)] = &[
+    ("from", iterator_from),
+    ("get [Symbol.toStringTag]", iterator_tag_getter),
+    ("get [Symbol.toStringTag]", iterator_helper_tag_getter),
+];
+/// Index of [`iterator_tag_getter`] within [`ITERATOR_STATIC_NATIVES`].
+const ITERATOR_TAG_GETTER: usize = 1;
+/// Index of [`iterator_helper_tag_getter`] within [`ITERATOR_STATIC_NATIVES`].
+const ITERATOR_HELPER_TAG_GETTER: usize = 2;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -14795,6 +14804,30 @@ impl Runtime {
                 );
             }
 
+            // `[Symbol.toStringTag]` getters so `Object.prototype.toString.call(...)` names an
+            // iterator `"[object Iterator]"` and a helper `"[object Iterator Helper]"` (D-308).
+            let tag = {
+                let named = PropertyKey::new("toStringTag");
+                self.heap
+                    .shape_of(symbol)
+                    .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                    .and_then(|slot| self.heap.get(symbol, slot.index()))
+                    .and_then(|value| value.as_address())
+            };
+            if let Some(tag) = tag {
+                KEY_SYMBOLS.with(|symbols| {
+                    if let Ok(mut entries) = symbols.try_borrow_mut() {
+                        entries.insert(Value::symbol(tag).to_bits());
+                    }
+                });
+                let tag_key = PropertyKey::symbol(tag, "Symbol.toStringTag");
+                let base = iterator_static_natives_base();
+                let iterator_tag = self.native_function(base + ITERATOR_TAG_GETTER);
+                self.install_accessor_keyed(iterator_prototype.handle(), &tag_key, iterator_tag);
+                let helper_tag = self.native_function(base + ITERATOR_HELPER_TAG_GETTER);
+                self.install_accessor_keyed(helper_prototype.handle(), &tag_key, helper_tag);
+            }
+
             // **Reparent the built-in iterator prototypes onto `%Iterator.prototype%`** — where the
             // specification puts the helpers. The acceptance regression is the guard that this
             // chain change leaves every existing array-iterator and generator working.
@@ -21651,6 +21684,30 @@ extern "C" fn iterator_from(
             make_iterator_helper(iterator, IH_WRAP, Value::UNDEFINED.to_bits(), 0.0)
         })
     })
+}
+
+/// `%Iterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Iterator"`, so
+/// `Object.prototype.toString.call(anIterator)` reads `"[object Iterator]"` (D-308). A getter
+/// rather than a data property matches how `%TypedArray%`'s tag is installed here.
+extern "C" fn iterator_tag_getter(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_string("Iterator")
+}
+
+/// `%IteratorHelperPrototype%[Symbol.toStringTag]`'s getter — answers `"Iterator Helper"` (D-308).
+extern "C" fn iterator_helper_tag_getter(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_string("Iterator Helper")
 }
 
 /// A named property of `object`, read as a value.
