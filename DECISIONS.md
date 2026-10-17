@@ -8501,3 +8501,21 @@ rooted across the store, which a shape transition can make allocate. `{ ...src }
 correct (`crisol_object_spread` checked the load); this brings `assign` in line. Confirmed by acceptance
 under GC stress: a throwing source getter, a read-only target, a non-extensible target, and an ordinary
 multi-source copy.
+
+## D-323
+
+**A computed accessor is named from its key.**
+
+Status: Accepted
+
+D-320 named the non-computed accessors; this is its computed sibling, `{get [k]() {…}}` and
+`class { get [k]() {…} }`, in the same runtime spot — `crisol_computed_define_accessor`, which already
+holds the key as a value. A new `computed_key_name` renders that value the way `NamedEvaluation` does: a
+string key as itself, a numeric key as its text (`number_text`), and a symbol key as `"[description]"` —
+empty for a symbol with no description, which is the specification's `[[Description]]`-undefined case. The
+rendered key goes through the same `name_accessor` D-320 uses, so a computed getter reads back as
+`"get pq"`, a symbol one as `"get [tag]"`. Confirmed by acceptance under GC stress (a computed string-key
+accessor, a symbol-key accessor, and a class computed accessor). **Deviation:** a computed *method*
+(`{[k]() {…}}`) is still unnamed — the runtime cannot tell a method shorthand from a data property
+`{[k]: fn}`, so naming it needs the frontend to signal the method case (a new op carrying the key),
+which is left for its own decision, together with the non-computed method path if that proves to want it.

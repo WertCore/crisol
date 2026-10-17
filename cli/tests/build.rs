@@ -191,6 +191,37 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **A computed accessor is named from its key** (D-323) — `"get "`/`"set "` before the key rendered
+/// the way `NamedEvaluation` renders it: the string itself, a number's text, or `"[description]"` for a
+/// symbol. The computed sibling of D-320, in the same runtime spot (`crisol_computed_define_accessor`).
+#[test]
+fn a_computed_accessor_is_named_from_its_key() {
+    // Object literal, a computed string key.
+    check(
+        "computed-accessor-string-key",
+        "var k = 'p' + 'q'; \
+         var o = { get [k]() { return 1; }, set [k](v) {} }; \
+         var d = Object.getOwnPropertyDescriptor(o, 'pq'); \
+         return d.get.name + ',' + d.set.name;",
+        "get pq,set pq",
+    );
+    // A symbol key reads as "[description]".
+    check(
+        "computed-accessor-symbol-key",
+        "var s = Symbol('tag'); \
+         var o = { get [s]() { return 1; } }; \
+         return Object.getOwnPropertyDescriptor(o, s).get.name;",
+        "get [tag]",
+    );
+    // A class body's computed accessor, on the prototype.
+    check(
+        "computed-accessor-class",
+        "var k = 'y'; class C { get [k]() { return 1; } } \
+         return Object.getOwnPropertyDescriptor(C.prototype, 'y').get.name;",
+        "get y",
+    );
+}
+
 /// **`Object.assign` propagates a throwing source getter and a refused write** (D-322). It reads each
 /// source value before writing it, so a getter that throws is the result — not an exception quietly
 /// copied across as if it were a value — and the write uses the throwing form of `Set`.

@@ -8979,6 +8979,23 @@ fn name_accessor(getter: u64, setter: u64, key: &str) {
     }
 }
 
+/// The name a computed key contributes to an accessor or method — the string for a string key, the
+/// rendered number for a numeric one, and `"[description]"` for a symbol (empty for a symbol with no
+/// description, which is `""`, as the specification's `[[Description]]`-undefined case gives) (D-323).
+fn computed_key_name(key: u64) -> String {
+    let value = Value::from_bits(key);
+    if value.kind() == crisol_value::Kind::Symbol {
+        return match property_text(key, SYMBOL_DESCRIPTION) {
+            Some(description) => format!("[{description}]"),
+            None => String::new(),
+        };
+    }
+    if let Some(number) = value.as_number() {
+        return number_text(number);
+    }
+    to_text(key).unwrap_or_default()
+}
+
 /// `{get x() {…}}` and `{set x(v) {…}}` — an accessor from a literal or a class body.
 ///
 /// **Not a property holding a function.** A getter is *called* on read and a data property is
@@ -9058,6 +9075,9 @@ pub unsafe extern "C" fn crisol_computed_define_accessor(
     setter: u64,
 ) -> u64 {
     with_rooted(&[object, key, getter, setter], || {
+        // Named `"get [k]"`/`"set [k]"` from the key, the computed sibling of D-320 (D-323).
+        let key_name = computed_key_name(key);
+        name_accessor(getter, setter, &key_name);
         let descriptor = crisol_create_object();
         with_rooted(&[descriptor, key, getter, setter], || {
             let Some(into) = handle_of(descriptor) else {
