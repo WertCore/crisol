@@ -2005,6 +2005,8 @@ const ASYNC_ITERATOR_NATIVES: &[(&str, Native)] = &[
     ("find", async_iterator_find),
     ("map", async_iterator_map),
     ("take", async_iterator_take),
+    ("filter", async_iterator_filter),
+    ("drop", async_iterator_drop),
 ];
 /// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309..D-311): the
 /// two drain reactions, the `[Symbol.toStringTag]` getter, the `forEach`/`reduce` processors, and
@@ -2023,6 +2025,7 @@ const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
     async_helper_step,
     async_helper_reject,
     async_helper_map_applied,
+    async_helper_filter_verdict,
 ];
 /// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_DRAIN_STEP: usize = 0;
@@ -2050,6 +2053,8 @@ const ASYNC_HELPER_STEP: usize = 10;
 const ASYNC_HELPER_REJECT: usize = 11;
 /// Index of [`async_helper_map_applied`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_HELPER_MAP_APPLIED: usize = 12;
+/// Index of [`async_helper_filter_verdict`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_HELPER_FILTER_VERDICT: usize = 13;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -6597,6 +6602,8 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("AsyncIterator.prototype", "find", 1),
     ("AsyncIterator.prototype", "map", 1),
     ("AsyncIterator.prototype", "take", 1),
+    ("AsyncIterator.prototype", "filter", 1),
+    ("AsyncIterator.prototype", "drop", 1),
     ("Async Iterator Helper", "next", 0),
     ("Async Iterator Helper", "return", 0),
 ];
@@ -22554,6 +22561,8 @@ extern "C" fn async_iterator_find(
 /// A lazy async helper's kind.
 const AH_MAP: u8 = 0;
 const AH_TAKE: u8 = 1;
+const AH_FILTER: u8 = 2;
+const AH_DROP: u8 = 3;
 /// A lazy async helper's recorded state.
 const AH_KIND: &str = "__ahKind";
 const AH_SOURCE: &str = "__ahSource";
@@ -22564,6 +22573,8 @@ const AH_DONE: &str = "__ahDone";
 /// Carried on an async-helper `next` reaction.
 const AH_HELPER: &str = "__ahHelper";
 const AH_RESULT: &str = "__ahResult";
+/// Carried on a `filter` verdict reaction: the value to yield if the predicate kept it.
+const AH_VALUE: &str = "__ahValue";
 
 /// Reads a lazy async helper's `AH_KIND` tag as a small integer.
 fn async_helper_kind(helper: u64) -> u8 {
@@ -22663,35 +22674,41 @@ extern "C" fn async_helper_next(
                 return async_done_result();
             }
         }
-        with_rooted(&[this_value, source], || {
-            let result = new_promise_object();
-            let (step, reject) = with_rooted(&[this_value, source, result], || {
-                async_helper_reactions(this_value, result)
-            });
-            with_rooted(&[this_value, source, result, step, reject], || {
-                let advance = property_of(source, "next");
-                if !is_callable(advance) {
-                    let reason =
-                        raise_value("an async iterator needs a `next` method", "TypeError");
-                    with_rooted(&[result, reason], || settle_promise(result, reason, true));
-                    return result;
-                }
-                let outcome = with_rooted(&[source, advance], || call_value(advance, source, &[]));
-                if Value::from_bits(outcome).is_exception() {
-                    let reason = crisol_pending_exception();
-                    with_rooted(&[result, reason], || settle_promise(result, reason, true));
-                    return result;
-                }
-                with_rooted(&[result, step, reject, outcome], || {
-                    let awaited = as_promise(outcome);
-                    with_rooted(&[awaited, step, reject], || {
-                        promise_then(awaited, step, reject, false);
-                    });
-                });
-                result
-            })
-        })
+        let result = new_promise_object();
+        with_rooted(&[this_value, result], || {
+            async_helper_pull(this_value, result)
+        });
+        result
     })
+}
+
+/// Pulls `source.next()` and routes the resolved step to the helper's step reaction (or a fault to
+/// its reject reaction). Shared by `next` and the `filter`/`drop` re-pull across async hops (D-313).
+fn async_helper_pull(helper: u64, result: u64) {
+    let source = property_of(helper, AH_SOURCE);
+    with_rooted(&[helper, source, result], || {
+        let (step, reject) = async_helper_reactions(helper, result);
+        with_rooted(&[helper, source, result, step, reject], || {
+            let advance = property_of(source, "next");
+            if !is_callable(advance) {
+                let reason = raise_value("an async iterator needs a `next` method", "TypeError");
+                with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                return;
+            }
+            let outcome = with_rooted(&[source, advance], || call_value(advance, source, &[]));
+            if Value::from_bits(outcome).is_exception() {
+                let reason = crisol_pending_exception();
+                with_rooted(&[result, reason], || settle_promise(result, reason, true));
+                return;
+            }
+            with_rooted(&[result, step, reject, outcome], || {
+                let awaited = as_promise(outcome);
+                with_rooted(&[awaited, step, reject], || {
+                    promise_then(awaited, step, reject, false);
+                });
+            });
+        });
+    });
 }
 
 /// A helper step's reaction: the resolved `source.next()` result. Maps (awaiting the mapper) or
@@ -22729,6 +22746,79 @@ extern "C" fn async_helper_step(
             with_rooted(&[result, produced], || {
                 settle_promise(result, produced, false)
             });
+            return Value::UNDEFINED.to_bits();
+        }
+        if async_helper_kind(helper) == AH_DROP {
+            // Skip the first `limit` values by re-pulling; yield the rest.
+            let remaining = Value::from_bits(property_of(helper, AH_LIMIT))
+                .as_number()
+                .unwrap_or(0.0);
+            if remaining > 0.0 {
+                set_bag(helper, AH_LIMIT, Value::number(remaining - 1.0).to_bits());
+                with_rooted(&[helper, result], || async_helper_pull(helper, result));
+            } else {
+                let produced = with_rooted(&[result, value], || iterator_result(value, false));
+                with_rooted(&[result, produced], || {
+                    settle_promise(result, produced, false)
+                });
+            }
+            return Value::UNDEFINED.to_bits();
+        }
+        if async_helper_kind(helper) == AH_FILTER {
+            // Await the predicate, then keep the value or re-pull.
+            let predicate = property_of(helper, AH_FUNC);
+            let counter = Value::from_bits(property_of(helper, AH_COUNTER))
+                .as_number()
+                .unwrap_or(0.0);
+            set_bag(helper, AH_COUNTER, Value::number(counter + 1.0).to_bits());
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a step index"
+            )]
+            let args = [value, index_value(counter as usize)];
+            let verdict = with_rooted(&[helper, result, value, predicate], || {
+                call_value(predicate, Value::UNDEFINED.to_bits(), &args)
+            });
+            if Value::from_bits(verdict).is_exception() {
+                let reason = crisol_pending_exception();
+                set_bag(helper, AH_DONE, Value::TRUE.to_bits());
+                with_rooted(&[helper, result, reason], || {
+                    iterator_close(property_of(helper, AH_SOURCE));
+                    settle_promise(result, reason, true);
+                });
+                return Value::UNDEFINED.to_bits();
+            }
+            let base = async_iterator_internal_natives_base();
+            let on_verdict = with_rooted(&[helper, result, value, verdict], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .native_function(base + ASYNC_HELPER_FILTER_VERDICT)
+                        .to_value()
+                        .to_bits()
+                })
+            });
+            let reject = with_rooted(&[helper, result, value, verdict, on_verdict], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .native_function(base + ASYNC_HELPER_REJECT)
+                        .to_value()
+                        .to_bits()
+                })
+            });
+            with_rooted(
+                &[helper, result, value, verdict, on_verdict, reject],
+                || {
+                    set_bag(on_verdict, AH_HELPER, helper);
+                    set_bag(on_verdict, AH_RESULT, result);
+                    set_bag(on_verdict, AH_VALUE, value);
+                    set_bag(reject, AH_RESULT, result);
+                    let awaited = as_promise(verdict);
+                    with_rooted(&[awaited, on_verdict, reject], || {
+                        promise_then(awaited, on_verdict, reject, false);
+                    });
+                },
+            );
             return Value::UNDEFINED.to_bits();
         }
         // `map`: await the mapper's result, then yield it.
@@ -22883,6 +22973,80 @@ extern "C" fn async_iterator_take(
         Err(thrown) => return thrown,
     };
     make_async_iterator_helper(this_value, AH_TAKE, Value::UNDEFINED.to_bits(), limit)
+}
+
+/// `filter`'s post-await reaction: keep the awaited-predicate's value, or re-pull (D-313).
+extern "C" fn async_helper_filter_verdict(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let keep = unsafe { argument(argc, argv, 0) };
+    let helper = property_of(closure, AH_HELPER);
+    let result = property_of(closure, AH_RESULT);
+    let value = property_of(closure, AH_VALUE);
+    with_rooted(&[helper, result, value], || {
+        if is_truthy(Value::from_bits(keep)) {
+            let produced = with_rooted(&[result, value], || iterator_result(value, false));
+            with_rooted(&[result, produced], || {
+                settle_promise(result, produced, false)
+            });
+        } else {
+            with_rooted(&[helper, result], || async_helper_pull(helper, result));
+        }
+    });
+    Value::UNDEFINED.to_bits()
+}
+
+/// `AsyncIterator.prototype.filter(fn)` — lazy; the predicate's result is awaited (D-313).
+extern "C" fn async_iterator_filter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if handle_of(this_value).is_none() {
+        return raise(
+            "AsyncIterator.prototype.filter requires an object receiver",
+            "TypeError",
+        );
+    }
+    if !is_callable(callback) {
+        return raise(
+            "AsyncIterator.prototype.filter needs a function",
+            "TypeError",
+        );
+    }
+    make_async_iterator_helper(this_value, AH_FILTER, callback, 0.0)
+}
+
+/// `AsyncIterator.prototype.drop(limit)` — lazy; skips the first `limit` values (D-313).
+extern "C" fn async_iterator_drop(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise(
+            "AsyncIterator.prototype.drop requires an object receiver",
+            "TypeError",
+        );
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let limit = unsafe { argument(argc, argv, 0) };
+    let limit = match with_rooted(&[this_value], || helper_limit(limit, "drop")) {
+        Ok(limit) => limit,
+        Err(thrown) => return thrown,
+    };
+    make_async_iterator_helper(this_value, AH_DROP, Value::UNDEFINED.to_bits(), limit)
 }
 
 /// `%AsyncIterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Async Iterator"` (D-309).

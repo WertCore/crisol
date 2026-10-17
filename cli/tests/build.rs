@@ -7085,6 +7085,28 @@ fn async_iterators_have_toarray() {
          return 0;",
         "c:2,4\n0",
     );
+    // Lazy `filter` (awaiting the predicate) and `drop` (D-313).
+    check(
+        "async-iterator-filter",
+        "async function* ag() { yield 1; yield 2; yield 3; yield 4; } \
+         ag().filter(function (x) { return x % 2 === 0; }).toArray().then(function (a) { print(\"f:\" + a.join(\",\")); }); \
+         return 0;",
+        "f:2,4\n0",
+    );
+    check(
+        "async-iterator-drop",
+        "async function* ag() { yield 1; yield 2; yield 3; yield 4; } \
+         ag().drop(2).toArray().then(function (a) { print(\"d:\" + a.join(\",\")); }); return 0;",
+        "d:3,4\n0",
+    );
+    // `filter` re-pulls across async hops and `take` short-circuits — together over an endless source.
+    check(
+        "async-iterator-filter-take-chain",
+        "async function* nat() { var i = 0; while (true) { yield i; i = i + 1; } } \
+         nat().filter(function (x) { return x % 2 === 0; }).take(3).toArray() \
+             .then(function (a) { print(\"ft:\" + a.join(\",\")); }); return 0;",
+        "ft:0,2,4\n0",
+    );
 }
 
 #[test]

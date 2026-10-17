@@ -8309,3 +8309,19 @@ methods join `ASYNC_ITERATOR_INTERNAL_NATIVES`; `%AsyncIteratorHelperPrototype%`
 `%AsyncIterator.prototype%`. Confirmed by acceptance — `map`, `take`, an endless-source `take`, and a
 `map`→`take` chain — under GC stress. Still deferred: `filter`/`drop`/`flatMap` (they re-pull across
 async hops) and `AsyncIterator.from`.
+
+## D-313
+
+**Lazy async `filter` and `drop` — re-pulling across async hops.**
+
+Status: Accepted
+
+Unlike `map`/`take`, these may consume several source values before one `next()` resolves, so the pull is
+factored into `async_helper_pull(helper, result)` and the step reaction re-arms it: `drop` skips its
+`limit` values by re-pulling, then yields; `filter` awaits the predicate and, on a falsy verdict,
+re-pulls rather than settling. A new `async_helper_filter_verdict` reaction carries the kept value and
+either resolves `{ value, done }` or re-pulls. Because the pull is shared, a `filter` feeding a `take`
+over an endless async generator both re-pulls past the odd numbers and short-circuits at the limit —
+`nat().filter(even).take(3)` resolves `[0, 2, 4]` rather than hanging. Confirmed by acceptance: `filter`,
+`drop`, and that `filter`→`take` chain, under GC stress. The async iterator helpers are now complete
+except `flatMap` (nested async iteration) and `AsyncIterator.from`.
