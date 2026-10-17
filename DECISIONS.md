@@ -8270,3 +8270,22 @@ consumes fully, this shape suits `forEach`/`reduce` but not the short-circuiting
 which stay deferred with the lazy helpers and `AsyncIterator.from`. Confirmed by acceptance — `forEach`
 summing three values, `reduce` with and without an initial value, and the empty-`reduce` rejection —
 under GC stress.
+
+## D-311
+
+**`AsyncIterator.prototype.some`/`every`/`find` — short-circuiting, not draining.**
+
+Status: Accepted
+
+Unlike `forEach`/`reduce` (D-310), these settle before the iterator is exhausted, so they cannot drain —
+an endless async iterator would hang. Each steps one value at a time: pull `next()`, await it, run the
+predicate, await *that*, and stop the moment the answer is decided. The three reactions
+(`async_search_step`/`async_search_verdict`/`async_search_reject`) share a state bag — the iterator,
+predicate, kind tag, running index, result promise, and the reactions themselves — so the walk resumes
+across each promise hop; `some`/`find` settle on the first truthy verdict (with `true`/the value),
+`every` on the first falsy (with `false`), and exhaustion gives `false`/`true`/`undefined`. On a hit the
+source is closed (`iterator_close`, fire-and-forget — its `return()` promise is not awaited, a small
+deviation). Three more reactions join `ASYNC_ITERATOR_INTERNAL_NATIVES`. Confirmed by acceptance:
+`some`/`every`/`find` over a three-value async generator, **and `some` over an endless one terminating
+early** (the proof the short-circuit is real), under GC stress. Still deferred: the lazy async helpers
+(`map`/`filter`/`take`/`drop`/`flatMap`) and `AsyncIterator.from`.

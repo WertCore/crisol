@@ -7030,6 +7030,32 @@ fn async_iterators_have_toarray() {
          return 0;",
         "no:TypeError\n0",
     );
+    // `some`/`every`/`find` short-circuit (D-311).
+    check(
+        "async-iterator-some",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().some(function (x) { return x > 2; }).then(function (r) { print(\"s:\" + r); }); return 0;",
+        "s:true\n0",
+    );
+    check(
+        "async-iterator-every",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().every(function (x) { return x > 2; }).then(function (r) { print(\"e:\" + r); }); return 0;",
+        "e:false\n0",
+    );
+    check(
+        "async-iterator-find",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().find(function (x) { return x > 1; }).then(function (r) { print(\"f:\" + r); }); return 0;",
+        "f:2\n0",
+    );
+    // The short-circuit is real: `some` over an endless async generator terminates.
+    check(
+        "async-iterator-some-is-lazy",
+        "async function* nat() { var i = 0; while (true) { yield i; i = i + 1; } } \
+         nat().some(function (x) { return x >= 3; }).then(function (r) { print(\"inf:\" + r); }); return 0;",
+        "inf:true\n0",
+    );
 }
 
 #[test]

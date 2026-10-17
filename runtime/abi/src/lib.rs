@@ -1995,15 +1995,22 @@ const ASYNC_ITERATOR_NATIVES: &[(&str, Native)] = &[
     ("toArray", async_iterator_to_array),
     ("forEach", async_iterator_for_each),
     ("reduce", async_iterator_reduce),
+    ("some", async_iterator_some),
+    ("every", async_iterator_every),
+    ("find", async_iterator_find),
 ];
-/// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309/D-310): the
-/// two drain reactions, the `[Symbol.toStringTag]` getter, and the `forEach`/`reduce` processors.
+/// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309..D-311): the
+/// two drain reactions, the `[Symbol.toStringTag]` getter, the `forEach`/`reduce` processors, and
+/// the three `some`/`every`/`find` reactions.
 const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
     async_drain_step,
     async_drain_reject,
     async_iterator_tag_getter,
     async_foreach_processor,
     async_reduce_processor,
+    async_search_step,
+    async_search_verdict,
+    async_search_reject,
 ];
 /// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_DRAIN_STEP: usize = 0;
@@ -2015,6 +2022,12 @@ const ASYNC_ITERATOR_TAG_GETTER: usize = 2;
 const ASYNC_FOREACH_PROCESSOR: usize = 3;
 /// Index of [`async_reduce_processor`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_REDUCE_PROCESSOR: usize = 4;
+/// Index of [`async_search_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_SEARCH_STEP: usize = 5;
+/// Index of [`async_search_verdict`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_SEARCH_VERDICT: usize = 6;
+/// Index of [`async_search_reject`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_SEARCH_REJECT: usize = 7;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -6557,6 +6570,9 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("AsyncIterator.prototype", "toArray", 0),
     ("AsyncIterator.prototype", "forEach", 1),
     ("AsyncIterator.prototype", "reduce", 1),
+    ("AsyncIterator.prototype", "some", 1),
+    ("AsyncIterator.prototype", "every", 1),
+    ("AsyncIterator.prototype", "find", 1),
 ];
 
 /// The arity the specification gives `owner.name`, if it gives one.
@@ -22190,6 +22206,301 @@ extern "C" fn async_iterator_reduce(
             })
         })
     })
+}
+
+// `some`/`every`/`find` short-circuit, so they cannot drain (an endless async iterator would hang);
+// they step one value at a time, await the predicate, and stop the moment the answer is settled —
+// state lives in a bag object the three reactions share (D-311).
+
+/// The `some`/`every`/`find` state bag's slots.
+const AS_ITER: &str = "__asIter";
+const AS_PRED: &str = "__asPred";
+const AS_KIND: &str = "__asKind";
+const AS_INDEX: &str = "__asIndex";
+const AS_RESULT: &str = "__asResult";
+const AS_VALUE: &str = "__asValue";
+const AS_STEP: &str = "__asStep";
+const AS_VERDICT: &str = "__asVerdict";
+const AS_REJECT: &str = "__asReject";
+/// The bag a search reaction carries.
+const AS_STATE: &str = "__asState";
+/// `some`/`every`/`find` as the `AS_KIND` tag, stored as a number but compared as a small integer.
+const AS_SOME: u8 = 0;
+const AS_EVERY: u8 = 1;
+const AS_FIND: u8 = 2;
+
+/// Writes one slot of a search bag.
+fn set_bag(bag: u64, name: &str, value: u64) {
+    if let Some(handle) = handle_of(bag) {
+        with_runtime(|runtime| runtime.define_hidden(handle, name, Value::from_bits(value)));
+    }
+}
+
+/// Pulls the next value and routes it to the step reaction (or a fault to the reject reaction).
+fn async_search_pull(bag: u64) {
+    let iterator = property_of(bag, AS_ITER);
+    let result = property_of(bag, AS_RESULT);
+    let step = property_of(bag, AS_STEP);
+    let reject = property_of(bag, AS_REJECT);
+    with_rooted(&[bag, iterator, result, step, reject], || {
+        let advance = property_of(iterator, "next");
+        if !is_callable(advance) {
+            let reason = raise_value("an async iterator needs a `next` method", "TypeError");
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return;
+        }
+        let outcome = with_rooted(&[iterator, advance], || call_value(advance, iterator, &[]));
+        if Value::from_bits(outcome).is_exception() {
+            let reason = crisol_pending_exception();
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return;
+        }
+        with_rooted(&[step, reject, outcome], || {
+            let awaited = as_promise(outcome);
+            with_rooted(&[awaited, step, reject], || {
+                promise_then(awaited, step, reject, false);
+            });
+        });
+    });
+}
+
+/// The answer when the iterator is exhausted without the predicate settling it.
+fn async_search_exhausted(kind: u8) -> u64 {
+    match kind {
+        AS_EVERY => Value::TRUE.to_bits(),
+        AS_FIND => Value::UNDEFINED.to_bits(),
+        _ => Value::FALSE.to_bits(),
+    }
+}
+
+/// Reads a search bag's `AS_KIND` tag as a small integer.
+fn async_search_kind(bag: u64) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the kind is a 0-2 tag this engine wrote"
+    )]
+    let kind = Value::from_bits(property_of(bag, AS_KIND))
+        .as_number()
+        .unwrap_or(0.0) as u8;
+    kind
+}
+
+/// A search's step reaction: one resolved `{ value, done }`. Runs the predicate (awaiting it) or
+/// resolves with the exhausted answer.
+extern "C" fn async_search_step(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let step = unsafe { argument(argc, argv, 0) };
+    let bag = property_of(closure, AS_STATE);
+    let result = property_of(bag, AS_RESULT);
+    with_rooted(&[bag, step, result], || {
+        if handle_of(step).is_none() {
+            let reason = raise_value("an async iterator step must be an object", "TypeError");
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return Value::UNDEFINED.to_bits();
+        }
+        if is_truthy(Value::from_bits(property_of(step, "done"))) {
+            let answer = async_search_exhausted(async_search_kind(bag));
+            with_rooted(&[result, answer], || settle_promise(result, answer, false));
+            return Value::UNDEFINED.to_bits();
+        }
+        let value = with_rooted(&[bag, step], || property_of(step, "value"));
+        set_bag(bag, AS_VALUE, value);
+        let predicate = property_of(bag, AS_PRED);
+        let index = Value::from_bits(property_of(bag, AS_INDEX))
+            .as_number()
+            .unwrap_or(0.0);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a step index"
+        )]
+        let args = [value, index_value(index as usize)];
+        set_bag(bag, AS_INDEX, Value::number(index + 1.0).to_bits());
+        let verdict = with_rooted(&[bag, value, predicate], || {
+            call_value(predicate, Value::UNDEFINED.to_bits(), &args)
+        });
+        if Value::from_bits(verdict).is_exception() {
+            let reason = crisol_pending_exception();
+            with_rooted(&[bag, result, reason], || {
+                iterator_close(property_of(bag, AS_ITER));
+                settle_promise(result, reason, true);
+            });
+            return Value::UNDEFINED.to_bits();
+        }
+        let on_verdict = property_of(bag, AS_VERDICT);
+        let reject = property_of(bag, AS_REJECT);
+        with_rooted(&[bag, verdict, on_verdict, reject], || {
+            let awaited = as_promise(verdict);
+            with_rooted(&[awaited, on_verdict, reject], || {
+                promise_then(awaited, on_verdict, reject, false);
+            });
+        });
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// A search's verdict reaction: the awaited predicate result. Settles the search, or pulls again.
+extern "C" fn async_search_verdict(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let verdict = unsafe { argument(argc, argv, 0) };
+    let bag = property_of(closure, AS_STATE);
+    with_rooted(&[bag, verdict], || {
+        let kind = async_search_kind(bag);
+        let truthy = is_truthy(Value::from_bits(verdict));
+        let hit = if kind == AS_EVERY { !truthy } else { truthy };
+        if hit {
+            let result = property_of(bag, AS_RESULT);
+            let answer = match kind {
+                AS_SOME => Value::TRUE.to_bits(),
+                AS_EVERY => Value::FALSE.to_bits(),
+                _ => property_of(bag, AS_VALUE),
+            };
+            with_rooted(&[bag, result, answer], || {
+                iterator_close(property_of(bag, AS_ITER));
+                settle_promise(result, answer, false);
+            });
+        } else {
+            with_rooted(&[bag], || async_search_pull(bag));
+        }
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// A search's rejection reaction: the source's `next()` or the predicate's promise rejected.
+extern "C" fn async_search_reject(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let reason = unsafe { argument(argc, argv, 0) };
+    let bag = property_of(closure, AS_STATE);
+    let result = property_of(bag, AS_RESULT);
+    with_rooted(&[result, reason], || settle_promise(result, reason, true));
+    Value::UNDEFINED.to_bits()
+}
+
+/// The shared body of the async `some`/`every`/`find`: validate, build the state bag and its three
+/// reactions, and start the per-element walk (D-311).
+fn async_iterator_search(this_value: u64, predicate: u64, kind: u8, method: &str) -> u64 {
+    if handle_of(this_value).is_none() {
+        return rejected_promise(
+            &format!("AsyncIterator.prototype.{method} requires an object"),
+            "TypeError",
+        );
+    }
+    if !is_callable(predicate) {
+        return rejected_promise(
+            &format!("AsyncIterator.prototype.{method} needs a function"),
+            "TypeError",
+        );
+    }
+    with_rooted(&[this_value, predicate], || {
+        let result = new_promise_object();
+        let bag = with_rooted(&[this_value, predicate, result], || crisol_create_object());
+        with_rooted(&[this_value, predicate, result, bag], || {
+            let base = async_iterator_internal_natives_base();
+            let step = with_runtime(|runtime| {
+                runtime
+                    .native_function(base + ASYNC_SEARCH_STEP)
+                    .to_value()
+                    .to_bits()
+            });
+            let verdict = with_rooted(&[bag, step], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .native_function(base + ASYNC_SEARCH_VERDICT)
+                        .to_value()
+                        .to_bits()
+                })
+            });
+            let reject = with_rooted(&[bag, step, verdict], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .native_function(base + ASYNC_SEARCH_REJECT)
+                        .to_value()
+                        .to_bits()
+                })
+            });
+            with_rooted(
+                &[this_value, predicate, result, bag, step, verdict, reject],
+                || {
+                    set_bag(bag, AS_ITER, this_value);
+                    set_bag(bag, AS_PRED, predicate);
+                    set_bag(bag, AS_KIND, Value::number(f64::from(kind)).to_bits());
+                    set_bag(bag, AS_INDEX, Value::number(0.0).to_bits());
+                    set_bag(bag, AS_RESULT, result);
+                    set_bag(bag, AS_VALUE, Value::UNDEFINED.to_bits());
+                    set_bag(bag, AS_STEP, step);
+                    set_bag(bag, AS_VERDICT, verdict);
+                    set_bag(bag, AS_REJECT, reject);
+                    for reaction in [step, verdict, reject] {
+                        if let Some(handle) = handle_of(reaction) {
+                            with_runtime(|runtime| {
+                                runtime.define_hidden(handle, AS_STATE, Value::from_bits(bag));
+                            });
+                        }
+                    }
+                    async_search_pull(bag);
+                },
+            );
+            result
+        })
+    })
+}
+
+/// `AsyncIterator.prototype.some(fn)` (D-311).
+extern "C" fn async_iterator_some(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let predicate = unsafe { argument(argc, argv, 0) };
+    async_iterator_search(this_value, predicate, AS_SOME, "some")
+}
+
+/// `AsyncIterator.prototype.every(fn)` (D-311).
+extern "C" fn async_iterator_every(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let predicate = unsafe { argument(argc, argv, 0) };
+    async_iterator_search(this_value, predicate, AS_EVERY, "every")
+}
+
+/// `AsyncIterator.prototype.find(fn)` (D-311).
+extern "C" fn async_iterator_find(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let predicate = unsafe { argument(argc, argv, 0) };
+    async_iterator_search(this_value, predicate, AS_FIND, "find")
 }
 
 /// `%AsyncIterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Async Iterator"` (D-309).
