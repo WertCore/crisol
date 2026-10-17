@@ -6998,6 +6998,38 @@ fn async_iterators_have_toarray() {
         "return Object.prototype.toString.call(AsyncIterator.prototype);",
         "[object Async Iterator]",
     );
+    // `forEach` runs the callback over every value, resolving when done (D-310).
+    check(
+        "async-iterator-foreach",
+        "async function* ag() { yield 1; yield 2; yield 3; } var s = 0; \
+         ag().forEach(function (x) { s = s + x; }).then(function () { print(\"sum:\" + s); }); \
+         return 0;",
+        "sum:6\n0",
+    );
+    // `reduce` folds, with and without an initial value.
+    check(
+        "async-iterator-reduce-initial",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().reduce(function (a, b) { return a + b; }, 10).then(function (r) { print(\"r:\" + r); }); \
+         return 0;",
+        "r:16\n0",
+    );
+    check(
+        "async-iterator-reduce-no-initial",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().reduce(function (a, b) { return a + b; }).then(function (r) { print(\"r:\" + r); }); \
+         return 0;",
+        "r:6\n0",
+    );
+    // `reduce` of an empty async iterator with no initial value rejects.
+    check(
+        "async-iterator-reduce-empty-rejects",
+        "async function* ag() {} \
+         ag().reduce(function (a, b) { return a + b; }) \
+             .then(function () { print(\"ok\"); }, function (e) { print(\"no:\" + e.name); }); \
+         return 0;",
+        "no:TypeError\n0",
+    );
 }
 
 #[test]

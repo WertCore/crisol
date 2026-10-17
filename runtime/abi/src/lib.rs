@@ -1991,13 +1991,19 @@ const ITERATOR_TAG_GETTER: usize = 1;
 /// Index of [`iterator_helper_tag_getter`] within [`ITERATOR_STATIC_NATIVES`].
 const ITERATOR_HELPER_TAG_GETTER: usize = 2;
 /// `%AsyncIterator.prototype%`'s helper methods (D-309) — only the eager `toArray` so far.
-const ASYNC_ITERATOR_NATIVES: &[(&str, Native)] = &[("toArray", async_iterator_to_array)];
-/// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309): the two
-/// drain reactions and the `[Symbol.toStringTag]` getter.
+const ASYNC_ITERATOR_NATIVES: &[(&str, Native)] = &[
+    ("toArray", async_iterator_to_array),
+    ("forEach", async_iterator_for_each),
+    ("reduce", async_iterator_reduce),
+];
+/// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309/D-310): the
+/// two drain reactions, the `[Symbol.toStringTag]` getter, and the `forEach`/`reduce` processors.
 const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
     async_drain_step,
     async_drain_reject,
     async_iterator_tag_getter,
+    async_foreach_processor,
+    async_reduce_processor,
 ];
 /// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_DRAIN_STEP: usize = 0;
@@ -2005,6 +2011,10 @@ const ASYNC_DRAIN_STEP: usize = 0;
 const ASYNC_DRAIN_REJECT: usize = 1;
 /// Index of [`async_iterator_tag_getter`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
 const ASYNC_ITERATOR_TAG_GETTER: usize = 2;
+/// Index of [`async_foreach_processor`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_FOREACH_PROCESSOR: usize = 3;
+/// Index of [`async_reduce_processor`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_REDUCE_PROCESSOR: usize = 4;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -6545,6 +6555,8 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Iterator Helper", "return", 0),
     ("global", "AsyncIterator", 0),
     ("AsyncIterator.prototype", "toArray", 0),
+    ("AsyncIterator.prototype", "forEach", 1),
+    ("AsyncIterator.prototype", "reduce", 1),
 ];
 
 /// The arity the specification gives `owner.name`, if it gives one.
@@ -21994,6 +22006,190 @@ extern "C" fn async_iterator_to_array(
         });
     }
     async_drain(this_value)
+}
+
+/// A promise already rejected with `message`/`kind` — the async terminals' *IfAbruptRejectPromise*
+/// for a bad receiver or callback (D-310).
+fn rejected_promise(message: &str, kind: &str) -> u64 {
+    let promise = new_promise_object();
+    let reason = with_rooted(&[promise], || raise_value(message, kind));
+    with_rooted(&[promise, reason], || settle_promise(promise, reason, true));
+    promise
+}
+
+/// The user callback a drain-result processor carries.
+const AT_CALLBACK: &str = "__atCallback";
+/// Whether `reduce` was given an initial value, and that value.
+const AT_HAS_INIT: &str = "__atHasInit";
+const AT_INIT: &str = "__atInit";
+
+/// Builds a drain-result `.then` reaction at `index` in [`ASYNC_ITERATOR_INTERNAL_NATIVES`] carrying
+/// `callback` (D-310).
+fn async_terminal_processor(index: usize, callback: u64) -> u64 {
+    let function = with_rooted(&[callback], || {
+        with_runtime(|runtime| {
+            runtime
+                .native_function(async_iterator_internal_natives_base() + index)
+                .to_value()
+                .to_bits()
+        })
+    });
+    with_rooted(&[function, callback], || {
+        if let Some(handle) = handle_of(function) {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, AT_CALLBACK, Value::from_bits(callback));
+            });
+        }
+    });
+    function
+}
+
+/// `forEach`'s processor: runs the callback over the drained array, in order (D-310).
+extern "C" fn async_foreach_processor(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let array = unsafe { argument(argc, argv, 0) };
+    let callback = property_of(closure, AT_CALLBACK);
+    with_rooted(&[array, callback], || {
+        let length = indexed_length(array).unwrap_or(0);
+        for index in 0..length {
+            let value = indexed_get(array, index);
+            let args = [value, index_value(index)];
+            let outcome = with_rooted(&[array, callback, value], || {
+                call_value(callback, Value::UNDEFINED.to_bits(), &args)
+            });
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
+            }
+        }
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// `reduce`'s processor: folds the callback over the drained array (D-310).
+extern "C" fn async_reduce_processor(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let array = unsafe { argument(argc, argv, 0) };
+    let reducer = property_of(closure, AT_CALLBACK);
+    let has_initial = is_truthy(Value::from_bits(property_of(closure, AT_HAS_INIT)));
+    let initial = property_of(closure, AT_INIT);
+    with_rooted(&[array, reducer, initial], || {
+        let length = indexed_length(array).unwrap_or(0);
+        let mut index = 0usize;
+        let mut accumulator = if has_initial {
+            initial
+        } else {
+            if length == 0 {
+                return raise(
+                    "AsyncIterator.prototype.reduce of an empty iterator with no initial value",
+                    "TypeError",
+                );
+            }
+            index = 1;
+            indexed_get(array, 0)
+        };
+        while index < length {
+            let value = indexed_get(array, index);
+            let args = [accumulator, value, index_value(index)];
+            let outcome = with_rooted(&[array, reducer, accumulator, value], || {
+                call_value(reducer, Value::UNDEFINED.to_bits(), &args)
+            });
+            if Value::from_bits(outcome).is_exception() {
+                return outcome;
+            }
+            accumulator = outcome;
+            index += 1;
+        }
+        accumulator
+    })
+}
+
+/// `AsyncIterator.prototype.forEach(fn)` — a promise that runs `fn` over every value (D-310).
+extern "C" fn async_iterator_for_each(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let callback = unsafe { argument(argc, argv, 0) };
+    if handle_of(this_value).is_none() {
+        return rejected_promise(
+            "AsyncIterator.prototype.forEach requires an object",
+            "TypeError",
+        );
+    }
+    if !is_callable(callback) {
+        return rejected_promise(
+            "AsyncIterator.prototype.forEach needs a function",
+            "TypeError",
+        );
+    }
+    with_rooted(&[this_value, callback], || {
+        let drained = async_drain(this_value);
+        with_rooted(&[drained, callback], || {
+            let processor = async_terminal_processor(ASYNC_FOREACH_PROCESSOR, callback);
+            with_rooted(&[drained, processor], || {
+                promise_then(drained, processor, 0, false)
+            })
+        })
+    })
+}
+
+/// `AsyncIterator.prototype.reduce(fn, initial?)` — a promise for the left fold (D-310).
+extern "C" fn async_iterator_reduce(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let reducer = unsafe { argument(argc, argv, 0) };
+    if handle_of(this_value).is_none() {
+        return rejected_promise(
+            "AsyncIterator.prototype.reduce requires an object",
+            "TypeError",
+        );
+    }
+    if !is_callable(reducer) {
+        return rejected_promise(
+            "AsyncIterator.prototype.reduce needs a function",
+            "TypeError",
+        );
+    }
+    let has_initial = argc >= 2;
+    // SAFETY: as above.
+    let initial = unsafe { argument(argc, argv, 1) };
+    with_rooted(&[this_value, reducer, initial], || {
+        let drained = async_drain(this_value);
+        with_rooted(&[drained, reducer, initial], || {
+            let processor = async_terminal_processor(ASYNC_REDUCE_PROCESSOR, reducer);
+            with_rooted(&[processor, initial], || {
+                if let Some(handle) = handle_of(processor) {
+                    with_runtime(|runtime| {
+                        runtime.define_hidden(handle, AT_HAS_INIT, boolean(has_initial));
+                        runtime.define_hidden(handle, AT_INIT, Value::from_bits(initial));
+                    });
+                }
+            });
+            with_rooted(&[drained, processor], || {
+                promise_then(drained, processor, 0, false)
+            })
+        })
+    })
 }
 
 /// `%AsyncIterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Async Iterator"` (D-309).

@@ -8251,3 +8251,22 @@ Confirmed by acceptance: `toArray` over a three-value and an empty async generat
 the abstract constructor throws, and `Object.prototype.toString` names the prototype — under GC stress.
 **Deferred:** the remaining async terminals (`forEach`/`reduce`/`some`/`every`/`find`) and the lazy async
 helpers (`map`/`filter`/`take`/`drop`/`flatMap`) + `AsyncIterator.from`.
+
+## D-310
+
+**`AsyncIterator.prototype.forEach` and `reduce`.**
+
+Status: Accepted
+
+Two more eager async terminals, built on the D-309 drain. Both fully consume the iterator, so each is
+`async_drain(this).then(processor)`: `forEach`'s processor runs the callback over the drained array in
+order and resolves with `undefined`; `reduce`'s folds it, resolving with the accumulator, or rejecting a
+`TypeError` for an empty iterator with no initial value. The processors are two more reactions in
+`ASYNC_ITERATOR_INTERNAL_NATIVES`, carrying the callback (and, for `reduce`, the initial value) in their
+own slots; a bad receiver or non-callable argument answers an already-rejected promise
+(*IfAbruptRejectPromise*). Deviation: the callback's own result is not awaited between elements (correct
+for a synchronous callback, the common case; an async callback is not sequenced) — and, because the drain
+consumes fully, this shape suits `forEach`/`reduce` but not the short-circuiting `some`/`every`/`find`,
+which stay deferred with the lazy helpers and `AsyncIterator.from`. Confirmed by acceptance — `forEach`
+summing three values, `reduce` with and without an initial value, and the empty-`reduce` rejection —
+under GC stress.
