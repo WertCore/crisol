@@ -8229,3 +8229,25 @@ prototype reads `"[object Iterator]"`. The two getters live in the `ITERATOR_STA
 (indices after `from`), keeping the single appended table. Deviation: the specification makes
 `%Iterator.prototype%`'s tag a get/set accessor (the setter ignores prototype writes); this is get-only,
 matching the engine's other tag getters. Confirmed by acceptance under GC stress.
+
+## D-309
+
+**`AsyncIterator` and `%AsyncIterator.prototype%` — the foundation and `toArray`.**
+
+Status: Accepted
+
+The async counterpart of D-305. A new `%AsyncIterator.prototype%` carries `[Symbol.asyncIterator]`
+(returns `this`), a `[Symbol.toStringTag]` getter (`"Async Iterator"`), and the first async helper,
+`toArray`; every async generator **reparents onto it**, so `asyncGen().toArray()` works. `AsyncIterator`
+is the abstract constructor (direct construction is a `TypeError`), linked to its prototype in
+`build_symbol_keyed_methods` like `Iterator`. Unlike the sync side, consumption is a promise chain:
+`toArray` *drains* the async iterator — calling `next()`, awaiting the promise it answers, collecting the
+value, and recursing — then resolves with the array. The drain is two native reactions
+(`async_drain_step`/`async_drain_reject`) sharing one result promise and accumulator through the step
+closure's non-enumerable slots, re-armed each step via `promise_then`; a non-object step or a rejected
+`next()` rejects the result. Two native tables are appended last (`ASYNC_ITERATOR_NATIVES` methods +
+`ASYNC_ITERATOR_INTERNAL_NATIVES` reactions/getter), so the `.len()`-computed offsets self-adjust.
+Confirmed by acceptance: `toArray` over a three-value and an empty async generator resolves correctly,
+the abstract constructor throws, and `Object.prototype.toString` names the prototype — under GC stress.
+**Deferred:** the remaining async terminals (`forEach`/`reduce`/`some`/`every`/`find`) and the lazy async
+helpers (`map`/`filter`/`take`/`drop`/`flatMap`) + `AsyncIterator.from`.

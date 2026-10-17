@@ -654,6 +654,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(ASYNC_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(BOOLEAN_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ARRAY_BUFFER_PROTOTYPE.with(std::cell::Cell::get));
@@ -746,6 +747,10 @@ thread_local! {
     /// `%IteratorHelperPrototype%` (D-305) — the prototype of the lazy iterator a helper returns;
     /// holds the single `next`/`return` that step a `map`/`filter`/`take`/`drop`/`flatMap` chain.
     static ITERATOR_HELPER_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%AsyncIterator.prototype%` (D-309) — the async counterpart of `%Iterator.prototype%`, where
+    /// the async iterator helpers live and that every async generator inherits from.
+    static ASYNC_ITERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// The prototype every number inherits from.
     static NUMBER_PROTOTYPE: std::cell::Cell<Option<GcRef>> = const { std::cell::Cell::new(None) };
@@ -1806,6 +1811,7 @@ const GLOBAL_NATIVES: &[(&str, Native)] = &[
     ("WeakRef", make_weakref),
     ("FinalizationRegistry", make_finalization_registry),
     ("Iterator", make_iterator),
+    ("AsyncIterator", make_async_iterator),
 ];
 
 /// The eleven typed-array constructor names, in [`ELEMENT_KINDS`] order.
@@ -1984,6 +1990,21 @@ const ITERATOR_STATIC_NATIVES: &[(&str, Native)] = &[
 const ITERATOR_TAG_GETTER: usize = 1;
 /// Index of [`iterator_helper_tag_getter`] within [`ITERATOR_STATIC_NATIVES`].
 const ITERATOR_HELPER_TAG_GETTER: usize = 2;
+/// `%AsyncIterator.prototype%`'s helper methods (D-309) — only the eager `toArray` so far.
+const ASYNC_ITERATOR_NATIVES: &[(&str, Native)] = &[("toArray", async_iterator_to_array)];
+/// `AsyncIterator`'s internal natives, addressed by the `ASYNC_*` indices below (D-309): the two
+/// drain reactions and the `[Symbol.toStringTag]` getter.
+const ASYNC_ITERATOR_INTERNAL_NATIVES: &[Native] = &[
+    async_drain_step,
+    async_drain_reject,
+    async_iterator_tag_getter,
+];
+/// Index of [`async_drain_step`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_DRAIN_STEP: usize = 0;
+/// Index of [`async_drain_reject`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_DRAIN_REJECT: usize = 1;
+/// Index of [`async_iterator_tag_getter`] within [`ASYNC_ITERATOR_INTERNAL_NATIVES`].
+const ASYNC_ITERATOR_TAG_GETTER: usize = 2;
 const WEAKMAP_GET: usize = 0;
 const WEAKMAP_SET: usize = 1;
 const WEAKMAP_HAS: usize = 2;
@@ -2017,6 +2038,18 @@ fn iterator_helper_natives_base() -> usize {
 /// [`ITERATOR_HELPER_NATIVES`] (D-306).
 fn iterator_static_natives_base() -> usize {
     iterator_helper_natives_base() + ITERATOR_HELPER_NATIVES.len()
+}
+
+/// The global index at which [`ASYNC_ITERATOR_NATIVES`] begins — right after
+/// [`ITERATOR_STATIC_NATIVES`] (D-309).
+fn async_iterator_natives_base() -> usize {
+    iterator_static_natives_base() + ITERATOR_STATIC_NATIVES.len()
+}
+
+/// The global index at which [`ASYNC_ITERATOR_INTERNAL_NATIVES`] begins — right after
+/// [`ASYNC_ITERATOR_NATIVES`] (D-309).
+fn async_iterator_internal_natives_base() -> usize {
+    async_iterator_natives_base() + ASYNC_ITERATOR_NATIVES.len()
 }
 
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
@@ -6510,6 +6543,8 @@ const ARITIES: &[(&str, &str, u32)] = &[
     ("Iterator.prototype", "find", 1),
     ("Iterator Helper", "next", 0),
     ("Iterator Helper", "return", 0),
+    ("global", "AsyncIterator", 0),
+    ("AsyncIterator.prototype", "toArray", 0),
 ];
 
 /// The arity the specification gives `owner.name`, if it gives one.
@@ -14886,6 +14921,68 @@ impl Runtime {
             }
         }
 
+        // **`%AsyncIterator.prototype%` (D-309).** The async counterpart of `%Iterator.prototype%`:
+        // it carries the async helper methods (only the eager `toArray` so far) and every async
+        // generator reparents onto it, so `asyncGen().toArray()` resolves. `[Symbol.asyncIterator]`
+        // answers `this`, and `[Symbol.toStringTag]` names it `"Async Iterator"`.
+        {
+            let shape = self.shapes.borrow().root();
+            let scope = self.heap.scope();
+            let async_proto = scope.alloc(shape, 0);
+            ASYNC_ITERATOR_PROTOTYPE.with(|cell| cell.set(Some(async_proto.handle())));
+            self.inherit_from_object(async_proto.handle());
+            let base = async_iterator_natives_base();
+            for (index, (name, _)) in ASYNC_ITERATOR_NATIVES.iter().enumerate() {
+                let method = self.native_function(base + index);
+                self.define_method(
+                    async_proto.handle(),
+                    "AsyncIterator.prototype",
+                    name,
+                    method.to_value(),
+                );
+            }
+            let async_symbol = {
+                let named = PropertyKey::new("asyncIterator");
+                self.heap
+                    .shape_of(symbol)
+                    .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                    .and_then(|slot| self.heap.get(symbol, slot.index()))
+                    .and_then(|value| value.as_address())
+            };
+            if let Some(async_symbol) = async_symbol {
+                let async_key = PropertyKey::symbol(async_symbol, "Symbol.asyncIterator");
+                let self_index =
+                    NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ITERATOR_SELF;
+                let self_fn = self.native_function(self_index);
+                self.define_keyed(async_proto.handle(), &async_key, self_fn.to_value());
+            }
+            let tag = {
+                let named = PropertyKey::new("toStringTag");
+                self.heap
+                    .shape_of(symbol)
+                    .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                    .and_then(|slot| self.heap.get(symbol, slot.index()))
+                    .and_then(|value| value.as_address())
+            };
+            if let Some(tag) = tag {
+                let tag_key = PropertyKey::symbol(tag, "Symbol.toStringTag");
+                let getter = self.native_function(
+                    async_iterator_internal_natives_base() + ASYNC_ITERATOR_TAG_GETTER,
+                );
+                self.install_accessor_keyed(async_proto.handle(), &tag_key, getter);
+            }
+            if let Some(async_gen) = ASYNC_GENERATOR_PROTOTYPE.with(std::cell::Cell::get) {
+                self.heap
+                    .set_prototype(async_gen, Some(async_proto.handle()));
+            }
+            if let Some(globals) = GLOBALS.with(std::cell::Cell::get)
+                && let Some(constructor) = self.global_object(globals, "AsyncIterator")
+            {
+                self.define_hidden(constructor, "prototype", async_proto.handle().to_value());
+                self.define_linking(async_proto.handle(), "constructor", constructor.to_value());
+            }
+        }
+
         // **A string answers `Symbol.iterator` with a code-point iterator.** `[...s]` already
         // works through the fast path, but `s[Symbol.iterator]()` needs the method itself.
         if let Some(prototype) = STRING_PROTOTYPE.with(std::cell::Cell::get) {
@@ -18895,9 +18992,17 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + ITERATOR_HELPER_NATIVES.len();
-        return ITERATOR_STATIC_NATIVES
+        if let Some((_, function)) = ITERATOR_STATIC_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + ITERATOR_STATIC_NATIVES.len();
+        if let Some((_, function)) = ASYNC_ITERATOR_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + ASYNC_ITERATOR_NATIVES.len();
+        return ASYNC_ITERATOR_INTERNAL_NATIVES
             .get(native.wrapping_sub(offset))
-            .map_or(fallback, |(_, function)| *function as *const u8);
+            .map_or(fallback, |function| *function as *const u8);
     }
     #[expect(
         clippy::cast_possible_truncation,
@@ -21708,6 +21813,213 @@ extern "C" fn iterator_helper_tag_getter(
     _argv: *const u64,
 ) -> u64 {
     new_string("Iterator Helper")
+}
+
+// ============================== Async iterator helpers (D-309) ==============================
+//
+// The async counterpart of the D-305 helpers. `%AsyncIterator.prototype%` carries the async helper
+// methods and every async generator inherits from it. Unlike the sync side, consumption is a chain
+// of promises: a terminal like `toArray` *drains* the async iterator — calling `next()`, awaiting
+// the promise it answers, and recursing — then resolves with the collected array. The drain is two
+// native reactions (`async_drain_step`/`async_drain_reject`) carrying their state in the step
+// closure's own non-enumerable slots. (Only the eager `toArray` lands in this slice; the lazy
+// helpers and the awaiting callback terminals are a follow-up.)
+
+/// The async iterator a drain pulls from.
+const AD_ITER: &str = "__adIter";
+/// The array a drain collects into.
+const AD_ACC: &str = "__adAcc";
+/// The promise a drain settles when the source is exhausted or faults.
+const AD_RESULT: &str = "__adResult";
+/// The paired rejection reaction a drain re-attaches on each step.
+const AD_REJECT: &str = "__adReject";
+
+/// Normalises `value` to a promise — itself if it already is one, else a promise fulfilled with it.
+fn as_promise(value: u64) -> u64 {
+    if is_promise(value) {
+        return value;
+    }
+    let promise = with_rooted(&[value], new_promise_object);
+    with_rooted(&[promise, value], || settle_promise(promise, value, false));
+    promise
+}
+
+/// Pulls the next value and re-arms the drain: `iterator.next()` → a promise whose fulfilment lands
+/// back here and whose rejection lands on the paired reject reaction.
+fn drain_pull(step_closure: u64) {
+    let iterator = property_of(step_closure, AD_ITER);
+    let result = property_of(step_closure, AD_RESULT);
+    let reject = property_of(step_closure, AD_REJECT);
+    with_rooted(&[step_closure, iterator, result, reject], || {
+        let advance = property_of(iterator, "next");
+        if !is_callable(advance) {
+            let reason = raise_value("an async iterator needs a `next` method", "TypeError");
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return;
+        }
+        let outcome = with_rooted(&[iterator, advance], || call_value(advance, iterator, &[]));
+        if Value::from_bits(outcome).is_exception() {
+            let reason = crisol_pending_exception();
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return;
+        }
+        with_rooted(&[step_closure, reject, outcome], || {
+            let awaited = as_promise(outcome);
+            with_rooted(&[awaited, step_closure, reject], || {
+                promise_then(awaited, step_closure, reject, false);
+            });
+        });
+    });
+}
+
+/// A drain's fulfilment reaction: one resolved `{ value, done }`. Collects the value and pulls
+/// again, or resolves the result with the accumulated array when done.
+extern "C" fn async_drain_step(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let step = unsafe { argument(argc, argv, 0) };
+    let result = property_of(closure, AD_RESULT);
+    with_rooted(&[closure, step, result], || {
+        if handle_of(step).is_none() {
+            let reason = raise_value("an async iterator step must be an object", "TypeError");
+            with_rooted(&[result, reason], || settle_promise(result, reason, true));
+            return Value::UNDEFINED.to_bits();
+        }
+        if is_truthy(Value::from_bits(property_of(step, "done"))) {
+            let acc = property_of(closure, AD_ACC);
+            with_rooted(&[result, acc], || settle_promise(result, acc, false));
+            return Value::UNDEFINED.to_bits();
+        }
+        let value = with_rooted(&[closure, step], || property_of(step, "value"));
+        if Value::from_bits(value).is_exception() {
+            with_rooted(&[result, value], || settle_promise(result, value, true));
+            return Value::UNDEFINED.to_bits();
+        }
+        let acc = property_of(closure, AD_ACC);
+        with_rooted(&[closure, acc, value], || {
+            if let Some(handle) = handle_of(acc) {
+                let count = indexed_length(acc).unwrap_or(0);
+                with_runtime(|runtime| {
+                    runtime
+                        .heap
+                        .set_element(handle, count, Value::from_bits(value));
+                });
+            }
+        });
+        with_rooted(&[closure], || drain_pull(closure));
+        Value::UNDEFINED.to_bits()
+    })
+}
+
+/// A drain's rejection reaction: the source's `next()` promise rejected, so the drain's result does.
+extern "C" fn async_drain_reject(
+    closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let reason = unsafe { argument(argc, argv, 0) };
+    let result = property_of(closure, AD_RESULT);
+    with_rooted(&[result, reason], || settle_promise(result, reason, true));
+    Value::UNDEFINED.to_bits()
+}
+
+/// Builds the two drain reactions (sharing one result promise + accumulator) and kicks off the
+/// pull. Returns the promise that settles with the collected array.
+fn async_drain(iterator: u64) -> u64 {
+    with_rooted(&[iterator], || {
+        let result = new_promise_object();
+        let acc = with_rooted(&[iterator, result], || crisol_create_array(0));
+        with_rooted(&[iterator, result, acc], || {
+            let base = async_iterator_internal_natives_base();
+            let reject = with_runtime(|runtime| {
+                runtime
+                    .native_function(base + ASYNC_DRAIN_REJECT)
+                    .to_value()
+                    .to_bits()
+            });
+            let step = with_rooted(&[iterator, result, acc, reject], || {
+                with_runtime(|runtime| {
+                    runtime
+                        .native_function(base + ASYNC_DRAIN_STEP)
+                        .to_value()
+                        .to_bits()
+                })
+            });
+            with_rooted(&[iterator, result, acc, reject, step], || {
+                if let Some(reject_handle) = handle_of(reject) {
+                    with_runtime(|runtime| {
+                        runtime.define_hidden(reject_handle, AD_RESULT, Value::from_bits(result));
+                    });
+                }
+                if let Some(step_handle) = handle_of(step) {
+                    with_runtime(|runtime| {
+                        runtime.define_hidden(step_handle, AD_ITER, Value::from_bits(iterator));
+                        runtime.define_hidden(step_handle, AD_ACC, Value::from_bits(acc));
+                        runtime.define_hidden(step_handle, AD_RESULT, Value::from_bits(result));
+                        runtime.define_hidden(step_handle, AD_REJECT, Value::from_bits(reject));
+                    });
+                }
+                drain_pull(step);
+            });
+            result
+        })
+    })
+}
+
+/// `AsyncIterator.prototype.toArray()` — a promise for every value the async iterator yields (D-309).
+extern "C" fn async_iterator_to_array(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        let promise = new_promise_object();
+        let reason = raise_value(
+            "AsyncIterator.prototype.toArray requires an object",
+            "TypeError",
+        );
+        return with_rooted(&[promise, reason], || {
+            settle_promise(promise, reason, true);
+            promise
+        });
+    }
+    async_drain(this_value)
+}
+
+/// `%AsyncIterator.prototype%[Symbol.toStringTag]`'s getter — answers `"Async Iterator"` (D-309).
+extern "C" fn async_iterator_tag_getter(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    new_string("Async Iterator")
+}
+
+/// `AsyncIterator()` — abstract, like `Iterator`: it exists so the prototype and helpers are
+/// reachable but cannot be constructed directly (D-309).
+extern "C" fn make_async_iterator(
+    _closure: u64,
+    _this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    raise(
+        "AsyncIterator is abstract and cannot be constructed directly",
+        "TypeError",
+    )
 }
 
 /// A named property of `object`, read as a value.

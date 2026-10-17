@@ -6965,6 +6965,41 @@ fn iterators_have_their_helpers() {
     );
 }
 
+/// The async iterator helpers (D-309): a shared `%AsyncIterator.prototype%` that async generators
+/// inherit, carrying (so far) the eager `toArray`, which answers a promise for every yielded value.
+#[test]
+fn async_iterators_have_toarray() {
+    check(
+        "async-iterator-global",
+        "return typeof AsyncIterator;",
+        "function",
+    );
+    check(
+        "async-iterator-abstract",
+        "try { new AsyncIterator(); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // An async generator inherits `toArray`, which drains it and resolves with the array.
+    check(
+        "async-iterator-toarray",
+        "async function* ag() { yield 1; yield 2; yield 3; } \
+         ag().toArray().then(function (a) { print(\"r:\" + a.join(\",\")); }); return 0;",
+        "r:1,2,3\n0",
+    );
+    check(
+        "async-iterator-toarray-empty",
+        "async function* ag() {} \
+         ag().toArray().then(function (a) { print(\"len:\" + a.length); }); return 0;",
+        "len:0\n0",
+    );
+    // `[Symbol.toStringTag]` names the shared prototype.
+    check(
+        "async-iterator-prototype-tostringtag",
+        "return Object.prototype.toString.call(AsyncIterator.prototype);",
+        "[object Async Iterator]",
+    );
+}
+
 #[test]
 fn keys_and_entries_walk_positions_and_pairs() {
     check("keys-first", "return [7, 8].keys().next().value;", "0");
