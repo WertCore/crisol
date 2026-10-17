@@ -8482,3 +8482,22 @@ Confirmed by acceptance under GC stress (a literal's getter/setter, a class's pr
 getters, and a `defineProperty` getter that keeps its own name). **Deviation:** a *computed* accessor
 (`{get [k]() {…}}`) is not named yet — that path (`crisol_computed_define_accessor`) must render the key,
 including the bracketed form a symbol takes, which is left for when computed-method naming is done too.
+
+## D-322
+
+**`Object.assign` propagates a throwing source getter and a refused write.**
+
+Status: Accepted
+
+The copy loop read each source value with `crisol_property_load` and passed it straight to the store
+without checking it — so a source getter that threw had its exception copied across as if it were an
+ordinary value, and `Object.assign` returned normally where it should have thrown. It now reads the value
+first, returns it when it is an exception (the same unchecked-load slip D-319 fixed in the iterator
+drain), and only then does the write — which is also the specification's order, `Get` before `Set`. The
+`refuses_assignment` check (read-only property, or a new property on a non-extensible target — both a
+`TypeError`, since `Object.assign` uses the throwing form of `Set`) now runs after the read rather than
+before, so a source getter's throw wins over a target refusal, as the step order requires. The value is
+rooted across the store, which a shape transition can make allocate. `{ ...src }` spread was already
+correct (`crisol_object_spread` checked the load); this brings `assign` in line. Confirmed by acceptance
+under GC stress: a throwing source getter, a read-only target, a non-extensible target, and an ordinary
+multi-source copy.

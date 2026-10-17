@@ -13750,20 +13750,33 @@ extern "C" fn object_assign(
                 // string wrapper's, so copying from either wrote a `length` the target had no
                 // business having.
                 for name in enumerable_keys(source) {
-                    // **A read-only property on the target is a `TypeError` here**, not a write
-                    // that quietly does nothing: `Object.assign` uses the throwing form of `Set`.
-                    // It is one of the few places the difference is observable from source that
-                    // is not in strict mode.
-                    if refuses_assignment(target, &name) {
-                        return raise("cannot assign to a read-only property", "TypeError");
-                    }
+                    // **The source is read first, and a throw from it is the answer** (D-322). A
+                    // getter on the source can throw, and `Object.assign` propagates that rather
+                    // than copying the exception across as if it were a value — the same
+                    // unchecked-load slip D-319 fixed in the iterator drain. Reading before the
+                    // refusal check is also the specification's order: `Get` precedes `Set`.
                     // SAFETY: `name` is a live Rust string.
                     let value =
                         unsafe { crisol_property_load(source, name.as_ptr(), name.len() as u64) };
-                    // SAFETY: as above.
-                    unsafe {
-                        crisol_property_store(target, name.as_ptr(), name.len() as u64, value);
+                    if Value::from_bits(value).is_exception() {
+                        return value;
                     }
+                    // **A read-only property on the target is a `TypeError` here**, not a write
+                    // that quietly does nothing: `Object.assign` uses the throwing form of `Set`.
+                    // It is one of the few places the difference is observable from source that
+                    // is not in strict mode — and a new property on a non-extensible target is
+                    // refused the same way (`refuses_assignment`).
+                    if refuses_assignment(target, &name) {
+                        return raise("cannot assign to a read-only property", "TypeError");
+                    }
+                    // Rooted across the store: a shape transition on the target allocates, and
+                    // `value` is a bare `u64` the collector cannot see on its own.
+                    with_rooted(&[value], || {
+                        // SAFETY: `name` is a live Rust string and `value` is rooted.
+                        unsafe {
+                            crisol_property_store(target, name.as_ptr(), name.len() as u64, value);
+                        }
+                    });
                 }
             }
             target

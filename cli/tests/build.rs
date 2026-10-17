@@ -191,6 +191,40 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`Object.assign` propagates a throwing source getter and a refused write** (D-322). It reads each
+/// source value before writing it, so a getter that throws is the result — not an exception quietly
+/// copied across as if it were a value — and the write uses the throwing form of `Set`.
+#[test]
+fn object_assign_propagates_errors() {
+    // A source getter that throws stops the copy and is the thrown value.
+    check(
+        "assign-source-getter-throws",
+        "var src = {}; Object.defineProperty(src, 'x', { enumerable: true, get: function () { throw new TypeError('boom'); } }); \
+         try { Object.assign({}, src); return 'no-throw'; } catch (e) { return e.name + ':' + e.message; }",
+        "TypeError:boom",
+    );
+    // A read-only property on the target is a TypeError, not a silent skip.
+    check(
+        "assign-readonly-target-throws",
+        "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false }); \
+         try { Object.assign(t, { x: 2 }); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A new property on a non-extensible target is refused the same way.
+    check(
+        "assign-new-on-nonextensible-throws",
+        "var t = Object.preventExtensions({}); \
+         try { Object.assign(t, { y: 1 }); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // The ordinary case still copies every enumerable own property.
+    check(
+        "assign-ordinary-copies",
+        "var t = Object.assign({ a: 1 }, { b: 2 }, { c: 3 }); return t.a + ',' + t.b + ',' + t.c;",
+        "1,2,3",
+    );
+}
+
 /// **An accessor is named `"get x"` / `"set x"`** (D-320). A getter or setter from an object literal
 /// or a class body is anonymous, so `NamedEvaluation` gives it a name built from `"get "`/`"set "` and
 /// the property key — where before it had an empty name.
