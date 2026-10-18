@@ -191,6 +191,33 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`RegExp.prototype[Symbol.match]` reads `flags`, not the `global` accessor** (D-327) — matching the
+/// specification, so a `flags` getter that throws is propagated rather than swallowed, and `g` is read
+/// from the flags string. An ordinary pattern matches exactly as before.
+#[test]
+fn symbol_match_reads_flags() {
+    // An ordinary global match is unchanged — every match, collected.
+    check(
+        "symbol-match-global",
+        "return 'a1b2'.match(/\\d/g).join(',');",
+        "1,2",
+    );
+    // A non-global match answers what `exec` answers, `index` included.
+    check(
+        "symbol-match-nonglobal",
+        "var m = 'xaay'.match(/a+/); return m[0] + ',' + m.index;",
+        "aa,1",
+    );
+    // A `flags` getter that throws is the answer, not a swallowed exception.
+    check(
+        "symbol-match-flags-throws",
+        "var o = { get flags() { throw new TypeError('boom'); }, exec: function () { return null; } }; \
+         try { RegExp.prototype[Symbol.match].call(o, 'a'); return 'no-throw'; } \
+         catch (e) { return e.name + ':' + e.message; }",
+        "TypeError:boom",
+    );
+}
+
 /// **An in-place array mutator throws on a frozen array** (D-326) rather than silently rewriting it
 /// through the raw element store. `sort`/`reverse`/`fill`/`copyWithin` write their elements with the
 /// Throw flag, so a non-writable element in the written range is a `TypeError` and the array is left

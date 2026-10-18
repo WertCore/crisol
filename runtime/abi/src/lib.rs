@@ -10584,7 +10584,15 @@ extern "C" fn regexp_symbol_match(
         new_string(&to_text(given).unwrap_or_default())
     });
     with_rooted(&[this_value, subject], || {
-        let global = is_truthy(Value::from_bits(property_of(this_value, "global")));
+        // **The specification reads `flags` (as a string) and looks for `g` in it** (D-327), not the
+        // `global` accessor — so a `flags` getter that throws is the answer rather than being
+        // swallowed, and a matcher that lies on `global` while reporting the truth on `flags` is read
+        // correctly. For an ordinary pattern the two agree, so matching is unchanged.
+        let flags = property_of(this_value, "flags");
+        if Value::from_bits(flags).is_exception() {
+            return flags;
+        }
+        let global = to_text(flags).is_some_and(|flags| flags.contains('g'));
         if !global {
             return regexp_exec_value(this_value, subject);
         }

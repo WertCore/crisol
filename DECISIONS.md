@@ -8583,3 +8583,22 @@ Confirmed by acceptance under GC stress (all four throw on a frozen array and le
 unrestricted array still sorts, and a `fill` clear of a non-writable element still writes). **Deviation:**
 an *array-like* (non-array) receiver with a non-writable indexed property is not covered — these walk it
 through the slot path, which refuses the write silently rather than throwing, as it did before.
+
+## D-327
+
+**`RegExp.prototype[Symbol.match]` reads `flags`, not the `global` accessor.**
+
+Status: Accepted
+
+`Symbol.match` chose its global-vs-single shape by reading the `global` accessor directly. The
+specification reads `ToString(Get(rx, "flags"))` and looks for `g` in the string — a difference that is
+observable two ways: a `flags` getter that throws must propagate (it was swallowed, because the `global`
+read never touched it), and a matcher that reports one thing on `flags` and another on `global` must be
+read by `flags`. It now reads `flags`, returns it when it is an exception, and takes `global` from whether
+the flags string contains `g`. For an ordinary pattern `flags` and `global` agree, so matching is
+unchanged. Confirmed by acceptance under GC stress (an ordinary global match, a non-global match, and a
+throwing `flags` getter that now propagates). **Deviation / not done here:** the rest of the RegExp
+`Symbol.*` error-propagation cluster — `Symbol.replace`/`Symbol.search`/`Symbol.matchAll` swallowing a
+throwing `lastIndex`/`flags`/`exec` — needs an error channel threaded through shared helpers that return a
+bare `f64` (`last_index_of`) or walk intricate paths (`replace_using_pattern`); it is left for a focused
+pass rather than bolted on.
