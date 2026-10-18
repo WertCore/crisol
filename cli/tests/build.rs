@@ -191,6 +191,37 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **An in-place array mutator throws on a frozen array** (D-326) rather than silently rewriting it
+/// through the raw element store. `sort`/`reverse`/`fill`/`copyWithin` write their elements with the
+/// Throw flag, so a non-writable element in the written range is a `TypeError` and the array is left
+/// unchanged. An unrestricted array still mutates (the fast path), and a non-writable element outside
+/// the written range does not block the write (the guard is range-precise).
+#[test]
+fn in_place_array_mutators_throw_on_a_frozen_array() {
+    check(
+        "frozen-array-mutators-throw",
+        "function t(f){ try { f(); return 'ok'; } catch (e) { return e.name; } } \
+         var a = Object.freeze([3, 1, 2]); \
+         var r = [t(function(){ a.sort(); }), t(function(){ a.reverse(); }), \
+                  t(function(){ a.fill(0); }), t(function(){ a.copyWithin(0, 1); })].join(','); \
+         return r + '|' + a.join(',');",
+        "TypeError,TypeError,TypeError,TypeError|3,1,2",
+    );
+    // An unrestricted array still sorts in place — the fast path, no per-element walk.
+    check(
+        "unrestricted-array-sorts",
+        "var a = [3, 1, 2]; a.sort(); return a.join(',');",
+        "1,2,3",
+    );
+    // A non-writable element *outside* the written range does not block the write.
+    check(
+        "fill-skips-out-of-range-nonwritable",
+        "var a = [1, 2, 3, 4]; Object.defineProperty(a, '0', {writable: false, configurable: true}); \
+         a.fill(9, 1, 3); return a.join(',');",
+        "1,9,9,4",
+    );
+}
+
 /// **A computed accessor is named from its key** (D-323) — `"get "`/`"set "` before the key rendered
 /// the way `NamedEvaluation` renders it: the string itself, a number's text, or `"[description]"` for a
 /// symbol. The computed sibling of D-320, in the same runtime spot (`crisol_computed_define_accessor`).

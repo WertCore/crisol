@@ -1096,6 +1096,12 @@ extern "C" fn array_copy_within(
             Err(thrown) => return thrown,
         }
     }
+    if elements_write_refused(this_value, target, target + moved.len()) {
+        return raise(
+            "cannot write an array with a non-writable element",
+            "TypeError",
+        );
+    }
     with_rooted(&moved, || {
         for (at, value) in moved.iter().enumerate() {
             indexed_set(this_value, target + at, *value);
@@ -1351,6 +1357,15 @@ extern "C" fn array_sort(
         };
         merge_sort(&mut present, &mut before);
 
+        // A frozen array's elements cannot be rewritten; the write-back would be a `TypeError`, so
+        // raise it now — after the comparator has run, before the array is touched — rather than let
+        // the raw element store silently reorder a frozen array (D-326).
+        if elements_write_refused(this_value, 0, length) {
+            return raise(
+                "cannot sort an array with a non-writable element",
+                "TypeError",
+            );
+        }
         with_runtime(|runtime| {
             for (index, value) in present.iter().enumerate() {
                 runtime
@@ -14283,6 +14298,18 @@ fn element_rule(object: u64, index: usize) -> crisol_value::Attributes {
         .map_or(ORDINARY_ELEMENT, unpack_attributes)
 }
 
+/// Whether an in-place write to the elements in `start..end` is refused (D-326). A frozen array — or
+/// one with any non-writable element in that range — rejects it, and the in-place methods (`sort`,
+/// `reverse`, `fill`, `copyWithin`) write with the Throw flag, so the method is a `TypeError` rather
+/// than a raw element store that would silently rewrite a frozen array. The fast path is the common
+/// case: an array nobody has restricted has no rule table, so one probe answers and no walk runs.
+fn elements_write_refused(object: u64, start: usize, end: usize) -> bool {
+    if own_property(object, ELEMENT_RULES).is_none() {
+        return false;
+    }
+    (start..end).any(|index| !element_rule(object, index).writable)
+}
+
 /// Records what one element permits, or what every element permits when `index` is `None`.
 fn set_element_rule(object: u64, index: Option<usize>, attributes: crisol_value::Attributes) {
     let Some(handle) = handle_of(object) else {
@@ -18719,6 +18746,12 @@ extern "C" fn array_reverse(
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
+    if elements_write_refused(this_value, 0, length) {
+        return raise(
+            "cannot reverse an array with a non-writable element",
+            "TypeError",
+        );
+    }
     for index in 0..length / 2 {
         let mirror = length - 1 - index;
         // **Lower then upper, which is the specification's order and is observable**: both
@@ -19082,6 +19115,12 @@ extern "C" fn array_fill(
         Ok(end) => end,
         Err(thrown) => return thrown,
     };
+    if elements_write_refused(this_value, start, end) {
+        return raise(
+            "cannot fill an array with a non-writable element",
+            "TypeError",
+        );
+    }
     with_rooted(&[this_value, value], || {
         for index in start..end {
             indexed_set(this_value, index, value);

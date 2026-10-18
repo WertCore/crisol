@@ -8562,3 +8562,24 @@ locked array is a `TypeError`. The `a.length = n` assignment path (D-318) keeps 
 which is the correct asymmetry. Confirmed by acceptance under GC stress (no-op `push`/`pop`/`unshift`/
 `splice` on a pinned array all throw). **Not addressed:** `splice`'s own `@@species`-created result object
 with a non-configurable `"0"` (`CreateDataPropertyOrThrow`) — a separate, species-specific path.
+
+## D-326
+
+**An in-place array mutator throws on a frozen array instead of rewriting it.**
+
+Status: Accepted
+
+`sort`, `reverse`, `fill`, and `copyWithin` wrote their elements through the *raw* element store
+(`heap.set_element`, or `indexed_set`'s in-bounds branch), which does not consult writability — so on a
+frozen array they did not merely fail to throw, they silently **rewrote** it, corrupting an object the
+program had locked. The specification writes each element with the Throw flag, so a non-writable element
+in the written range is a `TypeError`. A shared `elements_write_refused(object, start, end)` now guards
+each: `sort`/`reverse` over the whole array, `fill` over its `start..end`, `copyWithin` over its
+destination run — raised before any element is written (for `sort`, after the comparator has run; for
+`copyWithin`, after the source reads), so the array is left whole. The guard is range-precise, so a
+non-writable element *outside* the written range does not block the write, and it keeps a fast path: an
+array with no per-element rule table answers in one probe, so the ordinary in-place sort pays nothing.
+Confirmed by acceptance under GC stress (all four throw on a frozen array and leave it unchanged, an
+unrestricted array still sorts, and a `fill` clear of a non-writable element still writes). **Deviation:**
+an *array-like* (non-array) receiver with a non-writable indexed property is not covered — these walk it
+through the slot path, which refuses the write silently rather than throwing, as it did before.
