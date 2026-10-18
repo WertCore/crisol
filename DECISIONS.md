@@ -8602,3 +8602,21 @@ throwing `flags` getter that now propagates). **Deviation / not done here:** the
 throwing `lastIndex`/`flags`/`exec` — needs an error channel threaded through shared helpers that return a
 bare `f64` (`last_index_of`) or walk intricate paths (`replace_using_pattern`); it is left for a focused
 pass rather than bolted on.
+
+## D-328
+
+**`RegExp.prototype[Symbol.search]` propagates a throwing `lastIndex`.**
+
+Status: Accepted
+
+Continuing D-327's thread: `last_index_of` — the helper `Symbol.search` and `Symbol.match` use to save,
+compare, and restore `lastIndex` — returned a bare `f64` through `property_number`, whose `as_number()`
+turns a thrown exception into `None` and then `0.0`. So a `lastIndex` getter that threw was swallowed
+rather than propagated, where the specification's `Get(rx, "lastIndex")` is a `?`-guarded step. The helper
+now returns `Result<f64, u64>` — reading the property, returning the exception as `Err`, and otherwise the
+same "number or zero" it gave before — and its three callers (`Symbol.search`'s save and restore, and
+`Symbol.match`'s empty-match step) propagate the `Err`. Behaviour is identical for an ordinary pattern
+whose `lastIndex` is a plain number; only the throwing-getter case changes. Confirmed by acceptance under
+GC stress (an ordinary search, and a `lastIndex` getter that throws, which now propagates). **Still not
+done:** `Symbol.replace`/`Symbol.matchAll` error propagation, which runs through the larger
+`replace_using_pattern` and species machinery — a separate focused pass.

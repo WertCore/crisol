@@ -10550,9 +10550,15 @@ fn regexp_exec_value(rx: u64, subject: u64) -> u64 {
     })
 }
 
-/// Reads a pattern's `lastIndex`, which a program may have assigned.
-fn last_index_of(rx: u64) -> f64 {
-    property_number(rx, "lastIndex").unwrap_or(0.0)
+/// Reads a pattern's `lastIndex`, which a program may have assigned. A `lastIndex` getter that throws
+/// is propagated as `Err` rather than swallowed to zero (D-328); an absent or non-numeric one is zero,
+/// as before.
+fn last_index_of(rx: u64) -> Result<f64, u64> {
+    let value = property_of(rx, "lastIndex");
+    if Value::from_bits(value).is_exception() {
+        return Err(value);
+    }
+    Ok(Value::from_bits(value).as_number().unwrap_or(0.0))
 }
 
 /// Writes a pattern's `lastIndex` through the ordinary path, so one made non-writable is
@@ -10615,7 +10621,11 @@ extern "C" fn regexp_symbol_match(
             // **An empty match has to be stepped over by hand**, because it leaves
             // `lastIndex` where it was and the next call would find it again, for ever.
             if matched.is_empty() {
-                set_last_index(this_value, last_index_of(this_value) + 1.0);
+                let at = match last_index_of(this_value) {
+                    Ok(at) => at,
+                    Err(thrown) => return thrown,
+                };
+                set_last_index(this_value, at + 1.0);
             }
         }
         // **No matches at all is `null`, not an empty array** — `if (s.match(/x/g))` is how a
@@ -10659,7 +10669,10 @@ extern "C" fn regexp_symbol_search(
         new_string(&to_text(given).unwrap_or_default())
     });
     with_rooted(&[this_value, subject], || {
-        let previous = last_index_of(this_value);
+        let previous = match last_index_of(this_value) {
+            Ok(previous) => previous,
+            Err(thrown) => return thrown,
+        };
         if previous != 0.0 {
             set_last_index(this_value, 0.0);
         }
@@ -10667,7 +10680,11 @@ extern "C" fn regexp_symbol_search(
         if Value::from_bits(result).is_exception() {
             return result;
         }
-        if last_index_of(this_value) != previous {
+        let current = match last_index_of(this_value) {
+            Ok(current) => current,
+            Err(thrown) => return thrown,
+        };
+        if current != previous {
             set_last_index(this_value, previous);
         }
         if Value::from_bits(result).kind() == crisol_value::Kind::Null {

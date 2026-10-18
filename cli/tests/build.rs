@@ -191,6 +191,27 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`RegExp.prototype[Symbol.search]` propagates a throwing `lastIndex`** (D-328) — it saves and
+/// restores `lastIndex` around the search, and a getter that throws during that read is the answer
+/// rather than being swallowed to zero. An ordinary search is unchanged.
+#[test]
+fn symbol_search_propagates_last_index() {
+    // Ordinary search — the index of the first match, or -1.
+    check(
+        "symbol-search-basic",
+        "return 'abcabc'.search(/c/) + ',' + 'abc'.search(/z/);",
+        "2,-1",
+    );
+    // A `lastIndex` getter that throws is propagated, not silently read as zero.
+    check(
+        "symbol-search-lastindex-throws",
+        "var o = { get lastIndex() { throw new RangeError('li'); }, exec: function () { return null; } }; \
+         try { RegExp.prototype[Symbol.search].call(o, 'a'); return 'no-throw'; } \
+         catch (e) { return e.name + ':' + e.message; }",
+        "RangeError:li",
+    );
+}
+
 /// **`RegExp.prototype[Symbol.match]` reads `flags`, not the `global` accessor** (D-327) — matching the
 /// specification, so a `flags` getter that throws is propagated rather than swallowed, and `g` is read
 /// from the flags string. An ordinary pattern matches exactly as before.
