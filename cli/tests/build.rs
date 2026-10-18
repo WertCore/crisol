@@ -387,14 +387,17 @@ fn a_non_writable_length_refuses_resizes() {
                  t(function(){lock().unshift(0);}), t(function(){lock().splice(1,1);})].join(',');",
         "TypeError,TypeError,TypeError,TypeError",
     );
-    // A call that would not change the length is the same-value write the specification permits:
-    // `push()` with no arguments, and `pop()` on an array that is already empty.
+    // Even a call that would not change the length throws (D-325): the length write is `[[Set]]`,
+    // which refuses a non-writable property whatever the value — `push()`/`unshift()` with no
+    // arguments, `pop()` on an already-empty array, a no-op `splice`. (This is the `[[Set]]` path,
+    // not the `a.length = n` assignment, whose `[[DefineOwnProperty]]` does keep a same value.)
     check(
-        "fixed-length-noop-resizers-pass",
-        "var a=[1,2,3]; Object.defineProperty(a,'length',{writable:false}); a.push(); \
-         var b=[]; Object.defineProperty(b,'length',{writable:false}); b.pop(); \
-         return a.length + '/' + b.length;",
-        "3/0",
+        "fixed-length-noop-resizers-throw",
+        "function lock(a){ Object.defineProperty(a, 'length', {writable:false}); return a; } \
+         function t(f){ try { f(); return 'ok'; } catch (e) { return e.name; } } \
+         return [t(function(){lock([1,2,3]).push();}), t(function(){lock([]).pop();}), \
+                 t(function(){lock([1,2,3]).unshift();}), t(function(){lock([1,2,3]).splice(0,0);})].join(',');",
+        "TypeError,TypeError,TypeError,TypeError",
     );
 }
 

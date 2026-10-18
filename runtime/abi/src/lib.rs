@@ -1408,11 +1408,12 @@ extern "C" fn array_splice(
         count.min(length - start)
     };
 
-    // A splice that removes and inserts different counts changes `length`, which a non-writable
-    // length refuses. Raised up front, so the array is left whole; the specification writes the
-    // length last, after shifting the tail, but a program cannot observe the difference on an
-    // array it could not resize — the removed-array it would have built is discarded on the throw.
-    if length_resize_refused(this_value, removing != (argc as usize).saturating_sub(2)) {
+    // `splice` always writes `length` at the end (with the Throw flag), so a non-writable length
+    // refuses it whatever the counts — even a no-op `splice`. Raised up front, so the array is left
+    // whole; the specification writes the length last, after shifting the tail, but a program cannot
+    // observe the difference on an array it could not resize — the removed-array it would have built
+    // is discarded on the throw.
+    if length_resize_refused(this_value) {
         return raise(
             "cannot resize an array with a non-writable length",
             "TypeError",
@@ -18384,18 +18385,19 @@ extern "C" fn array_reduce(
     })
 }
 
-/// `Array.prototype.push` — appends, and answers the new length.
-/// **A resize of a non-writable-length array is a `TypeError`.** Every length-changing method
-/// (`push`, `pop`, `shift`, `unshift`, `splice`) finishes by writing `length` with the Throw flag,
-/// so one that would change the length on a locked array throws *before* it touches anything —
-/// matching the specification's order, where the refused write is the first observable step and the
-/// elements are left as they were. `changes_length` is false for the no-ops the specification lets
-/// through as a same-value write (`push()`/`unshift()` with no arguments, `pop()`/`shift()` on an
-/// empty array), which succeed. Only a real array carries the marker, so array-likes are unaffected.
-fn length_resize_refused(this_value: u64, changes_length: bool) -> bool {
-    changes_length && own_flag(this_value, FIXED_LENGTH)
+/// **A non-writable `length` makes every length-changing method a `TypeError`** (D-325 corrects the
+/// D-317 over-allowance). `push`, `pop`, `shift`, `unshift`, and `splice` each finish by writing
+/// `length` with the Throw flag — through `[[Set]]`, which returns false for a non-writable property
+/// *whatever the value*, so even a call that would not change the length throws rather than quietly
+/// succeeding: `push()`/`unshift()` with no arguments, `pop()`/`shift()` on an empty array, a no-op
+/// `splice`. (That is `[[Set]]`; the `[[DefineOwnProperty]]` an `a.length = n` assignment uses *does*
+/// keep a same value, which is why those two paths differ.) Raised before anything is touched, so the
+/// array is left whole. Only a real array carries the marker, so array-likes are unaffected.
+fn length_resize_refused(this_value: u64) -> bool {
+    own_flag(this_value, FIXED_LENGTH)
 }
 
+/// `Array.prototype.push` — appends, and answers the new length.
 extern "C" fn array_push(
     _closure: u64,
     this_value: u64,
@@ -18410,7 +18412,7 @@ extern "C" fn array_push(
             Ok(length) => length,
             Err(thrown) => return thrown,
         };
-        if length_resize_refused(this_value, argc > 0) {
+        if length_resize_refused(this_value) {
             return raise(
                 "cannot add to an array with a non-writable length",
                 "TypeError",
@@ -18755,7 +18757,7 @@ extern "C" fn array_pop(
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
-    if length_resize_refused(this_value, length > 0) {
+    if length_resize_refused(this_value) {
         return raise(
             "cannot shorten an array with a non-writable length",
             "TypeError",
@@ -18790,7 +18792,7 @@ extern "C" fn array_shift(
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
-    if length_resize_refused(this_value, length > 0) {
+    if length_resize_refused(this_value) {
         return raise(
             "cannot shorten an array with a non-writable length",
             "TypeError",
@@ -18843,7 +18845,7 @@ extern "C" fn array_unshift(
         Err(thrown) => return thrown,
     };
     let added = argc as usize;
-    if length_resize_refused(this_value, added > 0) {
+    if length_resize_refused(this_value) {
         return raise(
             "cannot grow an array with a non-writable length",
             "TypeError",

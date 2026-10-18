@@ -8542,3 +8542,23 @@ time, before a static one is parked). A named function value keeps its own name;
 untouched. Confirmed by acceptance under GC stress, and by the codegen symbol-table test and the frontend
 corpus snapshot (unchanged). **Deviation:** a computed *field* with an anonymous value (`[k] = () => {}`)
 is still unnamed — field `NamedEvaluation` is a separate path from the method/value one fixed here.
+
+## D-325
+
+**Every length-changing array method throws on a non-writable length — even when it would not change it.**
+
+Status: Accepted
+
+D-317 refused `push`/`pop`/`shift`/`unshift`/`splice` on a non-writable-length array *only when the call
+would change the length*, letting the no-op calls through as "same-value writes." That was the wrong
+model. Those methods write `length` with `[[Set]]`, and `[[Set]]` on a non-writable data property returns
+false **whatever the value** — the SameValue exception that lets `a.length = a.length` succeed lives in
+`[[DefineOwnProperty]]` (`ValidateAndApplyPropertyDescriptor`), which only the `a.length = n` *assignment*
+path uses, not the methods. So `[].pop()` on an empty non-writable-length array, `push()`/`unshift()` with
+no arguments, and a no-op `splice` all throw, and test262 asserts exactly that
+(`pop/set-length-zero-array-length-is-non-writable`). The fix drops the `changes_length` condition:
+`length_resize_refused` is now just the `__fixedLength` marker check, so any of the five methods on a
+locked array is a `TypeError`. The `a.length = n` assignment path (D-318) keeps its same-value allowance,
+which is the correct asymmetry. Confirmed by acceptance under GC stress (no-op `push`/`pop`/`unshift`/
+`splice` on a pinned array all throw). **Not addressed:** `splice`'s own `@@species`-created result object
+with a non-configurable `"0"` (`CreateDataPropertyOrThrow`) — a separate, species-specific path.
