@@ -162,6 +162,9 @@ fn write_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         } => {
             write!(f, "name-closure {closure} name={name} length={length}")
         }
+        Op::NameComputed { closure, key } => {
+            write!(f, "name-computed {closure} key={key}")
+        }
         Op::MakeGenerator { body, this_value } => {
             write!(f, "make-generator {body} this={this_value}")
         }

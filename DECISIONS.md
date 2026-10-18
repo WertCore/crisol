@@ -8519,3 +8519,26 @@ accessor, a symbol-key accessor, and a class computed accessor). **Deviation:** 
 (`{[k]() {…}}`) is still unnamed — the runtime cannot tell a method shorthand from a data property
 `{[k]: fn}`, so naming it needs the frontend to signal the method case (a new op carrying the key),
 which is left for its own decision, together with the non-computed method path if that proves to want it.
+
+## D-324
+
+**A computed method is named from its key.**
+
+Status: Accepted
+
+The deviation D-323 named: a computed *method* (`{ [k]() {…} }`, `class { [k]() {…} }`) and an anonymous
+function value under a computed key (`{ [k]: function () {} }`) read back with an empty name. The runtime
+cannot do this — a computed store carries only an object, a key, and a value, and cannot tell a method
+shorthand or an anonymous-function value (both of which `NamedEvaluation` names) from an arbitrary
+function stored under a computed key (which it must not rename). Only the frontend knows, syntactically,
+which it is. So this adds one IR op — `NameComputed { closure, key }` — threaded through the ir
+(`operands`/`can_collect`/display), codegen (a new `crisol_name_computed` import), and the runtime (the
+function of that name, which renders the key with the same `computed_key_name` D-323 added and reuses
+`crisol_name_closure`'s in-place overwrite, leaving the `.length` the frontend already stamped). The
+frontend emits it exactly where `NamedEvaluation` applies — a computed property whose value is an
+anonymous function (`anonymous_function_arity` is `Some`), for the object literal's generator and
+non-generator paths, and for a class body's instance and static computed methods (named at close-over
+time, before a static one is parked). A named function value keeps its own name; a non-function value is
+untouched. Confirmed by acceptance under GC stress, and by the codegen symbol-table test and the frontend
+corpus snapshot (unchanged). **Deviation:** a computed *field* with an anonymous value (`[k] = () => {}`)
+is still unnamed — field `NamedEvaluation` is a separate path from the method/value one fixed here.

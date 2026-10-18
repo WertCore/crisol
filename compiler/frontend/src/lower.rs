@@ -6252,6 +6252,16 @@ impl Lowering {
                 let (id, captures) =
                     self.lower_method(&format!("{name}.<computed>"), &method.value);
                 let closure = self.close_over(id, &captures);
+                // A computed *method* is named from its key at run time (D-324) — a computed accessor
+                // is named by the runtime define-accessor op instead (D-323), so this is only the
+                // plain-method case. Named here, before a `static` one is parked, so the stamp travels
+                // with the closure to wherever it is installed.
+                if matches!(method.kind, oxc_ast::ast::MethodDefinitionKind::Method) {
+                    self.emit_effect(Op::NameComputed {
+                        closure,
+                        key: computed_key,
+                    });
+                }
                 if method.r#static {
                     static_computed.push((computed_key, method.kind, closure));
                     continue;
@@ -6892,6 +6902,14 @@ impl Lowering {
                                 let absent = self.placeholder();
                                 match property.kind {
                                     oxc_ast::ast::PropertyKind::Init => {
+                                        // A computed method shorthand or an anonymous function value
+                                        // is named from the key — `NamedEvaluation` at run time (D-324).
+                                        if anonymous_function_arity(&property.value).is_some() {
+                                            self.emit_effect(Op::NameComputed {
+                                                closure: value,
+                                                key,
+                                            });
+                                        }
                                         self.emit_effect(Op::ComputedStore {
                                             object: result,
                                             key,
@@ -7008,6 +7026,14 @@ impl Lowering {
                             let value = self.expression(&property.value);
                             match property.kind {
                                 oxc_ast::ast::PropertyKind::Init => {
+                                    // A computed method shorthand or an anonymous function value is
+                                    // named from the key — `NamedEvaluation` at run time (D-324).
+                                    if anonymous_function_arity(&property.value).is_some() {
+                                        self.emit_effect(Op::NameComputed {
+                                            closure: value,
+                                            key,
+                                        });
+                                    }
                                     self.emit_effect(Op::ComputedStore {
                                         object: result,
                                         key,

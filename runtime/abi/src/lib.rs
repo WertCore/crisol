@@ -91,6 +91,7 @@ pub const SYMBOLS: &[&str] = &[
     "crisol_create_arguments",
     "crisol_global_load_optional",
     "crisol_relational",
+    "crisol_name_computed",
 ];
 
 /// `ToNumber` for a value that is already a number, and `NaN` otherwise.
@@ -17388,6 +17389,29 @@ pub extern "C" fn crisol_name_closure(closure: u64, name: u64, length: u64) {
             }
         });
     });
+}
+
+/// Names a computed method from its key (D-324) — `{ [k]() {…} }` and `class { [k]() {…} }`. The key
+/// is a value computed at run time, which the frontend cannot render into a constant name, so it hands
+/// the key here and the rendering (a string as itself, a number as its text, a symbol as
+/// `"[description]"`) happens with `computed_key_name`, the same spelling `NamedEvaluation` uses. Only
+/// the name changes: the `.length` the frontend already stamped is read back and written unchanged, so
+/// this reuses [`crisol_name_closure`]'s in-place overwrite rather than repeating it.
+#[unsafe(no_mangle)]
+pub extern "C" fn crisol_name_computed(closure: u64, key: u64) {
+    if handle_of(closure).is_none() {
+        return;
+    }
+    let rendered = computed_key_name(key);
+    let named = with_rooted(&[closure, key], || new_string(&rendered));
+    let length = {
+        let field = "length".to_owned();
+        // SAFETY: `field` is a live Rust string; reading a data property allocates nothing, so the
+        // freshly made `named` cannot be collected before the call below.
+        let value = unsafe { crisol_property_load(closure, field.as_ptr(), field.len() as u64) };
+        Value::from_bits(value).as_number().unwrap_or(0.0)
+    };
+    crisol_name_closure(closure, named, Value::number(length).to_bits());
 }
 
 /// Writes one of a closure's captured values.

@@ -198,6 +198,7 @@ const GLOBAL_LOAD_SYMBOL: &str = "crisol_global_load";
 const DELETE_SYMBOL: &str = "crisol_delete";
 const SET_PROTOTYPE_SYMBOL: &str = "crisol_set_prototype";
 const NAME_CLOSURE_SYMBOL: &str = "crisol_name_closure";
+const NAME_COMPUTED_SYMBOL: &str = "crisol_name_computed";
 const MAKE_GENERATOR_SYMBOL: &str = "crisol_make_generator";
 const ENUMERATE_SYMBOL: &str = "crisol_enumerate";
 const ITERATE_SYMBOL: &str = "crisol_iterate";
@@ -280,6 +281,8 @@ struct ObjectHelpers<T> {
     set_prototype: T,
     /// `crisol_name_closure(closure, name, length)`
     name_closure: T,
+    /// `crisol_name_computed(closure, key)`
+    name_computed: T,
     /// `crisol_make_generator(body, this) -> generator object`
     make_generator: T,
     /// `crisol_enumerate(object) -> array of names`
@@ -451,6 +454,10 @@ fn declare_object_helpers<M: cranelift_module::Module>(
     name_closure.params.push(AbiParam::new(types::I64));
     name_closure.params.push(AbiParam::new(types::I64));
 
+    let mut name_computed = module.make_signature();
+    name_computed.params.push(AbiParam::new(types::I64));
+    name_computed.params.push(AbiParam::new(types::I64));
+
     let mut make_generator = module.make_signature();
     make_generator.params.push(AbiParam::new(types::I64));
     make_generator.params.push(AbiParam::new(types::I64));
@@ -558,6 +565,7 @@ fn declare_object_helpers<M: cranelift_module::Module>(
         delete: declare(DELETE_SYMBOL, &delete)?,
         set_prototype: declare(SET_PROTOTYPE_SYMBOL, &set_prototype)?,
         name_closure: declare(NAME_CLOSURE_SYMBOL, &name_closure)?,
+        name_computed: declare(NAME_COMPUTED_SYMBOL, &name_computed)?,
         make_generator: declare(MAKE_GENERATOR_SYMBOL, &make_generator)?,
         enumerate: declare(ENUMERATE_SYMBOL, &enumerate)?,
         iterate: declare(ITERATE_SYMBOL, &iterate)?,
@@ -1116,6 +1124,9 @@ impl Backend for Cranelift {
             name_closure: self
                 .module
                 .declare_func_in_func(self.objects.name_closure, &mut context.func),
+            name_computed: self
+                .module
+                .declare_func_in_func(self.objects.name_computed, &mut context.func),
             make_generator: self
                 .module
                 .declare_func_in_func(self.objects.make_generator, &mut context.func),
@@ -1958,6 +1969,14 @@ impl Lowering<'_> {
                     .call(self.objects.name_closure, &[closure, name, length]);
                 None
             }
+            Op::NameComputed { closure, key } => {
+                let closure = self.value(*closure);
+                let key = self.value(*key);
+                self.builder
+                    .ins()
+                    .call(self.objects.name_computed, &[closure, key]);
+                None
+            }
             Op::MakeGenerator { body, this_value } => {
                 let body = self.value(*body);
                 let this_value = self.value(*this_value);
@@ -2460,6 +2479,9 @@ impl Jit {
             name_closure: self
                 .module
                 .declare_func_in_func(self.objects.name_closure, &mut context.func),
+            name_computed: self
+                .module
+                .declare_func_in_func(self.objects.name_computed, &mut context.func),
             make_generator: self
                 .module
                 .declare_func_in_func(self.objects.make_generator, &mut context.func),

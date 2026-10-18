@@ -288,6 +288,40 @@ fn an_accessor_is_named_get_or_set() {
     );
 }
 
+/// **A computed method is named from its key** (D-324) — `{ [k]() {…} }`, `class { [k]() {…} }`, and an
+/// anonymous function value under a computed key, all through a new `NameComputed` op the frontend emits
+/// and the runtime renders (a string as itself, a symbol as `"[description]"`). A *named* function value
+/// keeps its own name; a non-function value is untouched.
+#[test]
+fn a_computed_method_is_named_from_its_key() {
+    // Object literal: a computed method shorthand, and an anonymous function value.
+    check(
+        "computed-method-object",
+        "var k = 'm'; var o = { [k]() {}, ['v' + '1']: function () {} }; \
+         return o.m.name + ',' + o.v1.name;",
+        "m,v1",
+    );
+    // A symbol key reads as "[description]".
+    check(
+        "computed-method-symbol",
+        "var s = Symbol('it'); var o = { [s]() {} }; return o[s].name;",
+        "[it]",
+    );
+    // Class, instance and static computed methods.
+    check(
+        "computed-method-class",
+        "var k = 'm'; class C { [k]() {} static [('s' + 't')]() {} } \
+         return C.prototype.m.name + ',' + C.st.name;",
+        "m,st",
+    );
+    // A named function value keeps its own name; a non-function value is unaffected.
+    check(
+        "computed-method-keeps-named-and-ignores-nonfunction",
+        "var k = 'm'; var o = { [k]: function keep() {}, n: 5 }; return o.m.name + ',' + o.n;",
+        "keep,5",
+    );
+}
+
 /// **A bound function is named and sized** (D-321). `Function.prototype.bind` returns a function whose
 /// `name` is `"bound "` before the target's and whose `length` is the target's less the bound
 /// arguments, floored at zero — both with the function-property attributes (not writable, not

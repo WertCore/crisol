@@ -558,6 +558,17 @@ pub enum Op {
         /// Its `.length`.
         length: ValueId,
     },
+    /// Names a closure from a computed key — `{ [k]() {…} }` and `class { [k]() {…} }` (D-324).
+    /// Unlike [`Op::NameClosure`], whose name is a constant the frontend spelled, the name here is the
+    /// property key rendered at run time (a string as itself, a symbol as `"[description]"`), so the
+    /// frontend emits only the closure and the key and the runtime does the rendering. The `.length`
+    /// the closure already carries is left as it is.
+    NameComputed {
+        /// The closure to name.
+        closure: ValueId,
+        /// The property key its name is rendered from.
+        key: ValueId,
+    },
     /// Builds the generator object a `function*` returns: an object carrying the state-machine
     /// `body` closure and the caller's `this_value`, with `%GeneratorPrototype%` and the initial
     /// resume state. The outer function stores the parameters on it and returns it; the body runs
@@ -673,6 +684,7 @@ impl Op {
                 | Self::Await { .. }
                 | Self::MakeGenerator { .. }
                 | Self::NameClosure { .. }
+                | Self::NameComputed { .. }
         )
     }
 
@@ -722,6 +734,7 @@ impl Op {
                 name,
                 length,
             } => vec![*closure, *name, *length],
+            Self::NameComputed { closure, key } => vec![*closure, *key],
             Self::MakeGenerator { body, this_value } => vec![*body, *this_value],
             Self::DefineAccessor {
                 object,
