@@ -8762,3 +8762,21 @@ coercion); otherwise `ToPrimitive` decides, and a resulting **string is parsed**
 recurring shape of the GC-stress bugs this run surfaced. **Deviations:** `parse_iso_date` is the same
 simple-form parser `Date.parse` carries (no timezone offsets like `+05:00`, no RFC-2822 / locale strings),
 so this widens where strings are *accepted* to exactly where `Date.parse` already did, no further.
+
+## D-335
+
+**`JSON.stringify` applies an array replacer as a key allowlist.**
+
+Status: Accepted
+
+The second argument was ignored. An *array* replacer is now read into an ordered, de-duplicated list of
+property names — each element that is a string or a number (a number as its text) — and threaded through
+`to_json`: an object serializes exactly those names, in that order, and a name the object lacks reads
+`undefined` and is dropped. The list applies to every object in the structure (it is passed down the
+recursion unchanged), while array elements are serialized as they are, never filtered — which is the
+specification's split between `SerializeJSONObject`'s PropertyList and `SerializeJSONArray`. This path runs
+no user code of its own (a listed key is read with the same property load the default walk already uses),
+so it carries none of the function-replacer's rooting weight. **Not done:** a *function* replacer, which
+would have to call back per property with the holder and key (the serialization mirror of the D-333 reviver,
+needing `to_json` to thread a holder/key and an exception channel) — `json_allowlist` returns `None` for it,
+leaving every key to serialize, so a function replacer is inert rather than wrong.

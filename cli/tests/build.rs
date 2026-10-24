@@ -191,6 +191,31 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`JSON.stringify` applies an array replacer as a key allowlist** (D-335) — the listed names, in their
+/// order, restrict every object in the structure; array elements are not dropped. A non-array replacer
+/// (a function) still leaves every key.
+#[test]
+fn json_stringify_applies_an_array_replacer() {
+    check(
+        "json-replacer-allowlist",
+        "return JSON.stringify({b: 2, a: 1, c: 3}, ['a', 'b']);",
+        "{\"a\":1,\"b\":2}",
+    );
+    // Reaches nested objects; the array itself is kept, only its element object is filtered.
+    check(
+        "json-replacer-nested",
+        "return JSON.stringify({keep: [{a: 1, drop: 9}], drop: 8}, ['keep', 'a']);",
+        "{\"keep\":[{\"a\":1}]}",
+    );
+    // Number names become their text; a function replacer is not an allowlist, so every key stays.
+    check(
+        "json-replacer-numbers-and-function",
+        "return JSON.stringify({0: 'z', 1: 'y'}, [0]) + '|' + \
+         JSON.stringify({a: 1, b: 2}, function (k, v) { return v; });",
+        "{\"0\":\"z\"}|{\"a\":1,\"b\":2}",
+    );
+}
+
 /// **`new Date(string)` parses the string** (D-334) through the same ISO parser `Date.parse` uses, after
 /// `ToPrimitive`; a number argument stays a time value and a `Date` argument is copied. Before this every
 /// `new Date("…")` coerced the string with `ToNumber` and became `Invalid Date`.

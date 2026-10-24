@@ -24412,7 +24412,33 @@ fn is_constructor(value: u64) -> bool {
 /// changing its length, so the two containers treat the same absence differently.
 ///
 /// `visiting` carries the objects above this one, so a cycle is caught rather than followed.
-fn to_json(value: u64, visiting: &mut Vec<GcRef>) -> Result<Option<crisol_builtins::Json>, ()> {
+/// An array replacer as its key allowlist (D-335): each element that is a string or a number becomes a
+/// property name — a number as its text — in order, without repeats. A replacer that is not an array
+/// (including a function, which is not yet applied) yields `None`, which leaves every key to serialize.
+fn json_allowlist(replacer: u64) -> Option<Vec<String>> {
+    let (array, length) = elements_of(replacer)?;
+    let mut names: Vec<String> = Vec::new();
+    for index in 0..length {
+        let element = Value::from_bits(element_at(array, index));
+        let name = match element.kind() {
+            crisol_value::Kind::String => text_of(element.to_bits()),
+            crisol_value::Kind::Number => element.as_number().map(number_text),
+            _ => None,
+        };
+        if let Some(name) = name
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    Some(names)
+}
+
+fn to_json(
+    value: u64,
+    visiting: &mut Vec<GcRef>,
+    allowlist: Option<&[String]>,
+) -> Result<Option<crisol_builtins::Json>, ()> {
     let held = Value::from_bits(value);
     match held.kind() {
         crisol_value::Kind::Undefined => return Ok(None),
@@ -24454,19 +24480,26 @@ fn to_json(value: u64, visiting: &mut Vec<GcRef>) -> Result<Option<crisol_builti
         for index in 0..length {
             // An element with no JSON spelling becomes `null`: an array cannot drop one
             // without changing its length.
-            let item = to_json(element_at(array, index), visiting)?;
+            let item = to_json(element_at(array, index), visiting, allowlist)?;
             items.push(item.unwrap_or(crisol_builtins::Json::Null));
         }
         crisol_builtins::Json::Array(items)
     } else {
         let mut entries = Vec::new();
-        for name in enumerable_keys(value) {
+        // **An array replacer is a key allowlist** (D-335): its names, in its order, stand in for the
+        // object's own enumerable keys, and a name the object lacks reads `undefined` and is dropped. It
+        // applies to every object in the structure, so it is threaded down the recursion unchanged.
+        let names = match allowlist {
+            Some(list) => list.to_vec(),
+            None => enumerable_keys(value),
+        };
+        for name in names {
             let key = name.clone();
             // SAFETY: `key` is a live Rust string.
             let held = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
             // A property with no JSON spelling is dropped, which is what makes
             // `{a: undefined}` stringify as `{}`.
-            if let Some(item) = to_json(held, visiting)? {
+            if let Some(item) = to_json(held, visiting, allowlist)? {
                 entries.push((name, item));
             }
         }
@@ -24597,7 +24630,10 @@ extern "C" fn json_stringify(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
-    // SAFETY: as above. The second argument is a replacer, which is not applied.
+    // SAFETY: as above. An *array* replacer is applied as a key allowlist (D-335); a *function*
+    // replacer is still not applied.
+    let allowlist = json_allowlist(unsafe { argument(argc, argv, 1) });
+    // SAFETY: as above.
     let space = Value::from_bits(unsafe { argument(argc, argv, 2) })
         .as_number()
         .unwrap_or(0.0);
@@ -24609,7 +24645,7 @@ extern "C" fn json_stringify(
     let indent = space.clamp(0.0, 10.0) as usize;
 
     let mut visiting = Vec::new();
-    match to_json(value, &mut visiting) {
+    match to_json(value, &mut visiting, allowlist.as_deref()) {
         // **`undefined` for a value JSON cannot spell**, which is what
         // `JSON.stringify(undefined)` answers — not the string `"undefined"`.
         Ok(None) => Value::UNDEFINED.to_bits(),
