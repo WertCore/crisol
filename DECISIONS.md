@@ -8745,3 +8745,20 @@ fixed it, and the walk itself roots the holder, key, value, and each revived res
 allocations and user calls. **Deviation:** the walk runs on the freshly parsed tree, which has only plain
 data properties, so it does not attempt the specification's general `HasProperty`/`DefineOwnProperty` dance
 that a reviver mutating the tree mid-walk could otherwise observe.
+
+## D-334
+
+**`new Date(string)` parses the string.**
+
+Status: Accepted
+
+The one-argument `Date` constructor ran `ToNumber` on its argument unconditionally, so a string — the common
+`new Date("2020-01-02T03:04:05Z")` — became `NaN` and every such date was `Invalid Date`, even though
+`Date.parse` and its `parse_iso_date` already understood the format. The constructor now follows the
+specification's one-argument path: a `Date` argument is copied by its stored time directly (before any
+coercion); otherwise `ToPrimitive` decides, and a resulting **string is parsed** as a date through the same
+`parse_iso_date`, while anything else is `ToNumber`'d as a time value. `given` is rooted across `ToPrimitive`
+— which may run a `valueOf` — because this constructor, like a few others, takes no `live_values` guard, the
+recurring shape of the GC-stress bugs this run surfaced. **Deviations:** `parse_iso_date` is the same
+simple-form parser `Date.parse` carries (no timezone offsets like `+05:00`, no RFC-2822 / locale strings),
+so this widens where strings are *accepted* to exactly where `Date.parse` already did, no further.

@@ -9904,7 +9904,23 @@ extern "C" fn make_date_object(
         1 => {
             // SAFETY: the convention guarantees `argc` readable values at `argv`.
             let given = unsafe { argument(argc, argv, 0) };
-            to_number(given)
+            // **One argument is a time value *or* a date string** (D-334). `new Date(aDate)` copies the
+            // other's time directly; otherwise `ToPrimitive` decides — a string is parsed as a date (the
+            // same parser `Date.parse` uses), anything else is `ToNumber`'d. Before this a string went
+            // straight to `to_number` and every `new Date("…")` was `Invalid Date`. `given` is rooted
+            // across `ToPrimitive`, which may run `valueOf`, since this constructor takes no live guard.
+            if let Some((_, time)) = own_property(given, DATE_TIME) {
+                time.as_number().unwrap_or(f64::NAN)
+            } else {
+                let primitive = with_rooted(&[given], || to_primitive(given));
+                if Value::from_bits(primitive).kind() == crisol_value::Kind::String {
+                    to_text(primitive)
+                        .and_then(|text| parse_iso_date(&text))
+                        .unwrap_or(f64::NAN)
+                } else {
+                    to_number(primitive)
+                }
+            }
         }
         _ => {
             let part = |position: usize, fallback: f64| -> f64 {

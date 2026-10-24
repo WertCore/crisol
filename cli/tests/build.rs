@@ -191,6 +191,32 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`new Date(string)` parses the string** (D-334) through the same ISO parser `Date.parse` uses, after
+/// `ToPrimitive`; a number argument stays a time value and a `Date` argument is copied. Before this every
+/// `new Date("…")` coerced the string with `ToNumber` and became `Invalid Date`.
+#[test]
+fn new_date_parses_a_string() {
+    check(
+        "date-string-iso",
+        "var d = new Date('2020-01-02T03:04:05.000Z'); \
+         return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1) + '-' + d.getUTCDate() + \
+             ' ' + d.getUTCHours() + ':' + d.getUTCMinutes() + ':' + d.getUTCSeconds();",
+        "2020-1-2 3:4:5",
+    );
+    // A number argument is still a time value; a `Date` argument is copied by its time.
+    check(
+        "date-number-and-copy",
+        "return new Date(0).getTime() + '/' + new Date(new Date(1000)).getTime();",
+        "0/1000",
+    );
+    // An unparseable string is `Invalid Date`.
+    check(
+        "date-string-invalid",
+        "return isNaN(new Date('not a date').getTime());",
+        "true",
+    );
+}
+
 /// **`JSON.parse` applies a reviver** (D-333) — called bottom-up as `reviver(key, value)` with `this` the
 /// holder, its result replacing each property (or deleting it when `undefined`), the top value handed over
 /// last under the key `""`. Array indices reach it as strings.
