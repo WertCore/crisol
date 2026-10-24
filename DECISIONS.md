@@ -8858,3 +8858,29 @@ the reported and target descriptors), which would want the descriptor-object →
 flagged. **Still open for the property traps:** `ownKeys` (its check, `checked_own_keys`, is ready, but the
 `own_keys` helper that would carry the throw is called in many places with no error channel) and
 `defineProperty` (needs `IsCompatiblePropertyDescriptor` built from scratch).
+
+## D-340
+
+**A proxy's `setPrototypeOf` is invoked, and agrees with a non-extensible target.**
+
+Status: Accepted
+
+D-338 flagged that crisol never invoked the `setPrototypeOf` trap: `Object.setPrototypeOf`, `Reflect.setPrototypeOf`
+and the `__proto__` setter all funnelled through `set_prototype_of`, which read and wrote the object's own
+prototype slot directly — on a proxy that bypassed the handler entirely. `set_prototype_of` now detects a proxy
+(via `proxy_parts`, after the object-or-null type guard that the specification places ahead of `[[SetPrototypeOf]]`)
+and routes to a new `proxy_set_prototype`: revocation faults; an absent trap re-parents the target (which may itself
+be a proxy); a present trap is called with `(target, proto)`, a falsy answer is a `false` status, and a truthy answer
+on a **non-extensible** target must name the prototype the target already has (`SameValue`, read with the same
+`object_get_prototype` the no-trap path uses) — the mirror of `getPrototypeOf` (D-338). The three entries already
+disagreed about a refused write (`Reflect` reports `false`; the other two throw), so the shared helper's `Err` grew
+from a bare `&'static str` into `SetPrototypeError::{Refused(&str), Thrown(u64)}`: `Refused` carries the status-false
+message the faulting entries throw, `Thrown` carries a proxy's already-pending exception (a revoked handle, a trap
+that threw, or the invariant) so it reaches all three unchanged. The ordinary (non-proxy) refusals — cycle,
+non-extensible — moved from `Err(&str)` to `Err(Refused(&str))` with identical outcomes.
+
+Rejected: routing the proxy check in each of the three entry points instead of the shared helper (three copies of
+the same dispatch, and each already computes the handle the helper takes); and widening `Ok(false)` to mean both
+"wrong-type, ignored" and "status false" (the `__proto__` setter must stay silent for the first and throw for the
+second, so they cannot collapse). **Still open for the property traps:** `ownKeys` and `defineProperty`, as D-339
+records — this closes the prototype traps, leaving only those two unchecked.

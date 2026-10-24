@@ -252,6 +252,67 @@ fn a_proxy_cannot_lie_about_a_frozen_shape() {
     );
 }
 
+/// **A proxy's `setPrototypeOf` agrees with its target** (D-340) — the trap is invoked (not the slot) by
+/// every re-parenting entry (`Object.setPrototypeOf`, `Reflect.setPrototypeOf`, the `__proto__` setter);
+/// a falsy answer faults for the first and last but is `false` for `Reflect`; a trap that throws propagates;
+/// and on a non-extensible target a truthy answer must name the prototype the target already has — the
+/// mirror of `getPrototypeOf` (D-338).
+#[test]
+fn a_proxy_setprototypeof_agrees_with_its_target() {
+    check(
+        "proxy-setproto-runs",
+        "var target = {}; var saw = []; \
+         var p = new Proxy(target, {setPrototypeOf: function (t, proto) { saw.push(proto === Array.prototype); return Reflect.setPrototypeOf(t, proto); }}); \
+         Object.setPrototypeOf(p, Array.prototype); \
+         return saw[0] + '/' + (Object.getPrototypeOf(target) === Array.prototype) + '/' + (Object.getPrototypeOf(p) === Array.prototype);",
+        "true/true/true",
+    );
+    // A falsy status faults through `Object.setPrototypeOf` but is merely `false` through `Reflect`.
+    check(
+        "proxy-setproto-refused",
+        "var p = new Proxy({}, {setPrototypeOf: function () { return false; }}); \
+         var threw = false; \
+         try { Object.setPrototypeOf(p, Array.prototype); } catch (e) { threw = e instanceof TypeError; } \
+         return threw + '/' + Reflect.setPrototypeOf(p, Array.prototype);",
+        "true/false",
+    );
+    check(
+        "proxy-setproto-throws",
+        "var p = new Proxy({}, {setPrototypeOf: function () { throw new RangeError('no'); }}); \
+         try { Object.setPrototypeOf(p, null); return 'no-throw'; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A frozen target's prototype cannot move: a truthy answer that names a different one is a lie,
+    // but naming the one it already has is fine.
+    check(
+        "proxy-setproto-nonext-lies",
+        "var o = Object.preventExtensions({}); \
+         var p = new Proxy(o, {setPrototypeOf: function () { return true; }}); \
+         try { Object.setPrototypeOf(p, Array.prototype); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-setproto-nonext-same",
+        "var o = Object.preventExtensions({}); \
+         var p = new Proxy(o, {setPrototypeOf: function () { return true; }}); \
+         return Reflect.setPrototypeOf(p, Object.prototype);",
+        "true",
+    );
+    // No trap forwards to the target; a revoked proxy faults before anything else.
+    check(
+        "proxy-setproto-forwards",
+        "var target = {}; Object.setPrototypeOf(new Proxy(target, {}), Array.prototype); \
+         return Object.getPrototypeOf(target) === Array.prototype;",
+        "true",
+    );
+    check(
+        "proxy-setproto-revoked",
+        "var r = Proxy.revocable({}, {}); r.revoke(); \
+         try { Object.setPrototypeOf(r.proxy, null); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

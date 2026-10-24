@@ -12318,7 +12318,11 @@ extern "C" fn reflect_set_prototype_of(
     let Some(handle) = handle_of(target) else {
         return Value::FALSE.to_bits();
     };
-    boolean(set_prototype_of(handle, proto).is_ok()).to_bits()
+    match set_prototype_of(handle, proto) {
+        Ok(status) => boolean(status).to_bits(),
+        Err(SetPrototypeError::Refused(_)) => Value::FALSE.to_bits(),
+        Err(SetPrototypeError::Thrown(bits)) => bits,
+    }
 }
 
 /// `Reflect.defineProperty(target, key, descriptor)` — `false` where `Object`'s throws.
@@ -13703,6 +13707,19 @@ extern "C" fn object_get_prototype(
     })
 }
 
+/// Why a prototype write did not simply succeed, split out because the three public entries
+/// disagree about each: `Reflect.setPrototypeOf` reports a refused write as `false`, while
+/// `Object.setPrototypeOf` and the `__proto__` setter fault on it, and a proxy trap's own
+/// thrown exception must reach all three unchanged.
+enum SetPrototypeError {
+    /// The boolean status was `false` — a non-extensible target, a cycle, or a `setPrototypeOf`
+    /// trap that returned a falsy value. The message is what the faulting entries throw.
+    Refused(&'static str),
+    /// A proxy left an exception pending (revoked, a trap that threw, or a violated invariant);
+    /// the bits are the value to propagate unchanged.
+    Thrown(u64),
+}
+
 /// Re-parents `target`, or says why it may not be.
 ///
 /// Shared by `Object.setPrototypeOf`, `Reflect.setPrototypeOf` and the `__proto__` setter,
@@ -13718,7 +13735,7 @@ extern "C" fn object_get_prototype(
 ///
 /// `Ok(false)` means the request was not a change worth making — `proto` was neither an object
 /// nor `null`, which the specification ignores rather than faults.
-fn set_prototype_of(handle: GcRef, proto: u64) -> Result<bool, &'static str> {
+fn set_prototype_of(handle: GcRef, proto: u64) -> Result<bool, SetPrototypeError> {
     let held = Value::from_bits(proto);
     let parent = if held.is_null() {
         None
@@ -13728,6 +13745,24 @@ fn set_prototype_of(handle: GcRef, proto: u64) -> Result<bool, &'static str> {
         return Ok(false);
     };
 
+    // **A proxy re-parents through its handler, not its slots.** The type guard above runs first
+    // on purpose: `Object.setPrototypeOf`'s and the `__proto__` setter's rejection of a
+    // non-object, non-null prototype precedes `[[SetPrototypeOf]]`, so a trap never sees one.
+    let target_value = handle.to_value().to_bits();
+    if let Some((behind, handler)) = proxy_parts(target_value) {
+        let reported = proxy_set_prototype(behind, handler, proto);
+        if Value::from_bits(reported).is_exception() {
+            return Err(SetPrototypeError::Thrown(reported));
+        }
+        return if is_truthy(Value::from_bits(reported)) {
+            Ok(true)
+        } else {
+            Err(SetPrototypeError::Refused(
+                "a proxy setPrototypeOf trap refused the write",
+            ))
+        };
+    }
+
     let current = with_runtime(|runtime| runtime.heap.prototype_of(handle));
     if current == parent {
         // Setting the prototype it already has is not a change, so neither refusal applies —
@@ -13736,8 +13771,10 @@ fn set_prototype_of(handle: GcRef, proto: u64) -> Result<bool, &'static str> {
     }
     // Asked outside the borrow below: extensibility is a hidden *property*, so reading it is
     // a property load, and a property load enters the runtime itself.
-    if !is_extensible(handle.to_value().to_bits()) {
-        return Err("cannot change the prototype of a non-extensible object");
+    if !is_extensible(target_value) {
+        return Err(SetPrototypeError::Refused(
+            "cannot change the prototype of a non-extensible object",
+        ));
     }
 
     with_runtime(|runtime| {
@@ -13745,7 +13782,7 @@ fn set_prototype_of(handle: GcRef, proto: u64) -> Result<bool, &'static str> {
         for _ in 0..PROTOTYPE_CHAIN_LIMIT {
             let Some(step) = walk else { break };
             if step == handle {
-                return Err("cyclic prototype chain");
+                return Err(SetPrototypeError::Refused("cyclic prototype chain"));
             }
             walk = runtime.heap.prototype_of(step);
         }
@@ -13790,7 +13827,8 @@ extern "C" fn object_set_prototype(
     };
     match set_prototype_of(handle, proto) {
         Ok(_) => target,
-        Err(message) => raise(message, "TypeError"),
+        Err(SetPrototypeError::Refused(message)) => raise(message, "TypeError"),
+        Err(SetPrototypeError::Thrown(bits)) => bits,
     }
 }
 
@@ -16844,7 +16882,8 @@ pub unsafe extern "C" fn crisol_property_store(
         Write::Prototype => {
             return match set_prototype_of(handle, value) {
                 Ok(_) => Value::UNDEFINED.to_bits(),
-                Err(message) => raise(message, "TypeError"),
+                Err(SetPrototypeError::Refused(message)) => raise(message, "TypeError"),
+                Err(SetPrototypeError::Thrown(bits)) => bits,
             };
         }
         Write::Store => {}
@@ -21096,6 +21135,60 @@ fn proxy_prevent_extensions(target: u64, handler: u64) -> u64 {
             );
         }
         boolean(claimed).to_bits()
+    })
+}
+
+/// The `setPrototypeOf` trap, or the target's own re-parenting.
+///
+/// **A frozen target's prototype cannot move** — the mirror of `getPrototypeOf` (D-338). There
+/// the trap must *report* the real prototype of a non-extensible target; here a trap that
+/// *claims* to have set one must have set the one the target already has, because a non-extensible
+/// object's prototype is exactly the thing that can no longer change. Returns boolean bits (the
+/// trap's status, checked), or exception bits when the proxy is revoked, the trap throws, or the
+/// invariant is violated.
+fn proxy_set_prototype(target: u64, handler: u64, proto: u64) -> u64 {
+    let proxy = proxy_of(target, handler);
+    if proxy.is_revoked() {
+        return raise(
+            &crisol_builtins::ProxyError::Revoked.to_string(),
+            "TypeError",
+        );
+    }
+    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::SetPrototypeOf) else {
+        // No trap: re-parent the target itself (which may be another proxy), reporting whether
+        // it accepted. A refusal is a `false` status, not a throw — the caller decides.
+        let Some(behind) = handle_of(target) else {
+            return Value::TRUE.to_bits();
+        };
+        return match set_prototype_of(behind, proto) {
+            Ok(status) => boolean(status).to_bits(),
+            Err(SetPrototypeError::Refused(_)) => Value::FALSE.to_bits(),
+            Err(SetPrototypeError::Thrown(bits)) => bits,
+        };
+    };
+    with_rooted(&[target, handler, trap, proto], || {
+        let reported = call_value(trap, handler, &[target, proto]);
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        if !is_truthy(Value::from_bits(reported)) {
+            return Value::FALSE.to_bits();
+        }
+        // A truthy answer must be true of a non-extensible target: its prototype is fixed, so the
+        // one the trap claims to have installed has to be the one the target already has.
+        if !is_extensible(target) {
+            let arguments = [target];
+            let actual = with_rooted(&[target, handler, trap, proto], || {
+                object_get_prototype(0, 0, 0, 1, arguments.as_ptr())
+            });
+            if proto != actual {
+                return raise(
+                    "a setPrototypeOf trap cannot change the prototype of a non-extensible target",
+                    "TypeError",
+                );
+            }
+        }
+        Value::TRUE.to_bits()
     })
 }
 
