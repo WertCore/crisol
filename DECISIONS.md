@@ -8819,3 +8819,22 @@ a function, so `JSON.stringify(x, fn)` takes the function path and `JSON.stringi
 never both. With this the `JSON` callbacks are complete: parse reviver (D-333), stringify array replacer
 (D-335), `toJSON` (D-336), and function replacer. **Still not done:** the `space` argument as a string pad
 (it is a numeric indent only).
+
+## D-338
+
+**A proxy cannot lie about a non-extensible target's prototype or its extensibility.**
+
+Status: Accepted
+
+Crisol already enforced the proxy invariants whose check it had wired through `crisol_builtins`'s
+`checked_*` helpers — `get`, `set`, `has`, `deleteProperty`, `isExtensible` — but two traps returned their
+answer unchecked: `getPrototypeOf` and `preventExtensions`. `getPrototypeOf` now rejects a non-object,
+non-null answer, and, when the target is not extensible, requires the answer to be the target's actual
+prototype (`SameValue`, which for objects and null is identity) — because code uses `getPrototypeOf` to
+reason about a shape that can no longer change, and a lie there is unsound everywhere. `preventExtensions`
+now throws when the trap claims success while `IsExtensible(target)` is still true, so a sealed-looking view
+cannot sit over an object that can still grow. Both are abi-only, inline checks using the `is_extensible`
+and `object_get_prototype` the no-trap paths already call. **Deliberately split off:** the *property*-trap
+invariants — `ownKeys`, `getOwnPropertyDescriptor`, `defineProperty` — whose checks need either an error
+channel threaded through handlers that currently return `Option`/`u64` without one, or a descriptor-object
+→ `Property` parse (D-339); and `setPrototypeOf`, whose trap crisol does not invoke at all yet.

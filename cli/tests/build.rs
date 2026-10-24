@@ -191,6 +191,37 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **A proxy cannot lie about a frozen shape** (D-338) — `getPrototypeOf` on a non-extensible target must
+/// report its real prototype (and any answer must be an object or null), and `preventExtensions` cannot
+/// claim success while the target stays extensible.
+#[test]
+fn a_proxy_cannot_lie_about_a_frozen_shape() {
+    check(
+        "proxy-getproto-nonext-lies",
+        "var o = Object.preventExtensions({}); \
+         var p = new Proxy(o, {getPrototypeOf: function () { return Array.prototype; }}); \
+         try { Object.getPrototypeOf(p); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // Any prototype is fine on an extensible target; a non-object answer is always a TypeError.
+    check(
+        "proxy-getproto-ok-and-badtype",
+        "var ext = new Proxy({}, {getPrototypeOf: function () { return Array.prototype; }}); \
+         var okExt = Object.getPrototypeOf(ext) === Array.prototype; \
+         var threw = false; \
+         try { Object.getPrototypeOf(new Proxy({}, {getPrototypeOf: function () { return 5; }})); } \
+         catch (e) { threw = e instanceof TypeError; } \
+         return okExt + '/' + threw;",
+        "true/true",
+    );
+    check(
+        "proxy-preventext-lies",
+        "var p = new Proxy({}, {preventExtensions: function () { return true; }}); \
+         try { Object.preventExtensions(p); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

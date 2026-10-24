@@ -20963,7 +20963,32 @@ fn proxy_prototype(target: u64, handler: u64) -> u64 {
         });
     };
     with_rooted(&[target, handler, trap], || {
-        call_value(trap, handler, &[target])
+        let reported = call_value(trap, handler, &[target]);
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        let kind = Value::from_bits(reported).kind();
+        if kind != crisol_value::Kind::Object && kind != crisol_value::Kind::Null {
+            return raise(
+                "a getPrototypeOf trap must answer an object or null",
+                "TypeError",
+            );
+        }
+        // **A non-extensible target's prototype is fixed** (D-338): the trap must report the real one,
+        // since code uses `getPrototypeOf` to reason about a shape that can no longer change.
+        if !is_extensible(target) {
+            let arguments = [target];
+            let actual = with_rooted(&[target, handler, trap, reported], || {
+                object_get_prototype(0, 0, 0, 1, arguments.as_ptr())
+            });
+            if reported != actual {
+                return raise(
+                    "a getPrototypeOf trap on a non-extensible target must report its real prototype",
+                    "TypeError",
+                );
+            }
+        }
+        reported
     })
 }
 
@@ -21013,7 +21038,16 @@ fn proxy_prevent_extensions(target: u64, handler: u64) -> u64 {
         if Value::from_bits(reported).is_exception() {
             return reported;
         }
-        boolean(is_truthy(Value::from_bits(reported))).to_bits()
+        let claimed = is_truthy(Value::from_bits(reported));
+        // **A `true` answer must be true of the target** (D-338): reporting success while the target is
+        // still extensible would let a sealed-looking view sit over an object that can still grow.
+        if claimed && is_extensible(target) {
+            return raise(
+                "a preventExtensions trap cannot report success while the target stays extensible",
+                "TypeError",
+            );
+        }
+        boolean(claimed).to_bits()
     })
 }
 
