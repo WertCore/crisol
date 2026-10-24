@@ -191,6 +191,36 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **A proxy's `getOwnPropertyDescriptor` answer must agree with its target** (D-339): it cannot report a
+/// non-configurable property as absent, invent a property on a non-extensible target, or mark a descriptor
+/// non-configurable that the target does not back. Hiding an ordinary (configurable) property is allowed.
+#[test]
+fn a_proxy_descriptor_matches_its_target() {
+    check(
+        "proxy-gopd-hide",
+        "function fixed() { var o = {}; Object.defineProperty(o, 'x', {value: 1, configurable: false}); return o; } \
+         var hid = false; \
+         try { Object.getOwnPropertyDescriptor(new Proxy(fixed(), {getOwnPropertyDescriptor: function () { return undefined; }}), 'x'); } \
+         catch (e) { hid = e instanceof TypeError; } \
+         var ok = Object.getOwnPropertyDescriptor(new Proxy({a: 1}, {getOwnPropertyDescriptor: function () { return undefined; }}), 'a'); \
+         return hid + '/' + (ok === undefined);",
+        "true/true",
+    );
+    check(
+        "proxy-gopd-fake-on-nonext",
+        "var o = Object.preventExtensions({}); \
+         try { Object.getOwnPropertyDescriptor(new Proxy(o, {getOwnPropertyDescriptor: function () { return {value: 1, configurable: true}; }}), 'z'); return 'no-throw'; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "proxy-gopd-fake-nonconf",
+        "try { Object.getOwnPropertyDescriptor(new Proxy({a: 1}, {getOwnPropertyDescriptor: function () { return {value: 1, configurable: false}; }}), 'a'); return 'no-throw'; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **A proxy cannot lie about a frozen shape** (D-338) — `getPrototypeOf` on a non-extensible target must
 /// report its real prototype (and any answer must be an object or null), and `preventExtensions` cannot
 /// claim success while the target stays extensible.

@@ -8838,3 +8838,23 @@ and `object_get_prototype` the no-trap paths already call. **Deliberately split 
 invariants — `ownKeys`, `getOwnPropertyDescriptor`, `defineProperty` — whose checks need either an error
 channel threaded through handlers that currently return `Option`/`u64` without one, or a descriptor-object
 → `Property` parse (D-339); and `setPrototypeOf`, whose trap crisol does not invoke at all yet.
+
+## D-339
+
+**A proxy's `getOwnPropertyDescriptor` answer must agree with its target.**
+
+Status: Accepted
+
+`proxy_descriptor` returned the trap's answer unchecked. It now holds it to the target. The answer must be
+an object or `undefined`; then it is compared against the target's own descriptor (read with the same
+`object_own_descriptor` the no-trap path uses): a trap that answers `undefined` cannot hide a target
+property that is non-configurable; a trap that answers a descriptor cannot invent a property the target
+lacks when the target is non-extensible, nor mark a descriptor non-configurable unless the target backs it
+with a non-configurable property of its own. These are the common clauses of `[[GetOwnProperty]]`'s
+invariant — enforced inline (abi-only, no new plumbing), using the `is_extensible` and the descriptor's
+`configurable` flag. Hiding an ordinary (configurable) property is still allowed, as it must be.
+**Not covered:** the full `IsCompatiblePropertyDescriptor` reconciliation (writable/value agreement between
+the reported and target descriptors), which would want the descriptor-object → `Property` parse D-338
+flagged. **Still open for the property traps:** `ownKeys` (its check, `checked_own_keys`, is ready, but the
+`own_keys` helper that would carry the throw is called in many places with no error channel) and
+`defineProperty` (needs `IsCompatiblePropertyDescriptor` built from scratch).

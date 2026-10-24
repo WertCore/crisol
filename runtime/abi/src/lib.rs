@@ -20910,7 +20910,55 @@ fn proxy_descriptor(target: u64, handler: u64, key: u64) -> u64 {
         });
     };
     with_rooted(&[target, handler, trap, key], || {
-        call_value(trap, handler, &[target, key])
+        let reported = call_value(trap, handler, &[target, key]);
+        if Value::from_bits(reported).is_exception() {
+            return reported;
+        }
+        let reported_kind = Value::from_bits(reported).kind();
+        if reported_kind != crisol_value::Kind::Object
+            && reported_kind != crisol_value::Kind::Undefined
+        {
+            return raise(
+                "a getOwnPropertyDescriptor trap must answer an object or undefined",
+                "TypeError",
+            );
+        }
+        // The target's own descriptor, to check the trap's answer against (D-339).
+        let arguments = [target, key];
+        let target_desc = with_rooted(&[target, handler, trap, key, reported], || {
+            object_own_descriptor(0, 0, 0, 2, arguments.as_ptr())
+        });
+        let target_has = Value::from_bits(target_desc).kind() == crisol_value::Kind::Object;
+        let target_configurable =
+            target_has && is_truthy(Value::from_bits(property_of(target_desc, "configurable")));
+        if reported_kind == crisol_value::Kind::Undefined {
+            // **A property that cannot be removed cannot be reported absent**, and nothing can be
+            // dropped from a non-extensible target either.
+            if target_has && !target_configurable {
+                return raise(
+                    "a getOwnPropertyDescriptor trap cannot report a non-configurable property as absent",
+                    "TypeError",
+                );
+            }
+            return reported;
+        }
+        // The trap reported a descriptor. A non-extensible target gains nothing, and a descriptor the
+        // trap marks non-configurable must answer to a target property that is itself non-configurable.
+        let reported_configurable =
+            is_truthy(Value::from_bits(property_of(reported, "configurable")));
+        if !target_has && !is_extensible(target) {
+            return raise(
+                "a getOwnPropertyDescriptor trap cannot report a new property on a non-extensible target",
+                "TypeError",
+            );
+        }
+        if !reported_configurable && (!target_has || target_configurable) {
+            return raise(
+                "a getOwnPropertyDescriptor trap cannot report a non-configurable descriptor the target does not back",
+                "TypeError",
+            );
+        }
+        reported
     })
 }
 
