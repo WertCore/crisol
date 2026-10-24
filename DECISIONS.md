@@ -8620,3 +8620,36 @@ whose `lastIndex` is a plain number; only the throwing-getter case changes. Conf
 GC stress (an ordinary search, and a `lastIndex` getter that throws, which now propagates). **Still not
 done:** `Symbol.replace`/`Symbol.matchAll` error propagation, which runs through the larger
 `replace_using_pattern` and species machinery — a separate focused pass.
+
+## D-329
+
+**An array length past the dense limit is recorded, not materialised.**
+
+Status: Accepted
+
+An array's length *is* its dense element count (`heap.element_count`), so there was no way to have a length
+larger than what the array held: `a.length = 4294967295` ran `set_element(4294967294, EMPTY)` and tried to
+allocate four billion holes. That is a crash, not a `RangeError` a test could catch, and it took out the
+whole class of tests that set a near-`2^32` length and read it back (`push/S15.4.4.7_A3`,
+`Object/defineProperties/15.2.3.7-6-a-150`). The real fix — a logical length in the GC cell — is a change
+to the collector's object model and far too broad; so this records the length **beside** the array instead,
+as a hidden `__sparseLength` ([`SPARSE_LENGTH`]) set only when the length exceeds `DENSE_ELEMENT_LIMIT`, and
+makes `indexed_length` and the `length` *getter* report the larger of the dense count and that record. One
+`resize_array` helper now backs both length-set paths (the `a.length = n` assignment and the
+`Object.defineProperty` length): materialise when small, record when huge, and forget the record when a
+later length falls back within the dense part. `push` gained the `RangeError` its final length write owes
+when the new length would pass `2^32 - 1` (the pushed element is written first, so it survives the throw).
+`indexed_set_length` maintains the record so a push whose high index landed in a slot still reports the
+right length.
+
+Chosen over: **(a)** a logical-length field in the GC cell — correct and general, but a rewrite of the heap
+object model with GC and shape-sharing fallout, unjustified for a handful of huge-length tests; **(b)**
+storing `length` as an ordinary property — the "two lengths at once" bug the array code already carries a
+warning about, where the stored length and the element count disagree and each reader consults whichever it
+happens to. This keeps `indexed_length` the single authority (the record only ever *raises* the answer above
+the dense count, never lowers it), and an ordinary array never carries the record, so its shape and the
+existing 462 acceptance cases are untouched. **Deviations:** a method that iterates the dense part
+(`map`, `forEach`) sees only what is materialised, not the logical length — correct is impossible anyway, as
+a `2^32`-length array cannot be walked; shrinking a recorded length does not delete the high *slots* it ran
+past (they were already named-property stores, not elements); and the array-like `reduceRight`-over-`2^53`
+case is untouched (it is the separate non-array `indexed_length` clamp, left for its own pass).

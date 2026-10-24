@@ -191,6 +191,50 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **A length past the dense limit is recorded, not materialised** (D-329). `a.length = 4294967295`
+/// used to try to allocate four billion holes — a crash, not an error — so the whole class of tests that
+/// set a huge length and read it back aborted the process. The length is now kept as a hidden record and
+/// the dense part holds only what was written; an ordinary array is untouched by any of it.
+#[test]
+fn a_huge_array_length_is_recorded_not_materialised() {
+    // `x.length = 2^32-1` reads back, `push()` answers it, and `push("x")` is the `RangeError` the
+    // final length write raises — after the element it wrote survives (test262 `push/S15.4.4.7_A3`).
+    check(
+        "huge-length-push",
+        "var x = []; x.length = 4294967295; \
+         var first = x.push(); \
+         var ranged = false; \
+         try { x.push('x'); } catch (e) { ranged = e instanceof RangeError; } \
+         return first + '/' + ranged + '/' + x[4294967295] + '/' + x.length;",
+        "4294967295/true/x/4294967295",
+    );
+    // `Object.defineProperty(a, 'length', {value: 2^32-2})` records the length too (`15.2.3.7-6-a-150`).
+    check(
+        "huge-length-defineproperty",
+        "var a = []; Object.defineProperty(a, 'length', {value: 4294967294}); return a.length;",
+        "4294967294",
+    );
+    // An ordinary array is unchanged: grows with holes, shrinks, clears, pushes, pops.
+    check(
+        "ordinary-array-length-unchanged",
+        "var a = [1]; a.length = 4; \
+         var grown = a.length + '/' + (a[3] === undefined) + '/' + a.hasOwnProperty(3); \
+         var b = [1, 2]; b.push(3, 4); var moved = b.join(',') + '/' + b.pop() + '/' + b.length; \
+         var c = [1, 2, 3]; c.length = 0; \
+         return grown + '|' + moved + '|' + c.length + ',' + c.join(',');",
+        "4/true/false|1,2,3,4/4/3|0,",
+    );
+    // A recorded length survives a high-index write and collapses back when shrunk into the dense part.
+    check(
+        "sparse-index-then-shrink",
+        "var a = [9]; a.length = 5000000; a[4999999] = 'z'; \
+         var big = a.length + '/' + a[4999999] + '/' + a[0]; \
+         a.length = 2; \
+         return big + '|' + a.length + '/' + a.join(',');",
+        "5000000/z/9|2/9,",
+    );
+}
+
 /// **`RegExp.prototype[Symbol.search]` propagates a throwing `lastIndex`** (D-328) — it saves and
 /// restores `lastIndex` around the search, and a getter that throws during that read is the answer
 /// rather than being swallowed to zero. An ordinary search is unchanged.

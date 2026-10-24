@@ -6839,6 +6839,15 @@ const ASYNC_GEN_RESUME_CALL: usize = 17;
 /// its attributes — the flag has to live beside it.
 const FIXED_LENGTH: &str = "__fixedLength";
 
+/// The logical `length` of an array whose length runs past what it holds densely (D-329).
+///
+/// An array's length is normally its dense element count, but `a.length = 4294967295` would ask for
+/// four billion holes — a crash, not an allocation. Past `DENSE_ELEMENT_LIMIT` the length is recorded
+/// here instead, and [`indexed_length`] reports the larger of this and the dense count, so the array
+/// claims the right length while holding only what was actually written (high indices land in slots).
+/// Set only when the length exceeds the dense part, so an ordinary array never carries it.
+const SPARSE_LENGTH: &str = "__sparseLength";
+
 /// The longest string this engine will build.
 ///
 /// **Every engine has one**; the difference is whether it says so before or after trying. A
@@ -12737,13 +12746,10 @@ extern "C" fn object_define_property(
                     reason = "range-checked immediately above"
                 )]
                 let wanted = wanted as usize;
-                if wanted < count {
-                    blocked = truncate_respecting_rules(target, handle, count, wanted) != wanted;
-                } else if wanted > count {
-                    with_runtime(|runtime| {
-                        runtime.heap.set_element(handle, wanted - 1, Value::EMPTY)
-                    });
-                }
+                // Grows with holes, shrinks respecting non-configurable elements, or records a length
+                // past the dense limit rather than materialising it (D-329). A shrink a non-configurable
+                // element stopped above `wanted` is a failed `[[DefineOwnProperty]]`, surfaced below.
+                blocked = resize_array(target, handle, count, wanted) != wanted;
             }
             // `writable: false` on a length is remembered separately, because there is no slot
             // to hang an attribute on — the length is derived, so its permissions must be too.
@@ -16706,17 +16712,11 @@ pub unsafe extern "C" fn crisol_property_store(
                 reason = "checked finite and non-negative just above"
             )]
             let wanted = wanted as usize;
-            if wanted < count {
-                // A non-configurable element stops the shrink partway; an ordinary assignment
-                // takes whatever length that leaves without complaint (`ArraySetLength` returns
-                // false, which a non-strict `[[Set]]` swallows).
-                truncate_respecting_rules(object, handle, count, wanted);
-            } else if wanted > count {
-                // Growing fills with `undefined`, which is not what the specification
-                // says — those should be holes (D-64) — and is the same approximation
-                // array literals already make.
-                with_runtime(|runtime| runtime.heap.set_element(handle, wanted - 1, Value::EMPTY));
-            }
+            // Grows with holes (D-64), shrinks respecting non-configurable elements, or — past the
+            // dense limit — records the length rather than materialising it (D-329). A non-configurable
+            // element stopping the shrink partway leaves whatever length that reached, which a
+            // non-strict `[[Set]]` swallows without complaint.
+            resize_array(object, handle, count, wanted);
         }
         return Value::UNDEFINED.to_bits();
     }
@@ -16957,11 +16957,30 @@ pub unsafe extern "C" fn crisol_property_load(object: u64, key: *const u8, lengt
         if name == "length"
             && let Some(count) = runtime.heap.element_count(handle)
         {
+            // Honour a length recorded past the dense part (D-329): the dense count undercounts an
+            // array whose length runs beyond what it holds. Read inline from the shape, because
+            // `own_property`/`indexed_length` would re-enter `with_runtime` from inside this closure.
+            let recorded = runtime
+                .heap
+                .shape_of(handle)
+                .and_then(|shape| {
+                    runtime
+                        .shapes
+                        .borrow()
+                        .lookup(shape, &PropertyKey::new(SPARSE_LENGTH))
+                })
+                .filter(|slot| !runtime.heap.is_deleted(handle, slot.index()))
+                .and_then(|slot| runtime.heap.get(handle, slot.index()))
+                .and_then(|value| value.as_number());
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "an array this long cannot be allocated"
             )]
-            let length = count as f64;
+            let dense = count as f64;
+            let length = match recorded {
+                Some(recorded) if recorded > dense => recorded,
+                _ => dense,
+            };
             return Found::Value(Value::number(length).to_bits());
         }
         // **An index names an element, even spelled as text.** `a["0"]` and `a[0]` are the
@@ -17737,6 +17756,20 @@ fn relative_index(value: u64, length: usize, fallback: usize) -> Result<usize, u
 /// question.
 fn indexed_length(value: u64) -> Result<usize, u64> {
     if let Some((_, length)) = elements_of(value) {
+        // A length recorded past the dense part (D-329) wins when it is the larger — the one place the
+        // dense count and a `SPARSE_LENGTH` record are reconciled, so the array reports a single length.
+        // An ordinary array carries no record and reads its dense count, exactly as before.
+        if let Some((_, logical)) = own_property(value, SPARSE_LENGTH)
+            && let Some(logical) = logical.as_number()
+            && logical > wanted_as_f64(length)
+        {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a recorded array length, no greater than u32::MAX"
+            )]
+            return Ok(logical as usize);
+        }
         return Ok(length);
     }
     let key = "length".to_owned();
@@ -18144,8 +18177,66 @@ fn truncate_respecting_rules(object: u64, handle: GcRef, count: usize, wanted: u
     floor
 }
 
+/// Forgets a recorded [`SPARSE_LENGTH`], but only if one is present — so an ordinary array (which never
+/// carries it) keeps its shape untouched. "Forgotten" is a stored zero, which [`indexed_length`] never
+/// prefers over the real dense count (it takes the larger), rather than a slot deletion.
+fn clear_sparse_length(object: u64) {
+    if own_property(object, SPARSE_LENGTH).is_some()
+        && let Some(handle) = handle_of(object)
+    {
+        with_runtime(|runtime| runtime.define_hidden(handle, SPARSE_LENGTH, Value::number(0.0)));
+    }
+}
+
+/// Resizes an array to `wanted` (already range-checked to `0..=u32::MAX`), returning the length actually
+/// reached — a shrink can stop above `wanted` on a non-configurable element. Past `DENSE_ELEMENT_LIMIT`
+/// the length is recorded as [`SPARSE_LENGTH`] rather than materialised, so `a.length = 4294967295` is
+/// an O(1) record and not an attempt to allocate four billion holes (D-329). `count` is the current
+/// dense element count.
+fn resize_array(object: u64, handle: GcRef, count: usize, wanted: usize) -> usize {
+    if wanted > DENSE_ELEMENT_LIMIT {
+        // Too large to hold densely: record the logical length and leave the dense part as it is. A
+        // shrink from one huge length to another smaller-but-still-huge one lands here too, and only
+        // the record changes — the high elements that exist are slots, pruned by their own writes.
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, SPARSE_LENGTH, Value::number(wanted_as_f64(wanted)));
+        });
+        return wanted;
+    }
+    // Materialisable: forget any recorded logical length, then grow with holes or shrink the dense part.
+    clear_sparse_length(object);
+    if wanted < count {
+        truncate_respecting_rules(object, handle, count, wanted)
+    } else {
+        if wanted > count {
+            with_runtime(|runtime| runtime.heap.set_element(handle, wanted - 1, Value::EMPTY));
+        }
+        wanted
+    }
+}
+
+/// A dense-array length as `f64`, exact for every value a length can take (`<= 2^32 - 1`).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a length is at most u32::MAX, exact in f64"
+)]
+fn wanted_as_f64(length: usize) -> f64 {
+    length as f64
+}
+
 fn indexed_set_length(value: u64, length: usize) {
-    if elements_of(value).is_some() {
+    if let Some((handle, physical)) = elements_of(value) {
+        // For a dense array the length *is* the element count, so an ordinary write is already done by
+        // the element change itself. The exceptions are the length running past the dense part — a push
+        // whose high index landed in a slot, not the vector — which is recorded (D-329); and a length
+        // falling back within the dense part, which forgets a record it may have carried.
+        if length > physical {
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, SPARSE_LENGTH, Value::number(wanted_as_f64(length)));
+            });
+        } else {
+            clear_sparse_length(value);
+        }
         return;
     }
     let key = "length";
@@ -18475,6 +18566,12 @@ extern "C" fn array_push(
             let value = unsafe { argument(argc, argv, position) };
             indexed_set(this_value, at, value);
             at += 1;
+        }
+        // **A new length past 2^32-1 is a `RangeError`** — the final `Set(O, "length", …)` the
+        // specification does, which `ArraySetLength` rejects (D-329). The elements were written first
+        // (above), so they survive the throw, which is the order a program can observe.
+        if at > u32::MAX as usize {
+            return raise("invalid array length", "RangeError");
         }
         // **Written back even when nothing was pushed**, which is what `push()` on a frozen
         // array-like throws on and what the specification's step order requires.
