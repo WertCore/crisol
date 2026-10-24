@@ -191,6 +191,33 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`JSON.stringify` serializes what `toJSON` returns** (D-336), for this key — so a `Date` becomes its
+/// ISO string, not `{}`. A custom `toJSON` receives the property key and may return a fresh structure
+/// (rooted across the walk); a throwing one propagates.
+#[test]
+fn json_stringify_honors_tojson() {
+    check(
+        "json-tojson-date",
+        "return JSON.stringify(new Date(0));",
+        "\"1970-01-01T00:00:00.000Z\"",
+    );
+    check(
+        "json-tojson-custom",
+        "return JSON.stringify({ \
+             a: {toJSON: function () { return 'X'; }}, \
+             b: {toJSON: function (k) { return k; }}, \
+             c: {toJSON: function () { return [1, 2]; }} \
+         });",
+        "{\"a\":\"X\",\"b\":\"b\",\"c\":[1,2]}",
+    );
+    check(
+        "json-tojson-throws",
+        "try { JSON.stringify({toJSON: function () { throw new TypeError('no'); }}); return 'no-throw'; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **`JSON.stringify` applies an array replacer as a key allowlist** (D-335) — the listed names, in their
 /// order, restrict every object in the structure; array elements are not dropped. A non-array replacer
 /// (a function) still leaves every key.

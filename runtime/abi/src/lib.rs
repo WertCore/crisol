@@ -24434,11 +24434,34 @@ fn json_allowlist(replacer: u64) -> Option<Vec<String>> {
     Some(names)
 }
 
+/// `JSON.stringify`'s `toJSON` step (D-336): if `value` is an object with a callable `toJSON`, the thing
+/// serialized is what `value.toJSON(key)` returns, not the object itself — which is how
+/// `JSON.stringify(new Date())` is the ISO string and not `{}`. A throwing `toJSON` propagates. `value`,
+/// `method`, and `key` are rooted across the call, which runs user code and allocates.
+fn apply_tojson(value: u64, key: u64) -> Result<u64, u64> {
+    if Value::from_bits(value).kind() != crisol_value::Kind::Object {
+        return Ok(value);
+    }
+    let method = property_of(value, "toJSON");
+    if !is_callable(method) {
+        return Ok(value);
+    }
+    let result = with_rooted(&[value, method, key], || call_value(method, value, &[key]));
+    if Value::from_bits(result).is_exception() {
+        return Err(result);
+    }
+    Ok(result)
+}
+
 fn to_json(
     value: u64,
+    key: u64,
     visiting: &mut Vec<GcRef>,
     allowlist: Option<&[String]>,
-) -> Result<Option<crisol_builtins::Json>, ()> {
+) -> Result<Option<crisol_builtins::Json>, u64> {
+    // **`toJSON` is asked first** (D-336): an object defining a callable `toJSON` serializes what that
+    // returns for this key, not its own shape. A throwing one propagates.
+    let value = apply_tojson(value, key)?;
     let held = Value::from_bits(value);
     match held.kind() {
         crisol_value::Kind::Undefined => return Ok(None),
@@ -24468,19 +24491,31 @@ fn to_json(
     };
     if visiting.contains(&handle) {
         // A cycle. `Err` rather than a truncated document, because a document that silently
-        // stops describing the value is worse than no document.
-        return Err(());
+        // stops describing the value is worse than no document; the error channel now carries the
+        // exception itself (D-336), so the `TypeError` is raised here rather than at the top.
+        return Err(raise(
+            "cannot stringify a structure that contains itself",
+            "TypeError",
+        ));
     }
     if is_callable(value) {
         return Ok(None);
     }
     visiting.push(handle);
+    // `value` may be a fresh object a `toJSON` just returned — outside the rooted input graph — and each
+    // child allocates a key string, so it is rooted across every allocating step below (D-336). Between
+    // those steps nothing allocates, so a plain local holds it safely.
     let converted = if let Some((array, length)) = elements_of(value) {
         let mut items = Vec::with_capacity(length);
         for index in 0..length {
+            let child = element_at(array, index);
+            // The element's key is its index as a string — what `toJSON` and a replacer are handed.
+            let child_key = with_rooted(&[value], || new_string(&index.to_string()));
             // An element with no JSON spelling becomes `null`: an array cannot drop one
             // without changing its length.
-            let item = to_json(element_at(array, index), visiting, allowlist)?;
+            let item = with_rooted(&[value, child_key], || {
+                to_json(child, child_key, visiting, allowlist)
+            })?;
             items.push(item.unwrap_or(crisol_builtins::Json::Null));
         }
         crisol_builtins::Json::Array(items)
@@ -24494,12 +24529,16 @@ fn to_json(
             None => enumerable_keys(value),
         };
         for name in names {
-            let key = name.clone();
-            // SAFETY: `key` is a live Rust string.
-            let held = unsafe { crisol_property_load(value, key.as_ptr(), key.len() as u64) };
+            let child_key = with_rooted(&[value], || new_string(&name));
+            let held = with_rooted(&[value, child_key], || {
+                // SAFETY: `name` is a live Rust string.
+                unsafe { crisol_property_load(value, name.as_ptr(), name.len() as u64) }
+            });
             // A property with no JSON spelling is dropped, which is what makes
             // `{a: undefined}` stringify as `{}`.
-            if let Some(item) = to_json(held, visiting, allowlist)? {
+            if let Some(item) = with_rooted(&[value, child_key, held], || {
+                to_json(held, child_key, visiting, allowlist)
+            })? {
                 entries.push((name, item));
             }
         }
@@ -24645,15 +24684,20 @@ extern "C" fn json_stringify(
     let indent = space.clamp(0.0, 10.0) as usize;
 
     let mut visiting = Vec::new();
-    match to_json(value, &mut visiting, allowlist.as_deref()) {
+    // The top value is serialized as if held under the key `""` (D-336) — the holder the specification
+    // wraps it in, and the key a top-level `toJSON` or replacer is handed. `value` and that key are rooted
+    // across the walk, which runs `toJSON` user code and allocates.
+    let empty = with_rooted(&[value], || new_string(""));
+    let result = with_rooted(&[value, empty], || {
+        to_json(value, empty, &mut visiting, allowlist.as_deref())
+    });
+    match result {
         // **`undefined` for a value JSON cannot spell**, which is what
         // `JSON.stringify(undefined)` answers — not the string `"undefined"`.
         Ok(None) => Value::UNDEFINED.to_bits(),
         Ok(Some(json)) => new_string(&crisol_builtins::stringify(&json, indent)),
-        Err(()) => raise(
-            "cannot stringify a structure that contains itself",
-            "TypeError",
-        ),
+        // A thrown `toJSON`, or the cycle `TypeError`: the error channel now carries the exception.
+        Err(thrown) => thrown,
     }
 }
 

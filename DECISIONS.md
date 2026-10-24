@@ -8780,3 +8780,23 @@ so it carries none of the function-replacer's rooting weight. **Not done:** a *f
 would have to call back per property with the holder and key (the serialization mirror of the D-333 reviver,
 needing `to_json` to thread a holder/key and an exception channel) — `json_allowlist` returns `None` for it,
 leaving every key to serialize, so a function replacer is inert rather than wrong.
+
+## D-336
+
+**`JSON.stringify` serializes what `toJSON` returns.**
+
+Status: Accepted
+
+`to_json` serialized every object by its own shape, so a value with a `toJSON` method — `Date` chief among
+them — was ignored, and `JSON.stringify(new Date())` was `"{}"` rather than the ISO string. `to_json` now
+takes the property key and, as its first step (`apply_tojson`), replaces an object that has a callable
+`toJSON` with `toJSON(key)`'s result before dispatching on it; a `Date`'s returns its ISO string, a custom
+one may return anything, and a throwing one propagates. Three changes made that fit: the key is threaded
+into the recursion (an array element's is its index as a string, an object property's is its name, the top
+value's is `""` — the holder the specification wraps it in); the error channel became `Result<…, u64>` so a
+thrown `toJSON` — and the cycle `TypeError`, now raised at its site — travels out as the exception rather
+than a bare marker; and because a `toJSON` can return a **fresh** object outside the rooted input graph, the
+value is rooted across each child's key-string allocation and recursion (the GC-stress run confirmed a
+`toJSON` returning `[1, 2]` survives). **Not done:** a *function* replacer, the one remaining `JSON`
+callback, which needs the same per-property call threaded with the holder (`json_allowlist` still returns
+`None` for it, so it stays inert); and the `space` argument is still a number only, not a string pad.
