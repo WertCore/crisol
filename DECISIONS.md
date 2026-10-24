@@ -8800,3 +8800,22 @@ value is rooted across each child's key-string allocation and recursion (the GC-
 `toJSON` returning `[1, 2]` survives). **Not done:** a *function* replacer, the one remaining `JSON`
 callback, which needs the same per-property call threaded with the holder (`json_allowlist` still returns
 `None` for it, so it stays inert); and the `space` argument is still a number only, not a string pad.
+
+## D-337
+
+**`JSON.stringify` applies a function replacer.**
+
+Status: Accepted
+
+The last of the `JSON` callbacks. Building on D-336's restructured `to_json` — which already threaded the
+key, carried an exception channel, and rooted across user calls — the per-property hook (`apply_json_hooks`)
+now, after `toJSON`, calls a callable replacer as `replacer(holder, key, value)` and serializes what it
+returns, dropping the property when that is `undefined`. This needed the holder threaded alongside the key
+(a child's holder is the array or object it sits in; the top value's is a wrapper object that holds it under
+`""`, created only when a function replacer is actually present, so the no-replacer path allocates nothing
+extra), and both the holder and the replacer rooted across every call. A throwing replacer propagates
+through the same channel. The array form stays the allowlist of D-335 — `json_allowlist` answers `None` for
+a function, so `JSON.stringify(x, fn)` takes the function path and `JSON.stringify(x, ["a"])` the allowlist,
+never both. With this the `JSON` callbacks are complete: parse reviver (D-333), stringify array replacer
+(D-335), `toJSON` (D-336), and function replacer. **Still not done:** the `space` argument as a string pad
+(it is a numeric indent only).

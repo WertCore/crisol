@@ -191,6 +191,32 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
+/// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
+/// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,
+/// `toJSON`).
+#[test]
+fn json_stringify_applies_a_function_replacer() {
+    check(
+        "json-fn-replacer-transform",
+        "return JSON.stringify({a: 1, b: 2}, function (k, v) { \
+             return typeof v === 'number' ? v * 10 : v; \
+         });",
+        "{\"a\":10,\"b\":20}",
+    );
+    check(
+        "json-fn-replacer-drop",
+        "return JSON.stringify({a: 1, b: 2}, function (k, v) { return k === 'b' ? undefined : v; });",
+        "{\"a\":1}",
+    );
+    check(
+        "json-fn-replacer-throws",
+        "try { JSON.stringify({a: 1}, function () { throw new RangeError('x'); }); return 'no-throw'; } \
+         catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
 /// **`JSON.stringify` serializes what `toJSON` returns** (D-336), for this key — so a `Date` becomes its
 /// ISO string, not `{}`. A custom `toJSON` receives the property key and may return a fresh structure
 /// (rooted across the walk); a throwing one propagates.

@@ -24434,34 +24434,48 @@ fn json_allowlist(replacer: u64) -> Option<Vec<String>> {
     Some(names)
 }
 
-/// `JSON.stringify`'s `toJSON` step (D-336): if `value` is an object with a callable `toJSON`, the thing
-/// serialized is what `value.toJSON(key)` returns, not the object itself — which is how
-/// `JSON.stringify(new Date())` is the ISO string and not `{}`. A throwing `toJSON` propagates. `value`,
-/// `method`, and `key` are rooted across the call, which runs user code and allocates.
-fn apply_tojson(value: u64, key: u64) -> Result<u64, u64> {
-    if Value::from_bits(value).kind() != crisol_value::Kind::Object {
-        return Ok(value);
+/// `JSON.stringify`'s per-property hooks: first `toJSON` (D-336), then a function replacer (D-337). An
+/// object with a callable `toJSON` is replaced by what `value.toJSON(key)` returns — which is how
+/// `JSON.stringify(new Date())` is the ISO string and not `{}`; then, if `replacer` is callable, the value
+/// becomes `replacer.call(holder, key, value)`. Either throwing propagates. Everything live is rooted
+/// across each call, which runs user code and allocates.
+fn apply_json_hooks(holder: u64, key: u64, value: u64, replacer: u64) -> Result<u64, u64> {
+    let mut value = value;
+    if Value::from_bits(value).kind() == crisol_value::Kind::Object {
+        let method = property_of(value, "toJSON");
+        if is_callable(method) {
+            let result = with_rooted(&[holder, key, value, method, replacer], || {
+                call_value(method, value, &[key])
+            });
+            if Value::from_bits(result).is_exception() {
+                return Err(result);
+            }
+            value = result;
+        }
     }
-    let method = property_of(value, "toJSON");
-    if !is_callable(method) {
-        return Ok(value);
+    if is_callable(replacer) {
+        let result = with_rooted(&[holder, key, value, replacer], || {
+            call_value(replacer, holder, &[key, value])
+        });
+        if Value::from_bits(result).is_exception() {
+            return Err(result);
+        }
+        value = result;
     }
-    let result = with_rooted(&[value, method, key], || call_value(method, value, &[key]));
-    if Value::from_bits(result).is_exception() {
-        return Err(result);
-    }
-    Ok(result)
+    Ok(value)
 }
 
 fn to_json(
-    value: u64,
+    holder: u64,
     key: u64,
+    value: u64,
+    replacer: u64,
     visiting: &mut Vec<GcRef>,
     allowlist: Option<&[String]>,
 ) -> Result<Option<crisol_builtins::Json>, u64> {
-    // **`toJSON` is asked first** (D-336): an object defining a callable `toJSON` serializes what that
-    // returns for this key, not its own shape. A throwing one propagates.
-    let value = apply_tojson(value, key)?;
+    // **The per-property hooks run first** (D-336 `toJSON`, D-337 function replacer), on `holder[key]`
+    // before its own shape is read; either throwing propagates.
+    let value = apply_json_hooks(holder, key, value, replacer)?;
     let held = Value::from_bits(value);
     match held.kind() {
         crisol_value::Kind::Undefined => return Ok(None),
@@ -24514,7 +24528,7 @@ fn to_json(
             // An element with no JSON spelling becomes `null`: an array cannot drop one
             // without changing its length.
             let item = with_rooted(&[value, child_key], || {
-                to_json(child, child_key, visiting, allowlist)
+                to_json(value, child_key, child, replacer, visiting, allowlist)
             })?;
             items.push(item.unwrap_or(crisol_builtins::Json::Null));
         }
@@ -24537,7 +24551,7 @@ fn to_json(
             // A property with no JSON spelling is dropped, which is what makes
             // `{a: undefined}` stringify as `{}`.
             if let Some(item) = with_rooted(&[value, child_key, held], || {
-                to_json(held, child_key, visiting, allowlist)
+                to_json(value, child_key, held, replacer, visiting, allowlist)
             })? {
                 entries.push((name, item));
             }
@@ -24669,9 +24683,15 @@ extern "C" fn json_stringify(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let value = unsafe { argument(argc, argv, 0) };
-    // SAFETY: as above. An *array* replacer is applied as a key allowlist (D-335); a *function*
-    // replacer is still not applied.
-    let allowlist = json_allowlist(unsafe { argument(argc, argv, 1) });
+    // SAFETY: as above. The replacer is applied as a function (D-337) when callable, otherwise as an
+    // array key allowlist (D-335); `json_allowlist` answers `None` for a function, so the two never clash.
+    let replacer_arg = unsafe { argument(argc, argv, 1) };
+    let replacer = if is_callable(replacer_arg) {
+        replacer_arg
+    } else {
+        Value::UNDEFINED.to_bits()
+    };
+    let allowlist = json_allowlist(replacer_arg);
     // SAFETY: as above.
     let space = Value::from_bits(unsafe { argument(argc, argv, 2) })
         .as_number()
@@ -24685,11 +24705,30 @@ extern "C" fn json_stringify(
 
     let mut visiting = Vec::new();
     // The top value is serialized as if held under the key `""` (D-336) — the holder the specification
-    // wraps it in, and the key a top-level `toJSON` or replacer is handed. `value` and that key are rooted
-    // across the walk, which runs `toJSON` user code and allocates.
-    let empty = with_rooted(&[value], || new_string(""));
-    let result = with_rooted(&[value, empty], || {
-        to_json(value, empty, &mut visiting, allowlist.as_deref())
+    // wraps it in, and the key a top-level `toJSON` or replacer is handed. A function replacer is called on
+    // that wrapper object; without one the holder is never read, so it stays `undefined`. Everything live
+    // is rooted across the walk, which runs user code and allocates.
+    let empty = with_rooted(&[value, replacer], || new_string(""));
+    let holder = if is_callable(replacer) {
+        with_rooted(&[value, empty, replacer], || {
+            let wrapper = crisol_create_object();
+            with_rooted(&[value, empty, replacer, wrapper], || {
+                crisol_computed_store(wrapper, empty, value);
+            });
+            wrapper
+        })
+    } else {
+        Value::UNDEFINED.to_bits()
+    };
+    let result = with_rooted(&[value, empty, replacer, holder], || {
+        to_json(
+            holder,
+            empty,
+            value,
+            replacer,
+            &mut visiting,
+            allowlist.as_deref(),
+        )
     });
     match result {
         // **`undefined` for a value JSON cannot spell**, which is what
