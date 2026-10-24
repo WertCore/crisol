@@ -8725,3 +8725,23 @@ this engine's own deliberate choice (`crisol_add`), so `@@toPrimitive` is not co
 follows the same `to_number` path; the number hint reaches `@@toPrimitive` through the `coerce_number`
 builtins (`at`, `slice` bounds, …), other callers of which may still want the same receiver-rooting audit `at`
 just got.
+
+## D-333
+
+**`JSON.parse` applies a reviver.**
+
+Status: Accepted
+
+The second argument was ignored, so `JSON.parse(text, reviver)` returned the parsed document untouched.
+It now runs `InternalizeJSONProperty`: when the reviver is callable, the parsed value is placed on a
+synthetic root under the key `""` and walked bottom-up — each nested element first (an array by index as a
+string, an object by its own enumerable names, snapshotted before the walk), then `reviver(key, value)`
+with `this` the holder, whose result replaces the property or, when `undefined`, deletes it. A reviver that
+throws propagates. **The GC-stress run found the bug that made this look done when it was not:** `json_parse`,
+unlike most builtins, takes no `live_values` guard, so the `reviver` — held only in its frame — was collected
+during `from_json`'s allocation of the parse tree, and `is_callable` then read it as absent and skipped the
+walk entirely; the ordinary run passed because nothing collected it. Rooting `reviver` across `from_json`
+fixed it, and the walk itself roots the holder, key, value, and each revived result across its own
+allocations and user calls. **Deviation:** the walk runs on the freshly parsed tree, which has only plain
+data properties, so it does not attempt the specification's general `HasProperty`/`DefineOwnProperty` dance
+that a reviver mutating the tree mid-walk could otherwise observe.

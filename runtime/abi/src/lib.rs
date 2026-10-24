@@ -24499,6 +24499,43 @@ fn from_json(json: &crisol_builtins::Json) -> u64 {
 }
 
 /// `JSON.parse`.
+/// `InternalizeJSONProperty` — the `JSON.parse` reviver walk (D-333). `holder[key]` is revived bottom-up:
+/// each nested element first (an array by index, an object by its own enumerable keys, each snapshotted
+/// before the walk), then `reviver.call(holder, key, value)`, whose result replaces the property — or
+/// deletes it when `undefined`. It runs on the freshly parsed tree, which holds only plain data properties.
+fn internalize_json(holder: u64, key: u64, reviver: u64) -> u64 {
+    let value = with_rooted(&[holder, key, reviver], || {
+        crisol_computed_load(holder, key)
+    });
+    if Value::from_bits(value).kind() == crisol_value::Kind::Object {
+        // The keys to visit, snapshotted before the walk: an array's indices as their strings (the
+        // reviver is handed `"0"`, not `0`), an object's own enumerable names.
+        let names: Vec<String> = match elements_of(value) {
+            Some((_, length)) => (0..length).map(|index| index.to_string()).collect(),
+            None => enumerable_keys(value),
+        };
+        for name in names {
+            let element = with_rooted(&[holder, key, reviver, value], || new_string(&name));
+            let revived = with_rooted(&[holder, key, reviver, value, element], || {
+                internalize_json(value, element, reviver)
+            });
+            if Value::from_bits(revived).is_exception() {
+                return revived;
+            }
+            with_rooted(&[holder, key, reviver, value, element, revived], || {
+                if Value::from_bits(revived).kind() == crisol_value::Kind::Undefined {
+                    let _ = crisol_delete(value, element);
+                } else {
+                    crisol_computed_store(value, element, revived);
+                }
+            });
+        }
+    }
+    with_rooted(&[holder, key, reviver, value], || {
+        call_value(reviver, holder, &[key, value])
+    })
+}
+
 extern "C" fn json_parse(
     _closure: u64,
     _this_value: u64,
@@ -24510,12 +24547,28 @@ extern "C" fn json_parse(
     let Some(text) = to_text(unsafe { argument(argc, argv, 0) }) else {
         return raise("cannot parse this value as JSON", "SyntaxError");
     };
-    match crisol_builtins::parse(&text) {
-        // The reviver argument is not applied. Recorded rather than ignored silently: a
-        // program passing one gets the parsed document unchanged, which is wrong quietly.
-        Ok(json) => from_json(&json),
-        Err(error) => raise(&format!("{error}"), "SyntaxError"),
+    // SAFETY: as above — the reviver, applied below when it is callable.
+    let reviver = unsafe { argument(argc, argv, 1) };
+    // **`reviver` is rooted across `from_json`**, which allocates the whole parsed tree: without it the
+    // reviver — held only in this frame, which unlike most builtins takes no `live_values` guard — was
+    // collected under GC stress, and `is_callable` below then read it as absent and skipped the walk.
+    let parsed = match crisol_builtins::parse(&text) {
+        Ok(json) => with_rooted(&[reviver], || from_json(&json)),
+        Err(error) => return raise(&format!("{error}"), "SyntaxError"),
+    };
+    if !is_callable(reviver) {
+        return parsed;
     }
+    // **A reviver walks the result from a synthetic root whose `""` names it** (D-333), which is what
+    // gives the top-level value a holder and a key to be handed to the reviver like every other.
+    with_rooted(&[parsed, reviver], || {
+        let root = crisol_create_object();
+        let empty = with_rooted(&[parsed, reviver, root], || new_string(""));
+        with_rooted(&[parsed, reviver, root, empty], || {
+            crisol_computed_store(root, empty, parsed);
+        });
+        internalize_json(root, empty, reviver)
+    })
 }
 
 /// `JSON.stringify`.

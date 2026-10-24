@@ -191,6 +191,34 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`JSON.parse` applies a reviver** (D-333) — called bottom-up as `reviver(key, value)` with `this` the
+/// holder, its result replacing each property (or deleting it when `undefined`), the top value handed over
+/// last under the key `""`. Array indices reach it as strings.
+#[test]
+fn json_parse_applies_a_reviver() {
+    check(
+        "json-reviver-transform",
+        "var o = JSON.parse('{\"a\":1,\"b\":2}', function (k, v) { return k === 'a' ? v * 10 : v; }); \
+         return o.a + '/' + o.b;",
+        "10/2",
+    );
+    // Returning `undefined` deletes the property.
+    check(
+        "json-reviver-delete",
+        "var o = JSON.parse('{\"a\":1,\"b\":2}', function (k, v) { return k === 'b' ? undefined : v; }); \
+         return ('a' in o) + '/' + ('b' in o);",
+        "true/false",
+    );
+    // Bottom-up, nested and through arrays, with the root last under key "".
+    check(
+        "json-reviver-order",
+        "var seen = []; \
+         JSON.parse('{\"n\":[1,2]}', function (k, v) { seen.push(k); return v; }); \
+         return seen.join(',');",
+        "0,1,n,",
+    );
+}
+
 /// **`Symbol.toPrimitive` governs an object's coercion** (D-332) — when present it *is* `ToPrimitive`,
 /// ahead of `valueOf`/`toString`, and it receives the hint: `"string"` for `String(x)` and a template,
 /// `"default"` for `==`, and `"number"` for a builtin that coerces an argument to an index. (Arithmetic
