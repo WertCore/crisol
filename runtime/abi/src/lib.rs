@@ -21025,6 +21025,44 @@ fn proxy_define(target: u64, handler: u64, key: u64, descriptor: u64) -> u64 {
         // answer: `Object.defineProperty` throws when the definition does not take, and a
         // proxy saying `false` is a definition that did not take.
         if is_truthy(Value::from_bits(reported)) {
+            // **A successful definition must be one the target could accept** (D-341) — the mirror
+            // of `getOwnPropertyDescriptor` (D-339), read from the writing side. The target's own
+            // descriptor and extensibility bound what the trap may claim to have defined.
+            let arguments = [target, key];
+            let target_desc = with_rooted(&[target, handler, trap, key, descriptor], || {
+                object_own_descriptor(0, 0, 0, 2, arguments.as_ptr())
+            });
+            // Read before any further allocation could move it (D-339): a fresh descriptor object
+            // from `object_own_descriptor` is not itself rooted.
+            let target_has = Value::from_bits(target_desc).kind() == crisol_value::Kind::Object;
+            let target_configurable =
+                target_has && is_truthy(Value::from_bits(property_of(target_desc, "configurable")));
+            // Whether the incoming descriptor pins the property as non-configurable.
+            let setting_nonconfigurable =
+                descriptor_flag(descriptor, "configurable") == Some(false);
+            if !target_has {
+                // Defining a property the target lacks is an addition: a non-extensible target
+                // refuses it, and a non-configurable one it could never afterwards remove.
+                if !is_extensible(target) {
+                    return raise(
+                        "a defineProperty trap cannot add a property to a non-extensible target",
+                        "TypeError",
+                    );
+                }
+                if setting_nonconfigurable {
+                    return raise(
+                        "a defineProperty trap cannot report a new property as non-configurable",
+                        "TypeError",
+                    );
+                }
+            } else if setting_nonconfigurable && target_configurable {
+                // The property exists and the target still allows it to be reconfigured, so
+                // pinning it non-configurable is a guarantee the target does not make.
+                return raise(
+                    "a defineProperty trap cannot make a configurable target property non-configurable",
+                    "TypeError",
+                );
+            }
             return target;
         }
         raise(

@@ -313,6 +313,68 @@ fn a_proxy_setprototypeof_agrees_with_its_target() {
     );
 }
 
+/// **A proxy's `defineProperty` agrees with its target** (D-341) — the trap is invoked (not the slot) by
+/// `Object.defineProperty` and `Reflect.defineProperty`; a falsy answer faults for the first and is `false`
+/// for the second; and a truthy answer may neither add a property a non-extensible target would reject, nor
+/// pin as non-configurable a property the target lacks or still lets be reconfigured — the mirror of
+/// `getOwnPropertyDescriptor` (D-339), read from the writing side.
+#[test]
+fn a_proxy_defineproperty_agrees_with_its_target() {
+    check(
+        "proxy-define-runs",
+        "var target = {}; var saw = false; \
+         var p = new Proxy(target, {defineProperty: function (t, k, d) { saw = true; return Reflect.defineProperty(t, k, d); }}); \
+         Object.defineProperty(p, 'x', {value: 1, configurable: true}); \
+         return saw + '/' + (target.x === 1);",
+        "true/true",
+    );
+    // A falsy status faults through `Object.defineProperty` but is merely `false` through `Reflect`.
+    check(
+        "proxy-define-refused",
+        "var p = new Proxy({}, {defineProperty: function () { return false; }}); \
+         var threw = false; \
+         try { Object.defineProperty(p, 'x', {value: 1}); } catch (e) { threw = e instanceof TypeError; } \
+         return threw + '/' + Reflect.defineProperty(p, 'x', {value: 1});",
+        "true/false",
+    );
+    // A trap that claims success without touching the target cannot add to a frozen one...
+    check(
+        "proxy-define-nonext-add",
+        "var o = Object.preventExtensions({}); \
+         var p = new Proxy(o, {defineProperty: function () { return true; }}); \
+         try { Object.defineProperty(p, 'x', {value: 1}); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // ...nor invent a non-configurable property the target does not have...
+    check(
+        "proxy-define-new-nonconf",
+        "var p = new Proxy({}, {defineProperty: function () { return true; }}); \
+         try { Object.defineProperty(p, 'x', {value: 1, configurable: false}); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // ...nor pin a still-configurable target property as non-configurable.
+    check(
+        "proxy-define-pin-conf",
+        "var o = {}; Object.defineProperty(o, 'x', {value: 1, configurable: true}); \
+         var p = new Proxy(o, {defineProperty: function () { return true; }}); \
+         try { Object.defineProperty(p, 'x', {value: 2, configurable: false}); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // An honest, compatible definition on an extensible target is fine; a revoked proxy faults.
+    check(
+        "proxy-define-ok",
+        "var p = new Proxy({}, {defineProperty: function (t, k, d) { return Reflect.defineProperty(t, k, d); }}); \
+         return Reflect.defineProperty(p, 'x', {value: 1, configurable: false});",
+        "true",
+    );
+    check(
+        "proxy-define-revoked",
+        "var r = Proxy.revocable({}, {}); r.revoke(); \
+         try { Object.defineProperty(r.proxy, 'x', {value: 1}); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

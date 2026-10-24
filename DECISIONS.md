@@ -8884,3 +8884,27 @@ the same dispatch, and each already computes the handle the helper takes); and w
 "wrong-type, ignored" and "status false" (the `__proto__` setter must stay silent for the first and throw for the
 second, so they cannot collapse). **Still open for the property traps:** `ownKeys` and `defineProperty`, as D-339
 records — this closes the prototype traps, leaving only those two unchecked.
+
+## D-341
+
+**A proxy's `defineProperty` answer must agree with its target.**
+
+Status: Accepted
+
+`proxy_define` called the trap and threw only when it answered falsish; a truthy answer was taken on faith. It now
+holds a truthy answer to the target, the mirror of `getOwnPropertyDescriptor` (D-339) read from the writing side.
+Using the same `object_own_descriptor` the no-trap path takes and the `descriptor_flag` helper `Object.defineProperty`
+already uses, after a truthy trap result it reads the target's own descriptor and whether the incoming descriptor pins
+the property non-configurable, then rejects three lies: adding a property to a **non-extensible** target; reporting a
+**new** property as non-configurable (one the target lacks and so could never later remove); and pinning as
+non-configurable a property the target **still lets be reconfigured**. The target descriptor's `configurable` flag is
+read immediately (before any further allocation can move the unrooted descriptor object), the same rooting shape D-339
+uses. Abi-only, inline, no new plumbing — `proxy_define` already returns `u64`, so `raise` is the channel.
+
+**Deviations.** The full `IsCompatiblePropertyDescriptor` reconciliation (value/writable/get/set agreement between a
+redefinition and an existing non-configurable target property) is still not covered — the same parse D-339 deferred.
+And `Reflect.defineProperty` reports an invariant violation as `false` rather than re-throwing: it wraps
+`object_define_property` in `swallow_exception` (the pre-existing way it turns `Object`'s throw into a boolean), which
+cannot tell a status-false refusal from a thrown invariant. `Object.defineProperty` — the entry test262 exercises for
+these invariants — throws correctly. **Still open:** `ownKeys`, whose `own_keys` helper returns `Vec<String>` to many
+callers with no error channel and no symbol support — the one property trap left unchecked.
