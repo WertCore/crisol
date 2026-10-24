@@ -8653,3 +8653,33 @@ existing 462 acceptance cases are untouched. **Deviations:** a method that itera
 a `2^32`-length array cannot be walked; shrinking a recorded length does not delete the high *slots* it ran
 past (they were already named-property stores, not elements); and the array-like `reduceRight`-over-`2^53`
 case is untouched (it is the separate non-array `indexed_length` clamp, left for its own pass).
+
+## D-330
+
+**An array-like's length caps at 2^53-1, and its absent indices are holes.**
+
+Status: Accepted
+
+The length D-329 left for its own pass. `LengthOfArrayLike` is `ToLength(Get(O, "length"))`, which caps at
+`2^53 - 1`; `indexed_length` clamped an array-like's length to `u32::MAX` instead — "a length no array can
+exceed", true for an array but not for an array-like, which is an ordinary object and not bound by the array
+index space. A top-down method over one near the integer limit
+(`reduceRight/length-near-integer-limit`: elements at `MAX_SAFE_INTEGER - 1` and `- 3`) then started four
+billion indices *below* its first element and walked down to it — a timeout, where the specification's walk
+throws in three steps. The clamp is now `MAX_SAFE_INTEGER`. A full bottom-up iteration of such a length is
+still infeasible, but `u32::MAX` never made that terminate either (four billion is a timeout too), and no
+test asks for one — `reduce` has no matching test precisely because bottom-up cannot finish. Fixing the
+clamp exposed a second gap in the same path: `element_is_hole` answered `false` for *every* array-like index
+(it only knew the dense `EMPTY` marker), so the hole-skipping methods folded each absent index of an
+array-like in as `undefined` instead of stepping over it — `reduceRight` processed the hole between the two
+present elements. Its array-like arm now asks `indexed_has` (the proto-walking `HasProperty` the
+specification uses), which fixes `reduceRight`, `reduce`, `forEach`, `map`, and the rest at once; the dense
+arm is byte-for-byte unchanged, so an ordinary array is untouched. That exposed two further cases that reach
+the same arm and are *not* holes, which the regression caught: a **boxed string** — `every.call("abc", …)`
+folds three characters — whose code units `indexed_has` missed because `in` (`crisol_in`) did not look
+through the wrapper's `__primitive` to the text (now it does, which also makes `0 in new String("abc")`
+true); and a **typed array**, whose elements live in a byte buffer rather than the `Value` vector and which
+has no holes at all, so its arm short-circuits to "present". **Deviations:** a bottom-up method over a
+`2^53`-length array-like still cannot finish (inherent, untested); and a method that *materialises* a result
+sized to such a length would exhaust memory — but that was already true under the `u32::MAX` clamp (four
+billion is no more allocatable than nine quadrillion), and no test constructs one.

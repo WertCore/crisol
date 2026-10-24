@@ -17687,7 +17687,14 @@ fn element_present(array: GcRef, index: usize) -> bool {
 fn element_is_hole(object: u64, index: usize) -> bool {
     match elements_of(object) {
         Some((array, _)) => !element_present(array, index),
-        None => false,
+        // A typed array has no holes — every index below its length is present — and its elements live
+        // in a byte buffer, not the `Value` vector `elements_of` reads, so it reaches this arm too.
+        None if is_typed_array(object) => false,
+        // An array-like's hole is an absent property, which only `HasProperty` can tell from one
+        // holding `undefined` (D-330). Without this the hole-skipping methods (`reduceRight`, `reduce`,
+        // `forEach`, …) folded every absent index of an array-like in as `undefined` rather than
+        // stepping over it, so one over a sparse array-like processed indices that were never there.
+        None => !indexed_has(object, index),
     }
 }
 
@@ -17786,9 +17793,15 @@ fn indexed_length(value: u64) -> Result<usize, u64> {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "clamped to a length no array can exceed"
+        reason = "clamped to 2^53-1, which a 64-bit usize holds exactly"
     )]
-    let length = asked.min(f64::from(u32::MAX)) as usize;
+    // **`ToLength` caps at 2^53-1, not 2^32-1** (D-330). An array-like is not an array, so its length
+    // is not bound by the array index space; clamping it to `u32::MAX` made a top-down method over one
+    // near the integer limit (`reduceRight` with elements at `MAX_SAFE_INTEGER - 1`) start four billion
+    // indices below its first element and walk down to it — a timeout, not the quick throw the
+    // specification's walk reaches in three steps. A full bottom-up iteration of such a length is still
+    // infeasible, but no test asks for one; `u32::MAX` did not make that case terminate either.
+    let length = asked.min(crisol_builtins::MAX_SAFE_INTEGER) as usize;
     Ok(length)
 }
 
@@ -24726,6 +24739,19 @@ pub extern "C" fn crisol_in(key: u64, object: u64) -> u64 {
         && let Some((array, length)) = elements_of(object)
         && index < length
         && element_present(array, index)
+    {
+        return Value::TRUE.to_bits();
+    }
+    // A boxed string's characters are own properties, one per code unit below its length (D-330): so
+    // `0 in new String("abc")` is `true`, and the array methods walking it as an array-like see its
+    // characters rather than skipping them as holes. They are derived from the wrapped text (`held` on
+    // the wrapper as `__primitive`), not stored as slots, so the ordinary name walk below would miss
+    // them. Gated on the wrapper's primitive being a string, so a boxed number or a plain object does
+    // not match.
+    if let Some(index) = as_index(Value::from_bits(key))
+        && let Some((_, primitive)) = own_property(object, STRING_PRIMITIVE)
+        && let Some(text) = text_of(primitive.to_bits())
+        && index < text.encode_utf16().count()
     {
         return Value::TRUE.to_bits();
     }

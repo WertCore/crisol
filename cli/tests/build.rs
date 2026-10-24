@@ -191,6 +191,29 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **An array-like's length caps at 2^53-1, not 2^32-1** (D-330), so a top-down walk over one near the
+/// integer limit starts at its real top and reaches a throw in a few steps rather than timing out four
+/// billion absent indices below it (test262 `reduceRight/length-near-integer-limit`).
+#[test]
+fn a_top_down_method_walks_an_array_like_near_the_integer_limit() {
+    check(
+        "reduceright-near-integer-limit",
+        "var max = Number.MAX_SAFE_INTEGER; \
+         var o = { length: max }; \
+         o[max - 1] = 1; \
+         o[max - 3] = 3; \
+         try { \
+             Array.prototype.reduceRight.call(o, function (a, el, i) { \
+                 a.push(el + ':' + (max - i)); \
+                 if (el === 3) { throw a; } \
+                 return a; \
+             }, []); \
+             return 'no-throw'; \
+         } catch (a) { return a.join(','); }",
+        "1:1,3:3",
+    );
+}
+
 /// **A length past the dense limit is recorded, not materialised** (D-329). `a.length = 4294967295`
 /// used to try to allocate four billion holes — a crash, not an error — so the whole class of tests that
 /// set a huge length and read it back aborted the process. The length is now kept as a hidden record and
