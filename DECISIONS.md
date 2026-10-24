@@ -8701,3 +8701,27 @@ in the constructor's frame, was collected during `build_error_object`'s allocati
 read, so `cause` came back `undefined` under stress though the ordinary run was green; rooting `options`
 across the build fixed it. **Deviation:** `cause` is read from the bag's own data slot, so a `cause`
 *accessor* is not invoked — the value form (`{ cause: x }`) is what the language and the tests use.
+
+## D-332
+
+**`Symbol.toPrimitive` governs an object's coercion.**
+
+Status: Accepted
+
+`ToPrimitive` ran straight to `valueOf`/`toString`, ignoring `@@toPrimitive` — so an object that defines it
+coerced by the wrong rule. A shared `symbol_to_primitive(value, hint)` now runs the first step: if the
+object has a callable `Symbol.toPrimitive`, call it with the hint and demand a primitive (a thrown error or
+a non-primitive return is propagated as the specification requires), and only in its absence fall to the
+ordinary order. The three `ToPrimitive` entry points pass the hint the specification assigns: the
+`valueOf`-first path (`coerce_primitive`, used by `ToNumber`) passes `"number"` or `"string"` by its
+existing flag; the string path (`to_primitive_text`, used by `String(x)` and templates) passes `"string"`;
+and the `==` path (`to_primitive`) passes `"default"`. The two no-throw paths keep their contract — a
+throwing `@@toPrimitive` there falls through rather than raising — while `coerce_primitive` propagates it.
+**The GC-stress run caught two rooting holes** this surfaced: the just-found `@@toPrimitive` method was
+collected across the `new_string(hint)` allocation (rooted now); and `Array.prototype.at` did not root its
+receiver across the argument coercion, which now runs user code, so the array was collected mid-call and
+the read answered `undefined` — `at` roots it now. **Deviations:** arithmetic on an object stays `NaN` by
+this engine's own deliberate choice (`crisol_add`), so `@@toPrimitive` is not consulted there, and `Number(x)`
+follows the same `to_number` path; the number hint reaches `@@toPrimitive` through the `coerce_number`
+builtins (`at`, `slice` bounds, …), other callers of which may still want the same receiver-rooting audit `at`
+just got.

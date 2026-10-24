@@ -191,6 +191,36 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **`Symbol.toPrimitive` governs an object's coercion** (D-332) — when present it *is* `ToPrimitive`,
+/// ahead of `valueOf`/`toString`, and it receives the hint: `"string"` for `String(x)` and a template,
+/// `"default"` for `==`, and `"number"` for a builtin that coerces an argument to an index. (Arithmetic
+/// on an object stays `NaN` by this engine's own deliberate choice, so it is not exercised here.)
+#[test]
+fn symbol_to_primitive_governs_coercion() {
+    check(
+        "to-primitive-hints",
+        "var o = {[Symbol.toPrimitive]: function (hint) { \
+             return hint === 'number' ? 1 : hint === 'string' ? 'S' : 'D'; \
+         }}; \
+         return String(o) + '/' + `${o}` + '/' + (o == 'D') + '/' + [10, 20, 30].at(o);",
+        "S/S/true/20",
+    );
+    // A throwing `Symbol.toPrimitive` propagates through the number-hint path.
+    check(
+        "to-primitive-throws",
+        "var o = {[Symbol.toPrimitive]: function () { throw new RangeError('boom'); }}; \
+         try { [1].at(o); return 'no-throw'; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // Returning a non-primitive is a `TypeError`.
+    check(
+        "to-primitive-returns-object",
+        "var o = {[Symbol.toPrimitive]: function () { return {}; }}; \
+         try { [1].at(o); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+}
+
 /// **An error carries the `cause` from its options bag** (D-331) — the ES2022 second argument, as a
 /// non-enumerable property, set only when the bag actually has `cause`. Every error constructor shares
 /// the path, and `AggregateError` takes the bag in its third argument.

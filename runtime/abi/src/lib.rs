@@ -1707,7 +1707,10 @@ extern "C" fn array_at(
         Ok(length) => length,
         Err(thrown) => return thrown,
     };
-    let wanted = match integer_argument(argc, argv, 0) {
+    // **The receiver is rooted across the argument coercion**, which can run user code — a `valueOf`
+    // or a `Symbol.toPrimitive` (D-332) — and so allocate: without this the array was collected mid-at
+    // under GC stress and the read below answered `undefined`.
+    let wanted = match with_rooted(&[this_value], || integer_argument(argc, argv, 0)) {
         Ok(wanted) => wanted,
         Err(thrown) => return thrown,
     };
@@ -18012,9 +18015,50 @@ fn integer_argument(argc: u64, argv: *const u64, position: usize) -> Result<f64,
 /// the object back instead, which turns a reportable `TypeError` into arithmetic on `NaN` —
 /// and test262 checks both that the throw happens *and* that `valueOf` and `toString` were
 /// each tried, so answering wrongly and answering without asking are separately caught.
+/// `ToPrimitive`'s `@@toPrimitive` step (D-332): if `value` has a callable `Symbol.toPrimitive`, call it
+/// with `hint` (`"number"`, `"string"`, or `"default"`) and demand a primitive. `None` means there is no
+/// such method and the caller falls back to the ordinary `valueOf`/`toString` order; `Some(bits)` is the
+/// answer, which may be an exception — the method threw, or returned an object, which is a `TypeError`.
+fn symbol_to_primitive(value: u64, hint: &str) -> Option<u64> {
+    if Value::from_bits(value).kind() != crisol_value::Kind::Object {
+        return None;
+    }
+    let method = symbol_method(value, "toPrimitive");
+    if !is_callable(method) {
+        return None;
+    }
+    // `method` is rooted across `new_string`, which allocates: without it the just-found
+    // `@@toPrimitive` function was collected under GC stress and the call read "is not a function".
+    let hinted = with_rooted(&[value, method], || new_string(hint));
+    let result = with_rooted(&[value, method, hinted], || {
+        call_value(method, value, &[hinted])
+    });
+    if Value::from_bits(result).is_exception() {
+        return Some(result);
+    }
+    if Value::from_bits(result).kind() == crisol_value::Kind::Object {
+        return Some(raise(
+            "Symbol.toPrimitive must return a primitive value",
+            "TypeError",
+        ));
+    }
+    Some(result)
+}
+
 fn coerce_primitive(value: u64, prefer_string: bool) -> Result<u64, u64> {
     if Value::from_bits(value).kind() != crisol_value::Kind::Object {
         return Ok(value);
+    }
+    // **`@@toPrimitive` comes first**, and when present it is the whole of `ToPrimitive` — the
+    // `valueOf`/`toString` order below is only reached when an object does not define one (D-332).
+    if let Some(result) =
+        symbol_to_primitive(value, if prefer_string { "string" } else { "number" })
+    {
+        return if Value::from_bits(result).is_exception() {
+            Err(result)
+        } else {
+            Ok(result)
+        };
     }
     let order = if prefer_string {
         ["toString", "valueOf"]
@@ -24696,6 +24740,14 @@ fn bigint_loose_eq_primitive(big: u64, other: u64) -> bool {
 /// difference**: a string context asks for text first and a numeric one asks for a number
 /// first, and an object that answers both would otherwise give the wrong one to one of them.
 fn to_primitive_text(value: u64) -> u64 {
+    // **`@@toPrimitive` (string hint) wins when present** (D-332). A throwing one is left to fall
+    // through here, where this path has no way to raise; the primitive-returning case is the one that
+    // matters for `String(obj)` and a template.
+    if let Some(result) = symbol_to_primitive(value, "string")
+        && !Value::from_bits(result).is_exception()
+    {
+        return result;
+    }
     for name in ["toString", "valueOf"] {
         let key = name.to_owned();
         // SAFETY: `key` is a live Rust string.
@@ -24727,6 +24779,13 @@ fn to_primitive(value: u64) -> u64 {
     // map did not yet carry, so a collection under stress freed it and `2n < 3n` read `false`.
     if Value::from_bits(value).kind() != crisol_value::Kind::Object {
         return value;
+    }
+    // **`@@toPrimitive` (default hint) wins when present** (D-332), which is the hint `==` and binary
+    // `+` use. A throwing one falls through here, where this path cannot raise.
+    if let Some(result) = symbol_to_primitive(value, "default")
+        && !Value::from_bits(result).is_exception()
+    {
+        return result;
     }
     for name in ["valueOf", "toString"] {
         let key = name.to_owned();
