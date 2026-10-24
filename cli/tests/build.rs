@@ -191,6 +191,35 @@ fn locals_round_trip() {
     check("locals", "let a = 6; let b = 4; return a - b;", "2");
 }
 
+/// **An error carries the `cause` from its options bag** (D-331) — the ES2022 second argument, as a
+/// non-enumerable property, set only when the bag actually has `cause`. Every error constructor shares
+/// the path, and `AggregateError` takes the bag in its third argument.
+#[test]
+fn an_error_carries_its_cause() {
+    check(
+        "error-cause-present",
+        "return new Error('m', {cause: 42}).cause;",
+        "42",
+    );
+    // Absent unless the bag has `cause`; present (as `undefined`) when it does.
+    check(
+        "error-cause-absence",
+        "var a = new Error('m'); var b = new Error('m', {}); var c = new Error('m', {cause: undefined}); \
+         return (a.cause === undefined) + '/' + ('cause' in a) + '/' + ('cause' in b) + '/' + ('cause' in c);",
+        "true/false/false/true",
+    );
+    // Non-enumerable, like `message`; and the subclasses and `AggregateError` carry it too.
+    check(
+        "error-cause-nonenum-and-subclasses",
+        "var e = new Error('m', {cause: 1}); \
+         var k = Object.keys(e).indexOf('cause'); \
+         var te = new TypeError('m', {cause: 'x'}).cause; \
+         var ae = new AggregateError([], 'm', {cause: 9}).cause; \
+         return k + '/' + te + '/' + ae;",
+        "-1/x/9",
+    );
+}
+
 /// **An array-like's length caps at 2^53-1, not 2^32-1** (D-330), so a top-down walk over one near the
 /// integer limit starts at its real top and reaches a throw in a few steps rather than timing out four
 /// billion absent indices below it (test262 `reduceRight/length-near-integer-limit`).

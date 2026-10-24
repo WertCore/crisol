@@ -8683,3 +8683,21 @@ has no holes at all, so its arm short-circuits to "present". **Deviations:** a b
 `2^53`-length array-like still cannot finish (inherent, untested); and a method that *materialises* a result
 sized to such a length would exhaust memory — but that was already true under the `u32::MAX` clamp (four
 billion is no more allocatable than nine quadrillion), and no test constructs one.
+
+## D-331
+
+**An error carries the `cause` from its options bag.**
+
+Status: Accepted
+
+The ES2022 second argument to the error constructors — `new Error(message, { cause })` — was ignored, so
+`.cause` read `undefined`. `make_error` (which every non-aggregate error type shares) and
+`make_aggregate_error` (whose bag is the third argument) now run `InstallErrorCause`: when the options
+argument is an object with an own `cause`, it is copied onto the error as a **non-enumerable** `cause`,
+exactly as `message` is. "When present" is the test the specification makes — `new Error("x")` and
+`new Error("x", {})` leave `cause` absent, while `new Error("x", { cause: undefined })` defines it — so the
+check is presence, not truthiness. **The GC-stress run earned its keep here:** the options bag, held only
+in the constructor's frame, was collected during `build_error_object`'s allocation before the cause was
+read, so `cause` came back `undefined` under stress though the ordinary run was green; rooting `options`
+across the build fixed it. **Deviation:** `cause` is read from the bag's own data slot, so a `cause`
+*accessor* is not invoked — the value form (`{ cause: x }`) is what the language and the tests use.

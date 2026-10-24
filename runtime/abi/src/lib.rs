@@ -5874,7 +5874,33 @@ extern "C" fn make_error(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let message = unsafe { argument(argc, argv, 0) };
-    build_error_object(closure, this_value, message)
+    // SAFETY: as above — the options bag, where `{ cause }` lives.
+    let options = unsafe { argument(argc, argv, 1) };
+    // **`options` is rooted across `build_error_object`**, which allocates: without this a `{ cause }`
+    // bag held only in this frame was collected under GC stress before `install_error_cause` read it.
+    with_rooted(&[this_value, message, options], || {
+        let error = build_error_object(closure, this_value, message);
+        install_error_cause(error, options);
+        error
+    })
+}
+
+/// `InstallErrorCause`: when the options bag is an object carrying `cause`, copy it onto the error as a
+/// non-enumerable `cause` (D-331). Set only when the property is present, so `new Error("x")` and
+/// `new Error("x", {})` leave `cause` absent while `new Error("x", { cause: undefined })` defines it.
+fn install_error_cause(error: u64, options: u64) {
+    if Value::from_bits(options).kind() != crisol_value::Kind::Object {
+        return;
+    }
+    with_rooted(&[error, options], || {
+        if let Some((_, cause)) = own_property(options, "cause")
+            && let Some(target) = handle_of(error)
+        {
+            with_rooted(&[cause.to_bits()], || {
+                with_runtime(|runtime| runtime.define_hidden(target, "cause", cause));
+            });
+        }
+    });
 }
 
 /// The shared body of every error constructor: makes or fills the receiver, brands it, links its
@@ -5945,8 +5971,11 @@ extern "C" fn make_aggregate_error(
     let errors = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let message = unsafe { argument(argc, argv, 1) };
-    with_rooted(&[this_value, errors, message], || {
+    // SAFETY: as above — the options bag carrying `{ cause }`, here the third argument.
+    let options = unsafe { argument(argc, argv, 2) };
+    with_rooted(&[this_value, errors, message, options], || {
         let error = build_error_object(closure, this_value, message);
+        install_error_cause(error, options);
         with_rooted(&[error, errors], || {
             let Some(target) = handle_of(error) else {
                 return error;
