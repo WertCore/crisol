@@ -492,6 +492,52 @@ fn a_proxy_in_and_delete_forward_without_a_trap() {
     );
 }
 
+/// **RegExp.prototype exposes its flags as accessor getters** (D-345) — `source`, `flags` and the eight
+/// flag names are accessor properties on the prototype (so `getOwnPropertyDescriptor(...).get` is the
+/// function, named `"get <flag>"`), with the spec's `this`-handling: the bare prototype answers `"(?:)"`
+/// / `""` / `undefined`, an invalid `this` faults, and `flags` is built in canonical order. An instance's
+/// own data property shadows the getter, so ordinary reads are unchanged.
+#[test]
+fn regexp_prototype_exposes_flag_getters() {
+    // The getters exist as accessors, named "get <flag>".
+    check(
+        "regexp-getter-is-accessor",
+        "var d = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags'); \
+         return (typeof d.get) + '/' + d.get.name + '/' + (d.set === undefined) + '/' + d.enumerable;",
+        "function/get flags/true/false",
+    );
+    // The bare prototype answers specially rather than faulting.
+    check(
+        "regexp-getter-on-prototype",
+        "return RegExp.prototype.source + '/' + JSON.stringify(RegExp.prototype.flags) + '/' + RegExp.prototype.global;",
+        "(?:)/\"\"/undefined",
+    );
+    // An invalid `this` is a TypeError for source and the individual flags; flags is brand-less.
+    check(
+        "regexp-getter-invalid-this",
+        "var g = Object.getOwnPropertyDescriptor(RegExp.prototype, 'global').get; \
+         var s = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get; \
+         var threw = 0; \
+         try { g.call({}); } catch (e) { if (e instanceof TypeError) threw++; } \
+         try { s.call([]); } catch (e) { if (e instanceof TypeError) threw++; } \
+         return threw;",
+        "2",
+    );
+    // `flags` composes in canonical order dgimsuvy regardless of how it is invoked.
+    check(
+        "regexp-flags-canonical",
+        "var get = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get; \
+         return get.call({sticky: true, global: true, hasIndices: true});",
+        "dgy",
+    );
+    // Instance reads are unchanged — own data properties shadow the prototype getters.
+    check(
+        "regexp-instance-reads",
+        "var r = /abc/gi; return r.source + '/' + r.global + '/' + r.ignoreCase + '/' + r.multiline;",
+        "abc/true/true/false",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

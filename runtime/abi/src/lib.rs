@@ -2156,6 +2156,12 @@ fn async_iterator_internal_natives_base() -> usize {
     async_iterator_natives_base() + ASYNC_ITERATOR_NATIVES.len()
 }
 
+/// The global index at which [`REGEXP_GETTER_NATIVES`] begins — appended after every other table
+/// (D-345) so no earlier index moves. Shared by the build and [`crisol_closure_code`].
+fn regexp_getter_natives_base() -> usize {
+    async_iterator_internal_natives_base() + ASYNC_ITERATOR_INTERNAL_NATIVES.len()
+}
+
 /// The global index at which [`TYPED_NATIVES`] begins — the sum of every table before it, in the
 /// order [`crisol_closure_code`] chains them. Shared by the two places that address the table so
 /// they cannot drift.
@@ -9980,6 +9986,200 @@ const REGEXP_NATIVES: &[(&str, Native)] = &[
     ("toString", regexp_to_string),
 ];
 
+/// The accessor getters `RegExp.prototype` exposes (D-345). These are *accessor* properties, not the
+/// data properties the instance carries, which is what `Object.getOwnPropertyDescriptor(RegExp.prototype,
+/// 'flags').get` reaches for; installed as a group appended after every other native table so no earlier
+/// index moves. An instance's own data property of the same name shadows the getter, so an ordinary
+/// `/x/g.global` is unaffected — the getter runs only on `RegExp.prototype` itself or through `.call`.
+const REGEXP_GETTER_NATIVES: &[(&str, Native)] = &[
+    ("source", regexp_source_getter),
+    ("flags", regexp_flags_getter),
+    ("global", regexp_global_getter),
+    ("ignoreCase", regexp_ignore_case_getter),
+    ("multiline", regexp_multiline_getter),
+    ("dotAll", regexp_dot_all_getter),
+    ("sticky", regexp_sticky_getter),
+    ("unicode", regexp_unicode_getter),
+    ("unicodeSets", regexp_unicode_sets_getter),
+    ("hasIndices", regexp_has_indices_getter),
+];
+
+/// Whether `this_value` is `%RegExp.prototype%` itself — the one object for which the flag getters
+/// answer `undefined` and `source` answers `"(?:)"` rather than faulting (its internal flags slot is
+/// empty, but it is not an error to ask).
+fn regexp_is_prototype(this_value: u64) -> bool {
+    handle_of(this_value) == REGEXP_PROTOTYPE.with(std::cell::Cell::get)
+}
+
+/// A RegExp instance's flags string, read as its brand (D-345). Crisol keeps the flags as an own data
+/// property, so its presence stands in for the spec's `[[OriginalFlags]]` slot: an ordinary object that
+/// lacks it is not a RegExp. Read straight from the slot (no `[[Get]]`) so an instance whose own flag
+/// getters are shadowed cannot recurse.
+fn regexp_instance_flags(this_value: u64) -> Option<String> {
+    own_property(this_value, "flags").and_then(|(_, value)| text_of(value.to_bits()))
+}
+
+/// One flag bit of `get RegExp.prototype.<flag>` (D-345). Not an object → `TypeError`; the prototype
+/// itself → `undefined`; a RegExp instance → whether its flags string carries `flag`; anything else →
+/// `TypeError` (the spec's missing-`[[OriginalFlags]]` fault).
+fn regexp_flag_bit(this_value: u64, flag: char) -> u64 {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
+        return raise("a RegExp flag getter requires an object", "TypeError");
+    }
+    if regexp_is_prototype(this_value) {
+        return Value::UNDEFINED.to_bits();
+    }
+    match regexp_instance_flags(this_value) {
+        Some(flags) => boolean(flags.contains(flag)).to_bits(),
+        None => raise("a RegExp flag getter requires a RegExp", "TypeError"),
+    }
+}
+
+/// `get RegExp.prototype.source` — the pattern, or `"(?:)"` for the bare prototype.
+extern "C" fn regexp_source_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
+        return raise("RegExp.prototype.source requires an object", "TypeError");
+    }
+    if regexp_is_prototype(this_value) {
+        // **The empty pattern, spelled so it cannot be empty.** A literal `//` would start a comment,
+        // so the specification gives the prototype's source as `(?:)` rather than `""`.
+        return new_string("(?:)");
+    }
+    match own_property(this_value, "source") {
+        Some((_, source)) => source.to_bits(),
+        None => raise("RegExp.prototype.source requires a RegExp", "TypeError"),
+    }
+}
+
+/// `get RegExp.prototype.flags` — built from the individual flag properties in the fixed order
+/// `dgimsuvy`, so it reads through `[[Get]]` and works on the prototype (every flag `undefined` → `""`)
+/// and on any object, as the specification intends (it is the one that is brand-less).
+extern "C" fn regexp_flags_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
+        return raise("RegExp.prototype.flags requires an object", "TypeError");
+    }
+    let mut flags = String::new();
+    for (ch, name) in [
+        ('d', "hasIndices"),
+        ('g', "global"),
+        ('i', "ignoreCase"),
+        ('m', "multiline"),
+        ('s', "dotAll"),
+        ('u', "unicode"),
+        ('v', "unicodeSets"),
+        ('y', "sticky"),
+    ] {
+        let bit = property_of(this_value, name);
+        if Value::from_bits(bit).is_exception() {
+            return bit;
+        }
+        if is_truthy(Value::from_bits(bit)) {
+            flags.push(ch);
+        }
+    }
+    new_string(&flags)
+}
+
+/// `get RegExp.prototype.global`.
+extern "C" fn regexp_global_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 'g')
+}
+
+/// `get RegExp.prototype.ignoreCase`.
+extern "C" fn regexp_ignore_case_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 'i')
+}
+
+/// `get RegExp.prototype.multiline`.
+extern "C" fn regexp_multiline_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 'm')
+}
+
+/// `get RegExp.prototype.dotAll`.
+extern "C" fn regexp_dot_all_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 's')
+}
+
+/// `get RegExp.prototype.sticky`.
+extern "C" fn regexp_sticky_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 'y')
+}
+
+/// `get RegExp.prototype.unicode`.
+extern "C" fn regexp_unicode_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 'u')
+}
+
+/// `get RegExp.prototype.unicodeSets`.
+extern "C" fn regexp_unicode_sets_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 'v')
+}
+
+/// `get RegExp.prototype.hasIndices`.
+extern "C" fn regexp_has_indices_getter(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    regexp_flag_bit(this_value, 'd')
+}
+
 /// Runs `body` against the pattern compiled from `source` and `flags`.
 ///
 /// The cursor is loaded from the object's `lastIndex` before and stored back after, so the
@@ -16212,6 +16412,18 @@ impl Runtime {
                 method.to_value(),
             );
         }
+
+        // The accessor getters (D-345), installed after the methods. Each is an accessor property so
+        // `getOwnPropertyDescriptor(RegExp.prototype, name).get` is the function; it is named `"get
+        // <name>"` after it is on the prototype (reachable, so the name string's allocation cannot free
+        // it). An instance's own data property of the same name shadows it, leaving instance reads alone.
+        let getter_base = regexp_getter_natives_base();
+        for (index, (name, _)) in REGEXP_GETTER_NATIVES.iter().enumerate() {
+            let getter = self.native_function(getter_base + index);
+            self.install_accessor(prototype.handle(), name, getter);
+            let named = self.string(&format!("get {name}"));
+            self.define_named(getter, "name", named);
+        }
     }
 
     /// Builds the object every date inherits from.
@@ -19648,9 +19860,13 @@ pub extern "C" fn crisol_closure_code(closure: u64) -> *const u8 {
             return *function as *const u8;
         }
         let offset = offset + ASYNC_ITERATOR_NATIVES.len();
-        return ASYNC_ITERATOR_INTERNAL_NATIVES
+        if let Some(function) = ASYNC_ITERATOR_INTERNAL_NATIVES.get(native.wrapping_sub(offset)) {
+            return *function as *const u8;
+        }
+        let offset = offset + ASYNC_ITERATOR_INTERNAL_NATIVES.len();
+        return REGEXP_GETTER_NATIVES
             .get(native.wrapping_sub(offset))
-            .map_or(fallback, |function| *function as *const u8);
+            .map_or(fallback, |(_, function)| *function as *const u8);
     }
     #[expect(
         clippy::cast_possible_truncation,

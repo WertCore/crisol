@@ -8974,3 +8974,32 @@ none. The builtin-dispatched traps were already safe — this closes the two ope
 Rejected: rooting inside `proxy_has`/`proxy_delete` — too late, since the target can be freed before the call, being
 reachable only through the unrooted proxy the caller still holds. Discovered while writing the D-343 forward test (the
 pre-existing failure it surfaced was not D-343's change — the forward body is byte-identical).
+
+## D-345
+
+**`RegExp.prototype` exposes its flags as accessor getters.**
+
+Status: Accepted
+
+Picked from a test262 sample (the runner at `cli/tests/test262.rs` against `scam-repo/test262`, which reports what *ran
+and then threw* — the actionable conformance signal), where the single largest cluster was `RegExp.prototype` getters
+answering "cannot read a property of undefined": crisol kept `source`/`flags`/`global`/… as per-instance **data**
+properties, so `getOwnPropertyDescriptor(RegExp.prototype, 'flags').get` was `undefined` and every `name`/`prop-desc`/
+`this-val-invalid`/`cross-realm` case failed. `RegExp.prototype` now carries the ten as **accessor** getters
+(`REGEXP_GETTER_NATIVES`), with the spec's `this`-handling: the bare prototype answers `"(?:)"` / `""` / `undefined`;
+`get flags` is brand-less and composes the string in canonical order `dgimsuvy` through `[[Get]]` (so it works on the
+prototype and any object); `get source` and each individual flag getter fault on a non-RegExp, and answer `undefined`/
+`"(?:)"` on the prototype. The getter group is appended **after every existing native table** so no earlier index in the
+shared `crisol_closure_code` space moves (the same discipline D-305 records), with a `regexp_getter_natives_base()`
+helper shared by the dispatch and the install; installed via the existing `install_accessor`, named `"get <flag>"` once
+reachable on the prototype.
+
+Scoped deliberately: **instance data properties are kept.** An instance's own `global`/`source`/`flags` shadows the
+prototype getter, so `/x/g.global` and the engine's internal `property_of(this, "flags")` readers are untouched — zero
+risk to the existing behaviour and no instance-shape change. The brand is therefore a duck-type (own `flags`/`source`
+slot stands in for `[[OriginalFlags]]`), which the `this-val-invalid` cases (`{}`, `[]`, `arguments`, a function) all
+fail correctly; a hand-built faker carrying those own properties would pass, which no test exercises. **Deviations:**
+an instance still owns enumerable flag data properties (so `Object.keys(/x/g)` is non-empty, and `/x/ig.flags` returns
+the stored order rather than canonical — both pre-existing); and `get source` returns the stored pattern rather than
+`EscapeRegExpPattern`'s escaped form. Fully removing the instance data properties (hidden `[[OriginalFlags]]`/
+`[[OriginalSource]]` slots + a real brand in `INTERNAL_PROPERTIES`) is the follow-up that would close those.
