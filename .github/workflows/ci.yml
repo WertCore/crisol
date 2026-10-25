@@ -5,6 +5,22 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      test262_sample:
+        description: >-
+          How many test262 cases to attempt. Empty runs the whole corpus, which is roughly five
+          hours of compiling and linking and will hit the job's ceiling — a number is the
+          useful choice unless the wait is the point.
+        required: false
+        default: '1500'
+
+# One run per ref. A push to a branch with an open pull request fires **two** workflows — the
+# `push` (or `pull_request`) event and any manual dispatch — and each spawns the whole matrix.
+# Sixteen concurrent jobs was enough for the runners to be reclaimed mid-run, which surfaces as
+# `exit code 143` and a shutdown signal rather than anything about the code.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,9 +48,25 @@ jobs:
           - name: Linux (x86_64)
             os: ubuntu-latest
             budget_mib: 28 # observed 13.5 (VmRSS)
+          # **Here to separate "Linux" from "x86-64" in D-142.** The collector fails on
+          # `Linux (x86_64)` and passes on `macOS (arm64)`, which are two differences at once —
+          # the operating system and the architecture. This job holds the architecture fixed
+          # against macOS and the system fixed against x86-64, so whichever way it lands names
+          # the variable. Free for public repositories, and cheaper than reproducing it in a
+          # local VM, which filled a laptop's disk before it finished.
+          - name: Linux (arm64)
+            os: ubuntu-24.04-arm
+            budget_mib: 28 # same counter as x86-64; no separate reading yet
+            # **Known red, and kept that way deliberately** (D-144). Frame pointers fixed
+            # x86-64 and changed nothing here, so this target has a second fault of its own.
+            # Deleting the job would hide it and leaving it blocking would make every run red
+            # for something already understood and recorded — so it reports without failing
+            # the build, and the day it goes green this line comes out.
+            allow_failure: true
           - name: Windows (x86_64)
             os: windows-latest
             budget_mib: 8 # observed 3.4 (PrivateUsage)
+    continue-on-error: ${{ matrix.allow_failure || false }}
     steps:
       - uses: actions/checkout@v4
 
@@ -105,6 +137,19 @@ jobs:
             test/built-ins/Promise test/built-ins/Proxy test/built-ins/Reflect
           echo "CRISOL_TEST262_ROOT=$root" >> "$GITHUB_ENV"
           echo "CRISOL_REQUIRE_TEST262=1" >> "$GITHUB_ENV"
+          # A smoke sample here, not a measurement. Every case that compiles costs a `cc`
+          # invocation, so this step gets slower each time something stops being refused — and
+          # it is sharing a job with checks that should stay fast. The `test262` job below
+          # takes the real reading with a timeout that suits it.
+          echo "CRISOL_TEST262_SAMPLE=40" >> "$GITHUB_ENV"
+
+      # **`cargo test` does not build a `staticlib`.** The test262 runner links compiled
+      # programs against `libcrisol_abi.a`, which only `cargo build` emits — so the suite has
+      # been asserting its absence on every Linux run since `CRISOL_REQUIRE_TEST262` was
+      # added. It passed locally because a developer runs `cargo build -p crisol-abi` by habit
+      # before testing, which is precisely the difference a CI job exists to catch.
+      - name: Build the runtime archive
+        run: cargo build -p crisol-abi
 
       - name: Test
         run: cargo test --workspace --all-features
@@ -286,3 +331,86 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check on the declared floor
         run: cargo check --workspace --all-features
+
+  # A job of its own, because this is the only thing here whose cost grows as the engine
+  # improves: a refused case costs milliseconds and a compiled one costs a compile and a link.
+  # Sharing a job with the fast checks meant either a timeout or a sample too small to mean
+  # anything, so it gets its own runner and its own budget.
+  test262:
+    name: test262 (full corpus)
+    # **Not on every push.** The corpus is a compile and a link per case, and the matrix job
+    # already carries a sample of 40 as a smoke check. Running the full thing on each commit
+    # was most of the load that got the runners reclaimed — it belongs on `main` and on
+    # request, where somebody is actually going to read the number.
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch the test262 corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/test262"
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/tc39/test262.git "$root"
+          cd "$root"
+          git sparse-checkout set harness \
+            test/built-ins/Object test/built-ins/Array test/built-ins/String \
+            test/built-ins/Number test/built-ins/Boolean test/built-ins/Symbol \
+            test/built-ins/Map test/built-ins/Set test/built-ins/Date \
+            test/built-ins/Error test/built-ins/RegExp test/built-ins/JSON \
+            test/built-ins/Promise test/built-ins/Proxy test/built-ins/Reflect
+          echo "CRISOL_TEST262_ROOT=$root" >> "$GITHUB_ENV"
+          echo "CRISOL_REQUIRE_TEST262=1" >> "$GITHUB_ENV"
+
+      - name: Build the runtime archive
+        run: cargo build -p crisol-abi
+
+      # **A large sample, not the whole corpus, by default.** Every case is a compile and a
+      # link; twelve thousand of them is about five hours, which is past the ceiling above, and
+      # a job that times out reports nothing at all. Fifteen hundred is enough for the
+      # proportions to mean something and finishes inside the budget. The dispatch input takes
+      # a different number, or an empty one for all of them.
+      - name: Run the corpus
+        shell: bash
+        env:
+          CRISOL_TEST262_SAMPLE: ${{ inputs.test262_sample }}
+          CRISOL_TEST262_ALL: ${{ inputs.test262_sample == '' && '1' || '' }}
+        run: |
+          set -euo pipefail
+          # `tee` so the numbers survive into the next step. Without it the summary would have
+          # to re-run the suite to report on it, which is an hour to say the same thing twice.
+          cargo test -p crisol --test test262 -- --nocapture | tee "$RUNNER_TEMP/test262.log"
+
+      - name: Publish the numbers
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/test262.log"
+          {
+            echo "## test262"
+            if [ -f "$log" ]; then
+              # The counts and the reason breakdown, which is the part worth reading — a pass
+              # rate says how much and the reasons say what to do next.
+              #
+              # `|| true` because `head` closes the pipe once it has its sixty lines, `sed`
+              # takes SIGPIPE, and `pipefail` turns that into a failed step — so the summary
+              # was lost exactly when the run had something to say.
+              { sed -n '/attempted of/,$p' "$log" | head -60; } || true
+            else
+              echo "no log: the run did not get far enough to produce one"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-log
+          path: ${{ runner.temp }}/test262.log
+          if-no-files-found: warn

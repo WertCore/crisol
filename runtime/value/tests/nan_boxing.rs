@@ -158,6 +158,7 @@ fn an_address_round_trips_through_every_pointer_kind() {
         (Value::object as fn(Address) -> Value, Kind::Object),
         (Value::string as fn(Address) -> Value, Kind::String),
         (Value::symbol as fn(Address) -> Value, Kind::Symbol),
+        (Value::bigint as fn(Address) -> Value, Kind::BigInt),
     ] {
         let value = make(address);
         assert_eq!(value.kind(), kind);

@@ -681,6 +681,7 @@ dependencies = [
  "crisol-frontend",
  "crisol-ir",
  "crisol-render-wgpu",
+ "crisol-value",
  "wgpu",
 ]
 
@@ -702,7 +703,11 @@ dependencies = [
 name = "crisol-abi"
 version = "0.0.0"
 dependencies = [
+ "crisol-builtins",
+ "crisol-gc",
  "crisol-value",
+ "num-bigint",
+ "num-traits",
 ]
 
 [[package]]
@@ -789,6 +794,7 @@ dependencies = [
  "oxc_parser",
  "oxc_resolver",
  "oxc_span",
+ "oxc_syntax",
 ]
 
 [[package]]
