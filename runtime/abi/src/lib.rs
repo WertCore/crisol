@@ -12703,6 +12703,30 @@ fn descriptor_flag(descriptor: u64, name: &str) -> Option<bool> {
     Some(is_truthy(value))
 }
 
+/// A descriptor object read into the partial form [`crisol_builtins::validate_and_apply`] takes —
+/// the way `Object.defineProperty` reads one, where present-and-`undefined` is a field and absent
+/// is not. Used by the proxy `defineProperty`/`getOwnPropertyDescriptor` invariants (D-342) to hold
+/// a reported descriptor against the target's existing property.
+fn partial_descriptor_of(descriptor: u64) -> crisol_builtins::PartialDescriptor {
+    let value = read_descriptor_field(descriptor, "value");
+    let has_value = Value::from_bits(value).kind() != crisol_value::Kind::Undefined
+        || own_property(descriptor, "value").is_some();
+    let get = read_descriptor_field(descriptor, "get");
+    let has_get = Value::from_bits(get).kind() != crisol_value::Kind::Undefined
+        || own_property(descriptor, "get").is_some();
+    let set = read_descriptor_field(descriptor, "set");
+    let has_set = Value::from_bits(set).kind() != crisol_value::Kind::Undefined
+        || own_property(descriptor, "set").is_some();
+    crisol_builtins::PartialDescriptor {
+        value: has_value.then(|| Value::from_bits(value)),
+        get: has_get.then(|| Value::from_bits(get)),
+        set: has_set.then(|| Value::from_bits(set)),
+        writable: descriptor_flag(descriptor, "writable"),
+        enumerable: descriptor_flag(descriptor, "enumerable"),
+        configurable: descriptor_flag(descriptor, "configurable"),
+    }
+}
+
 /// `Object.defineProperty(target, key, descriptor)`.
 ///
 /// **A defined property defaults to none of writable, enumerable or configurable**, which is
@@ -20997,6 +21021,26 @@ fn proxy_descriptor(target: u64, handler: u64, key: u64) -> u64 {
                 "TypeError",
             );
         }
+        // **A descriptor reported for a non-configurable property must be one it could become**
+        // (D-342) — the `IsCompatiblePropertyDescriptor` reconciliation D-339 deferred, run against
+        // the target's current property. A configurable property can become anything, so skip it.
+        if target_has && !target_configurable {
+            let extensible = is_extensible(target);
+            if let Some(property) = key_of(Value::from_bits(key))
+                && let Some(current) =
+                    crisol_builtins::Target::own_property(&HeapTarget(target), &property)
+            {
+                let partial = partial_descriptor_of(reported);
+                if crisol_builtins::validate_and_apply(Some(&current), &partial, extensible)
+                    .is_err()
+                {
+                    return raise(
+                        "a getOwnPropertyDescriptor trap cannot report a descriptor incompatible with a non-configurable property",
+                        "TypeError",
+                    );
+                }
+            }
+        }
         reported
     })
 }
@@ -21062,6 +21106,26 @@ fn proxy_define(target: u64, handler: u64, key: u64, descriptor: u64) -> u64 {
                     "a defineProperty trap cannot make a configurable target property non-configurable",
                     "TypeError",
                 );
+            } else if !target_configurable {
+                // The property exists and is frozen in place: the redefinition must be one the
+                // target would itself accept — the full `IsCompatiblePropertyDescriptor`
+                // reconciliation (D-342), run against the target's current property. A still
+                // configurable property accepts anything, so only the non-configurable case checks.
+                let extensible = is_extensible(target);
+                if let Some(property) = key_of(Value::from_bits(key))
+                    && let Some(current) =
+                        crisol_builtins::Target::own_property(&HeapTarget(target), &property)
+                {
+                    let partial = partial_descriptor_of(descriptor);
+                    if crisol_builtins::validate_and_apply(Some(&current), &partial, extensible)
+                        .is_err()
+                    {
+                        return raise(
+                            "a defineProperty trap cannot redefine a non-configurable property incompatibly",
+                            "TypeError",
+                        );
+                    }
+                }
             }
             return target;
         }

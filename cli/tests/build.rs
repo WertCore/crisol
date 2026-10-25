@@ -375,6 +375,55 @@ fn a_proxy_defineproperty_agrees_with_its_target() {
     );
 }
 
+/// **A proxy reconciles with a frozen property** (D-342) — the full `IsCompatiblePropertyDescriptor` check that
+/// D-339 and D-341 deferred. A `defineProperty` or `getOwnPropertyDescriptor` trap may neither change the value
+/// of a non-configurable, non-writable target property, re-widen its writability, nor swap its kind; a change
+/// the target itself would accept (a value on a still-writable one, or a matching descriptor) is allowed.
+#[test]
+fn a_proxy_reconciles_with_a_frozen_property() {
+    // defineProperty: the value of a frozen (non-configurable, non-writable) property cannot move.
+    check(
+        "proxy-define-frozen-value",
+        "var o = {}; Object.defineProperty(o, 'x', {value: 1, writable: false, configurable: false}); \
+         var p = new Proxy(o, {defineProperty: function () { return true; }}); \
+         try { Object.defineProperty(p, 'x', {value: 2}); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // defineProperty: nor may its kind swap from data to accessor.
+    check(
+        "proxy-define-frozen-kind",
+        "var o = {}; Object.defineProperty(o, 'x', {value: 1, writable: false, configurable: false}); \
+         var p = new Proxy(o, {defineProperty: function () { return true; }}); \
+         try { Object.defineProperty(p, 'x', {get: function () { return 9; }}); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // defineProperty: a value change on a non-configurable but still-writable property is fine.
+    check(
+        "proxy-define-writable-value",
+        "var o = {}; Object.defineProperty(o, 'x', {value: 1, writable: true, configurable: false}); \
+         var p = new Proxy(o, {defineProperty: function (t, k, d) { return Reflect.defineProperty(t, k, d); }}); \
+         Object.defineProperty(p, 'x', {value: 2}); \
+         return o.x === 2;",
+        "true",
+    );
+    // getOwnPropertyDescriptor: a reported descriptor that disagrees with a frozen property faults...
+    check(
+        "proxy-gopd-frozen-value",
+        "var o = {}; Object.defineProperty(o, 'x', {value: 1, writable: false, configurable: false}); \
+         var p = new Proxy(o, {getOwnPropertyDescriptor: function () { return {value: 2, writable: false, configurable: false}; }}); \
+         try { Object.getOwnPropertyDescriptor(p, 'x'); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // ...but one that matches is reported as-is.
+    check(
+        "proxy-gopd-frozen-match",
+        "var o = {}; Object.defineProperty(o, 'x', {value: 1, writable: false, configurable: false}); \
+         var p = new Proxy(o, {getOwnPropertyDescriptor: function () { return {value: 1, writable: false, enumerable: false, configurable: false}; }}); \
+         return Object.getOwnPropertyDescriptor(p, 'x').value === 1;",
+        "true",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

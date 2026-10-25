@@ -8908,3 +8908,31 @@ And `Reflect.defineProperty` reports an invariant violation as `false` rather th
 cannot tell a status-false refusal from a thrown invariant. `Object.defineProperty` — the entry test262 exercises for
 these invariants — throws correctly. **Still open:** `ownKeys`, whose `own_keys` helper returns `Vec<String>` to many
 callers with no error channel and no symbol support — the one property trap left unchecked.
+
+## D-342
+
+**A proxy may not report or define a descriptor its target's frozen property would reject.**
+
+Status: Accepted
+
+D-339 (`getOwnPropertyDescriptor`) and D-341 (`defineProperty`) each covered the structural invariants — presence,
+extensibility, configurability — but both deferred the full `IsCompatiblePropertyDescriptor` reconciliation: whether a
+descriptor reported for, or defined on, a **non-configurable** target property actually agrees with it. That check
+already existed, unused by the proxy paths: `crisol_builtins::validate_and_apply` is the spec's
+`ValidateAndApplyPropertyDescriptor` written out, and the proxy target wrapper's `own_property` already yields the
+target's current property as a `Property`. This wires the two together. A new `partial_descriptor_of` reads a descriptor
+object into the `PartialDescriptor` the validator takes — the same present-vs-absent field reading `Object.defineProperty`
+does — and both `proxy_descriptor` and `proxy_define`, when the target property exists and is non-configurable, call
+`validate_and_apply(Some(&current), &partial, is_extensible(target))` and throw on `Err`. A configurable property accepts
+any change, so the check is skipped there (the validator would return `Ok` regardless). This catches a trap that changes
+the value of a frozen (non-configurable, non-writable) property, re-widens its writability, or swaps its kind — the
+asymmetric rules that live in one place so the target and its proxy cannot disagree about them.
+
+Rejected: hand-rolling the reconciliation inline (it is exactly `validate_and_apply`, and a second copy would be a second
+thing to keep in step with the spec). Reuses D-339/D-341's rooting discipline — `is_extensible` first, then the partial,
+then the current property, with the pure validator last so no allocation sits between building a descriptor and reading
+it. **Deviation retained:** `getOwnPropertyDescriptor` does not run `CompletePropertyDescriptor` on the reported
+descriptor first, so an omitted `enumerable`/`writable` is read as absent rather than completed to `false` — the
+value/kind/writable mismatches test262 exercises are caught; a reported descriptor that omits a field a non-configurable
+enumerable property fixes is not. `Reflect.defineProperty` still reports a violation as `false` (D-341). **Still open:**
+`ownKeys` — the one property trap left unchecked, as D-341 records.
