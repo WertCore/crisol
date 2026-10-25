@@ -9065,3 +9065,22 @@ the caller holds was otherwise collected mid-coercion under GC stress, so `value
 fallback silently failed. The swallow had hidden that latent bug; turning it into a throw surfaced it, and the root
 fixes it. **Not extended:** other coercions still on `to_text` (`split` separator, `replace` pattern/replacement,
 `concat`) — their own pass.
+
+## D-349
+
+**`replaceAll`'s global-regexp guard goes through `IsRegExp`.**
+
+Status: Accepted
+
+The follow-up D-347 flagged. `String.prototype.replaceAll` must reject a non-global regular-expression `searchValue`
+with a `TypeError`, and the spec keys that on `IsRegExp` (`@@match`) — but crisol keyed it on the `source` duck-type,
+which cannot see a `@@match` getter, so an abrupt read (`searchValue-isRegExp-abrupt`) was not propagated and a
+`@@match`-only object slipped past. The guard now runs `is_regexp` (D-347) up front, gated on `all` because
+`replace` has no such guard (it never calls `IsRegExp`): a regular expression whose `flags` lack `g` throws, an abrupt
+`@@match` propagates as `Err`, and a `@@match`-only object is caught. The duplicate `source`-based global check inside
+the regex-replacement branch is removed; that branch still recognises a real regex by `source` to drive
+`replace_using_pattern`/`@@replace`, which is unchanged. A global regex, and a plain string pattern, still replace
+every occurrence.
+
+Rejected: rerouting the whole `@@replace` dispatch through `IsRegExp`/`GetMethod` (a larger restructure of
+`replace_with`'s regex branch than the guard needs) — left for if the `@@replace`-on-a-non-regex cases surface.

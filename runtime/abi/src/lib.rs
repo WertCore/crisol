@@ -10496,12 +10496,24 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
     // SAFETY: as above.
     let replacement = unsafe { argument(argc, argv, 1) };
 
+    // **`replaceAll`'s one guard** (D-349): a regular-expression `searchValue` must be global. Keyed on
+    // `IsRegExp` (`@@match`) rather than `source`, so an abrupt read propagates and a `@@match`-only object
+    // is caught too; `replace` has no such guard, so this is gated on `all`.
+    if all {
+        match is_regexp(pattern) {
+            Ok(true) => {
+                let flags = property_text(pattern, "flags").unwrap_or_default();
+                if !flags.contains('g') {
+                    return raise("replaceAll needs a global regular expression", "TypeError");
+                }
+            }
+            Ok(false) => {}
+            Err(thrown) => return thrown,
+        }
+    }
+
     // A regular expression pattern, recognised by its `source` rather than by a type tag.
     if property_text(pattern, "source").is_some() {
-        let flags = property_text(pattern, "flags").unwrap_or_default();
-        if all && !flags.contains('g') {
-            return raise("replaceAll needs a global regular expression", "TypeError");
-        }
         // Asked of the pattern, which is what the specification says — see `symbol_method`.
         let replacer = symbol_method(pattern, "replace");
         if is_callable(replacer) {

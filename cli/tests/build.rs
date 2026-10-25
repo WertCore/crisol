@@ -639,6 +639,30 @@ fn string_argument_coercion_propagates() {
     );
 }
 
+/// **`replaceAll` requires a global regular expression, via `IsRegExp`** (D-349) — a non-global regex is a
+/// `TypeError`, an abrupt `@@match` read propagates, and a `@@match`-only object is caught; `replace` keeps
+/// accepting a non-global regex, and a global regex / string pattern replaces every occurrence.
+#[test]
+fn replace_all_requires_a_global_regexp() {
+    check(
+        "replaceall-nonglobal",
+        "try { 'aaa'.replaceAll(/a/, 'b'); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "replaceall-match-abrupt",
+        "try { 'a'.replaceAll({get [Symbol.match]() { throw new RangeError('no'); }}, 'x'); return 'no-throw'; } \
+         catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A global regex and a plain string both replace every occurrence; `replace` still allows a non-global regex.
+    check(
+        "replaceall-and-replace-ok",
+        "return 'aaa'.replaceAll(/a/g, 'b') + '/' + 'aaa'.replaceAll('a', 'b') + '/' + 'axbxc'.replace(/x/, '-');",
+        "bbb/bbb/a-bxc",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,
