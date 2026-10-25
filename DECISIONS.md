@@ -8936,3 +8936,41 @@ descriptor first, so an omitted `enumerable`/`writable` is read as absent rather
 value/kind/writable mismatches test262 exercises are caught; a reported descriptor that omits a field a non-configurable
 enumerable property fixes is not. `Reflect.defineProperty` still reports a violation as `false` (D-341). **Still open:**
 `ownKeys` — the one property trap left unchecked, as D-341 records.
+
+## D-343
+
+**A proxy trap that is present but not callable is a `TypeError`.**
+
+Status: Accepted
+
+`proxy_trap` — the engine's `GetMethod` for a handler — collapsed two of the spec's three answers into one:
+`is_callable(method).then_some(method)` returned `None` both for an **absent** trap (`undefined`/`null`, which forwards to
+the target) and for one **present but not a function** (which the spec faults). A handler written `{ get: 5 }` was
+treated as a pass-through rather than the error it is. It now returns `Result<Option<u64>, u64>`: `Ok(None)` absent,
+`Ok(Some)` callable, and `Err(bits)` for a present-non-callable (a raised `TypeError`) or a `[[Get]]` on the handler that
+itself threw (a handler that is a proxy — previously swallowed to `None` and silently forwarded). The ten property and
+prototype traps propagate the `Err`; `ownKeys` keeps the old non-throwing lookup inline, because it still has no error
+channel back to `own_keys`'s many callers (its invariant is deferred, D-341). Apply/construct are unaffected — crisol has
+no `Trap::Apply`/`Construct`, so callable proxies take a different path.
+
+Rejected: having `proxy_trap` set the pending exception and return `None` — the caller could not then tell "forward" from
+"a throw to propagate", and `ownKeys`'s path would strand the pending exception. Found by a test262 sample, where every
+`trap-is-not-callable` case across the traps failed.
+
+## D-344
+
+**`in` and `delete` on a trap-less proxy must root it across the dispatch.**
+
+Status: Accepted
+
+`crisol_in` and `crisol_delete` are the `in` and `delete` operators, lowered to direct calls — so unlike an
+`Object.*`/`Reflect.*` builtin, whose arguments the invoker roots, their operand arrives unrooted. Both extracted
+`(target, handler)` from the proxy and called `proxy_has`/`proxy_delete`, which read the handler for a trap — a `[[Get]]`
+that allocates. Under GC stress the unrooted proxy, and the target reachable only through it, were collected during that
+read, so the no-trap forward ran against a freed object and answered wrong (`'a' in new Proxy({a: 1}, {})` was `false`).
+Both now root `[object, target, handler]` across the dispatch; the `PropertyKey` owns its text (`Arc<str>`) and needs
+none. The builtin-dispatched traps were already safe — this closes the two operator paths.
+
+Rejected: rooting inside `proxy_has`/`proxy_delete` — too late, since the target can be freed before the call, being
+reachable only through the unrooted proxy the caller still holds. Discovered while writing the D-343 forward test (the
+pre-existing failure it surfaced was not D-343's change — the forward body is byte-identical).

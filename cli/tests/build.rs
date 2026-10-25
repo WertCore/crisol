@@ -424,6 +424,74 @@ fn a_proxy_reconciles_with_a_frozen_property() {
     );
 }
 
+/// **A proxy trap must be callable** (D-343) — `GetMethod` reads an absent trap (`undefined`/`null`) as a
+/// forward to the target, but a trap that is *present and not a function* is a `TypeError`, not another
+/// spelling of absent. Every property and prototype trap now rejects one; `ownKeys` keeps the old
+/// non-throwing lookup (its invariant is deferred and it has no error channel back to `own_keys`).
+#[test]
+fn a_proxy_trap_must_be_callable() {
+    // One non-callable trap per entry point.
+    let cases: &[(&str, &str)] = &[
+        ("get", "p.a;"),
+        ("set", "p.a = 1;"),
+        ("has", "'a' in p;"),
+        ("deleteProperty", "delete p.a;"),
+        (
+            "defineProperty",
+            "Object.defineProperty(p, 'a', {value: 1});",
+        ),
+        (
+            "getOwnPropertyDescriptor",
+            "Object.getOwnPropertyDescriptor(p, 'a');",
+        ),
+        ("getPrototypeOf", "Object.getPrototypeOf(p);"),
+        ("setPrototypeOf", "Object.setPrototypeOf(p, null);"),
+        ("isExtensible", "Object.isExtensible(p);"),
+        ("preventExtensions", "Object.preventExtensions(p);"),
+    ];
+    for (trap, operation) in cases {
+        check(
+            "proxy-trap-not-callable",
+            &format!(
+                "var p = new Proxy({{a: 1}}, {{{trap}: 5}}); \
+                 try {{ {operation} return 'no-throw'; }} catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // An absent trap (undefined or null) must still forward, not fault.
+    check(
+        "proxy-trap-null-forwards",
+        "var p = new Proxy({a: 7}, {get: null, set: undefined}); p.b = 2; return p.a;",
+        "7",
+    );
+    // A callable trap is unaffected.
+    check(
+        "proxy-trap-callable-ok",
+        "var p = new Proxy({}, {get: function () { return 9; }}); return p.anything;",
+        "9",
+    );
+}
+
+/// **`in` and `delete` on a trap-less proxy survive a collection** (D-344) — both are operators, so their
+/// operand is not rooted the way a builtin's arguments are. Dispatching `has`/`deleteProperty` reads the
+/// handler (an allocating `[[Get]]`), and without rooting the proxy first the target reachable only through
+/// it is collected, so the no-trap forward reads a freed object. The `check` harness runs each under GC
+/// stress, which is where the freed read showed.
+#[test]
+fn a_proxy_in_and_delete_forward_without_a_trap() {
+    check(
+        "proxy-in-forward",
+        "return ('a' in new Proxy({a: 7}, {})) + '/' + ('z' in new Proxy({a: 7}, {}));",
+        "true/false",
+    );
+    check(
+        "proxy-delete-forward",
+        "var t = {a: 1}; var removed = delete (new Proxy(t, {})).a; return removed + '/' + ('a' in t);",
+        "true/false",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

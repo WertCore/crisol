@@ -20495,7 +20495,14 @@ pub extern "C" fn crisol_delete(object: u64, key: u64) -> u64 {
         let Some(name) = key_of(Value::from_bits(key)) else {
             return Value::TRUE.to_bits();
         };
-        return proxy_delete(target, handler, &name);
+        // **Root the proxy across the trap dispatch** (D-344): `delete` is an operator, so unlike an
+        // `Object.*` builtin its operand is not rooted for it. `proxy_delete` reads the handler (a
+        // `[[Get]]` that allocates), and without this the unrooted proxy — and the target reachable
+        // only through it — is collected mid-dispatch, so the no-trap forward deletes from a freed
+        // object. The `PropertyKey` owns its text (`Arc<str>`), so only the heap values need rooting.
+        return with_rooted(&[object, target, handler], || {
+            proxy_delete(target, handler, &name)
+        });
     }
     let key_value = Value::from_bits(key);
 
@@ -20761,13 +20768,31 @@ impl crisol_builtins::Target for HeapTarget {
     }
 }
 
-/// The trap `name` on `handler`, or `None` when the handler does not define one.
+/// The trap `name` on `handler` — this is the spec's `GetMethod`, which has three answers, not
+/// two.
 ///
-/// **Absent means forward to the target**, which is what makes a handler with one trap a
-/// pass-through for everything else.
-fn proxy_trap(handler: u64, trap: crisol_builtins::Trap) -> Option<u64> {
+/// `Ok(None)` is **absent**: the trap is `undefined` or `null`, so the handler does not intercept
+/// this operation and the request forwards to the target — what makes a handler with one trap a
+/// pass-through for everything else. `Ok(Some(trap))` is a callable to invoke. `Err(bits)` is a
+/// fault the caller returns unchanged: a trap that is **present but not callable** (a handler that
+/// wrote `{ get: 5 }` named something the proxy can never call, which is a `TypeError`, not another
+/// spelling of absent), or a `[[Get]]` on the handler that itself threw (a handler that is a proxy).
+fn proxy_trap(handler: u64, trap: crisol_builtins::Trap) -> Result<Option<u64>, u64> {
     let method = property_of(handler, trap.name());
-    is_callable(method).then_some(method)
+    let value = Value::from_bits(method);
+    if value.is_exception() {
+        return Err(method);
+    }
+    if value.is_nullish() {
+        return Ok(None);
+    }
+    if !is_callable(method) {
+        return Err(raise(
+            &format!("a proxy '{}' trap is not callable", trap.name()),
+            "TypeError",
+        ));
+    }
+    Ok(Some(method))
 }
 
 /// Checks a trap's answer against the target, turning a violation into a thrown `TypeError`.
@@ -20830,7 +20855,11 @@ fn proxy_load(receiver: u64, target: u64, handler: u64, key: &PropertyKey) -> u6
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::Get) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::Get) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         return load_with_key(target, key);
     };
     with_rooted(&[receiver, target, handler, trap], || {
@@ -20857,7 +20886,11 @@ fn proxy_store(receiver: u64, target: u64, handler: u64, key: &PropertyKey, valu
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::Set) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::Set) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         return store_with_key(target, key, value);
     };
     with_rooted(&[receiver, target, handler, trap, value], || {
@@ -20885,7 +20918,11 @@ fn proxy_has(target: u64, handler: u64, key: &PropertyKey) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::Has) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::Has) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         let name = key_value(key);
         return with_rooted(&[target, name], || crisol_in(name, target));
     };
@@ -20911,7 +20948,11 @@ fn proxy_delete(target: u64, handler: u64, key: &PropertyKey) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::DeleteProperty) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::DeleteProperty) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         let name = key_value(key);
         return with_rooted(&[target, name], || crisol_delete(target, name));
     };
@@ -20937,7 +20978,11 @@ fn proxy_own_keys(target: u64, handler: u64) -> Option<Vec<String>> {
     if proxy.is_revoked() {
         return Some(Vec::new());
     }
-    let trap = proxy_trap(handler, crisol_builtins::Trap::OwnKeys)?;
+    // `ownKeys` keeps the old non-throwing lookup: it has no error channel back to `own_keys`'s
+    // many callers (the invariant is deferred), so a non-callable trap forwards rather than
+    // faulting — unlike the other traps, which now reject one through `proxy_trap` (D-343).
+    let method = property_of(handler, crisol_builtins::Trap::OwnKeys.name());
+    let trap = is_callable(method).then_some(method)?;
     let reported = with_rooted(&[target, handler, trap], || {
         call_value(trap, handler, &[target])
     });
@@ -20966,7 +21011,11 @@ fn proxy_descriptor(target: u64, handler: u64, key: u64) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::GetOwnPropertyDescriptor) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::GetOwnPropertyDescriptor) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         let arguments = [target, key];
         return with_rooted(&arguments, || {
             object_own_descriptor(0, 0, 0, 2, arguments.as_ptr())
@@ -21054,7 +21103,11 @@ fn proxy_define(target: u64, handler: u64, key: u64, descriptor: u64) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::DefineProperty) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::DefineProperty) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         let arguments = [target, key, descriptor];
         return with_rooted(&arguments, || {
             object_define_property(0, 0, 0, 3, arguments.as_ptr())
@@ -21145,7 +21198,11 @@ fn proxy_prototype(target: u64, handler: u64) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::GetPrototypeOf) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::GetPrototypeOf) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         let arguments = [target];
         return with_rooted(&arguments, || {
             object_get_prototype(0, 0, 0, 1, arguments.as_ptr())
@@ -21194,7 +21251,11 @@ fn proxy_is_extensible(target: u64, handler: u64) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::IsExtensible) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::IsExtensible) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         return boolean(is_extensible(target)).to_bits();
     };
     with_rooted(&[target, handler, trap], || {
@@ -21218,7 +21279,11 @@ fn proxy_prevent_extensions(target: u64, handler: u64) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::PreventExtensions) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::PreventExtensions) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         prevent_extensions(target);
         return Value::TRUE.to_bits();
     };
@@ -21256,7 +21321,11 @@ fn proxy_set_prototype(target: u64, handler: u64, proto: u64) -> u64 {
             "TypeError",
         );
     }
-    let Some(trap) = proxy_trap(handler, crisol_builtins::Trap::SetPrototypeOf) else {
+    let trap = match proxy_trap(handler, crisol_builtins::Trap::SetPrototypeOf) {
+        Ok(trap) => trap,
+        Err(exception) => return exception,
+    };
+    let Some(trap) = trap else {
         // No trap: re-parent the target itself (which may be another proxy), reporting whether
         // it accepted. A refusal is a `false` status, not a throw — the caller decides.
         let Some(behind) = handle_of(target) else {
@@ -25283,7 +25352,11 @@ pub extern "C" fn crisol_in(key: u64, object: u64) -> u64 {
         let Some(name) = key_of(Value::from_bits(key)) else {
             return Value::FALSE.to_bits();
         };
-        return proxy_has(target, handler, &name);
+        // Root the proxy across the trap dispatch (D-344): `in` is an operator, so its operand is not
+        // rooted for it. See `crisol_delete` for why the no-trap forward otherwise reads a freed target.
+        return with_rooted(&[object, target, handler], || {
+            proxy_has(target, handler, &name)
+        });
     }
     // A present element answers `true` straight away; a hole or an out-of-range index falls
     // through to the general own-and-prototype walk, which finds neither and answers `false` —
