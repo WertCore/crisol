@@ -606,6 +606,39 @@ fn string_search_rejects_a_regexp() {
     );
 }
 
+/// **A string-method argument whose coercion throws propagates it** (D-348) — a `toString`/`valueOf` that
+/// faults is no longer swallowed to the empty string; and an object whose `ToPrimitive` yields no primitive
+/// is a `TypeError`. An object that coerces cleanly (including through `valueOf`) still works.
+#[test]
+fn string_argument_coercion_propagates() {
+    // A throwing toString propagates through each argument path.
+    for source in [
+        "'abc'.padEnd(10, {toString: function () { throw new RangeError('x'); }})",
+        "'abc'.indexOf({toString: function () { throw new RangeError('x'); }})",
+        "'abc'.startsWith({toString: function () { throw new RangeError('x'); }})",
+    ] {
+        check(
+            "string-arg-abrupt",
+            &format!("try {{ {source}; return 'no-throw'; }} catch (e) {{ return e.name; }}"),
+            "RangeError",
+        );
+    }
+    // Both toString and valueOf returning objects is a TypeError.
+    check(
+        "string-arg-no-primitive",
+        "try { 'x'.indexOf({toString: function () { return {}; }, valueOf: function () { return {}; }}); return 'no-throw'; } \
+         catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // An object that coerces cleanly (via valueOf when toString yields an object) still works.
+    check(
+        "string-arg-valueof",
+        "return 'xabc'.startsWith({toString: function () { return {}; }, valueOf: function () { return 'xa'; }}) \
+         + '/' + 'ab2cd'.indexOf({toString: function () { return 2; }});",
+        "true/2",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

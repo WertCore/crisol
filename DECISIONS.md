@@ -9044,3 +9044,24 @@ Rejected: duck-typing on `source` alone (misses a plain object with a truthy `@@
 sets to `false`). **Not extended here:** `replaceAll`, whose `searchValue`-is-a-non-global-regexp check still uses the
 `source` duck-type rather than `is_regexp`, so an abrupt `@@match` there is not yet propagated (the
 `replaceAll/searchValue-isRegExp-abrupt` case) — a small follow-up now that `is_regexp` exists.
+
+## D-348
+
+**A string-method argument whose coercion throws propagates it.**
+
+Status: Accepted
+
+The abrupt-coercion half of D-346. `to_primitive_text` already returns the exception sentinel when a
+`toString`/`valueOf` throws, but `to_text` — which the argument paths reached — folds that into its `None` and
+spends it as the empty string, so `'abc'.padEnd(10, { toString() { throw } })` padded with `""` instead of
+propagating. `string_argument` now routes an object argument through `ToPrimitive` (string hint) itself: a thrown
+`toString`/`valueOf` returns as `Err`, a `valueOf` that answers a symbol is a `TypeError`, and an object that yields
+no primitive at all is a `TypeError` (`ToString` of a non-primitive). A primitive still coerces exactly as before.
+This covers every argument site already on `string_argument` (`padStart`/`padEnd` fill; `indexOf`/`lastIndexOf`/
+`includes`/`startsWith`/`endsWith` searchString).
+
+The argument is **rooted across `to_primitive_text`** — the first method's result allocates, and a bare argument
+the caller holds was otherwise collected mid-coercion under GC stress, so `valueOf` read a freed object and the
+fallback silently failed. The swallow had hidden that latent bug; turning it into a throw surfaced it, and the root
+fixes it. **Not extended:** other coercions still on `to_text` (`split` separator, `replace` pattern/replacement,
+`concat`) — their own pass.

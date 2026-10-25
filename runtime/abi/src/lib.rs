@@ -11407,16 +11407,39 @@ fn coercible_text(this_value: u64) -> Result<String, u64> {
     Ok(this_text(this_value).unwrap_or_default())
 }
 
-/// `ToString` of a method **argument**, which faults on a symbol (D-346) rather than reading it as the
-/// empty string. A string argument's coercion is specified exactly like the receiver's — `'x'.padEnd(2,
-/// Symbol())` is a `TypeError`, not a pad with `""` — but the argument paths reached for `to_text`, whose
-/// `None` they spent as a default. Everything else coerces as before.
+/// `ToString` of a method **argument**, which faults rather than reading a value it cannot convert as
+/// the empty string (D-346, D-348). A symbol is a `TypeError`; an object is run through `ToPrimitive`
+/// (string hint), and a `toString`/`valueOf` that **throws propagates** instead of being swallowed to a
+/// default (the `return-abrupt-from-*` cases) — `to_text`, whose `None` the argument paths spent as a
+/// default, has no channel to surface that. A primitive coerces exactly as before.
 fn string_argument(bits: u64) -> Result<String, u64> {
-    if Value::from_bits(bits).kind() == crisol_value::Kind::Symbol {
+    let value = Value::from_bits(bits);
+    if value.kind() == crisol_value::Kind::Symbol {
         return Err(raise(
             "a symbol cannot be converted to a string",
             "TypeError",
         ));
+    }
+    if value.kind() == crisol_value::Kind::Object {
+        // `to_primitive_text` returns the exception sentinel when a `toString`/`valueOf` throws, the
+        // object itself when neither yields a primitive, and a symbol when `valueOf` answers one. The
+        // object is rooted across it: the first method's result allocates, and a bare argument the
+        // caller holds is otherwise freed mid-coercion under stress (so `valueOf` reads a dead object).
+        let primitive = with_rooted(&[bits], || to_primitive_text(bits));
+        let held = Value::from_bits(primitive);
+        if held.is_exception() {
+            return Err(primitive);
+        }
+        if held.kind() == crisol_value::Kind::Symbol {
+            return Err(raise(
+                "a symbol cannot be converted to a string",
+                "TypeError",
+            ));
+        }
+        if held.kind() == crisol_value::Kind::Object {
+            return Err(raise("cannot convert the object to a string", "TypeError"));
+        }
+        return Ok(to_text(primitive).unwrap_or_default());
     }
     Ok(to_text(bits).unwrap_or_default())
 }
