@@ -538,6 +538,36 @@ fn regexp_prototype_exposes_flag_getters() {
     );
 }
 
+/// **A string-method argument that is a Symbol faults** (D-346) — `ToString` of a symbol is a `TypeError`,
+/// so `padEnd`/`padStart`'s fill, and the `searchString` of `indexOf`/`lastIndexOf`/`includes`/`startsWith`/
+/// `endsWith`, throw rather than reading it as the empty string. Ordinary string, number and regular
+/// expression arguments coerce as before.
+#[test]
+fn string_methods_reject_a_symbol_argument() {
+    let cases: &[&str] = &[
+        "'abc'.padEnd(10, Symbol())",
+        "'abc'.padStart(10, Symbol())",
+        "'abc'.indexOf(Symbol())",
+        "'abc'.lastIndexOf(Symbol())",
+        "'abc'.includes(Symbol())",
+        "'abc'.startsWith(Symbol())",
+        "'abc'.endsWith(Symbol())",
+    ];
+    for source in cases {
+        check(
+            "string-arg-symbol",
+            &format!("try {{ {source}; return 'no-throw'; }} catch (e) {{ return e.name; }}"),
+            "TypeError",
+        );
+    }
+    // Ordinary arguments are unaffected, and a short pad still skips the fill entirely (no throw).
+    check(
+        "string-arg-ok",
+        "return 'abcabc'.indexOf('b') + '/' + 'xy'.padEnd(4, '.') + '/' + 'abc'.startsWith('ab') + '/' + 'abc'.padEnd(2, Symbol());",
+        "1/xy../true/abc",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

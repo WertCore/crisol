@@ -10432,7 +10432,10 @@ fn pad_with(this_value: u64, argc: u64, argv: *const u64, at_start: bool) -> u64
     let filler = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
         " ".to_owned()
     } else {
-        to_text(given).unwrap_or_default()
+        match string_argument(given) {
+            Ok(filler) => filler,
+            Err(thrown) => return thrown,
+        }
     };
     // **An empty filler pads nothing**, and answering the original rather than looping is the
     // whole of why that case is checked.
@@ -11404,6 +11407,20 @@ fn coercible_text(this_value: u64) -> Result<String, u64> {
     Ok(this_text(this_value).unwrap_or_default())
 }
 
+/// `ToString` of a method **argument**, which faults on a symbol (D-346) rather than reading it as the
+/// empty string. A string argument's coercion is specified exactly like the receiver's — `'x'.padEnd(2,
+/// Symbol())` is a `TypeError`, not a pad with `""` — but the argument paths reached for `to_text`, whose
+/// `None` they spent as a default. Everything else coerces as before.
+fn string_argument(bits: u64) -> Result<String, u64> {
+    if Value::from_bits(bits).kind() == crisol_value::Kind::Symbol {
+        return Err(raise(
+            "a symbol cannot be converted to a string",
+            "TypeError",
+        ));
+    }
+    Ok(to_text(bits).unwrap_or_default())
+}
+
 /// Whether `needle` sits at `haystack[at..]`, both in UTF-16 code units.
 fn units_match_at(haystack: &[u16], needle: &[u16], at: usize) -> bool {
     haystack
@@ -11508,8 +11525,9 @@ extern "C" fn string_index_of(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
-        return Value::number(-1.0).to_bits();
+    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+        Ok(needle) => needle,
+        Err(thrown) => return thrown,
     };
     // Reported in code units, so the answer is an index into the same space `charAt` uses.
     match text.find(&needle) {
@@ -11531,8 +11549,9 @@ extern "C" fn string_last_index_of(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
-        return Value::number(-1.0).to_bits();
+    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+        Ok(needle) => needle,
+        Err(thrown) => return thrown,
     };
     match text.rfind(&needle) {
         Some(byte) => index_value(code_units(&text[..byte]).len()),
@@ -11553,8 +11572,9 @@ extern "C" fn string_includes(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
-        return Value::FALSE.to_bits();
+    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+        Ok(needle) => needle,
+        Err(thrown) => return thrown,
     };
     // **The position is coerced, and a symbol there throws** — the same rule as any index.
     let from = match integer_argument(argc, argv, 1) {
@@ -11589,8 +11609,9 @@ extern "C" fn string_starts_with(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
-        return Value::FALSE.to_bits();
+    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+        Ok(needle) => needle,
+        Err(thrown) => return thrown,
     };
     let from = match integer_argument(argc, argv, 1) {
         Ok(from) => from,
@@ -11620,8 +11641,9 @@ extern "C" fn string_ends_with(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let Some(needle) = to_text(unsafe { argument(argc, argv, 0) }) else {
-        return Value::FALSE.to_bits();
+    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+        Ok(needle) => needle,
+        Err(thrown) => return thrown,
     };
     let units = code_units(&text);
     // SAFETY: the convention guarantees `argc` readable values at `argv`.

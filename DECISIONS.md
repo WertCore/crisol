@@ -9003,3 +9003,24 @@ an instance still owns enumerable flag data properties (so `Object.keys(/x/g)` i
 the stored order rather than canonical — both pre-existing); and `get source` returns the stored pattern rather than
 `EscapeRegExpPattern`'s escaped form. Fully removing the instance data properties (hidden `[[OriginalFlags]]`/
 `[[OriginalSource]]` slots + a real brand in `INTERNAL_PROPERTIES`) is the follow-up that would close those.
+
+## D-346
+
+**`ToString` of a string-method argument faults on a symbol.**
+
+Status: Accepted
+
+Another test262-sample cluster: `'abc'.padEnd(10, Symbol())` and the `searchString` of `indexOf`/`lastIndexOf`/
+`includes`/`startsWith`/`endsWith` must throw a `TypeError`, because `ToString` of a symbol does. The receiver's
+coercion already faulted (`coercible_text`), but the argument paths reached for `to_text`, whose `None` they spent as a
+default — reading the symbol as `""` (so `padEnd` padded with nothing, `startsWith` answered `false`) instead of
+throwing. A new `string_argument` helper rejects a symbol and otherwise coerces exactly as before; the six argument
+sites call it and propagate its `Err`. `padEnd`'s fill is still read only after the length check, matching `StringPad`'s
+order (`'abc'.padEnd(2, Symbol())` returns `"abc"` without reaching the fill). `indexOf`/`lastIndexOf` keep accepting a
+regular expression argument (they have no `IsRegExp` guard, and should not).
+
+Scoped to the symbol case deliberately. **Not covered:** an argument object whose `toString`/`@@toPrimitive` throws is
+still swallowed to a default by `to_text` rather than propagating (the `return-abrupt-from-searchstring` cluster), and
+`includes`/`startsWith`/`endsWith` still lack the `IsRegExp` guard that makes a regular expression `searchString` a
+`TypeError` — both are separate items. Other argument coercions (`split` separator, `replace` pattern/replacement,
+`concat`) were left on `to_text` here; they carry regex/replacement handling that wants its own pass.
