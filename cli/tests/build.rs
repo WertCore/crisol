@@ -663,6 +663,62 @@ fn replace_all_requires_a_global_regexp() {
     );
 }
 
+/// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
+/// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
+#[test]
+fn error_subclasses_inherit_the_error_constructor() {
+    check(
+        "error-ctor-proto",
+        "return (Object.getPrototypeOf(RangeError) === Error) + '/' \
+         + (Object.getPrototypeOf(TypeError) === Error) + '/' \
+         + (Object.getPrototypeOf(SyntaxError) === Error) + '/' \
+         + (Object.getPrototypeOf(Error) === Function.prototype);",
+        "true/true/true/true",
+    );
+}
+
+/// **`Object` statics coerce an object property key** (D-351) — `ToPropertyKey` runs `ToPrimitive` on an
+/// object key, so `getOwnPropertyDescriptor`/`defineProperty` read the coerced name rather than treating it
+/// as absent; a throwing coercion propagates.
+#[test]
+fn object_methods_coerce_an_object_key() {
+    check(
+        "topropkey-gopd",
+        "var o = {abc: 1}; \
+         var k = {toString: function () { return {}; }, valueOf: function () { return 'abc'; }}; \
+         return Object.getOwnPropertyDescriptor(o, k).value;",
+        "1",
+    );
+    check(
+        "topropkey-define",
+        "var o = {}; Object.defineProperty(o, {toString: function () { return 'x'; }}, {value: 5}); \
+         return o.x;",
+        "5",
+    );
+    check(
+        "topropkey-abrupt",
+        "try { Object.getOwnPropertyDescriptor({}, {toString: function () { throw new RangeError('k'); }}); \
+         return 'no-throw'; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
+/// **`Error.prototype.toString` requires an object receiver** (D-352) — a string primitive has a cell, so
+/// the old handle test let `.call("x")` read a name off it instead of faulting.
+#[test]
+fn error_tostring_requires_an_object() {
+    check(
+        "error-tostring-primitive",
+        "try { Error.prototype.toString.call('x'); return 'no-throw'; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "error-tostring-ok",
+        "return new TypeError('boom').toString();",
+        "TypeError: boom",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

@@ -6804,8 +6804,11 @@ extern "C" fn error_to_text(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
-    if handle_of(this_value).is_none() {
-        return raise("an error is an object", "TypeError");
+    // **A primitive receiver is a `TypeError`, not just a handle-less one** (D-352). A string is a
+    // cell, so `handle_of` answered `Some` for `Error.prototype.toString.call("x")` and it read a
+    // name off the string instead of faulting; the receiver must be an Object.
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
+        return raise("Error.prototype.toString requires an object", "TypeError");
     }
     let name = property_text(this_value, "name").unwrap_or_else(|| "Error".to_owned());
     let message = property_text(this_value, "message").unwrap_or_default();
@@ -13071,8 +13074,10 @@ extern "C" fn object_define_property(
         // likely to define that way. The key goes through `key_of`, which knows both
         // spellings, and the string is kept alongside only for the two questions that are
         // genuinely about names: whether this is `length`, and whether it is an index.
-        let Some(property) = key_of(Value::from_bits(key)) else {
-            return raise("a property key must be a name", "TypeError");
+        let property = match to_property_key(key) {
+            Ok(Some(property)) => property,
+            Ok(None) => return raise("a property key must be a name", "TypeError"),
+            Err(thrown) => return thrown,
         };
         let name = if property.is_symbol() {
             String::new()
@@ -13359,8 +13364,10 @@ extern "C" fn object_own_descriptor(
         }
         // A symbol is a key here too — see `object_define_property`, which refused one for
         // the same reason until it stopped asking `to_text`.
-        let Some(property) = key_of(Value::from_bits(key)) else {
-            return Value::UNDEFINED.to_bits();
+        let property = match to_property_key(key) {
+            Ok(Some(property)) => property,
+            Ok(None) => return Value::UNDEFINED.to_bits(),
+            Err(thrown) => return thrown,
         };
         let named = !property.is_symbol();
         let name = if named {
@@ -16010,18 +16017,21 @@ impl Runtime {
                     NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ERROR_TO_TEXT,
                 );
                 self.define_method(prototype, "Error.prototype", "toString", method.to_value());
-            } else if let Some(base) =
-                self.global_object(globals.handle(), "Error")
-                    .and_then(|base| {
-                        let shape = self.heap.shape_of(base)?;
-                        let slot = self.shapes.borrow().lookup(shape, &key)?;
-                        self.heap
-                            .get(base, slot.index())
-                            .and_then(|value| value.as_address())
-                            .map(GcRef::from_address)
-                    })
-            {
-                self.heap.set_prototype(prototype, Some(base));
+            } else if let Some(error_ctor) = self.global_object(globals.handle(), "Error") {
+                // The subclass prototype inherits `Error.prototype`, so `e instanceof Error` holds…
+                let base = self
+                    .heap
+                    .shape_of(error_ctor)
+                    .and_then(|shape| self.shapes.borrow().lookup(shape, &key))
+                    .and_then(|slot| self.heap.get(error_ctor, slot.index()))
+                    .and_then(|value| value.as_address())
+                    .map(GcRef::from_address);
+                if let Some(base) = base {
+                    self.heap.set_prototype(prototype, Some(base));
+                }
+                // The subclass **constructor** inheriting the `Error` constructor (D-350) is done after
+                // the `Function.prototype` pass below, which would otherwise reset it.
+                let _ = error_ctor;
             }
         }
 
@@ -16146,6 +16156,26 @@ impl Runtime {
             for name in ["Object", "Array"] {
                 if let Some(global) = self.global_object(globals.handle(), name) {
                     self.heap.set_prototype(global, Some(functions));
+                }
+            }
+        }
+
+        // **An error subclass constructor inherits the `Error` constructor** (D-350), set *after* the
+        // `Function.prototype` pass above — which sets every global constructor's `[[Prototype]]` and
+        // would otherwise reset these. `Object.getPrototypeOf(RangeError) === Error`, and
+        // `class X extends TypeError` reaches `Error.prototype`'s statics through it.
+        if let Some(error_ctor) = self.global_object(globals.handle(), "Error") {
+            for name in [
+                "TypeError",
+                "RangeError",
+                "ReferenceError",
+                "SyntaxError",
+                "EvalError",
+                "URIError",
+                "AggregateError",
+            ] {
+                if let Some(constructor) = self.global_object(globals.handle(), name) {
+                    self.heap.set_prototype(constructor, Some(error_ctor));
                 }
             }
         }
@@ -20037,6 +20067,31 @@ fn as_index(key: Value) -> Option<usize> {
 /// through `Value`'s own formatting rather than Rust's, because `1e21` and `-0` do not print
 /// the same in the two languages and a property name that differs by a character is a
 /// different property.
+/// `ToPropertyKey(argument)` (D-351) — a symbol stays a symbol, every other primitive becomes a string
+/// key, and an **object** is run through `ToPrimitive` (string hint) first. `key_of` alone returned `None`
+/// for an object, which the `Object` statics spent as "no such property" — so
+/// `Object.getOwnPropertyDescriptor(o, {toString(){return "x"}})` read nothing and the caller faulted on
+/// the `undefined` it got back. `Ok(None)` is a key that names nothing; `Err` carries an abrupt coercion
+/// (a throwing `toString`/`valueOf`) or an object that yields no primitive.
+fn to_property_key(key: u64) -> Result<Option<PropertyKey>, u64> {
+    let value = Value::from_bits(key);
+    if value.kind() == crisol_value::Kind::Object {
+        let primitive = with_rooted(&[key], || to_primitive_text(key));
+        let held = Value::from_bits(primitive);
+        if held.is_exception() {
+            return Err(primitive);
+        }
+        if held.kind() == crisol_value::Kind::Object {
+            return Err(raise(
+                "cannot convert the value to a property key",
+                "TypeError",
+            ));
+        }
+        return Ok(key_of(held));
+    }
+    Ok(key_of(value))
+}
+
 fn key_of(key: Value) -> Option<PropertyKey> {
     // **A string key is the ordinary case.** This returned `None` for one until strings
     // existed, which made `o["a"]` silently do nothing — a computed read answered `undefined`

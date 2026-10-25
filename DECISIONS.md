@@ -9084,3 +9084,43 @@ every occurrence.
 
 Rejected: rerouting the whole `@@replace` dispatch through `IsRegExp`/`GetMethod` (a larger restructure of
 `replace_with`'s regex branch than the guard needs) — left for if the `@@replace`-on-a-non-regex cases surface.
+
+## D-350
+
+**An error subclass constructor inherits the `Error` constructor.**
+
+Status: Accepted
+
+`build_globals` linked each error subclass *prototype* to `Error.prototype` (so `e instanceof Error` holds) but left
+the subclass *constructor*'s `[[Prototype]]` at `Function.prototype`, so `Object.getPrototypeOf(RangeError)` was
+`Function.prototype` rather than `Error`. The constructors (`TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`,
+`EvalError`, `URIError`, `AggregateError`) now inherit the `Error` constructor. The link is set in a small pass **after**
+the one that gives every global constructor `Function.prototype` — placing it in the error loop had it immediately
+overwritten by that later pass, which is the bug the first attempt hit and the reason the pass order is called out.
+
+## D-351
+
+**`Object`'s key coercion runs `ToPropertyKey` on an object key.**
+
+Status: Accepted
+
+`Object.getOwnPropertyDescriptor`/`defineProperty` coerced their key argument with `key_of`, which answers `None` for an
+object — so `getOwnPropertyDescriptor(o, { toString() { return "x" } })` read nothing and the caller faulted on the
+`undefined` descriptor. A new `to_property_key` writes out `ToPropertyKey`: a symbol stays a symbol, a primitive becomes
+a string key, and an object is run through `ToPrimitive` (string hint) — rooted across the call (D-348) — before
+`key_of`, with a throwing `toString`/`valueOf` propagated and an object that yields no primitive a `TypeError`. Both
+statics use it; `Reflect.getOwnPropertyDescriptor`/`defineProperty` inherit the fix through them. `hasOwn`/
+`hasOwnProperty` already coerced via `to_text`, so they were unaffected. **Not extended:** computed member access, `in`
+and `delete` still coerce object keys through their own `to_text`/`key_of` paths (they handle the common case but do not
+propagate a throwing coercion) — the operator layer is a separate pass.
+
+## D-352
+
+**`Error.prototype.toString` requires an object receiver.**
+
+Status: Accepted
+
+The brand check was `handle_of(this).is_none()`, but a string is a cell with a handle, so
+`Error.prototype.toString.call("x")` read a `name` off the string rather than throwing. It now requires `kind == Object`,
+so a primitive receiver is the `TypeError` the specification calls for; an ordinary (non-error) object is still accepted,
+since the method only reads `name`/`message`.
