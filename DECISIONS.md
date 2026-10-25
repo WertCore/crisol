@@ -9024,3 +9024,23 @@ still swallowed to a default by `to_text` rather than propagating (the `return-a
 `includes`/`startsWith`/`endsWith` still lack the `IsRegExp` guard that makes a regular expression `searchString` a
 `TypeError` — both are separate items. Other argument coercions (`split` separator, `replace` pattern/replacement,
 `concat`) were left on `to_text` here; they carry regex/replacement handling that wants its own pass.
+
+## D-347
+
+**`includes`/`startsWith`/`endsWith` reject a regular expression searchString.**
+
+Status: Accepted
+
+The `IsRegExp` guard D-346 flagged. `String.prototype.includes`/`startsWith`/`endsWith` must throw a `TypeError` when
+their `searchString` is a regular expression — the step that stops `'a/b'.startsWith(/a/)` from matching a regex coerced
+to its own text. A new `is_regexp` writes out the spec's `IsRegExp`: not an object → false; otherwise `Get(@@match)`
+(crisol already reads it through `symbol_method`) decides by `ToBoolean` when present, falling back to crisol's
+`source`-based brand when it is absent. The three methods run it before `string_argument`, matching the spec order
+(`IsRegExp` then `ToString`, so a regex faults before a symbol would). `Err` carries an abrupt `@@match` read (a getter
+that throws) through unchanged. `indexOf`/`lastIndexOf` are untouched — they take a regular expression and coerce it,
+and have no such guard.
+
+Rejected: duck-typing on `source` alone (misses a plain object with a truthy `@@match`, and cannot honour one a program
+sets to `false`). **Not extended here:** `replaceAll`, whose `searchValue`-is-a-non-global-regexp check still uses the
+`source` duck-type rather than `is_regexp`, so an abrupt `@@match` there is not yet propagated (the
+`replaceAll/searchValue-isRegExp-abrupt` case) — a small follow-up now that `is_regexp` exists.

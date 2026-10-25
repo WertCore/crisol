@@ -568,6 +568,44 @@ fn string_methods_reject_a_symbol_argument() {
     );
 }
 
+/// **`includes`/`startsWith`/`endsWith` reject a regular expression searchString** (D-347) — the spec's
+/// `IsRegExp` guard (`@@match`), run before coercion, so a regex is not matched as its own text. `indexOf`
+/// keeps accepting one; a `@@match` getter that throws propagates.
+#[test]
+fn string_search_rejects_a_regexp() {
+    for method in ["includes", "startsWith", "endsWith"] {
+        check(
+            "string-search-regexp",
+            &format!(
+                "try {{ 'abc'.{method}(/b/); return 'no-throw'; }} catch (e) {{ return e.name; }}"
+            ),
+            "TypeError",
+        );
+    }
+    // A truthy @@match on a plain object makes it regex-like; a falsy one does not.
+    check(
+        "string-search-match-flag",
+        "var threw = false; \
+         try { 'x'.includes({[Symbol.match]: true}); } catch (e) { threw = e instanceof TypeError; } \
+         var ok = 'xabc'.startsWith({[Symbol.match]: false, toString: function () { return 'xa'; }}); \
+         return threw + '/' + ok;",
+        "true/true",
+    );
+    // indexOf still accepts a regular expression (it has no IsRegExp guard), coercing it to a string.
+    check(
+        "string-indexof-regexp-ok",
+        "return 'a/y/b'.indexOf(/y/);",
+        "1",
+    );
+    // An abrupt @@match read propagates.
+    check(
+        "string-search-match-abrupt",
+        "try { 'x'.endsWith({get [Symbol.match]() { throw new RangeError('no'); }}); return 'no-throw'; } \
+         catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
 /// **`JSON.stringify` applies a function replacer** (D-337) — called for every property (and the `""`
 /// root), on its holder, with `(key, value)`; its result replaces the value, and `undefined` drops it. A
 /// throwing replacer propagates. This completes the JSON callbacks (reviver, array + function replacer,

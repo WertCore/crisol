@@ -11421,6 +11421,24 @@ fn string_argument(bits: u64) -> Result<String, u64> {
     Ok(to_text(bits).unwrap_or_default())
 }
 
+/// The spec's `IsRegExp` (D-347): `@@match` decides, falling back to crisol's `source`-based brand only
+/// when it is absent. `includes`/`startsWith`/`endsWith` reject a regular expression `searchString` before
+/// coercing it, so `'a'.startsWith(/a/)` is a `TypeError` — the guard that stops a regex being matched as
+/// its own text. `Err` carries an abrupt `@@match` read (a getter that throws) unchanged.
+fn is_regexp(value: u64) -> Result<bool, u64> {
+    if Value::from_bits(value).kind() != crisol_value::Kind::Object {
+        return Ok(false);
+    }
+    let matcher = symbol_method(value, "match");
+    if Value::from_bits(matcher).is_exception() {
+        return Err(matcher);
+    }
+    if !Value::from_bits(matcher).is_undefined() {
+        return Ok(is_truthy(Value::from_bits(matcher)));
+    }
+    Ok(property_text(value, "source").is_some())
+}
+
 /// Whether `needle` sits at `haystack[at..]`, both in UTF-16 code units.
 fn units_match_at(haystack: &[u16], needle: &[u16], at: usize) -> bool {
     haystack
@@ -11572,7 +11590,18 @@ extern "C" fn string_includes(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+    let search = unsafe { argument(argc, argv, 0) };
+    match is_regexp(search) {
+        Ok(true) => {
+            return raise(
+                "String.prototype.includes does not accept a regular expression",
+                "TypeError",
+            );
+        }
+        Ok(false) => {}
+        Err(thrown) => return thrown,
+    }
+    let needle = match string_argument(search) {
         Ok(needle) => needle,
         Err(thrown) => return thrown,
     };
@@ -11609,7 +11638,18 @@ extern "C" fn string_starts_with(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+    let search = unsafe { argument(argc, argv, 0) };
+    match is_regexp(search) {
+        Ok(true) => {
+            return raise(
+                "String.prototype.startsWith does not accept a regular expression",
+                "TypeError",
+            );
+        }
+        Ok(false) => {}
+        Err(thrown) => return thrown,
+    }
+    let needle = match string_argument(search) {
         Ok(needle) => needle,
         Err(thrown) => return thrown,
     };
@@ -11641,7 +11681,18 @@ extern "C" fn string_ends_with(
         Err(thrown) => return thrown,
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let needle = match string_argument(unsafe { argument(argc, argv, 0) }) {
+    let search = unsafe { argument(argc, argv, 0) };
+    match is_regexp(search) {
+        Ok(true) => {
+            return raise(
+                "String.prototype.endsWith does not accept a regular expression",
+                "TypeError",
+            );
+        }
+        Ok(false) => {}
+        Err(thrown) => return thrown,
+    }
+    let needle = match string_argument(search) {
         Ok(needle) => needle,
         Err(thrown) => return thrown,
     };
