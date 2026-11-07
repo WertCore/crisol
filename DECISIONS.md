@@ -9124,3 +9124,25 @@ The brand check was `handle_of(this).is_none()`, but a string is a cell with a h
 `Error.prototype.toString.call("x")` read a `name` off the string rather than throwing. It now requires `kind == Object`,
 so a primitive receiver is the `TypeError` the specification calls for; an ordinary (non-error) object is still accepted,
 since the method only reads `name`/`message`.
+
+## D-353
+
+**A global `RegExp.prototype[Symbol.match]` propagates a throwing match result.**
+
+Status: Accepted
+
+First piece of the RegExp protocol work. `@@match` for a global pattern loops `RegExpExec(rx, S)` (which honours a
+user `exec`, so this part of the protocol already existed — `STATE.md`'s "it does not exist" predates it) and reads
+`ToString(result[0])` from each result. That read went through `to_text(...).unwrap_or_default()`, which **swallowed a
+throwing `toString` to `""`** — and since the loop only exits on a `null` result, an `exec` that never returns `null`
+(the `g-coerce-result-err` case) had no exit at all and spun until the process was killed. It now coerces through
+`string_argument` (D-346/D-348), so a throwing `ToString(result[0])` is returned as the abrupt completion the spec
+requires (21.2.5.6 step 8.g.iv), which both propagates the error and terminates the loop. The normal path is unchanged —
+`string_argument` of a real match string is the same `to_text` as before.
+
+**Remaining RegExp-protocol pieces** (scoped, not yet done): `@@replace`/`@@split` delegate to the built-in matcher
+(`replace_using_pattern`/`compiled.all_matches`) instead of looping `RegExpExec`, so a user `exec` is ignored and the
+`exec`-invocation/`groups`-coercion cases fail — the rewrite is to build the `Captured` list from a `RegExpExec` loop and
+feed the existing `splice_matches`, with UTF-16↔byte index conversion and named-group handling. And `@@matchAll` is not
+installed (absent from `REGEXP_SYMBOL_NAMES`), so `RegExp.prototype[Symbol.matchAll]` is `undefined` — it needs a
+`RegExpStringIterator`.

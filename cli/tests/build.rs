@@ -663,6 +663,26 @@ fn replace_all_requires_a_global_regexp() {
     );
 }
 
+/// **`RegExp.prototype[Symbol.match]` propagates a throwing match result** (D-353) — a global match whose
+/// user `exec` returns a `result[0]` that throws on `ToString` aborts, instead of swallowing the throw to
+/// `""` and spinning forever on an `exec` that never answers `null` (which killed the process).
+#[test]
+fn regexp_symbol_match_propagates_a_throwing_result() {
+    check(
+        "regexp-match-abrupt-result",
+        "var r = /./g; \
+         r.exec = function () { return {0: {toString: function () { throw new RangeError('x'); }}}; }; \
+         try { r[Symbol.match](''); return 'no-throw'; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A normal global match (built-in exec) still collects every match.
+    check(
+        "regexp-match-global",
+        "return 'a1b2c3'.match(/\\d/g).join(',');",
+        "1,2,3",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

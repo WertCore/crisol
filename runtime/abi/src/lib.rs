@@ -10887,10 +10887,14 @@ extern "C" fn regexp_symbol_match(
             if Value::from_bits(result).kind() == crisol_value::Kind::Null {
                 break;
             }
-            let matched = with_rooted(&collected, || {
-                let first = indexed_get(result, 0);
-                to_text(first).unwrap_or_default()
-            });
+            let first = with_rooted(&collected, || indexed_get(result, 0));
+            // **A throwing `ToString(result[0])` aborts the match** (spec 21.2.5.6 step 8.g.iv), it is
+            // not swallowed to `""` (D-353) — on an `exec` that never returns `null`, swallowing it was
+            // the only exit the loop had, so it spun forever and the process was killed.
+            let matched = match with_rooted(&collected, || string_argument(first)) {
+                Ok(matched) => matched,
+                Err(thrown) => return thrown,
+            };
             let piece = with_rooted(&collected, || new_string(&matched));
             collected.push(piece);
             // **An empty match has to be stepped over by hand**, because it leaves
