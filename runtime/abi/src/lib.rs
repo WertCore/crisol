@@ -655,6 +655,7 @@ pub unsafe fn install_compiled_roots(heap: &Heap) {
         roots.extend(ARRAY_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get));
+        roots.extend(REGEXP_STRING_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ASYNC_ITERATOR_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(ASYNC_ITERATOR_HELPER_PROTOTYPE.with(std::cell::Cell::get));
         roots.extend(NUMBER_PROTOTYPE.with(std::cell::Cell::get));
@@ -749,6 +750,12 @@ thread_local! {
     /// `%IteratorHelperPrototype%` (D-305) — the prototype of the lazy iterator a helper returns;
     /// holds the single `next`/`return` that step a `map`/`filter`/`take`/`drop`/`flatMap` chain.
     static ITERATOR_HELPER_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
+        const { std::cell::Cell::new(None) };
+    /// `%RegExpStringIteratorPrototype%` (D-354) — the prototype of the lazy iterator
+    /// `RegExp.prototype[Symbol.matchAll]` returns; inherits `%Iterator.prototype%` (so it is its
+    /// own iterable and reaches the helpers) and carries the one `next` that drives `RegExpExec` a
+    /// match at a time.
+    static REGEXP_STRING_ITERATOR_PROTOTYPE: std::cell::Cell<Option<GcRef>> =
         const { std::cell::Cell::new(None) };
     /// `%AsyncIterator.prototype%` (D-309) — the async counterpart of `%Iterator.prototype%`, where
     /// the async iterator helpers live and that every async generator inherits from.
@@ -6732,6 +6739,8 @@ const ANONYMOUS_NATIVES: &[Native] = &[
     async_gen_return,
     async_gen_throw,
     async_gen_resume_call,
+    regexp_symbol_match_all,
+    regexp_string_iterator_next,
 ];
 
 /// Where a `resolve`/`reject` function keeps the promise it settles.
@@ -6873,6 +6882,14 @@ const ASYNC_GEN_NEXT: usize = 14;
 const ASYNC_GEN_RETURN: usize = 15;
 const ASYNC_GEN_THROW: usize = 16;
 const ASYNC_GEN_RESUME_CALL: usize = 17;
+
+/// The indices within [`ANONYMOUS_NATIVES`] of `RegExp.prototype[Symbol.matchAll]` and of the
+/// `next` its lazy `%RegExpStringIteratorPrototype%` carries (D-354). **Appended after the async
+/// generator entries** so every index above keeps its value — the matcher is installed by hand
+/// rather than through the `REGEXP_SYMBOL_NAMES` loop, whose contiguous `7 + offset` mapping has
+/// no room for it.
+const REGEXP_SYMBOL_MATCH_ALL: usize = 18;
+const REGEXP_STRING_ITERATOR_NEXT: usize = 19;
 
 /// Marks an array whose `length` has been made non-writable.
 ///
@@ -11026,6 +11043,179 @@ extern "C" fn regexp_symbol_split(
     })
 }
 
+/// The matcher a RegExp String Iterator walks.
+const REGEXP_ITER_MATCHER: &str = "__matcher";
+/// The subject it walks over.
+const REGEXP_ITER_SUBJECT: &str = "__subject";
+/// Whether the walk is global — `1` for every match, `0` for the first and then done. Kept as a
+/// number so [`property_number`] reads it, the way the array iterator keeps its `__kind`.
+const REGEXP_ITER_GLOBAL: &str = "__global";
+/// Whether the walk has ended; latches to `1` so an exhausted iterator keeps answering `done`.
+const REGEXP_ITER_DONE: &str = "__done";
+
+/// `RegExp.prototype[Symbol.matchAll]` — a lazy iterator over every match, each shaped as `exec`
+/// produces it.
+///
+/// **Lazy, not eager** (D-354): the iterator calls `RegExpExec` one match at a time from its
+/// `next`, so a pattern whose `exec` never answers `null` runs for exactly as many steps as the
+/// caller takes, where collecting every match up front would spin for ever on it — the hang
+/// [D-353] removed from the global `@@match` loop, not reintroduced here. It also honours an
+/// overridden `exec`, which the eager `String.prototype.matchAll` path (built on the compiled
+/// matcher) cannot. The original pattern is walked directly rather than a `SpeciesConstructor`
+/// clone, so a global `matchAll` moves the pattern's own `lastIndex` — the one shortcut here, the
+/// same one every other method in this protocol takes.
+extern "C" fn regexp_symbol_match_all(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    argc: u64,
+    argv: *const u64,
+) -> u64 {
+    if handle_of(this_value).is_none() {
+        return raise("this matcher needs a pattern", "TypeError");
+    }
+    // SAFETY: the convention guarantees `argc` readable values at `argv`.
+    let given = unsafe { argument(argc, argv, 0) };
+    let subject = with_rooted(&[this_value, given], || {
+        new_string(&to_text(given).unwrap_or_default())
+    });
+    with_rooted(&[this_value, subject], || {
+        // **`flags` as a string, looked at for `g`** (D-327) — a throwing `flags` getter is the
+        // answer rather than being swallowed, as everywhere else in this protocol.
+        let flags = property_of(this_value, "flags");
+        if Value::from_bits(flags).is_exception() {
+            return flags;
+        }
+        let global = to_text(flags).is_some_and(|flags| flags.contains('g'));
+        make_regexp_string_iterator(this_value, subject, global)
+    })
+}
+
+/// Builds a `%RegExpStringIteratorPrototype%` iterator holding the state its `next` steps.
+fn make_regexp_string_iterator(matcher: u64, subject: u64, global: bool) -> u64 {
+    with_rooted(&[matcher, subject], || {
+        let iterator = crisol_create_object();
+        with_rooted(&[iterator, matcher, subject], || {
+            let Some(handle) = handle_of(iterator) else {
+                return;
+            };
+            with_runtime(|runtime| {
+                runtime.define_hidden(handle, REGEXP_ITER_MATCHER, Value::from_bits(matcher));
+                runtime.define_hidden(handle, REGEXP_ITER_SUBJECT, Value::from_bits(subject));
+                runtime.define_hidden(
+                    handle,
+                    REGEXP_ITER_GLOBAL,
+                    Value::number(if global { 1.0 } else { 0.0 }),
+                );
+                runtime.define_hidden(handle, REGEXP_ITER_DONE, Value::number(0.0));
+                if let Some(prototype) = REGEXP_STRING_ITERATOR_PROTOTYPE.with(std::cell::Cell::get)
+                {
+                    runtime.heap.set_prototype(handle, Some(prototype));
+                }
+            });
+        });
+        iterator
+    })
+}
+
+/// `next()` on a RegExp String Iterator.
+///
+/// **One `RegExpExec` per step** — `null` ends the walk, a non-global pattern ends it after the
+/// first match, and an empty match steps `lastIndex` by hand so the next call moves on (the same
+/// correction the global `@@match` loop makes). `done` latches, so an exhausted iterator keeps
+/// answering `{ value: undefined, done: true }`.
+extern "C" fn regexp_string_iterator_next(
+    _closure: u64,
+    this_value: u64,
+    _new_target: u64,
+    _argc: u64,
+    _argv: *const u64,
+) -> u64 {
+    if property_number(this_value, REGEXP_ITER_DONE).unwrap_or(0.0) != 0.0 {
+        return regexp_iter_result_done();
+    }
+    // Read like the array iterator reads `__target`: hidden object slots are not named lookups.
+    let matcher = {
+        let key = REGEXP_ITER_MATCHER.to_owned();
+        // SAFETY: `key` is a live Rust string.
+        unsafe { crisol_property_load(this_value, key.as_ptr(), key.len() as u64) }
+    };
+    let subject = {
+        let key = REGEXP_ITER_SUBJECT.to_owned();
+        // SAFETY: `key` is a live Rust string.
+        unsafe { crisol_property_load(this_value, key.as_ptr(), key.len() as u64) }
+    };
+    let global = property_number(this_value, REGEXP_ITER_GLOBAL).unwrap_or(0.0) != 0.0;
+    with_rooted(&[this_value, matcher, subject], || {
+        let result = regexp_exec_value(matcher, subject);
+        if Value::from_bits(result).is_exception() {
+            return result;
+        }
+        if Value::from_bits(result).kind() == crisol_value::Kind::Null {
+            regexp_iter_mark_done(this_value);
+            return regexp_iter_result_done();
+        }
+        if global {
+            // **An empty match is stepped over by hand**, or `lastIndex` stays put and the next
+            // call finds it again for ever — the correction the global `@@match` loop makes.
+            let first = with_rooted(&[this_value, result, matcher], || indexed_get(result, 0));
+            let matched =
+                match with_rooted(&[this_value, result, matcher], || string_argument(first)) {
+                    Ok(matched) => matched,
+                    Err(thrown) => return thrown,
+                };
+            if matched.is_empty() {
+                let at = match last_index_of(matcher) {
+                    Ok(at) => at,
+                    Err(thrown) => return thrown,
+                };
+                set_last_index(matcher, at + 1.0);
+            }
+        } else {
+            // A non-global pattern yields this one match and then stops.
+            regexp_iter_mark_done(this_value);
+        }
+        with_rooted(&[result], || regexp_iter_result_value(result))
+    })
+}
+
+/// `{ value: undefined, done: true }` — the answer an exhausted iterator keeps giving.
+fn regexp_iter_result_done() -> u64 {
+    let result = crisol_create_object();
+    with_rooted(&[result], || {
+        if let Some(into) = handle_of(result) {
+            with_runtime(|runtime| {
+                runtime.define(into, "value", Value::UNDEFINED);
+                runtime.define(into, "done", Value::TRUE);
+            });
+        }
+    });
+    result
+}
+
+/// `{ value, done: false }` — one step of a walk.
+fn regexp_iter_result_value(value: u64) -> u64 {
+    let result = crisol_create_object();
+    with_rooted(&[result, value], || {
+        if let Some(into) = handle_of(result) {
+            with_runtime(|runtime| {
+                runtime.define(into, "value", Value::from_bits(value));
+                runtime.define(into, "done", Value::FALSE);
+            });
+        }
+    });
+    result
+}
+
+/// Latches a RegExp String Iterator to done.
+fn regexp_iter_mark_done(iterator: u64) {
+    if let Some(handle) = handle_of(iterator) {
+        with_runtime(|runtime| {
+            runtime.define_hidden(handle, REGEXP_ITER_DONE, Value::number(1.0));
+        });
+    }
+}
+
 /// How many pieces a `split` may answer — `ToUint32(limit)`, or everything.
 fn split_limit(limit: u64) -> Result<usize, u64> {
     if Value::from_bits(limit).is_undefined() {
@@ -11272,9 +11462,10 @@ extern "C" fn string_match(
 /// `RegExp.prototype.exec` produces it.
 ///
 /// A `RegExp` argument that is not global is a `TypeError`, as the specification requires; a string
-/// argument is matched globally. The iterator is an array iterator over the results collected up
-/// front — a real iterator object with `next` and `[Symbol.iterator]`, though not the distinct
-/// `%RegExpStringIteratorPrototype%` (D-257).
+/// argument is matched globally. A `RegExp` delegates to `RegExp.prototype[Symbol.matchAll]`
+/// (D-354), which answers the lazy `%RegExpStringIteratorPrototype%` iterator; only a string
+/// pattern takes the fall-through below, an eager array iterator over the results collected up
+/// front — a real iterator with `next` and `[Symbol.iterator]`, though not the distinct prototype.
 extern "C" fn string_match_all(
     _closure: u64,
     this_value: u64,
@@ -11288,7 +11479,21 @@ extern "C" fn string_match_all(
     };
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let pattern = unsafe { argument(argc, argv, 0) };
-    // A pattern with its own `Symbol.matchAll` answers instead, exactly as `match` delegates.
+    // **The global check comes before delegating** (spec 22.1.3.14 step 3.b): a non-global
+    // `RegExp` is a `TypeError` whether or not it carries a `Symbol.matchAll`. The check cannot
+    // live past the delegation — now that `RegExp.prototype[Symbol.matchAll]` exists (D-354),
+    // every real pattern delegates, and a check placed after it would never run.
+    // A RegExp is one with `flags`; anything else is a string pattern, matched globally.
+    let is_regexp = handle_of(pattern).is_some() && property_text(pattern, "flags").is_some();
+    if is_regexp
+        && !property_text(pattern, "flags")
+            .unwrap_or_default()
+            .contains('g')
+    {
+        return raise("matchAll must be called with a global RegExp", "TypeError");
+    }
+    // A pattern with its own `Symbol.matchAll` answers instead, exactly as `match` delegates — and
+    // with D-354 every `RegExp` has one, so the eager fall-through below is now a string pattern.
     let matcher = symbol_method(pattern, "matchAll");
     if is_callable(matcher) {
         let subject = with_rooted(&[pattern, matcher], || new_string(&text));
@@ -11296,14 +11501,9 @@ extern "C" fn string_match_all(
             call_value(matcher, pattern, &[subject])
         });
     }
-    // A RegExp is one with `flags`; anything else is a string pattern, matched globally.
-    let is_regexp = handle_of(pattern).is_some() && property_text(pattern, "flags").is_some();
-    let Some((mut compiled, flags)) = pattern_argument(pattern) else {
+    let Some((mut compiled, _flags)) = pattern_argument(pattern) else {
         return new_array_iterator(array_of_values(&[]), 1.0);
     };
-    if is_regexp && !flags.contains('g') {
-        return raise("matchAll must be called with a global RegExp", "TypeError");
-    }
     let founds = compiled.all_matches(&text);
     // The result arrays are stashed in a rooted holder as they are built, since each `match_result`
     // allocates and would otherwise collect the ones before it under GC stress (D-255).
@@ -15594,6 +15794,49 @@ impl Runtime {
                 let from = self.native_function(iterator_static_natives_base());
                 self.define_method(constructor, "Iterator", "from", from.to_value());
             }
+
+            // **`%RegExpStringIteratorPrototype%` (D-354).** The prototype of the iterator
+            // `RegExp.prototype[Symbol.matchAll]` returns: it inherits `%Iterator.prototype%` — so it
+            // is its own iterable and reaches the helpers — and carries the one `next` that drives
+            // `RegExpExec` a match at a time. Built here, where `%Iterator.prototype%` exists to
+            // inherit from.
+            {
+                let regexp_iter = scope.alloc(shape, 0);
+                REGEXP_STRING_ITERATOR_PROTOTYPE.with(|cell| cell.set(Some(regexp_iter.handle())));
+                self.heap
+                    .set_prototype(regexp_iter.handle(), Some(iterator_prototype.handle()));
+                let index = NATIVES.len()
+                    + GLOBAL_NATIVES.len()
+                    + NAMESPACE_NATIVES.len()
+                    + REGEXP_STRING_ITERATOR_NEXT;
+                let next = self.native_function(index);
+                self.define_method(
+                    regexp_iter.handle(),
+                    "RegExp String Iterator",
+                    "next",
+                    next.to_value(),
+                );
+                // `[Symbol.toStringTag]` is the string `"RegExp String Iterator"` — a data property,
+                // not a getter, which is what `Object.prototype.toString.call(rx.matchAll(s))` reads.
+                let tag = {
+                    let named = PropertyKey::new("toStringTag");
+                    self.heap
+                        .shape_of(symbol)
+                        .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                        .and_then(|slot| self.heap.get(symbol, slot.index()))
+                        .and_then(|value| value.as_address())
+                };
+                if let Some(tag) = tag {
+                    KEY_SYMBOLS.with(|symbols| {
+                        if let Ok(mut entries) = symbols.try_borrow_mut() {
+                            entries.insert(Value::symbol(tag).to_bits());
+                        }
+                    });
+                    let tag_key = PropertyKey::symbol(tag, "Symbol.toStringTag");
+                    let text = self.string("RegExp String Iterator");
+                    self.define_keyed(regexp_iter.handle(), &tag_key, text);
+                }
+            }
         }
 
         // **An async generator is its own async-iterator** — `for await` reaches its `next` through
@@ -15759,6 +16002,38 @@ impl Runtime {
             let text = self.string(&format!("[Symbol.{name}]"));
             self.define_named(function, "name", text);
             self.define_named(function, "length", Value::number(1.0));
+        }
+
+        // **`Symbol.matchAll` on `RegExp.prototype`** (D-354) — installed apart from the loop
+        // above because its native is appended to the end of `ANONYMOUS_NATIVES` (so the indices
+        // the loop relies on do not move) and it has no entry in `REGEXP_SYMBOL_NAMES`. The
+        // iterator it returns is lazy, so unlike the eager `String.prototype.matchAll` it cannot
+        // hang on an `exec` that never ends, and it honours an overridden `exec`.
+        {
+            let named = PropertyKey::new("matchAll");
+            let address = self
+                .heap
+                .shape_of(symbol)
+                .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                .and_then(|slot| self.heap.get(symbol, slot.index()))
+                .and_then(|value| value.as_address());
+            if let Some(address) = address {
+                KEY_SYMBOLS.with(|symbols| {
+                    if let Ok(mut entries) = symbols.try_borrow_mut() {
+                        entries.insert(Value::symbol(address).to_bits());
+                    }
+                });
+                let index = NATIVES.len()
+                    + GLOBAL_NATIVES.len()
+                    + NAMESPACE_NATIVES.len()
+                    + REGEXP_SYMBOL_MATCH_ALL;
+                let function = self.native_function(index);
+                let key = PropertyKey::symbol(address, "Symbol.matchAll");
+                self.define_keyed(prototype, &key, function.to_value());
+                let text = self.string("[Symbol.matchAll]");
+                self.define_named(function, "name", text);
+                self.define_named(function, "length", Value::number(1.0));
+            }
         }
 
         // **`Symbol.toStringTag` on the namespaces that carry one**, so

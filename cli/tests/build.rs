@@ -683,6 +683,52 @@ fn regexp_symbol_match_propagates_a_throwing_result() {
     );
 }
 
+/// **`RegExp.prototype[Symbol.matchAll]` is a lazy iterator** (D-354) — the method exists (it was
+/// `undefined`), its iterator's `next` calls `exec` one match at a time (so an overridden `exec` is
+/// honoured, where the eager `String.prototype.matchAll` ignores it, and a non-terminating `exec`
+/// cannot hang an up-front collection), a non-global pattern yields one match then done, and the
+/// iterator prototype names itself.
+#[test]
+fn regexp_symbol_match_all_is_a_lazy_iterator() {
+    // The method exists — it was `undefined`.
+    check(
+        "regexp-matchall-exists",
+        "return typeof RegExp.prototype[Symbol.matchAll];",
+        "function",
+    );
+    // A direct call answers every match, each with its capture groups.
+    check(
+        "regexp-matchall-direct",
+        "var out = []; \
+         for (var m of /([a-z])(\\d)/g[Symbol.matchAll](\"a1b2\")) { out.push(m[1] + m[2]); } \
+         return out.join(\",\");",
+        "a1,b2",
+    );
+    // Lazy: `next` drives an overridden `exec` one step at a time (eager `matchAll` ignores it).
+    check(
+        "regexp-matchall-honours-exec",
+        "var r = /x/g; var n = 0; \
+         r.exec = function () { n++; if (n > 2) return null; return {0: \"x\", index: 0, length: 1}; }; \
+         var out = []; for (var m of r[Symbol.matchAll](\"xxxx\")) { out.push(m[0]); } \
+         return out.join(\",\") + \"/\" + n;",
+        "x,x/3",
+    );
+    // A non-global RegExp yields exactly one match, then latches done — no TypeError at this level.
+    check(
+        "regexp-matchall-nonglobal-one",
+        "var it = /a/[Symbol.matchAll](\"aaa\"); \
+         var a = it.next(); var b = it.next(); \
+         return a.done + \",\" + a.value[0] + \",\" + b.done;",
+        "false,a,true",
+    );
+    // The iterator names itself through `Symbol.toStringTag`.
+    check(
+        "regexp-matchall-tag",
+        "return Object.prototype.toString.call(/a/g[Symbol.matchAll](\"a\"));",
+        "[object RegExp String Iterator]",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

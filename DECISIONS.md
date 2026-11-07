@@ -9146,3 +9146,43 @@ requires (21.2.5.6 step 8.g.iv), which both propagates the error and terminates 
 feed the existing `splice_matches`, with UTF-16↔byte index conversion and named-group handling. And `@@matchAll` is not
 installed (absent from `REGEXP_SYMBOL_NAMES`), so `RegExp.prototype[Symbol.matchAll]` is `undefined` — it needs a
 `RegExpStringIterator`.
+
+## D-354
+
+**`RegExp.prototype[Symbol.matchAll]` is a lazy `%RegExpStringIteratorPrototype%` iterator.**
+
+Status: Accepted
+
+Second piece of the RegExp protocol work (after [D-353]). The method was absent from
+`REGEXP_SYMBOL_NAMES`, so `RegExp.prototype[Symbol.matchAll]` read `undefined` — `rx[Symbol.matchAll](s)` was not
+callable, and `String.prototype.matchAll` could not delegate to it (its `symbol_method(pattern, "matchAll")` check never
+found one, so an overridden `exec` was ignored in favour of the compiled matcher).
+
+It is now installed, and deliberately **lazy**: the returned iterator calls `RegExpExec` one match at a time from its
+`next`, rather than collecting every match up front. Eager collection would re-create exactly the hang D-353 removed from
+the global `@@match` loop — a user `exec` that never answers `null` would spin — whereas a lazy iterator runs for only as
+many steps as the caller takes. It also honours an overridden `exec`, which the eager `String.prototype.matchAll` path
+(built on `compiled.all_matches`) cannot.
+
+Mechanics. Two natives — `regexp_symbol_match_all` and the iterator's `regexp_string_iterator_next` — are **appended to
+the end of `ANONYMOUS_NATIVES`** (indices 18/19) rather than slotted into the contiguous `REGEXP_SYMBOL_METHODS + offset`
+block the `REGEXP_SYMBOL_NAMES` loop walks: appending leaves every existing anonymous-native index (`ITERATOR_SELF`,
+`STRING_ITERATOR`, the `ASYNC_GEN_*` set) untouched, where inserting would have shifted them and, per the warning on that
+table, "resolved every later method to its neighbour." `Symbol.matchAll` is therefore installed by hand, outside the
+loop. The iterator is a plain object carrying hidden `__matcher`/`__subject`/`__global`/`__done` slots (read the way the
+array iterator reads `__target`), with `%RegExpStringIteratorPrototype%` — a new prototype that inherits
+`%Iterator.prototype%` (so the iterator is its own iterable and reaches the helpers) and carries the single `next`, plus
+a `Symbol.toStringTag` data property naming it `"RegExp String Iterator"`. The original pattern is walked directly rather
+than a `SpeciesConstructor` clone, so a global `matchAll` moves the pattern's own `lastIndex` — the one shortcut, shared
+with every other method in this protocol; `lastIndex` is **not** reset to zero at creation, which matches the
+specification (`@@matchAll` copies the current `lastIndex`, where `@@match` resets it).
+
+A knock-on fix: `String.prototype.matchAll`'s non-global-`RegExp` `TypeError` moved **ahead of** the delegation. The
+check previously sat after the `symbol_method` delegation; now that every `RegExp` carries a `Symbol.matchAll`, every one
+delegates, and a check left behind it would never run (spec 22.1.3.14 puts the global check before `GetMethod`).
+
+**Remaining RegExp-protocol piece** (scoped, not yet done): `@@replace`/`@@split` still delegate to the built-in matcher
+(`replace_using_pattern`/`split_using_pattern` → `compiled.all_matches`/`exec`) rather than looping `RegExpExec`, so a
+user `exec` is ignored and the `exec`-invocation / `groups`-coercion cases fail. The spec-correct rewrite works directly
+off `exec` result objects (reading `index`, `length`, indexed captures, and `groups`) rather than reconstructing the
+byte-offset `Captured` the built-in path uses — it does not reuse `splice_matches`.
