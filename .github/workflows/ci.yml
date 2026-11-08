@@ -380,6 +380,9 @@ jobs:
         env:
           CRISOL_TEST262_SAMPLE: ${{ inputs.test262_sample }}
           CRISOL_TEST262_ALL: ${{ inputs.test262_sample == '' && '1' || '' }}
+          # The full per-case failure list (not the capped examples) rides along in the uploaded
+          # `test262.log`, so an area can be driven to zero from CI without a local run.
+          CRISOL_TEST262_DUMP_FAILURES: "1"
         run: |
           set -euo pipefail
           # `tee` so the numbers survive into the next step. Without it the summary would have
