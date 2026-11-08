@@ -12284,28 +12284,26 @@ fn named_indices_object(text: &str, found: &crisol_builtins::Captured) -> u64 {
 
 /// `MakeMatchIndicesIndexPairArray` — the `indices` array a `d`-flag match carries: the whole match
 /// at `0`, then a `[start, end]` pair per group, plus `indices.groups` for named groups.
+///
+/// **Each pair is a heap array**, so they are collected into a `Vec` with the ones built so far held
+/// live across the next allocation (D-127), then the outer array is assembled from them — rather than
+/// nesting `with_new_array`, which let a pair be collected under GC stress and read back as `NaN`.
 fn match_indices_array(text: &str, found: &crisol_builtins::Captured) -> u64 {
-    with_new_array(found.groups.len() + 1, |array| {
-        let whole = index_pair(text, Some((found.start, found.end)));
-        with_rooted(&[whole], || {
-            with_runtime(|runtime| runtime.heap.set_element(array, 0, Value::from_bits(whole)));
-        });
-        for (position, group) in found.groups.iter().enumerate() {
-            let value = index_pair(text, *group);
-            with_rooted(&[value], || {
-                with_runtime(|runtime| {
-                    runtime
-                        .heap
-                        .set_element(array, position + 1, Value::from_bits(value));
-                });
-            });
+    let mut pairs: Vec<u64> = Vec::with_capacity(found.groups.len() + 1);
+    let whole = index_pair(text, Some((found.start, found.end)));
+    pairs.push(whole);
+    for group in &found.groups {
+        let value = with_rooted(&pairs, || index_pair(text, *group));
+        pairs.push(value);
+    }
+    let array = with_rooted(&pairs, || array_of_values(&pairs));
+    let groups = with_rooted(&[array], || named_indices_object(text, found));
+    with_rooted(&[array, groups], || {
+        if let Some(handle) = handle_of(array) {
+            with_runtime(|runtime| runtime.define(handle, "groups", Value::from_bits(groups)));
         }
-        let groups = named_indices_object(text, found);
-        with_rooted(&[groups], || {
-            with_runtime(|runtime| runtime.define(array, "groups", Value::from_bits(groups)));
-        });
-        array.to_value().to_bits()
-    })
+    });
+    array
 }
 
 /// One match as the array `exec` answers: the whole match, then the groups, then `index`,
