@@ -1062,7 +1062,11 @@ fn regexp_methods_require_a_regexp_receiver() {
         "TypeError",
     );
     // A real RegExp receiver still works both ways.
-    check("exec-real", "return /a/.exec(\"bab\")[0] + \"/\" + /z/.test(\"bab\");", "a/false");
+    check(
+        "exec-real",
+        "return /a/.exec(\"bab\")[0] + \"/\" + /z/.test(\"bab\");",
+        "a/false",
+    );
 }
 
 /// **The `d` flag carries an `indices` array** (D-363) — `[start, end]` code-unit pairs per group,

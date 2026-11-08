@@ -10302,7 +10302,9 @@ extern "C" fn regexp_exec(
     // Rooted across the array's allocation: `this_value` reached here in a register and the
     // text came out of it.
     match with_pattern(this_value, |pattern| pattern.exec(&text)) {
-        Some(Some(found)) => with_rooted(&[this_value], || match_result(&text, &found, has_indices)),
+        Some(Some(found)) => {
+            with_rooted(&[this_value], || match_result(&text, &found, has_indices))
+        }
         // **`null`, not `undefined`**, which is what `while ((m = re.exec(s)) !== null)` tests.
         Some(None) => Value::NULL.to_bits(),
         // **A receiver with no `[[RegExpMatcher]]` is a `TypeError`, not a null match** — calling
@@ -12232,7 +12234,8 @@ fn index_pair(text: &str, range: Option<(usize, usize)>) -> u64 {
     };
     #[expect(clippy::cast_precision_loss, reason = "indices into a string")]
     let pair = [
-        Value::number(text.get(..start).unwrap_or_default().encode_utf16().count() as f64).to_bits(),
+        Value::number(text.get(..start).unwrap_or_default().encode_utf16().count() as f64)
+            .to_bits(),
         Value::number(text.get(..end).unwrap_or_default().encode_utf16().count() as f64).to_bits(),
     ];
     array_of_values(&pair)
