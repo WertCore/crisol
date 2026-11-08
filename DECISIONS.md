@@ -9330,3 +9330,21 @@ dependency update with no call-site changes; the acceptance regression is the gu
 
 A property that still lags its latest Unicode value (e.g. `\p{Cased}` on a code point added very recently) is `regress`'s
 data, not a crisol bug — recorded rather than chased per code point.
+
+## D-361
+
+**The RegExp protocol methods require an Object receiver and propagate a throwing `exec` getter.**
+
+Status: Accepted
+
+Two conformance gaps the post-0.12 corpus surfaced. First, `@@match`/`@@matchAll`/`@@replace`/`@@split`/`@@search`
+guarded their receiver with `handle_of(this).is_none()`, but a string or symbol is heap-allocated — it *has* a handle —
+while not being an Object, so `RegExp.prototype[Symbol.search].call("string")` slipped past and matched instead of
+throwing (`this-val-non-obj`). The guard is now `kind() != Object`, the specification's `Type(rx) is not Object` check.
+
+Second, `RegExpExec` read `exec` with `property_of` and tested `is_callable`; a throwing `exec` **getter** returned the
+exception sentinel, which is not callable, so it was swallowed and the built-in ran instead (`g-get-exec-err`). The
+exception is now propagated — `GetMethod` reads the property, and an accessor that throws is the answer.
+
+(`g-init-lastindex-err` — a `Set` of `lastIndex` on a non-writable property throwing — is left: it needs a
+throw-on-non-writable `Set`, where `crisol_property_store` follows sloppy semantics and ignores it silently.)

@@ -10856,6 +10856,12 @@ fn symbol_method(value: u64, name: &str) -> u64 {
 /// is indistinguishable from working until somebody overrides something.
 fn regexp_exec_value(rx: u64, subject: u64) -> u64 {
     let exec = property_of(rx, "exec");
+    // **A throwing `exec` getter is the answer, not a reason to fall back** (`g-get-exec-err`):
+    // `GetMethod(rx, "exec")` reads the property first, so an accessor that throws propagates rather
+    // than being read as "no `exec`" and silently routing to the built-in.
+    if Value::from_bits(exec).is_exception() {
+        return exec;
+    }
     if is_callable(exec) {
         let result = with_rooted(&[rx, exec, subject], || call_value(exec, rx, &[subject]));
         if Value::from_bits(result).is_exception() {
@@ -10915,7 +10921,7 @@ extern "C" fn regexp_symbol_match(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    if handle_of(this_value).is_none() {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
         return raise("this matcher needs a pattern", "TypeError");
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
@@ -10999,7 +11005,7 @@ extern "C" fn regexp_symbol_search(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    if handle_of(this_value).is_none() {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
         return raise("this searcher needs a pattern", "TypeError");
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
@@ -11414,7 +11420,7 @@ extern "C" fn regexp_symbol_replace(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    if handle_of(this_value).is_none() {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
         return raise("this replacer needs a pattern", "TypeError");
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
@@ -11637,7 +11643,7 @@ extern "C" fn regexp_symbol_split(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    if handle_of(this_value).is_none() {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
         return raise("this splitter needs a pattern", "TypeError");
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
@@ -11688,7 +11694,7 @@ extern "C" fn regexp_symbol_match_all(
     argc: u64,
     argv: *const u64,
 ) -> u64 {
-    if handle_of(this_value).is_none() {
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
         return raise("this matcher needs a pattern", "TypeError");
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
