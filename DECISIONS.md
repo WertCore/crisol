@@ -9365,7 +9365,13 @@ a RegExp with no match is still `null`/`false`, but a receiver `with_pattern` ca
 
 **The `d` flag reports match indices.**
 
-Status: Accepted
+Status: Reverted
+
+**Reverted** — the implementation had a platform-dependent memory-safety bug: the `indices` pair arrays were read back as
+`NaN` under GC stress on Linux x86_64 while passing on macOS arm64 (a rooting hole exposed only on one target). It could not
+be reproduced locally or fixed reliably through CI alone, so the feature was backed out to keep the branch green and
+UB-free; it needs local x86_64 debugging of the nested-array GC rooting. The original design is left below for when it is
+retried.
 
 With `d`, a match result carries an `indices` array beside its captures: `indices[0]` is the `[start, end]` of the whole
 match, `indices[i]` the pair for group `i` (or `undefined` where the group did not participate), and `indices.groups` a

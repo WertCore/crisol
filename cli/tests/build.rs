@@ -1069,34 +1069,6 @@ fn regexp_methods_require_a_regexp_receiver() {
     );
 }
 
-/// **The `d` flag carries an `indices` array** (D-363) — `[start, end]` code-unit pairs per group,
-/// the whole match at `0`, a null-prototype `indices.groups` for named groups, and `undefined` for a
-/// group that did not participate. Absent without the flag.
-#[test]
-fn regexp_d_flag_reports_match_indices() {
-    check(
-        "indices-pairs",
-        "var m = \"ab\".match(/(a)(b)/d); return m.indices[0] + \"/\" + m.indices[1] + \"/\" + m.indices[2];",
-        "0,2/0,1/1,2",
-    );
-    check(
-        "indices-named",
-        "var m = /(?<x>a)/d.exec(\"a\"); return m.indices.groups.x + \"/\" + (Object.getPrototypeOf(m.indices.groups) === null);",
-        "0,1/true",
-    );
-    check(
-        "indices-nonparticipating",
-        "var m = /(a)|(b)/d.exec(\"a\"); return typeof m.indices[2];",
-        "undefined",
-    );
-    // No `d` flag: no `indices`. And `indices.groups` is `undefined` without named groups.
-    check(
-        "indices-absent-and-no-groups",
-        "return typeof /(a)/.exec(\"a\").indices + \"/\" + typeof /(a)/d.exec(\"a\").indices.groups;",
-        "undefined/undefined",
-    );
-}
-
 /// **Duplicate named groups report the participating capture** (D-364) — the same name in distinct
 /// alternatives (ES2025) resolves `groups[name]` to the alternative that matched, not whichever the
 /// list held last, regardless of which side participates.
@@ -1111,11 +1083,6 @@ fn regexp_duplicate_named_groups_pick_the_participant() {
         "dup-named-second",
         "return \"..ba\".match(/(?<x>a)|(?<x>b)/).groups.x;",
         "b",
-    );
-    check(
-        "dup-named-indices",
-        "return \"..ab\".match(/(?<x>a)|(?<x>b)/d).indices.groups.x.join(\",\");",
-        "2,3",
     );
 }
 
