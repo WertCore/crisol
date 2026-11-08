@@ -9218,3 +9218,28 @@ replacer's last argument, again only when a group is named, so `(m, p, s) =>` is
 `RegExpExec`, so a user-overridden `exec` is ignored. With named groups now on `Captured`, an exec-rewrite would be
 purely about honouring that override — a narrower, lower-value change than it was. `@@split`-via-`exec` additionally needs
 a sticky-flag `SpeciesConstructor` clone the engine shortcuts.
+
+## D-356
+
+**A RegExp protocol method propagates a throwing subject `ToString`.**
+
+Status: Accepted
+
+Fourth piece of the RegExp protocol work. `@@match`, `@@matchAll`, `@@replace`, `@@split`, and `@@search` each begin
+by coercing their `string` argument with `ToString` (a `?`-prefixed step). The argument may be an object whose `toString`
+throws, or a symbol — the `*-coerce-*-err`, `arg-1-coerce-err`, and `string-tostring-throws` cases hand them exactly that.
+Every one of these read the subject through `to_text(given).unwrap_or_default()`, which **swallowed the throw to `""`** and
+then matched on the empty string, so a program that threw in `toString` saw a match result instead of its exception.
+
+They now coerce through `string_argument` (D-346/D-348) via a shared `subject_text`, so the exception is returned as the
+abrupt completion it is. The normal path is unchanged — `string_argument` of a string, or of a number like `123`, is the
+same text `to_text` produced — so only the throwing and symbol cases change, which is the whole of the fix. This is the
+cheap half of the remaining `@@replace` work; the `exec`-invocation and `result`-coercion cases still need the
+`RegExpExec`-loop rewrite (see below).
+
+**Remaining RegExp-protocol piece** (scoped): `@@replace`/`@@split` still use the built-in matcher rather than looping
+`RegExpExec`, so a user-overridden `exec` is ignored (`exec-invocation`), and the result-object coercions
+(`result-coerce-length-err`, `result-coerce-capture-err`) and `lastIndex` set (`g-init-lastindex-err`, which needs an
+ordinary `Set` that honours a throwing setter, not the `define` `set_last_index` uses) are unreached. The rewrite also
+needs a code-unit↔byte converter and `AdvanceStringIndex`, neither of which exists yet. `@@split`-via-`exec` additionally
+needs a sticky-flag `SpeciesConstructor` clone the engine shortcuts.

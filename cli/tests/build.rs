@@ -784,6 +784,56 @@ fn named_capture_groups_are_available() {
     );
 }
 
+/// **A RegExp protocol method propagates a throwing subject `ToString`** (D-356) — `@@match`,
+/// `@@matchAll`, `@@replace`, `@@split`, and `@@search` coerce `string` with `ToString`, which the
+/// `*-coerce-*-err`/`string-tostring-throws` cases make throw; the exception is the answer, not
+/// swallowed to `""` and matched on the empty string.
+#[test]
+fn regexp_protocol_propagates_a_throwing_subject() {
+    let bad = "var o = { toString: function () { throw new RangeError(\"x\"); } }; ";
+    check(
+        "regexp-match-subject-throws",
+        &format!(
+            "{bad} try {{ /a/[Symbol.match](o); return \"no\"; }} catch (e) {{ return e.name; }}"
+        ),
+        "RangeError",
+    );
+    check(
+        "regexp-matchall-subject-throws",
+        &format!(
+            "{bad} try {{ /a/g[Symbol.matchAll](o); return \"no\"; }} catch (e) {{ return e.name; }}"
+        ),
+        "RangeError",
+    );
+    check(
+        "regexp-replace-subject-throws",
+        &format!(
+            "{bad} try {{ /a/[Symbol.replace](o, \"x\"); return \"no\"; }} catch (e) {{ return e.name; }}"
+        ),
+        "RangeError",
+    );
+    check(
+        "regexp-split-subject-throws",
+        &format!(
+            "{bad} try {{ /a/[Symbol.split](o); return \"no\"; }} catch (e) {{ return e.name; }}"
+        ),
+        "RangeError",
+    );
+    check(
+        "regexp-search-subject-throws",
+        &format!(
+            "{bad} try {{ /a/[Symbol.search](o); return \"no\"; }} catch (e) {{ return e.name; }}"
+        ),
+        "RangeError",
+    );
+    // A coercible non-string subject still works — the fix changed only the throwing case.
+    check(
+        "regexp-match-subject-coerces",
+        "return /2/[Symbol.match](123)[0];",
+        "2",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

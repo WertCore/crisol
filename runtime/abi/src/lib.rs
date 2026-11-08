@@ -10897,6 +10897,17 @@ fn set_last_index(rx: u64, to: f64) {
 /// **Two shapes from one method.** A global pattern answers the matched text and nothing
 /// else; a non-global one answers what `exec` answers, groups and `index` included. A program
 /// written for one and handed the other reads `undefined` where it expected a group.
+/// `ToString(string)` for a RegExp-protocol method's subject (D-356).
+///
+/// **The throw propagates** — the `*-coerce-*-err` and `string-tostring-throws` cases hand these
+/// methods an argument whose `toString` throws or a symbol, and the specification's `ToString` is
+/// `?`-prefixed, so the exception is the answer. `to_text(...).unwrap_or_default()` swallowed it to
+/// `""` and matched on the empty string. `roots` are held live across the coercion, since a user
+/// `toString` allocates.
+fn subject_text(roots: &[u64], given: u64) -> Result<String, u64> {
+    with_rooted(roots, || string_argument(given))
+}
+
 extern "C" fn regexp_symbol_match(
     _closure: u64,
     this_value: u64,
@@ -10909,9 +10920,10 @@ extern "C" fn regexp_symbol_match(
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let given = unsafe { argument(argc, argv, 0) };
-    let subject = with_rooted(&[this_value, given], || {
-        new_string(&to_text(given).unwrap_or_default())
-    });
+    let subject = match subject_text(&[this_value, given], given) {
+        Ok(text) => with_rooted(&[this_value], || new_string(&text)),
+        Err(thrown) => return thrown,
+    };
     with_rooted(&[this_value, subject], || {
         // **The specification reads `flags` (as a string) and looks for `g` in it** (D-327), not the
         // `global` accessor — so a `flags` getter that throws is the answer rather than being
@@ -10992,9 +11004,10 @@ extern "C" fn regexp_symbol_search(
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let given = unsafe { argument(argc, argv, 0) };
-    let subject = with_rooted(&[this_value, given], || {
-        new_string(&to_text(given).unwrap_or_default())
-    });
+    let subject = match subject_text(&[this_value, given], given) {
+        Ok(text) => with_rooted(&[this_value], || new_string(&text)),
+        Err(thrown) => return thrown,
+    };
     with_rooted(&[this_value, subject], || {
         let previous = match last_index_of(this_value) {
             Ok(previous) => previous,
@@ -11036,8 +11049,9 @@ extern "C" fn regexp_symbol_replace(
     let given = unsafe { argument(argc, argv, 0) };
     // SAFETY: as above.
     let replacement = unsafe { argument(argc, argv, 1) };
-    let Some(text) = with_rooted(&[this_value, given, replacement], || to_text(given)) else {
-        return new_string("");
+    let text = match subject_text(&[this_value, given, replacement], given) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     with_rooted(&[this_value, replacement], || {
         replace_using_pattern(&text, this_value, replacement)
@@ -11063,8 +11077,9 @@ extern "C" fn regexp_symbol_split(
         Ok(cap) => cap,
         Err(thrown) => return thrown,
     };
-    let Some(text) = with_rooted(&[this_value, given], || to_text(given)) else {
-        return one_piece_array("");
+    let text = match subject_text(&[this_value, given], given) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
     };
     with_rooted(&[this_value], || {
         if cap == 0 {
@@ -11107,9 +11122,10 @@ extern "C" fn regexp_symbol_match_all(
     }
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let given = unsafe { argument(argc, argv, 0) };
-    let subject = with_rooted(&[this_value, given], || {
-        new_string(&to_text(given).unwrap_or_default())
-    });
+    let subject = match subject_text(&[this_value, given], given) {
+        Ok(text) => with_rooted(&[this_value], || new_string(&text)),
+        Err(thrown) => return thrown,
+    };
     with_rooted(&[this_value, subject], || {
         // **`flags` as a string, looked at for `g`** (D-327) — a throwing `flags` getter is the
         // answer rather than being swallowed, as everywhere else in this protocol.
