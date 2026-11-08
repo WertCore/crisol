@@ -42,6 +42,9 @@ pub struct Flags {
     pub dot_all: bool,
     /// `u` — Unicode mode.
     pub unicode: bool,
+    /// `v` — Unicode-sets mode: set operations in character classes and properties of strings.
+    /// Mutually exclusive with `u`.
+    pub unicode_sets: bool,
     /// `y` — anchor the match **at** `lastIndex` rather than searching from it.
     pub sticky: bool,
     /// `d` — report capture group indices.
@@ -66,6 +69,7 @@ impl Flags {
                 'm' => &mut flags.multiline,
                 's' => &mut flags.dot_all,
                 'u' => &mut flags.unicode,
+                'v' => &mut flags.unicode_sets,
                 'y' => &mut flags.sticky,
                 'd' => &mut flags.has_indices,
                 _ => return Err(letter),
@@ -74,6 +78,11 @@ impl Flags {
                 return Err(letter);
             }
             *slot = true;
+        }
+        // **`u` and `v` are mutually exclusive**, a `SyntaxError` the specification names
+        // explicitly — `v` is a different dialect of the same mode, not an addition to it.
+        if flags.unicode && flags.unicode_sets {
+            return Err('v');
         }
         Ok(flags)
     }
@@ -93,6 +102,7 @@ impl Flags {
             (self.multiline, 'm'),
             (self.dot_all, 's'),
             (self.unicode, 'u'),
+            (self.unicode_sets, 'v'),
             (self.sticky, 'y'),
         ] {
             if set {
@@ -123,6 +133,11 @@ pub struct Captured {
     /// **not** the same as one that matched empty, and the difference is visible in `exec`'s
     /// result as `undefined` versus `""`.
     pub groups: Vec<Option<(usize, usize)>>,
+    /// The named groups, `(name, range)`, in source order — empty for a pattern with none. A
+    /// named group is **also** numbered, so it appears in `groups` too; this is the extra mapping
+    /// `exec`'s `groups` object and a `$<name>` replacement read, which positions alone cannot
+    /// give.
+    pub named: Vec<(String, Option<(usize, usize)>)>,
 }
 
 /// A compiled `RegExp`, with its cursor.
@@ -147,6 +162,7 @@ impl JsRegExp {
             multiline: flags.multiline,
             dot_all: flags.dot_all,
             unicode: flags.unicode,
+            unicode_sets: flags.unicode_sets,
             ..RegressFlags::default()
         };
         let regex = Regex::with_flags(pattern, regress_flags).map_err(|error| error.to_string())?;
@@ -191,12 +207,18 @@ impl JsRegExp {
     /// With `y` the match must begin exactly at `lastIndex`; a match found later in the string
     /// is not a match at all.
     pub fn exec(&mut self, text: &str) -> Option<Captured> {
-        let start = if self.flags.uses_last_index() {
+        // **`last_index` is in code units** — the units JavaScript counts and the specification's
+        // `lastIndex` uses — but `regress` searches by byte offset, so the cursor is converted on
+        // the way in and the match end on the way out (D-358). Measuring it in bytes agreed with
+        // code units only for ASCII, and fed `find_from` an offset inside a multi-byte sequence for
+        // anything else — which panicked the moment `@@replace`'s empty-match advance (D-357) set a
+        // code-unit `lastIndex` over an astral character.
+        let start_unit = if self.flags.uses_last_index() {
             self.last_index
         } else {
             0
         };
-        if start > text.len() {
+        if start_unit > code_unit_len(text) {
             // Past the end. Only meaningful when the cursor is live, but resetting
             // unconditionally would clobber a `lastIndex` the program set on a non-global regex,
             // where the specification says it is inert.
@@ -206,6 +228,7 @@ impl JsRegExp {
             return None;
         }
 
+        let start = byte_of_code_unit(text, start_unit);
         let found = self.regex.find_from(text, start).next();
         let Some(found) = found else {
             if self.flags.uses_last_index() {
@@ -221,7 +244,7 @@ impl JsRegExp {
         }
 
         if self.flags.uses_last_index() {
-            self.last_index = found.range.end;
+            self.last_index = code_unit_of_byte(text, found.range.end);
         }
         Some(Captured {
             start: found.range.start,
@@ -230,6 +253,10 @@ impl JsRegExp {
                 .captures
                 .iter()
                 .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
+                .collect(),
+            named: found
+                .named_groups()
+                .map(|(name, range)| (name.to_owned(), range.map(|range| (range.start, range.end))))
                 .collect(),
         })
     }
@@ -270,6 +297,12 @@ impl JsRegExp {
                     .iter()
                     .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
                     .collect(),
+                named: found
+                    .named_groups()
+                    .map(|(name, range)| {
+                        (name.to_owned(), range.map(|range| (range.start, range.end)))
+                    })
+                    .collect(),
             });
             if empty && at > text.len() {
                 break;
@@ -289,4 +322,34 @@ fn next_boundary(text: &str, from: usize) -> usize {
         at += 1;
     }
     at
+}
+
+/// The number of UTF-16 code units in `text` — the length JavaScript reports.
+fn code_unit_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Byte offset of UTF-16 code-unit index `units`, clamped to the end. A `units` that falls inside a
+/// surrogate pair resolves past the whole pair, so the byte offset is always a character boundary
+/// and never splits a code point for `regress`.
+fn byte_of_code_unit(text: &str, units: usize) -> usize {
+    if units == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (byte, ch) in text.char_indices() {
+        if seen >= units {
+            return byte;
+        }
+        seen += ch.len_utf16();
+    }
+    text.len()
+}
+
+/// UTF-16 code-unit index of byte offset `byte`, which a match boundary always is.
+fn code_unit_of_byte(text: &str, byte: usize) -> usize {
+    text.get(..byte).map_or_else(
+        || code_unit_len(text),
+        |prefix| prefix.encode_utf16().count(),
+    )
 }

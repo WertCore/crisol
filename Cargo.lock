@@ -681,6 +681,7 @@ dependencies = [
  "crisol-frontend",
  "crisol-ir",
  "crisol-render-wgpu",
+ "crisol-value",
  "wgpu",
 ]
 
@@ -702,7 +703,11 @@ dependencies = [
 name = "crisol-abi"
 version = "0.0.0"
 dependencies = [
+ "crisol-builtins",
+ "crisol-gc",
  "crisol-value",
+ "num-bigint",
+ "num-traits",
 ]
 
 [[package]]
@@ -789,6 +794,7 @@ dependencies = [
  "oxc_parser",
  "oxc_resolver",
  "oxc_span",
+ "oxc_syntax",
 ]
 
 [[package]]
@@ -2978,11 +2984,10 @@ dependencies = [
 
 [[package]]
 name = "regress"
-version = "0.10.5"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2057b2325e68a893284d1538021ab90279adac1139957ca2a74426c6f118fb48"
+checksum = "32eef8b209c3c1c15dbad02c1f30f9539f00dc7253e0cbcdaae442a50a09d7c1"
 dependencies = [
- "hashbrown 0.16.1",
  "memchr",
 ]
 

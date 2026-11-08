@@ -3,10 +3,87 @@
 **Current milestone:** M13 — codegen. Lowering is complete; the backend compiles a numeric
 subset to object code for all four targets, and `crisol-abi` defines the symbols it calls.
 
+The stack map path is now connected end to end: the backend emits a table, the C entry point
+registers it before running anything, and the collector reads it through a root provider
+(D-91), reading each offset from the frame's **stack pointer**, which is what Cranelift
+measures them from (D-93). Object literals and property access compile.
+
+Every compiled function now takes `(closure, this, new.target, argc, argv)` (D-94), so a
+call site does not need to know which function it is reaching — the prerequisite for closures,
+classes and array methods. `this` is bound to the slot the function names, and a function
+knows its own `FunctionId` so a closure can be resolved without relying on compile order.
+
+**Closures and calls work.** A function can be called, a closure reads what it captured, a
+missing argument is `undefined` and an extra one is ignored, and a callback passed as a value
+is reached indirectly — `twice(inc, 5)` compiles to a native binary and prints `7`. Calling a
+non-function returns `undefined` rather than crashing (D-95). All of it holds under
+`CRISOL_GC_STRESS=1`.
+
+**Classes work** — fields, methods found through the prototype chain, `this` as the receiver,
+and a constructor returning an object replacing the instance. Heap objects carry a prototype
+the collector traces, and engine state lives beside the property slots rather than in them
+(D-96), which is what made every class constructor silently uncallable.
+
+**test262 is now attempted rather than counted.** `cli/tests/test262.rs` compiles and runs
+cases and reports three numbers — refused, crashed, ran — and does not collapse them: crisol
+has no throw path, so a case that runs to completion may have reached an assertion it could not
+signal. `ran` is an upper bound on the pass rate, not the pass rate.
+
+**test262 has a real pass rate: 16 passed, 205 failed, 0 crashed, 158 refused** of 379
+sampled. An uncaught throw exits non-zero (D-106), which is what makes the number mean
+anything — a case reports failure by throwing, and before that every failing case exited
+successfully and scored as a pass. Reporting "ran to completion" would have claimed 58%.
+
+**CI is green, and the corpus number is real.** 1361 cases attempted of a 1500 sample:
+**252 passed, 1066 failed, 0 crashed, 43 refused.** Measured on Linux x86-64, which is the
+platform whose collector was broken until D-143 — every earlier figure in this file was
+macOS-only.
+
+**Crashes are zero and the job asserts they stay that way.** All twelve were `new String(…)`
+recursing into its own `toString` (D-146).
+
+The failures are legible for the first time (D-145): `is not a function` (211),
+`cannot read a property of undefined` (125), `Expected SameValue(«undefined», …)` (88),
+`Symbol` (79), `Proxy` (40), `Promise` (29), `Set` (25), `Map` (18).
+
+**Linux arm64 remains red and non-blocking** (D-144): 64 failures, all under GC stress, a second
+fault distinct from the frame-pointer one that fixed x86-64.
+
+What is still refused: `delete` (59), regular expression literals (26), computed property keys
+(21), template literals (20), `for-in` (14), array holes (11).
+
+**M13's acceptance is met.** `main.ts` containing arithmetic, closures, classes and array
+methods compiles to a standalone binary that runs and produces correct output, with GC stress
+enabled — every acceptance program is run twice, the second time collecting on every
+allocation. Four targets are built in CI; only the host is executed.
+
+`[1,2,3,4].filter(…).map(…).reduce(…)` compiles and prints `90`. Built-ins are closures with a
+negative function index (D-101), so a call site cannot tell a native from a compiled callee.
+
+**Arrays work** — literals, indexing, writing, growing past the end, `length`, and computed
+keys that are not indices falling back to ordinary properties. Elements live beside the
+property slots rather than in them, so a thousand-element array does not make a thousand
+shapes.
+
+**Every acceptance program now runs twice, the second time under GC stress** (D-99). That is
+not extra caution: it is the only thing that tests rooting, and it has caught two bugs that
+every ordinary run passed.
+
+**Captured variables are shared, not copied** (D-97). A variable that is both captured and
+assigned lives in a heap cell that the closure and the enclosing scope hold jointly, so a
+counter mutated inside a closure accumulates. Decided by a pre-pass, because the lowering only
+discovers a capture after it has emitted the enclosing code.
+
+`CRISOL_GC_STRESS=1` collects on every allocation and is the only thing that tests any of
+this: with the offsets read from the wrong end of the frame, every acceptance test still
+printed the right answer, because none of them allocated enough to collect at all. That is what unblocks allocation in compiled code — until the
+collector could see compiled frames, anything `Op::CreateObject` allocated could be freed
+while still in use.
+
 **Last finished:** M11 — IR, acceptance met. **M12's surface is complete but its acceptance
 is not**: it asks for a test262 pass rate, and nothing can execute JavaScript yet (D-78).
 
-**Totals:** 966 tests passing; the `node_modules` and test262 cases skip without their suites.
+**Totals:** 1235 tests passing (measured, not carried forward — see D-121); the `node_modules` and test262 cases skip without their suites.
 
 > The live total lives **here**, beside the milestone, not at the end of the newest section.
 > Four separate merges duplicated or misplaced it there — twice putting a current figure
@@ -1725,6 +1802,28 @@ control flow and locals work end to end; closures, classes and array methods do 
 `Op::Closure`, `Op::Construct` and `Op::CreateArray` are not lowered. One of four. The pipeline
 is real and the coverage is not there yet.
 
+### Stack maps: the table is emitted
+
+A precise collector must know where every live reference is. Rust code says so via a shadow
+stack; **compiled code cannot** — its values sit in registers and frame slots with no list
+anywhere (D-90). The maps are now read out of the compiled buffer and written into the object
+as `crisol_stack_maps`, with a relocation per row so the linker fills in each function's
+address — the same job Go's linker does for `pclntab`.
+
+D-87 said `cranelift-object` does not write stack maps into a section. True of the *writer*,
+not of the information: `user_stack_maps()` is public, and carrying it across is our job.
+
+**Cranelift spills every live value to the frame before a safepoint**, so the collector reads
+stack slots and nothing else — no register maps. Go needed those only once it began preempting
+goroutines mid-function.
+
+The table is **flat**, one row per live value: the runtime reads it while walking a stack
+mid-collection, which is the worst place for a length-prefix parser to be subtly wrong.
+
+**What remains:** walking native frames, matching return addresses against the table, and
+reading the live slots. Until then, collection during compiled code is unsafe and §M13's GC
+stress requirement is unmet.
+
 **Still ahead for M13's acceptance:** actually linking and running a binary, and GC stress.
 unary, logical, conditional and array literals. array *methods*, then the Cranelift backend.
 
@@ -1788,6 +1887,54 @@ because `ToPrimitive` calls user code.
 both operands, which changes what the program *does*. `??` tests nullishness rather than
 falsiness — `0 ?? 1` is `0` — and emits explicit comparisons rather than branching on the value.
 Both mutation-tested.
+
+---
+
+## Where the corpus stands
+
+The number that matters is `cargo test -p crisol --test test262` on CI, at the default sample
+of 1500. **490 → 767 → 809 → 847**, the last three measured at `e8fea2d`, `0c0076a` and
+`dbd57fb`; the sample is identical between runs, so they are comparable. D-168 to D-217 are
+that work.
+
+**One crashed case fails the whole job**, which is the design (D-205) and is worth knowing
+before reading a red corpus run as a regression: `dbd57fb` passed 847 and still reported
+failure, for a single case the timeout killed.
+
+**The matrix jobs use a sample of 400 and the dispatch uses 1500, and they are different
+subsets.** Comparing one against the other reads as a regression that is not there.
+
+**Read the failure histogram before picking anything up.** The runner prints examples per
+failure reason *and* per area, and the two cuts disagree usefully: the `Object` area barely
+moved across the first half of that work while twenty-one more cases passed, because the
+element-descriptor machinery is shared and the wins landed in `Array.prototype`. Picking by
+area alone would have looked like no progress.
+
+The list that used to be here — `Proxy`, `Promise`, `Reflect`, symbols as property keys —
+is done (D-187 to D-201). What the report says now is different in kind: almost nothing is
+refused any more (43 of 1500), and the failures are behaviour.
+
+**Check which commit a histogram came from before working off it.** The one that named the
+`return-abrupt-from-*` family was three commits stale and that family was already fixed. A
+measurement is one dispatch away.
+
+At `dbd57fb` the largest reasons were "is not a function" and "expected a TypeError, got
+none", and by area `Array.prototype`, `RegExp` + `RegExp.prototype`, `Object` and
+`String.prototype`. **The `RegExp` half is the most concentrated thing left**: the
+`Symbol.match`/`replace`/`search`/`split` protocol does not exist, so the string methods do
+the work themselves — a `RegExp` subclass that overrides one is ignored and a user-supplied
+`exec` is never called (D-216).
+
+"TypeError: is not a function" is not one problem — it is a list, and the report prints it.
+Working through it is the cheapest thing available: `Reflect.construct`,
+`String.prototype.match`, `Date.prototype.toUTCString`, `Error.isError` and `Map.groupBy` were
+all on it and are all in (D-207, D-209, D-210, D-215). `RegExp.escape`,
+`String.prototype.matchAll`, `Error.prototype.stack` and the `RegExp.prototype[Symbol.*]`
+family are what is left of it.
+
+Two things are deliberately not done. The regular-expression `v` flag is refused rather than
+accepted as `u`, because accepting it turns a correct `SyntaxError` into wrong match results
+(15 cases). `$262` (11 cases) wants `createRealm`, which is a second global object.
 
 ---
 

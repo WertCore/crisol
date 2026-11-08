@@ -33,8 +33,10 @@ pub fn to_boolean(value: Value) -> bool {
             // `NaN` fails both comparisons, and `-0 != 0.0` is false, so both zeros land here.
             number != 0.0 && !number.is_nan()
         }),
-        // A string's truthiness is its *length*, not its content. `"false"` is true.
-        Kind::String | Kind::Symbol | Kind::Object => true,
+        // A string's truthiness is its *length*, not its content. `"false"` is true. A BigInt is
+        // truthy unless it is `0n`, which the value layer cannot tell apart from here — the
+        // heap-aware caller in the ABI refines it, exactly as it does for a string.
+        Kind::String | Kind::Symbol | Kind::BigInt | Kind::Object => true,
     }
 }
 
@@ -188,8 +190,10 @@ pub fn to_string(value: Value) -> Option<String> {
             .map(|flag| if flag { "true" } else { "false" }.to_owned()),
         Kind::Number => value.as_number().map(number_to_string),
         // `String(Symbol())` is a TypeError — only `String()` itself is allowed to describe
-        // one, and implicit coercion must fail. Reported as "not here" rather than as text.
-        Kind::String | Kind::Symbol | Kind::Object => None,
+        // one, and implicit coercion must fail. Reported as "not here" rather than as text. A
+        // BigInt's digits live behind a handle too, so it defers the same way; the ABI formats
+        // them without the trailing `n`.
+        Kind::String | Kind::Symbol | Kind::BigInt | Kind::Object => None,
     }
 }
 
@@ -203,6 +207,8 @@ pub fn to_number(value: Value) -> Option<f64> {
         Kind::Null => Some(0.0),
         Kind::Boolean => value.as_boolean().map(|flag| if flag { 1.0 } else { 0.0 }),
         Kind::Number => value.as_number(),
-        Kind::String | Kind::Symbol | Kind::Object => None,
+        // A BigInt is *not* here even though its value is numeric: `Number(1n)` works but the
+        // implicit `ToNumber(1n)` is a TypeError, and only the ABI can tell which caller it is.
+        Kind::String | Kind::Symbol | Kind::BigInt | Kind::Object => None,
     }
 }

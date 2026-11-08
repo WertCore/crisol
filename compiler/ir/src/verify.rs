@@ -16,11 +16,24 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::{BlockId, Function, Terminator, Type, ValueId};
+use crate::{BlockId, Function, FunctionId, Terminator, Type, ValueId};
 
 /// Why a function is malformed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
+    /// A function's `id` does not match its position in the module.
+    ///
+    /// A backend resolves [`crate::Op::Closure`]'s callee through that field, so a stale one
+    /// means a closure that runs the wrong function — which is not a crash, just the wrong
+    /// answer.
+    FunctionIdMismatch {
+        /// Which function.
+        name: String,
+        /// What it claims.
+        claimed: FunctionId,
+        /// Where it actually is.
+        actual: FunctionId,
+    },
     /// A terminator names a block that does not exist.
     NoSuchBlock {
         /// Where from.
@@ -119,6 +132,16 @@ pub enum VerifyError {
 impl fmt::Display for VerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FunctionIdMismatch {
+                name,
+                claimed,
+                actual,
+            } => write!(
+                f,
+                "{name} claims to be function {} but is at {}",
+                claimed.index(),
+                actual.index()
+            ),
             Self::NoSuchBlock { from, target } => {
                 write!(f, "{from} jumps to {target}, which does not exist")
             }
@@ -416,6 +439,17 @@ pub fn verify_module(functions: &[Function]) -> Result<(), Vec<VerifyError>> {
     for function in functions {
         if let Err(mut found) = verify(function) {
             errors.append(&mut found);
+        }
+    }
+
+    for (index, function) in functions.iter().enumerate() {
+        let expected = FunctionId(u32::try_from(index).unwrap_or(u32::MAX));
+        if function.id != expected {
+            errors.push(VerifyError::FunctionIdMismatch {
+                name: function.name.clone(),
+                claimed: function.id,
+                actual: expected,
+            });
         }
     }
 

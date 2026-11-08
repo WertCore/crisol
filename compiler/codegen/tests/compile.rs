@@ -231,9 +231,11 @@ fn strict_equality_on_numbers_is_float_equality() {
 }
 
 #[test]
-fn strict_equality_on_unknown_values_is_still_refused() {
-    // On boxed values of unknown type a bit comparison gets NaN and ±0 wrong, which is D-53's
-    // whole subject. The lattice has proved nothing here, so the backend refuses.
+fn strict_equality_on_unknown_values_becomes_a_call() {
+    // On boxed values of unknown type a bit comparison gets `NaN` and `±0` wrong, which is
+    // D-53's whole subject. The lattice has proved nothing here, so this is a call to the
+    // runtime rather than an instruction — it used to be refused outright, and `switch` needs
+    // it, since every case comparison is exactly this.
     let mut function = Function::new("eq_unknown");
     let left = function.value();
     let right = function.value();
@@ -266,10 +268,13 @@ fn strict_equality_on_unknown_values_is_still_refused() {
     entry.terminator = Terminator::Return(Some(result));
 
     let mut backend = host();
-    assert!(matches!(
-        backend.compile(&function).expect_err("refused"),
-        CodegenError::Unsupported { .. }
-    ));
+    let _ = backend.compile(&function).expect("compiles");
+    let object = backend.finish().expect("emits");
+    let needle = b"crisol_strict_equal";
+    assert!(
+        object.windows(needle.len()).any(|window| window == needle),
+        "it must reach the runtime rather than compare bits"
+    );
 }
 
 #[test]
@@ -395,4 +400,117 @@ fn every_listed_target_can_be_constructed() {
             "{triple} should be constructible"
         );
     }
+}
+#[test]
+fn a_safepoint_reports_where_live_values_sit() {
+    // The table a precise collector needs: not "how many" but "at code offset X, live values
+    // are at frame offsets Y". Cranelift spills every live value to the frame before a
+    // safepoint, so stack slots are the whole story here.
+    use crisol_ir::*;
+    let mut function = Function::new("mapped");
+    let kept = function.value();
+    let called = function.value();
+    let after = function.value();
+    let entry = function.get_mut(BlockId::ENTRY).expect("entry");
+    entry.instructions = vec![
+        Instruction {
+            result: Some(kept),
+            ty: Type::Number,
+            op: Op::Const(Constant::Number(1.0)),
+            safepoint: None,
+        },
+        Instruction {
+            result: Some(called),
+            ty: Type::Unknown,
+            op: Op::Binary {
+                op: BinaryOp::Add,
+                left: kept,
+                right: kept,
+            },
+            safepoint: Some(Safepoint { live: vec![kept] }),
+        },
+        Instruction {
+            result: Some(after),
+            ty: Type::Number,
+            op: Op::Binary {
+                op: BinaryOp::Multiply,
+                left: kept,
+                right: called,
+            },
+            safepoint: None,
+        },
+    ];
+    entry.terminator = Terminator::Return(Some(after));
+
+    let mut backend = Cranelift::new("aarch64-apple-darwin").expect("target");
+    let report = backend.compile(&function).expect("compiles");
+    assert_eq!(report.safepoints.len(), 1, "one call, one safepoint");
+    let map = &report.safepoints[0];
+    assert!(
+        !map.live_offsets.is_empty(),
+        "the live value needs a frame offset"
+    );
+    assert!(map.span > 0, "and a frame to be in");
+}
+
+#[test]
+fn the_object_carries_a_stack_map_table() {
+    // The table a compiled program's collector reads. It is emitted as a data symbol with a
+    // relocation per row, because nothing here knows where the code will land — the same job
+    // Go's linker does for `pclntab`.
+    let mut function = Function::new("mapped");
+    let kept = function.value();
+    let called = function.value();
+    let after = function.value();
+    let entry = function.get_mut(BlockId::ENTRY).expect("entry");
+    entry.instructions = vec![
+        number(kept, 1.0),
+        Instruction {
+            result: Some(called),
+            ty: Type::Unknown,
+            op: Op::Binary {
+                op: BinaryOp::Add,
+                left: kept,
+                right: kept,
+            },
+            safepoint: Some(Safepoint { live: vec![kept] }),
+        },
+        Instruction {
+            result: Some(after),
+            ty: Type::Number,
+            op: Op::Binary {
+                op: BinaryOp::Multiply,
+                left: kept,
+                right: called,
+            },
+            safepoint: None,
+        },
+    ];
+    entry.terminator = Terminator::Return(Some(after));
+
+    let mut backend = host();
+    let report = backend.compile(&function).expect("compiles");
+    assert!(
+        !report.safepoints.is_empty(),
+        "the function has a safepoint"
+    );
+
+    let object = backend.finish().expect("emits");
+    let needle = crisol_codegen::STACK_MAP_SYMBOL.as_bytes();
+    assert!(
+        object.windows(needle.len()).any(|window| window == needle),
+        "the object should export {}",
+        crisol_codegen::STACK_MAP_SYMBOL
+    );
+}
+
+#[test]
+fn a_program_with_no_safepoints_still_emits_a_table() {
+    // An empty table rather than a missing symbol: the runtime looks the symbol up
+    // unconditionally, and "absent" and "empty" would need different handling for no reason.
+    let mut backend = host();
+    let _ = backend.compile(&returns_constant(1.0)).expect("compiles");
+    let object = backend.finish().expect("emits");
+    let needle = crisol_codegen::STACK_MAP_SYMBOL.as_bytes();
+    assert!(object.windows(needle.len()).any(|window| window == needle));
 }
