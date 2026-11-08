@@ -834,6 +834,93 @@ fn regexp_protocol_propagates_a_throwing_subject() {
     );
 }
 
+/// **`RegExp.prototype[Symbol.replace]` runs on `RegExpExec`** (D-357) — it calls `exec` (so an
+/// override is used), reads the result object's `index`/`length`/captures/`groups`, and propagates
+/// the throw from any of those coercions or from setting `lastIndex`. The ordinary cases — global,
+/// `$`-patterns, named groups, a function replacer, code-unit positions, empty matches — are
+/// unchanged.
+#[test]
+fn regexp_symbol_replace_runs_on_exec() {
+    check(
+        "replace-exec-ordinary",
+        "return \"abc\".replace(/b/, \"X\");",
+        "aXc",
+    );
+    check(
+        "replace-exec-global",
+        "return \"aaa\".replace(/a/g, \"X\");",
+        "XXX",
+    );
+    // `$\``, `$&`, `$'` together.
+    check(
+        "replace-exec-dollar",
+        "return \"abc\".replace(/b/, \"[$`-$&-$']\");",
+        "a[a-b-c]c",
+    );
+    // `$n` numbered captures.
+    check(
+        "replace-exec-numbered",
+        "return \"a1b\".replace(/([a-z])(\\d)/, \"$2$1\");",
+        "1ab",
+    );
+    // Named groups through the exec path.
+    check(
+        "replace-exec-named",
+        "return \"2024-01\".replace(/(?<y>\\d+)-(?<mo>\\d+)/, \"$<mo>/$<y>\");",
+        "01/2024",
+    );
+    // A function replacer, with the match coerced through the same path.
+    check(
+        "replace-exec-fn",
+        "return \"abc\".replace(/b/, function (m) { return m.toUpperCase(); });",
+        "aBc",
+    );
+    // **Code-unit positions, not bytes**: the prefix of a match after a multi-byte character.
+    check(
+        "replace-exec-nonascii",
+        "return \"\\u00f1b\".replace(/b/, \"$`\");",
+        "\u{00f1}\u{00f1}",
+    );
+    // An empty global match is stepped over, not matched forever.
+    check(
+        "replace-exec-empty-global",
+        "return \"ab\".replace(/(?:)/g, \"-\");",
+        "-a-b-",
+    );
+    // **`exec` is actually invoked** — an override counts the calls (2 matches + the closing null).
+    check(
+        "replace-exec-invocation",
+        "var r = /x/g; var n = 0; var orig = RegExp.prototype.exec; \
+         r.exec = function (s) { n++; return orig.call(this, s); }; \
+         \"xx\".replace(r, \"Y\"); return n;",
+        "3",
+    );
+    // A custom `exec` result object drives the replacement.
+    check(
+        "replace-exec-custom-result",
+        "var r = /x/; var done = false; \
+         r.exec = function () { if (done) return null; done = true; return {0: \"x\", index: 1, length: 1}; }; \
+         return \"axc\".replace(r, \"Y\");",
+        "aYc",
+    );
+    // A throwing `length` coercion on the result propagates (result-coerce-length-err).
+    check(
+        "replace-exec-length-throws",
+        "var r = /x/; \
+         r.exec = function () { return {0: \"x\", index: 0, get length() { throw new RangeError(\"L\"); }}; }; \
+         try { \"x\".replace(r, \"Y\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+    // A throwing `lastIndex` setter propagates (g-init-lastindex-err).
+    check(
+        "replace-exec-lastindex-throws",
+        "var r = /x/g; \
+         Object.defineProperty(r, \"lastIndex\", { get: function () { return 0; }, set: function () { throw new RangeError(\"LI\"); } }); \
+         try { \"x\".replace(r, \"Y\"); return \"no\"; } catch (e) { return e.name; }",
+        "RangeError",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

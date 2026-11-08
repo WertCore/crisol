@@ -9243,3 +9243,31 @@ cheap half of the remaining `@@replace` work; the `exec`-invocation and `result`
 ordinary `Set` that honours a throwing setter, not the `define` `set_last_index` uses) are unreached. The rewrite also
 needs a code-unit↔byte converter and `AdvanceStringIndex`, neither of which exists yet. `@@split`-via-`exec` additionally
 needs a sticky-flag `SpeciesConstructor` clone the engine shortcuts.
+
+## D-357
+
+**`RegExp.prototype[Symbol.replace]` is built on `RegExpExec`, not the built-in matcher.**
+
+Status: Accepted
+
+Fifth piece of the RegExp protocol work. `@@replace` delegated to `replace_using_pattern`, which recompiled the source
+and ran the built-in `all_matches`/`exec` — so a program that overrode `exec` was ignored (`exec-invocation`), and the
+result-object coercions the specification performs (`ToLength(Get(result, "length"))`, `ToString(Get(result, i))`,
+`ToString(Get(result, 0))`, `ToIntegerOrInfinity(Get(result, "index"))`) never ran, so their throwing cases
+(`result-coerce-length-err`, `result-coerce-capture-err`) passed silently. It now loops `RegExpExec` and reads each result
+object exactly as 21.2.5.8 says.
+
+Why not reuse `splice_matches`/`expand_replacement`. Those read a `Captured` — byte ranges into the subject. An `exec`
+result gives **strings** for its captures and a **code-unit** `index`, with no byte ranges (a user `exec` may return any
+object), so the spec's `GetSubstitution` is defined over strings and code-unit positions, not ranges. `@@replace` gets its
+own `substitution_from_exec` and `call_exec_replacer`, the string-shaped twins of the `Captured` ones, and the subject is
+sliced through `byte_offset_of_code_unit` since the positions arrive in code units (D-115). An empty global match is
+stepped by `advance_string_index` (`AdvanceStringIndex`, Unicode-aware), and `lastIndex` is written through an ordinary
+`Set` (`crisol_property_store`, via `set_honoring`) so a throwing setter is the answer (`g-init-lastindex-err`) — not the
+`define` `set_last_index` uses, which would bypass it. `String.prototype.replace` already delegates to this through
+`@@replace`, so both reach `exec`; `replace_using_pattern` stays only as the fallback for a `source`-bearing object that
+has no `@@replace`.
+
+**Remaining RegExp-protocol piece** (scoped): `@@split` still uses the built-in matcher, so its `exec` override is ignored.
+`@@split`-via-`exec` additionally needs a sticky-flag `SpeciesConstructor` clone the engine shortcuts, which is why it is
+left for a dedicated change.

@@ -11034,6 +11034,378 @@ extern "C" fn regexp_symbol_search(
     })
 }
 
+/// Byte offset in `text` of UTF-16 code-unit index `units` (clamped to the end).
+///
+/// Linear, but a replace already walks the string, so the cost is the same order as the work
+/// around it. A `units` that falls inside a surrogate pair resolves to the pair's start.
+fn byte_offset_of_code_unit(text: &str, units: usize) -> usize {
+    if units == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (byte, ch) in text.char_indices() {
+        if seen >= units {
+            return byte;
+        }
+        seen += ch.len_utf16();
+    }
+    text.len()
+}
+
+/// `AdvanceStringIndex` — the index after an empty match: one code unit, or a whole surrogate pair
+/// under a Unicode flag so it does not land inside an astral character.
+fn advance_string_index(text: &str, units: usize, unicode: bool) -> usize {
+    if !unicode {
+        return units + 1;
+    }
+    let byte = byte_offset_of_code_unit(text, units);
+    match text.get(byte..).and_then(|rest| rest.chars().next()) {
+        Some(ch) => units + ch.len_utf16(),
+        None => units + 1,
+    }
+}
+
+/// `Set(object, name, value)` honouring a setter — the thrown value if one throws (what
+/// `g-init-lastindex-err` requires), where the `define` [`set_last_index`] uses would bypass it.
+fn set_honoring(object: u64, name: &str, value: u64) -> Option<u64> {
+    // SAFETY: `name` is a live Rust string of `name.len()` UTF-8 bytes.
+    let out = unsafe { crisol_property_store(object, name.as_ptr(), name.len() as u64, value) };
+    Value::from_bits(out).is_exception().then_some(out)
+}
+
+/// `ToLength` of `bits` — `Get(result, "length")` as a non-negative integer, capped at 2^53-1, with
+/// a throwing coercion propagated (`result-coerce-length-err`).
+fn to_length_bits(bits: u64) -> Result<usize, u64> {
+    let number = coerce_number(bits)?;
+    if !number.is_finite() || number <= 0.0 {
+        return Ok(0);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped finite and positive"
+    )]
+    let capped = number.min(9_007_199_254_740_991.0) as usize;
+    Ok(capped)
+}
+
+/// `GetSubstitution` reading an `exec` result's strings — the exec path's counterpart to
+/// [`expand_replacement`], which reads a `Captured`'s byte ranges. Positions are code units.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pieces GetSubstitution is defined over"
+)]
+fn substitution_from_exec(
+    matched: &str,
+    text: &str,
+    position: usize,
+    match_len: usize,
+    captures: &[Option<String>],
+    named: u64,
+    has_named: bool,
+    template: &str,
+) -> Result<String, u64> {
+    let bytes = template.as_bytes();
+    let mut out = String::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'$' || at + 1 >= bytes.len() {
+            let character = template[at..].chars().next().unwrap_or('$');
+            out.push(character);
+            at += character.len_utf8();
+            continue;
+        }
+        match bytes[at + 1] {
+            b'$' => {
+                out.push('$');
+                at += 2;
+            }
+            b'&' => {
+                out.push_str(matched);
+                at += 2;
+            }
+            b'`' => {
+                let edge = byte_offset_of_code_unit(text, position);
+                out.push_str(text.get(..edge).unwrap_or_default());
+                at += 2;
+            }
+            b'\'' => {
+                let edge = byte_offset_of_code_unit(text, position + match_len);
+                out.push_str(text.get(edge..).unwrap_or_default());
+                at += 2;
+            }
+            b'0'..=b'9' => {
+                let two = bytes
+                    .get(at + 2)
+                    .filter(|byte| byte.is_ascii_digit())
+                    .map(|byte| usize::from(bytes[at + 1] - b'0') * 10 + usize::from(*byte - b'0'))
+                    .filter(|index| *index >= 1 && *index <= captures.len());
+                let one = usize::from(bytes[at + 1] - b'0');
+                if let Some(index) = two {
+                    if let Some(Some(group)) = captures.get(index - 1) {
+                        out.push_str(group);
+                    }
+                    at += 3;
+                } else if one >= 1 && one <= captures.len() {
+                    if let Some(Some(group)) = captures.get(one - 1) {
+                        out.push_str(group);
+                    }
+                    at += 2;
+                } else {
+                    out.push('$');
+                    at += 1;
+                }
+            }
+            b'<' => {
+                if !has_named {
+                    out.push('$');
+                    at += 1;
+                } else if let Some(close) = template[at + 2..].find('>') {
+                    let name = &template[at + 2..at + 2 + close];
+                    let capture = with_rooted(&[named], || property_of(named, name));
+                    if Value::from_bits(capture).is_exception() {
+                        return Err(capture);
+                    }
+                    if !Value::from_bits(capture).is_undefined() {
+                        let group = with_rooted(&[named], || string_argument(capture))?;
+                        out.push_str(&group);
+                    }
+                    at += 2 + close + 1;
+                } else {
+                    out.push('$');
+                    at += 1;
+                }
+            }
+            _ => {
+                out.push('$');
+                at += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A function replacement called with `(matched, …captures, position, subject[, groups])` for the
+/// exec path, its result coerced with `ToString` (which propagates). The twin of [`call_replacer`],
+/// taking the captures as the strings `exec` yielded rather than a `Captured`'s byte ranges.
+fn call_exec_replacer(
+    matched: &str,
+    captures: &[Option<String>],
+    position: usize,
+    subject: u64,
+    named: u64,
+    has_named: bool,
+    replacement: u64,
+) -> Result<String, u64> {
+    let mut arguments = Vec::with_capacity(captures.len() + 4);
+    arguments.push(with_rooted(&[subject, named], || new_string(matched)));
+    for capture in captures {
+        let value = with_rooted(&arguments, || {
+            with_rooted(&[subject, named], || match capture {
+                Some(group) => new_string(group),
+                None => Value::UNDEFINED.to_bits(),
+            })
+        });
+        arguments.push(value);
+    }
+    #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+    let position = Value::number(position as f64).to_bits();
+    arguments.push(position);
+    arguments.push(subject);
+    if has_named {
+        arguments.push(named);
+    }
+    let produced = with_rooted(&arguments, || {
+        with_rooted(&[subject, named], || {
+            call_value(replacement, Value::UNDEFINED.to_bits(), &arguments)
+        })
+    });
+    if Value::from_bits(produced).is_exception() {
+        return Err(produced);
+    }
+    string_argument(produced)
+}
+
+/// `RegExp.prototype[Symbol.replace]`, built on `RegExpExec` (D-357).
+///
+/// **The matcher is `exec`, not the built-in search**, so a program that overrides `exec` changes
+/// what replace does (`exec-invocation`), and the result object is read exactly as the
+/// specification says — `index`, `length`, the indexed captures, and `groups` — each coercion
+/// propagating its throw (`result-coerce-length-err`, `result-coerce-capture-err`). A global
+/// replace sets `lastIndex` through an ordinary `Set` so a throwing setter is the answer
+/// (`g-init-lastindex-err`), and steps an empty match by `AdvanceStringIndex`. Positions arrive in
+/// code units, so the slices of `text` go through [`byte_offset_of_code_unit`].
+fn replace_via_exec(text: &str, rx: u64, replacement: u64) -> u64 {
+    let functional = is_callable(replacement);
+    let template = if functional {
+        String::new()
+    } else {
+        match with_rooted(&[rx, replacement], || string_argument(replacement)) {
+            Ok(template) => template,
+            Err(thrown) => return thrown,
+        }
+    };
+    let subject = with_rooted(&[rx, replacement], || new_string(text));
+    let flags = with_rooted(&[rx, replacement, subject], || property_of(rx, "flags"));
+    if Value::from_bits(flags).is_exception() {
+        return flags;
+    }
+    let flags_text = to_text(flags).unwrap_or_default();
+    let global = flags_text.contains('g');
+    let unicode = flags_text.contains('u') || flags_text.contains('v');
+    if global && let Some(thrown) = set_honoring(rx, "lastIndex", Value::number(0.0).to_bits()) {
+        return thrown;
+    }
+    let mut results: Vec<u64> = Vec::new();
+    loop {
+        let result = with_rooted(&results, || {
+            with_rooted(&[rx, replacement, subject], || {
+                regexp_exec_value(rx, subject)
+            })
+        });
+        if Value::from_bits(result).is_exception() {
+            return result;
+        }
+        if Value::from_bits(result).kind() == crisol_value::Kind::Null {
+            break;
+        }
+        results.push(result);
+        if !global {
+            break;
+        }
+        let first = with_rooted(&results, || {
+            with_rooted(&[subject], || indexed_get(result, 0))
+        });
+        let matched = match with_rooted(&results, || {
+            with_rooted(&[subject], || string_argument(first))
+        }) {
+            Ok(matched) => matched,
+            Err(thrown) => return thrown,
+        };
+        if matched.is_empty() {
+            let last = match with_rooted(&results, || last_index_of(rx)) {
+                Ok(last) => last,
+                Err(thrown) => return thrown,
+            };
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a lastIndex this code reads back as a non-negative whole number"
+            )]
+            let last = if last < 0.0 { 0 } else { last as usize };
+            let next = advance_string_index(text, last, unicode);
+            #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+            let next = Value::number(next as f64).to_bits();
+            if let Some(thrown) = set_honoring(rx, "lastIndex", next) {
+                return thrown;
+            }
+        }
+    }
+    let span = text.encode_utf16().count();
+    let mut accumulated = String::new();
+    let mut next_source = 0usize;
+    for index in 0..results.len() {
+        let result = results[index];
+        let length_bits = with_rooted(&results, || {
+            with_rooted(&[subject], || property_of(result, "length"))
+        });
+        if Value::from_bits(length_bits).is_exception() {
+            return length_bits;
+        }
+        let captures_count = match to_length_bits(length_bits) {
+            Ok(total) => total.saturating_sub(1),
+            Err(thrown) => return thrown,
+        };
+        let first = with_rooted(&results, || {
+            with_rooted(&[subject], || indexed_get(result, 0))
+        });
+        let matched = match with_rooted(&results, || {
+            with_rooted(&[subject], || string_argument(first))
+        }) {
+            Ok(matched) => matched,
+            Err(thrown) => return thrown,
+        };
+        let match_len = matched.encode_utf16().count();
+        let index_bits = with_rooted(&results, || {
+            with_rooted(&[subject], || property_of(result, "index"))
+        });
+        if Value::from_bits(index_bits).is_exception() {
+            return index_bits;
+        }
+        let position = match coerce_number(index_bits) {
+            Ok(number) if number.is_finite() && number > 0.0 => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "checked finite and positive just above"
+                )]
+                let position = number as usize;
+                position.min(span)
+            }
+            Ok(_) => 0,
+            Err(thrown) => return thrown,
+        };
+        let mut captures: Vec<Option<String>> = Vec::with_capacity(captures_count);
+        for capture_index in 1..=captures_count {
+            let capture = with_rooted(&results, || {
+                with_rooted(&[subject], || indexed_get(result, capture_index))
+            });
+            if Value::from_bits(capture).is_undefined() {
+                captures.push(None);
+            } else {
+                match with_rooted(&results, || {
+                    with_rooted(&[subject], || string_argument(capture))
+                }) {
+                    Ok(group) => captures.push(Some(group)),
+                    Err(thrown) => return thrown,
+                }
+            }
+        }
+        let named = with_rooted(&results, || {
+            with_rooted(&[subject], || property_of(result, "groups"))
+        });
+        if Value::from_bits(named).is_exception() {
+            return named;
+        }
+        let has_named = !Value::from_bits(named).is_undefined();
+        let piece = if functional {
+            match with_rooted(&results, || {
+                call_exec_replacer(
+                    &matched,
+                    &captures,
+                    position,
+                    subject,
+                    named,
+                    has_named,
+                    replacement,
+                )
+            }) {
+                Ok(piece) => piece,
+                Err(thrown) => return thrown,
+            }
+        } else {
+            match substitution_from_exec(
+                &matched, text, position, match_len, &captures, named, has_named, &template,
+            ) {
+                Ok(piece) => piece,
+                Err(thrown) => return thrown,
+            }
+        };
+        if position >= next_source {
+            let from = byte_offset_of_code_unit(text, next_source);
+            let to = byte_offset_of_code_unit(text, position);
+            accumulated.push_str(text.get(from..to).unwrap_or_default());
+            accumulated.push_str(&piece);
+            next_source = position + match_len;
+        }
+    }
+    if next_source < span {
+        let from = byte_offset_of_code_unit(text, next_source);
+        accumulated.push_str(text.get(from..).unwrap_or_default());
+    }
+    with_rooted(&[rx, replacement], || new_string(&accumulated))
+}
+
 /// `RegExp.prototype[Symbol.replace]`.
 extern "C" fn regexp_symbol_replace(
     _closure: u64,
@@ -11054,7 +11426,7 @@ extern "C" fn regexp_symbol_replace(
         Err(thrown) => return thrown,
     };
     with_rooted(&[this_value, replacement], || {
-        replace_using_pattern(&text, this_value, replacement)
+        replace_via_exec(&text, this_value, replacement)
     })
 }
 
