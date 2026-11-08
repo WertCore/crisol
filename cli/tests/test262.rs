@@ -476,6 +476,16 @@ fn the_suite_is_attempted_and_the_result_reported() {
     // Named rather than counted, so a fall in the number can be read as "these stopped
     // passing" rather than taken on trust. A fix that makes a case *correctly* fail looks
     // exactly like a regression in the total.
+    //
+    // **Every failure, not a capped sample**, when asked — the capped examples answer "what
+    // kind" but driving a whole area to zero needs the full list. Behind a variable so the
+    // ordinary report stays readable.
+    if std::env::var("CRISOL_TEST262_DUMP_FAILURES").is_ok_and(|value| !value.is_empty()) {
+        println!("every failure:");
+        for (case, reason) in &by_case {
+            println!("  {}: {reason}", case.display());
+        }
+    }
     println!("what passed:");
     for case in &passing {
         println!("  {}", case.display());

@@ -9314,3 +9314,19 @@ stays as the fallback for a `source`-bearing object with no `@@split`, mirroring
 
 **The RegExp `Symbol.*` protocol is now complete** — `@@match`, `@@matchAll`, `@@replace`, `@@split`, and `@@search` all
 run on `RegExpExec`, honour an overridden `exec`, propagate their coercions' throws, and carry named groups.
+
+## D-360
+
+**The `regress` regular-expression engine is on 0.12.**
+
+Status: Accepted
+
+The RegExp `Symbol.*` protocol is complete (D-353–D-359), so the remaining test262 RegExp failures are the engine's, not
+the protocol's: `\p{…}` property escapes matching an older Unicode than the suite expects, and edge cases in `v`-flag
+unicode-sets and inline `(?i:…)` modifiers. All of that is `regress`'s to carry, and the pin was `0.10`. Bumped to `0.12`,
+which regenerates the Unicode property tables against a newer Unicode and carries the engine's own fixes. The API `JsRegExp`
+uses — `Regex::with_flags`, `find_from`, `Match::{range, captures, named_groups}` — is unchanged, so the bump is a
+dependency update with no call-site changes; the acceptance regression is the guard that matching did not shift under it.
+
+A property that still lags its latest Unicode value (e.g. `\p{Cased}` on a code point added very recently) is `regress`'s
+data, not a crisol bug — recorded rather than chased per code point.

@@ -1008,6 +1008,28 @@ fn regexp_symbol_split_runs_on_exec() {
     );
 }
 
+/// **Unicode property escapes track a current Unicode** (D-360) — the `regress` bump to 0.12 carries
+/// newer property data, so `\p{…}` matches the code points a recent test262 expects. U+1C89 is
+/// `Cased` in current Unicode, which the older data missed.
+#[test]
+fn regexp_property_escapes_use_current_unicode() {
+    check(
+        "pe-general-category",
+        "return /\\p{L}/u.test(\"x\") + \"/\" + /\\p{L}/u.test(\"1\");",
+        "true/false",
+    );
+    check(
+        "pe-cased",
+        "return /\\p{Cased}/u.test(\"a\") + \"/\" + /\\P{Cased}/u.test(\"1\");",
+        "true/true",
+    );
+    check(
+        "pe-script-greek",
+        "return /\\p{Script=Greek}/u.test(\"\\u03b1\");",
+        "true",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

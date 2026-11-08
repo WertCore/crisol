@@ -107,7 +107,7 @@ oxc_resolver = "11.13.1"
 # JavaScript-compatible regular expressions. §M12 names it explicitly, because Rust's `regex`
 # deliberately omits backreferences and lookaround — which real code uses, so a "close enough"
 # engine would reject patterns that work everywhere else.
-regress = "0.10"
+regress = "0.12"
 
 # Arbitrary-precision integers for BigInt (D-248). JavaScript's `BigInt` is unbounded, so it
 # cannot be a machine word; `num-bigint` owns the representation and the arithmetic, and
