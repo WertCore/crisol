@@ -9360,3 +9360,17 @@ to compile — a non-RegExp. Both then treated that `None` as "no match": `exec`
 `false`, so `RegExp.prototype.exec` called as a plain function (`this` undefined) answered `null` where the specification's
 `RequireInternalSlot([[RegExpMatcher]])` demands a `TypeError` (`S15.10.6.2`/`S15.10.6.3`). They now distinguish the two:
 a RegExp with no match is still `null`/`false`, but a receiver `with_pattern` cannot read a pattern from is a `TypeError`.
+
+## D-363
+
+**The `d` flag reports match indices.**
+
+Status: Accepted
+
+With `d`, a match result carries an `indices` array beside its captures: `indices[0]` is the `[start, end]` of the whole
+match, `indices[i]` the pair for group `i` (or `undefined` where the group did not participate), and `indices.groups` a
+null-prototype object of the named groups to their pairs — or `undefined` when the pattern names nothing, mirroring
+`result.groups`. The positions are **code units** (D-115), converted from the byte ranges `Captured` already carries, so no
+new matching is needed — only `MakeMatchIndicesIndexPairArray`, built in `match_result` when the pattern's flags contain
+`d`. The flag is threaded to `match_result` from each caller (`exec`, the non-global `String.prototype.match`, the eager
+`matchAll`); the lazy `@@matchAll` iterator reaches it through `exec`.

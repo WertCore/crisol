@@ -1065,6 +1065,34 @@ fn regexp_methods_require_a_regexp_receiver() {
     check("exec-real", "return /a/.exec(\"bab\")[0] + \"/\" + /z/.test(\"bab\");", "a/false");
 }
 
+/// **The `d` flag carries an `indices` array** (D-363) — `[start, end]` code-unit pairs per group,
+/// the whole match at `0`, a null-prototype `indices.groups` for named groups, and `undefined` for a
+/// group that did not participate. Absent without the flag.
+#[test]
+fn regexp_d_flag_reports_match_indices() {
+    check(
+        "indices-pairs",
+        "var m = \"ab\".match(/(a)(b)/d); return m.indices[0] + \"/\" + m.indices[1] + \"/\" + m.indices[2];",
+        "0,2/0,1/1,2",
+    );
+    check(
+        "indices-named",
+        "var m = /(?<x>a)/d.exec(\"a\"); return m.indices.groups.x + \"/\" + (Object.getPrototypeOf(m.indices.groups) === null);",
+        "0,1/true",
+    );
+    check(
+        "indices-nonparticipating",
+        "var m = /(a)|(b)/d.exec(\"a\"); return typeof m.indices[2];",
+        "undefined",
+    );
+    // No `d` flag: no `indices`. And `indices.groups` is `undefined` without named groups.
+    check(
+        "indices-absent-and-no-groups",
+        "return typeof /(a)/.exec(\"a\").indices + \"/\" + typeof /(a)/d.exec(\"a\").indices.groups;",
+        "undefined/undefined",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]
