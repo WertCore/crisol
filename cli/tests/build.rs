@@ -949,6 +949,65 @@ fn regexp_lastindex_is_in_code_units() {
     );
 }
 
+/// **`RegExp.prototype[Symbol.split]` runs on `RegExpExec`** (D-359) — a `y`-flagged splitter clone
+/// driven by `exec`, walking in code units. Captures are appended as `exec` yields them; the species
+/// constructor is consulted (defaulting to `RegExp`); and `AdvanceStringIndex` steps a whole astral
+/// code point so a split never lands inside a surrogate pair.
+#[test]
+fn regexp_symbol_split_runs_on_exec() {
+    check(
+        "split-exec-ordinary",
+        "return \"a1b2c\".split(/\\d/).join(\",\");",
+        "a,b,c",
+    );
+    // Captures are interleaved into the result.
+    check(
+        "split-exec-captures",
+        "return \"a1b\".split(/(\\d)/).join(\",\");",
+        "a,1,b",
+    );
+    // A non-participating capture is `undefined`, not coerced.
+    check(
+        "split-exec-capture-undefined",
+        "var r = \"ab\".split(/(x)|b/); return r.length + \"/\" + (r[1] === undefined);",
+        "3/true",
+    );
+    check(
+        "split-exec-limit",
+        "return \"a1b2c\".split(/\\d/, 2).join(\",\");",
+        "a,b",
+    );
+    // An empty-pattern split separates every character.
+    check(
+        "split-exec-empty-pattern",
+        "return \"abc\".split(/(?:)/).join(\",\");",
+        "a,b,c",
+    );
+    // An empty subject: `[]` when the pattern matches it, `[\"\"]` when it does not.
+    check(
+        "split-exec-empty-subject-match",
+        "return \"\".split(/(?:)/).length;",
+        "0",
+    );
+    check(
+        "split-exec-empty-subject-nomatch",
+        "return \"\".split(/x/).length;",
+        "1",
+    );
+    // species-ctor-ctor-undef: an undefined `constructor` falls back to the default `RegExp`.
+    check(
+        "split-exec-ctor-undef",
+        "var re = /[db]/; re.constructor = undefined; return re[Symbol.split](\"abcde\").join(\",\");",
+        "a,c,e",
+    );
+    // u-lastindex-adv-thru-failure: an astral subject is not split inside its surrogate pair.
+    check(
+        "split-exec-u-advance",
+        "return /\\udf06/u[Symbol.split](\"\\ud834\\udf06\").length;",
+        "1",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

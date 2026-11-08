@@ -11430,6 +11430,205 @@ extern "C" fn regexp_symbol_replace(
     })
 }
 
+/// `SpeciesConstructor(rx, %RegExp%)` for `@@split`'s sticky clone.
+///
+/// `Ok(None)` is the default — an absent `constructor` or a nullish `@@species`, where the clone is
+/// built directly as a `RegExp`; `Ok(Some(c))` is a custom constructor to `Construct`; `Err` is a
+/// throwing lookup or a species that is not a constructor (`species-ctor-*`).
+fn regexp_species(rx: u64) -> Result<Option<u64>, u64> {
+    let constructor = property_of(rx, "constructor");
+    if Value::from_bits(constructor).is_exception() {
+        return Err(constructor);
+    }
+    if Value::from_bits(constructor).is_undefined() {
+        return Ok(None);
+    }
+    if Value::from_bits(constructor).kind() != crisol_value::Kind::Object {
+        return Err(raise(
+            "a pattern's constructor must be an object",
+            "TypeError",
+        ));
+    }
+    let Some(symbol) = well_known_symbol("species") else {
+        return Ok(None);
+    };
+    let species = with_rooted(&[constructor], || crisol_computed_load(constructor, symbol));
+    if Value::from_bits(species).is_exception() {
+        return Err(species);
+    }
+    let held = Value::from_bits(species);
+    if held.is_undefined() || held.kind() == crisol_value::Kind::Null {
+        return Ok(None);
+    }
+    if !is_constructor(species) {
+        return Err(raise(
+            "a pattern's species is not a constructor",
+            "TypeError",
+        ));
+    }
+    Ok(Some(species))
+}
+
+/// The sticky splitter `@@split` matches with — a clone of `rx` whose flags include `y`, built
+/// through the species constructor, or directly as a `RegExp` for the default.
+fn make_splitter(rx: u64, new_flags: &str) -> Result<u64, u64> {
+    match regexp_species(rx)? {
+        None => {
+            let source = property_text(rx, "source").unwrap_or_default();
+            // SAFETY: both strings are live for the call.
+            Ok(with_rooted(&[rx], || unsafe {
+                crisol_create_regexp(
+                    source.as_ptr(),
+                    source.len() as u64,
+                    new_flags.as_ptr(),
+                    new_flags.len() as u64,
+                )
+            }))
+        }
+        Some(constructor) => {
+            let flags_value = with_rooted(&[rx, constructor], || new_string(new_flags));
+            let arguments = [rx, flags_value];
+            // SAFETY: `arguments` holds two readable values and outlives the call.
+            let built = with_rooted(&[rx, constructor, flags_value], || unsafe {
+                construct_with(constructor, constructor, 2, arguments.as_ptr())
+            });
+            if Value::from_bits(built).is_exception() {
+                return Err(built);
+            }
+            Ok(built)
+        }
+    }
+}
+
+/// `RegExp.prototype[Symbol.split]` built on `RegExpExec` and a sticky splitter clone (D-359).
+///
+/// **The matcher is a `y`-flagged clone driven by `RegExpExec`**, so a species subclass and an
+/// overridden `exec` both take effect, where the built-in matcher saw neither. The cursor walks in
+/// code units — `lastIndex` is set to `q`, read back as `e`, and an unmatched or zero-width position
+/// steps by `AdvanceStringIndex` (Unicode-aware) so a split never lands inside a surrogate pair
+/// (`u-lastindex-adv-thru-failure`). Captures are appended **as `exec` yielded them**, not coerced,
+/// so a group that did not participate stays `undefined`. `cap` is the already-computed limit and is
+/// at least one (the zero case returns before here).
+fn split_via_exec(text: &str, rx: u64, cap: usize) -> u64 {
+    let flags = property_of(rx, "flags");
+    if Value::from_bits(flags).is_exception() {
+        return flags;
+    }
+    let flags_text = to_text(flags).unwrap_or_default();
+    let unicode = flags_text.contains('u') || flags_text.contains('v');
+    let new_flags = if flags_text.contains('y') {
+        flags_text
+    } else {
+        format!("{flags_text}y")
+    };
+    let splitter = match make_splitter(rx, &new_flags) {
+        Ok(splitter) => splitter,
+        Err(thrown) => return thrown,
+    };
+    let subject = with_rooted(&[rx, splitter], || new_string(text));
+    let size = text.encode_utf16().count();
+    let mut pieces: Vec<u64> = Vec::new();
+
+    if size == 0 {
+        let matched = with_rooted(&[splitter, subject], || {
+            regexp_exec_value(splitter, subject)
+        });
+        if Value::from_bits(matched).is_exception() {
+            return matched;
+        }
+        if Value::from_bits(matched).kind() == crisol_value::Kind::Null {
+            return one_piece_array(text);
+        }
+        return with_new_array(0, |array| array.to_value().to_bits());
+    }
+
+    let mut p = 0usize;
+    let mut q = 0usize;
+    while q < size {
+        #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+        let at = Value::number(q as f64).to_bits();
+        if let Some(thrown) = with_rooted(&pieces, || {
+            with_rooted(&[splitter, subject], || {
+                set_honoring(splitter, "lastIndex", at)
+            })
+        }) {
+            return thrown;
+        }
+        let matched = with_rooted(&pieces, || {
+            with_rooted(&[splitter, subject], || {
+                regexp_exec_value(splitter, subject)
+            })
+        });
+        if Value::from_bits(matched).is_exception() {
+            return matched;
+        }
+        if Value::from_bits(matched).kind() == crisol_value::Kind::Null {
+            q = advance_string_index(text, q, unicode);
+            continue;
+        }
+        let last = with_rooted(&pieces, || {
+            with_rooted(&[splitter, subject, matched], || {
+                property_of(splitter, "lastIndex")
+            })
+        });
+        if Value::from_bits(last).is_exception() {
+            return last;
+        }
+        let end = match to_length_bits(last) {
+            Ok(end) => end.min(size),
+            Err(thrown) => return thrown,
+        };
+        if end == p {
+            q = advance_string_index(text, q, unicode);
+            continue;
+        }
+        let from = byte_offset_of_code_unit(text, p);
+        let to = byte_offset_of_code_unit(text, q);
+        let piece = with_rooted(&pieces, || {
+            with_rooted(&[splitter, subject, matched], || {
+                new_string(text.get(from..to).unwrap_or_default())
+            })
+        });
+        pieces.push(piece);
+        if pieces.len() >= cap {
+            return with_rooted(&pieces, || array_of_values(&pieces));
+        }
+        p = end;
+        let total = with_rooted(&pieces, || {
+            with_rooted(&[splitter, subject, matched], || {
+                property_of(matched, "length")
+            })
+        });
+        if Value::from_bits(total).is_exception() {
+            return total;
+        }
+        let captures = match to_length_bits(total) {
+            Ok(total) => total.saturating_sub(1),
+            Err(thrown) => return thrown,
+        };
+        for capture_index in 1..=captures {
+            let capture = with_rooted(&pieces, || {
+                with_rooted(&[splitter, subject, matched], || {
+                    indexed_get(matched, capture_index)
+                })
+            });
+            pieces.push(capture);
+            if pieces.len() >= cap {
+                return with_rooted(&pieces, || array_of_values(&pieces));
+            }
+        }
+        q = p;
+    }
+    let from = byte_offset_of_code_unit(text, p);
+    let piece = with_rooted(&pieces, || {
+        with_rooted(&[splitter, subject], || {
+            new_string(text.get(from..).unwrap_or_default())
+        })
+    });
+    pieces.push(piece);
+    with_rooted(&pieces, || array_of_values(&pieces))
+}
+
 /// `RegExp.prototype[Symbol.split]`.
 extern "C" fn regexp_symbol_split(
     _closure: u64,
@@ -11457,7 +11656,7 @@ extern "C" fn regexp_symbol_split(
         if cap == 0 {
             return with_new_array(0, |array| array.to_value().to_bits());
         }
-        split_using_pattern(&text, this_value, cap)
+        split_via_exec(&text, this_value, cap)
     })
 }
 

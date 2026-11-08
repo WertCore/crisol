@@ -9291,3 +9291,26 @@ inside a surrogate pair resolves past the pair, so the byte offset is always a c
 point. `all_matches` is unaffected — it walks a local byte cursor and never consults `last_index`. The visible change is that
 `rx.lastIndex` after a non-ASCII match now reads the code-unit index the specification defines (e.g. `3`, not the byte `5`),
 which `match_result`'s `index` already agreed with.
+
+## D-359
+
+**`RegExp.prototype[Symbol.split]` is built on `RegExpExec` and a sticky splitter clone.**
+
+Status: Accepted
+
+Sixth and final piece of the RegExp protocol work — the one earlier decisions deferred as the hardest. `@@split`
+delegated to the built-in `split_using_pattern` (`all_matches` on a recompiled source), so neither a species subclass nor
+an overridden `exec` was honoured (`species-ctor-*`, the `exec` cases), and the cursor walked bytes, which split astral
+input inside a surrogate pair (`u-lastindex-adv-thru-failure`).
+
+It now follows 22.2.6.14. `SpeciesConstructor(rx, %RegExp%)` resolves the constructor — `regexp_species` returns the
+default (a direct `crisol_create_regexp` clone) for an absent `constructor` or nullish `@@species`, a custom constructor to
+`Construct`, or a throw — and the splitter is that constructor built with a `y`-flagged copy of the flags. The main loop
+sets `lastIndex` to `q`, runs `RegExpExec(splitter, S)`, reads the match end back as `e`, and advances an unmatched or
+zero-width position by `AdvanceStringIndex` — all in **code units**, which only works because `lastIndex` is now code units
+too (D-358, the prerequisite this piece was waiting on behind the others). Captures are appended **as `exec` yields them**,
+not coerced, so a non-participating group stays `undefined` where `@@replace` would stringify it. `split_using_pattern`
+stays as the fallback for a `source`-bearing object with no `@@split`, mirroring `replace_using_pattern`.
+
+**The RegExp `Symbol.*` protocol is now complete** — `@@match`, `@@matchAll`, `@@replace`, `@@split`, and `@@search` all
+run on `RegExpExec`, honour an overridden `exec`, propagate their coercions' throws, and carry named groups.
