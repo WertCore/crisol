@@ -9271,3 +9271,23 @@ has no `@@replace`.
 **Remaining RegExp-protocol piece** (scoped): `@@split` still uses the built-in matcher, so its `exec` override is ignored.
 `@@split`-via-`exec` additionally needs a sticky-flag `SpeciesConstructor` clone the engine shortcuts, which is why it is
 left for a dedicated change.
+
+## D-358
+
+**`RegExp` `lastIndex` is in code units, converted to bytes at the `regress` boundary.**
+
+Status: Accepted
+
+`JsRegExp` kept `last_index` as a **byte** offset — it is what `regress`'s `find_from` searches by, and what a match's
+`range.end` is — while everything the specification and the rest of the engine count is in **code units** (`match_result`'s
+`index` already reported code units). The two agreed for ASCII and diverged for anything else, a latent bug that D-357 turned
+into a **panic**: `@@replace`'s empty-match advance set `lastIndex` in code units (`AdvanceStringIndex`), and the next `exec`
+handed that number to `find_from` as a byte offset, landing inside a multi-byte sequence (`u-advance-after-empty`, a global
+unicode replace over an astral character).
+
+`exec` now treats `last_index` as code units: the cursor is converted with `byte_of_code_unit` on the way in, the match end
+with `code_unit_of_byte` on the way out, and the past-the-end check compares against `code_unit_len`. A cursor that lands
+inside a surrogate pair resolves past the pair, so the byte offset is always a character boundary and never splits a code
+point. `all_matches` is unaffected — it walks a local byte cursor and never consults `last_index`. The visible change is that
+`rx.lastIndex` after a non-ASCII match now reads the code-unit index the specification defines (e.g. `3`, not the byte `5`),
+which `match_result`'s `index` already agreed with.

@@ -921,6 +921,34 @@ fn regexp_symbol_replace_runs_on_exec() {
     );
 }
 
+/// **`lastIndex` is in code units, not bytes** (D-358) — the cursor `regress` searches by is a byte
+/// offset, but `lastIndex` is what JavaScript counts, so it is converted at the boundary. Measuring
+/// it in bytes fed `find_from` an offset inside a multi-byte sequence, which panicked once
+/// `@@replace`'s empty-match advance set a code-unit `lastIndex` over an astral character.
+#[test]
+fn regexp_lastindex_is_in_code_units() {
+    // The exact case that crashed (test262 Symbol.replace/u-advance-after-empty): a unicode global
+    // `@@replace` whose empty `^` match advances by a whole astral code point.
+    check(
+        "replace-u-advance-after-empty",
+        "return /^|\\udf06/ug[Symbol.replace](\"\\ud834\\udf06\", \"XXX\");",
+        "XXX\u{1d306}",
+    );
+    // `exec` reports `lastIndex` in code units: U+1D306 is two units, so after it `x` is at 2 and
+    // the cursor lands at 3 — not the byte offset 5.
+    check(
+        "lastindex-code-units",
+        "var r = /x/g; r.exec(\"\\ud834\\udf06x\"); return r.lastIndex;",
+        "3",
+    );
+    // A global match over astral text walks without splitting a code point.
+    check(
+        "match-astral-global",
+        "return \"\\ud834\\udf06a\\ud834\\udf06b\".match(/[ab]/g).join(\"\");",
+        "ab",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]
