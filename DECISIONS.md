@@ -9348,3 +9348,15 @@ exception is now propagated — `GetMethod` reads the property, and an accessor 
 
 (`g-init-lastindex-err` — a `Set` of `lastIndex` on a non-writable property throwing — is left: it needs a
 throw-on-non-writable `Set`, where `crisol_property_store` follows sloppy semantics and ignores it silently.)
+
+## D-362
+
+**`RegExp.prototype.exec`/`test` throw on a receiver that is not a RegExp.**
+
+Status: Accepted
+
+`exec` and `test` read the pattern through `with_pattern`, which answers `None` when the receiver has no `source`/`flags`
+to compile — a non-RegExp. Both then treated that `None` as "no match": `exec` returned `null` and `test` returned
+`false`, so `RegExp.prototype.exec` called as a plain function (`this` undefined) answered `null` where the specification's
+`RequireInternalSlot([[RegExpMatcher]])` demands a `TypeError` (`S15.10.6.2`/`S15.10.6.3`). They now distinguish the two:
+a RegExp with no match is still `null`/`false`, but a receiver `with_pattern` cannot read a pattern from is a `TypeError`.

@@ -10276,8 +10276,11 @@ extern "C" fn regexp_test(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
-    let found = with_pattern(this_value, |pattern| pattern.test(&text)).unwrap_or(false);
-    if found { Value::TRUE } else { Value::FALSE }.to_bits()
+    match with_pattern(this_value, |pattern| pattern.test(&text)) {
+        Some(found) => (if found { Value::TRUE } else { Value::FALSE }).to_bits(),
+        // As `exec`: a non-RegExp receiver is a `TypeError`, not a quiet `false`.
+        None => raise("RegExp.prototype.test needs a RegExp receiver", "TypeError"),
+    }
 }
 
 /// `RegExp.prototype.exec`.
@@ -10295,14 +10298,16 @@ extern "C" fn regexp_exec(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
-    let Some(Some(found)) = with_pattern(this_value, |pattern| pattern.exec(&text)) else {
-        // **`null`, not `undefined`**, which is what `while ((m = re.exec(s)) !== null)` tests.
-        return Value::NULL.to_bits();
-    };
-
     // Rooted across the array's allocation: `this_value` reached here in a register and the
     // text came out of it.
-    with_rooted(&[this_value], || match_result(&text, &found))
+    match with_pattern(this_value, |pattern| pattern.exec(&text)) {
+        Some(Some(found)) => with_rooted(&[this_value], || match_result(&text, &found)),
+        // **`null`, not `undefined`**, which is what `while ((m = re.exec(s)) !== null)` tests.
+        Some(None) => Value::NULL.to_bits(),
+        // **A receiver with no `[[RegExpMatcher]]` is a `TypeError`, not a null match** — calling
+        // `RegExp.prototype.exec` as a plain function (`this` undefined) must throw, not answer null.
+        None => raise("RegExp.prototype.exec needs a RegExp receiver", "TypeError"),
+    }
 }
 
 /// `RegExp.prototype.toString`.

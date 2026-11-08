@@ -1030,6 +1030,41 @@ fn regexp_property_escapes_use_current_unicode() {
     );
 }
 
+/// **The protocol methods and `exec`/`test` require a real RegExp receiver** (D-361, D-362) — a
+/// primitive `this` on a `Symbol.*` method is a `TypeError` (a string is heap-allocated but not an
+/// Object), and `exec`/`test` called without a RegExp `this` throw rather than answering
+/// `null`/`false`.
+#[test]
+fn regexp_methods_require_a_regexp_receiver() {
+    check(
+        "search-this-string",
+        "try { RegExp.prototype[Symbol.search].call(\"s\", \"s\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "match-this-number",
+        "try { RegExp.prototype[Symbol.match].call(86, \"x\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "replace-this-null",
+        "try { RegExp.prototype[Symbol.replace].call(null, \"x\", \"y\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "exec-no-receiver",
+        "var exec = RegExp.prototype.exec; try { exec(\"x\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    check(
+        "test-no-receiver",
+        "var test = RegExp.prototype.test; try { test(\"x\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
+    // A real RegExp receiver still works both ways.
+    check("exec-real", "return /a/.exec(\"bab\")[0] + \"/\" + /z/.test(\"bab\");", "a/false");
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]
