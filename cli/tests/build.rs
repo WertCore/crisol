@@ -1097,6 +1097,28 @@ fn regexp_d_flag_reports_match_indices() {
     );
 }
 
+/// **Duplicate named groups report the participating capture** (D-364) — the same name in distinct
+/// alternatives (ES2025) resolves `groups[name]` to the alternative that matched, not whichever the
+/// list held last, regardless of which side participates.
+#[test]
+fn regexp_duplicate_named_groups_pick_the_participant() {
+    check(
+        "dup-named-first",
+        "return \"..ab\".match(/(?<x>a)|(?<x>b)/).groups.x;",
+        "a",
+    );
+    check(
+        "dup-named-second",
+        "return \"..ba\".match(/(?<x>a)|(?<x>b)/).groups.x;",
+        "b",
+    );
+    check(
+        "dup-named-indices",
+        "return \"..ab\".match(/(?<x>a)|(?<x>b)/d).indices.groups.x.join(\",\");",
+        "2,3",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

@@ -9374,3 +9374,16 @@ null-prototype object of the named groups to their pairs — or `undefined` when
 new matching is needed — only `MakeMatchIndicesIndexPairArray`, built in `match_result` when the pattern's flags contain
 `d`. The flag is threaded to `match_result` from each caller (`exec`, the non-global `String.prototype.match`, the eager
 `matchAll`); the lazy `@@matchAll` iterator reaches it through `exec`.
+
+## D-364
+
+**Duplicate named groups report the capture that participated.**
+
+Status: Accepted
+
+ES2025 allows the same group name in distinct alternatives (`/(?<x>a)|(?<x>b)/`), which `regress` 0.12 parses and reports
+as two positional groups sharing a name. The `groups` object (and `indices.groups`) is keyed by name, so building it by
+walking the captures last-wins set `groups.x` to the *non-participating* alternative's `undefined` whenever the match took
+the earlier branch. `deduped_named` now collapses repeats by name, keeping the range that participated — at most one
+alternative matches, so there is a single answer — which both `named_groups_object` and `named_indices_object` build from.
+A pattern with no duplicates is unchanged, in source order.

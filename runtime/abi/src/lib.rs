@@ -12201,6 +12201,25 @@ extern "C" fn string_search(
 /// **`undefined`, not `{}`, for a pattern with no named groups** (spec 22.2.7.2 step 28), which is
 /// what `m.groups === undefined` feature-tests. The object has a **null prototype**, so a group
 /// named `toString` is the capture rather than the inherited method.
+/// Named groups deduplicated by name, keeping the participating range — **duplicate names appear in
+/// distinct alternatives** (ES2025 duplicate named groups), and at most one alternative matches, so
+/// `groups[name]` is the capture that participated, not whichever the list held last. A pattern with
+/// no duplicates is returned unchanged, in source order.
+fn deduped_named(found: &crisol_builtins::Captured) -> Vec<(&str, Option<(usize, usize)>)> {
+    let mut out: Vec<(&str, Option<(usize, usize)>)> = Vec::new();
+    for (name, range) in &found.named {
+        if let Some(entry) = out.iter_mut().find(|(seen, _)| *seen == name.as_str()) {
+            // A later alternative that participated upgrades the earlier `undefined`.
+            if entry.1.is_none() {
+                entry.1 = *range;
+            }
+        } else {
+            out.push((name.as_str(), *range));
+        }
+    }
+    out
+}
+
 fn named_groups_object(text: &str, found: &crisol_builtins::Captured) -> u64 {
     if found.named.is_empty() {
         return Value::UNDEFINED.to_bits();
@@ -12211,9 +12230,9 @@ fn named_groups_object(text: &str, found: &crisol_builtins::Captured) -> u64 {
             return;
         };
         with_runtime(|runtime| runtime.heap.set_prototype(handle, None));
-        for (name, range) in &found.named {
+        for (name, range) in deduped_named(found) {
             let value = match range {
-                Some((start, end)) => new_string(text.get(*start..*end).unwrap_or_default()),
+                Some((start, end)) => new_string(text.get(start..end).unwrap_or_default()),
                 None => Value::UNDEFINED.to_bits(),
             };
             // Each is rooted as it is made: the object holds it only once stored, and the next
@@ -12253,8 +12272,8 @@ fn named_indices_object(text: &str, found: &crisol_builtins::Captured) -> u64 {
             return;
         };
         with_runtime(|runtime| runtime.heap.set_prototype(handle, None));
-        for (name, range) in &found.named {
-            let value = with_rooted(&[object], || index_pair(text, *range));
+        for (name, range) in deduped_named(found) {
+            let value = with_rooted(&[object], || index_pair(text, range));
             with_rooted(&[object, value], || {
                 with_runtime(|runtime| runtime.define(handle, name, Value::from_bits(value)));
             });
