@@ -10560,6 +10560,7 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
             start,
             end: start + needle.len(),
             groups: Vec::new(),
+            named: Vec::new(),
         });
         if !all {
             break;
@@ -10643,17 +10644,20 @@ fn splice_matches(text: &str, found: &[crisol_builtins::Captured], replacement: 
     new_string(&out)
 }
 
-/// Calls a function replacement with `(matched, …groups, position, whole)`.
+/// Calls a function replacement with `(matched, …groups, position, whole)`, plus a trailing
+/// named-groups object when the pattern has named groups.
 ///
 /// `position` is in **code units**, the space every other index in the language is in
 /// (D-115) — handing over a byte offset reads correctly for ASCII and wrongly for the strings
-/// that make the difference visible.
+/// that make the difference visible. The named-groups object is **only** appended when the pattern
+/// names a group (spec 22.1.3.17 step 14.e): adding it unconditionally would hand `(m, p, s) =>`
+/// an extra argument it never expects.
 fn call_replacer(
     text: &str,
     capture: &crisol_builtins::Captured,
     replacement: u64,
 ) -> Result<String, u64> {
-    let mut arguments = Vec::with_capacity(capture.groups.len() + 3);
+    let mut arguments = Vec::with_capacity(capture.groups.len() + 4);
     arguments.push(new_string(
         text.get(capture.start..capture.end).unwrap_or_default(),
     ));
@@ -10675,6 +10679,10 @@ fn call_replacer(
     arguments.push(Value::number(position).to_bits());
     let whole = with_rooted(&arguments, || new_string(text));
     arguments.push(whole);
+    if !capture.named.is_empty() {
+        let groups = with_rooted(&arguments, || named_groups_object(text, capture));
+        arguments.push(groups);
+    }
 
     let produced = with_rooted(&arguments, || {
         call_value(replacement, Value::UNDEFINED.to_bits(), &arguments)
@@ -10722,6 +10730,29 @@ fn expand_replacement(
             b'\'' => {
                 out.push_str(text.get(capture.end..).unwrap_or_default());
                 at += 2;
+            }
+            b'<' => {
+                // **`$<name>` is a named-group reference only when the pattern has named
+                // groups** (spec GetSubstitution): with none, `$<` is two literal characters, so
+                // a replacement built by concatenating user text does not change meaning the day
+                // a group is named. An unknown name, or one that did not participate, contributes
+                // nothing — but still consumes the whole `$<name>`.
+                if capture.named.is_empty() {
+                    out.push('$');
+                    at += 1;
+                } else if let Some(close) = template[at + 2..].find('>') {
+                    let name = &template[at + 2..at + 2 + close];
+                    if let Some((_, Some((start, end)))) =
+                        capture.named.iter().find(|group| group.0 == *name)
+                    {
+                        out.push_str(text.get(*start..*end).unwrap_or_default());
+                    }
+                    at += 2 + close + 1;
+                } else {
+                    // No closing `>`, so this is not a reference — `$<` stays as written.
+                    out.push('$');
+                    at += 1;
+                }
             }
             b'0'..=b'9' => {
                 // **Two digits are tried before one**, so `$12` is group twelve where there
@@ -11563,7 +11594,39 @@ extern "C" fn string_search(
     Value::number(index).to_bits()
 }
 
-/// One match as the array `exec` answers: the whole match, then the groups, then `index`.
+/// A match's `groups` object — `{ name: capture-or-undefined, … }`, or `undefined` when the
+/// pattern names nothing.
+///
+/// **`undefined`, not `{}`, for a pattern with no named groups** (spec 22.2.7.2 step 28), which is
+/// what `m.groups === undefined` feature-tests. The object has a **null prototype**, so a group
+/// named `toString` is the capture rather than the inherited method.
+fn named_groups_object(text: &str, found: &crisol_builtins::Captured) -> u64 {
+    if found.named.is_empty() {
+        return Value::UNDEFINED.to_bits();
+    }
+    let object = crisol_create_object();
+    with_rooted(&[object], || {
+        let Some(handle) = handle_of(object) else {
+            return;
+        };
+        with_runtime(|runtime| runtime.heap.set_prototype(handle, None));
+        for (name, range) in &found.named {
+            let value = match range {
+                Some((start, end)) => new_string(text.get(*start..*end).unwrap_or_default()),
+                None => Value::UNDEFINED.to_bits(),
+            };
+            // Each is rooted as it is made: the object holds it only once stored, and the next
+            // group's `new_string` allocates (D-127).
+            with_rooted(&[object, value], || {
+                with_runtime(|runtime| runtime.define(handle, name, Value::from_bits(value)));
+            });
+        }
+    });
+    object
+}
+
+/// One match as the array `exec` answers: the whole match, then the groups, then `index`,
+/// `input`, and `groups` (the named-capture object).
 ///
 /// Shared by `exec` and `match`, because a caller that compares the two — and test262 does,
 /// repeatedly — is comparing objects rather than the text in them.
@@ -11591,6 +11654,12 @@ fn match_result(text: &str, found: &crisol_builtins::Captured) -> u64 {
         with_runtime(|runtime| {
             runtime.define(array, "index", index);
             runtime.define(array, "input", Value::from_bits(input));
+        });
+        // `groups` is built after `array` holds its elements, so a collection during its own
+        // allocation finds them rooted through the live array.
+        let groups = named_groups_object(text, found);
+        with_rooted(&[groups], || {
+            with_runtime(|runtime| runtime.define(array, "groups", Value::from_bits(groups)));
         });
         array.to_value().to_bits()
     })

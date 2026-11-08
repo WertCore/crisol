@@ -729,6 +729,61 @@ fn regexp_symbol_match_all_is_a_lazy_iterator() {
     );
 }
 
+/// **Named capture groups** (D-355) — `(?<name>…)` surfaces a `groups` object on `exec`/`match`
+/// results (null-prototype; `undefined` when the pattern names nothing), a `$<name>` string
+/// replacement, and the trailing `groups` argument a function replacer receives.
+#[test]
+fn named_capture_groups_are_available() {
+    // The `groups` object carries each named capture.
+    check(
+        "named-groups-match",
+        "var m = \"2024-01\".match(/(?<y>\\d+)-(?<mo>\\d+)/); return m.groups.y + \"/\" + m.groups.mo;",
+        "2024/01",
+    );
+    // `exec` too, and it is `undefined` — not `{}` — when the pattern names nothing.
+    check(
+        "named-groups-undefined",
+        "return typeof /(\\d)/.exec(\"5\").groups + \"/\" + /(?<d>\\d)/.exec(\"5\").groups.d;",
+        "undefined/5",
+    );
+    // The `groups` object has a null prototype, so a group named `toString` is the capture.
+    check(
+        "named-groups-null-proto",
+        "return Object.getPrototypeOf(\"5\".match(/(?<d>\\d)/).groups) === null;",
+        "true",
+    );
+    // A named group that did not participate is `undefined`.
+    check(
+        "named-groups-nonparticipating",
+        "return typeof \"b\".match(/(?<x>a)?b/).groups.x;",
+        "undefined",
+    );
+    // `$<name>` in a string replacement, including reordering.
+    check(
+        "named-groups-replace",
+        "return \"2024-01\".replace(/(?<y>\\d+)-(?<mo>\\d+)/, \"$<mo>/$<y>\");",
+        "01/2024",
+    );
+    // `$<name>` is two literal characters when the pattern has no named groups.
+    check(
+        "named-groups-replace-literal",
+        "return \"a\".replace(/a/, \"$<x>\");",
+        "$<x>",
+    );
+    // A function replacer receives the named-groups object as its last argument.
+    check(
+        "named-groups-replace-fn",
+        "return \"ab\".replace(/(?<x>a)/, function (m, g1, pos, s, groups) { return groups.x.toUpperCase(); });",
+        "Ab",
+    );
+    // matchAll surfaces named groups on each result.
+    check(
+        "named-groups-matchall",
+        "var out = []; for (var m of \"a1b2\".matchAll(/(?<l>[a-z])(?<d>\\d)/g)) { out.push(m.groups.l + m.groups.d); } return out.join(\",\");",
+        "a1,b2",
+    );
+}
+
 /// **An error subclass inherits the `Error` constructor** (D-350) — `Object.getPrototypeOf(RangeError)` is
 /// `Error`, not `Function.prototype`, which is what `class X extends TypeError` and feature-detection read.
 #[test]

@@ -133,6 +133,11 @@ pub struct Captured {
     /// **not** the same as one that matched empty, and the difference is visible in `exec`'s
     /// result as `undefined` versus `""`.
     pub groups: Vec<Option<(usize, usize)>>,
+    /// The named groups, `(name, range)`, in source order — empty for a pattern with none. A
+    /// named group is **also** numbered, so it appears in `groups` too; this is the extra mapping
+    /// `exec`'s `groups` object and a `$<name>` replacement read, which positions alone cannot
+    /// give.
+    pub named: Vec<(String, Option<(usize, usize)>)>,
 }
 
 /// A compiled `RegExp`, with its cursor.
@@ -242,6 +247,10 @@ impl JsRegExp {
                 .iter()
                 .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
                 .collect(),
+            named: found
+                .named_groups()
+                .map(|(name, range)| (name.to_owned(), range.map(|range| (range.start, range.end))))
+                .collect(),
         })
     }
 
@@ -280,6 +289,12 @@ impl JsRegExp {
                     .captures
                     .iter()
                     .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
+                    .collect(),
+                named: found
+                    .named_groups()
+                    .map(|(name, range)| {
+                        (name.to_owned(), range.map(|range| (range.start, range.end)))
+                    })
                     .collect(),
             });
             if empty && at > text.len() {

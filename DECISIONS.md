@@ -9186,3 +9186,35 @@ delegates, and a check left behind it would never run (spec 22.1.3.14 puts the g
 user `exec` is ignored and the `exec`-invocation / `groups`-coercion cases fail. The spec-correct rewrite works directly
 off `exec` result objects (reading `index`, `length`, indexed captures, and `groups`) rather than reconstructing the
 byte-offset `Captured` the built-in path uses — it does not reuse `splice_matches`.
+
+## D-355
+
+**Named capture groups, carried on `Captured`, surface through every built-in match path.**
+
+Status: Accepted
+
+Third piece of the RegExp protocol work (after [D-353], [D-354]). `(?<name>…)` compiled and matched — a named
+group is numbered too, so it was already in the positional `groups` — but the *name* was thrown away: `exec`/`match`
+results had no `groups` object, a `$<name>` replacement was two literal characters, and a function replacer got no
+trailing groups argument. This was the "groups coercion" gap the earlier decisions deferred, and the blocker the
+protocol's remaining `@@replace`/`@@split` work was waiting on.
+
+The names now live on `crisol_builtins::Captured` itself — a new `named: Vec<(String, Option<(usize, usize)>)>`,
+populated in `exec`/`all_matches` from `regress`'s `Match::named_groups()`. **Putting them on `Captured` rather than
+threading a regex handle through the ABI is what makes the gap close through the *existing* built-in paths** — `exec`,
+`match`, `matchAll`, and `replace` all already carry a `Captured`, so one field reaches every one of them without the
+`RegExpExec`-loop rewrite. That rewrite is still the only way to honour a *user-overridden* `exec`, but the far more
+common named-group behaviour no longer needs it.
+
+Three readers were added. `match_result` builds the result's `groups` object — a **null-prototype** object (so a group
+named `toString` is the capture, not the inherited method), or `undefined` when the pattern names nothing, which is what
+`m.groups === undefined` feature-tests rather than an empty object. `expand_replacement` handles `$<name>`, but **only
+when the pattern has named groups** — with none, `$<` stays two literal characters, so a replacement built by
+concatenating user text does not change meaning the day a group is named; an unknown or non-participating name
+contributes nothing yet still consumes the whole `$<name>`. `call_replacer` appends the groups object as the function
+replacer's last argument, again only when a group is named, so `(m, p, s) =>` is not handed an argument it never expects.
+
+**Remaining RegExp-protocol piece** (scoped): `@@replace`/`@@split` still use the built-in matcher rather than looping
+`RegExpExec`, so a user-overridden `exec` is ignored. With named groups now on `Captured`, an exec-rewrite would be
+purely about honouring that override — a narrower, lower-value change than it was. `@@split`-via-`exec` additionally needs
+a sticky-flag `SpeciesConstructor` clone the engine shortcuts.
