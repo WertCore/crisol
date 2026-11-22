@@ -380,8 +380,20 @@ pub struct StackMapRow {
     pub function: *const u8,
     /// Offset of the safepoint within it.
     pub code_offset: u32,
-    /// Offset within the frame of one live value.
+    /// Offset within the frame of one live value — measured from the function's own stack pointer
+    /// at the safepoint (D-371).
     pub frame_offset: u32,
+    /// This function's SP-to-FP span (Cranelift's `active_size`). The collector reaches the live slot
+    /// from the function's own frame pointer: its stack pointer at the safepoint is `fp - frame_size`,
+    /// and the value sits `frame_offset` above that. Reaching it from the *callee's* `fp + 16` instead
+    /// assumed the callee saved its frame record at the top of its frame — true on Mach-O and x86-64,
+    /// but not for every aarch64-linux frame, where LLVM puts callee-saved registers above the record,
+    /// so the slot was read at the wrong place and live values were freed (the D-144 "second fault"
+    /// that only aarch64-linux showed). A function's own frame pointer and span are independent of how
+    /// its callee laid out its frame.
+    pub frame_size: u32,
+    /// Padding to an eight-byte stride so the next row's `function` pointer stays aligned.
+    pub _padding: u32,
 }
 
 /// The table a compiled program registers before it runs.
@@ -401,32 +413,33 @@ impl StackMaps {
         self.rows
     }
 
-    /// Every frame offset live at `return_address`, if it is a safepoint.
+    /// Every `(frame_offset, frame_size)` live at `return_address`, if it is a safepoint.
     #[must_use]
-    pub fn live_at(&self, return_address: *const u8) -> Vec<u32> {
+    pub fn live_at(&self, return_address: *const u8) -> Vec<(u32, u32)> {
         live_at(self.rows, return_address)
     }
 }
 
-/// Every frame offset live at `return_address`, given a table.
+/// Every `(frame_offset, frame_size)` live at `return_address`, given a table.
 ///
 /// The lookup is an **exact match** on `function + code_offset`, because a return address
 /// points at the instruction after a call and that is where the safepoint sits. An address
 /// matching nothing is not an error: it is a frame that was not at a safepoint, which is every
-/// frame except those at a call into the runtime.
+/// frame except those at a call into the runtime. The `frame_size` rides along so the caller can
+/// reach the slot from the function's own frame pointer rather than its callee's (D-371).
 ///
 /// A free function taking the rows, rather than only a method on the registered table, so it
 /// can be tested against a hand-built table — a lookup reachable only through a process-global
 /// registered by generated code is a lookup nothing can check.
 #[must_use]
-pub fn live_at(rows: &[StackMapRow], return_address: *const u8) -> Vec<u32> {
+pub fn live_at(rows: &[StackMapRow], return_address: *const u8) -> Vec<(u32, u32)> {
     rows.iter()
         .filter(|row| {
             // `wrapping_add` rather than `add`: the function pointer comes from a linker, and
             // arithmetic on it must not be undefined behaviour if the table is malformed.
             row.function.wrapping_add(row.code_offset as usize) == return_address
         })
-        .map(|row| row.frame_offset)
+        .map(|row| (row.frame_offset, row.frame_size))
         .collect()
 }
 
@@ -594,194 +607,39 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
     let maps = stack_maps();
     // SAFETY: the caller promises the program is stopped at a safepoint.
     let frames = unsafe { walk_frames(limit) };
-    // TEMPORARY platform diagnostic (D-371). Two one-shot stderr lines, shown only on a failing
-    // subprocess so green macOS stays quiet. MATCH: the first collection where a frame matches a row
-    // — proves the scan works on this platform at all (the first collection is shadow-stack-rooted
-    // setup, so a match only ever appears once a compiled JS frame is live). NEARMISS: the first
-    // collection where a frame falls inside a row's function (a real compiled frame) yet nothing
-    // matched — reports the frame's offset within that function and the signed distance to the
-    // nearest safepoint, separating a `code_offset` off-by-N (small delta) from a mis-based row.
-    if let Some(m) = maps {
-        static MATCH_DUMPED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        static NEARMISS_DUMPED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        static BUG_DUMPED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        let rows = m.rows();
-        let matched = frames
-            .iter()
-            .filter(|f| !m.live_at(f.return_address).is_empty())
-            .count();
-        // Per-collection distribution to a file (local macOS capture, where the run passes and
-        // stderr is hidden). One line per collection: the match count and, when zero, the nearest
-        // in-function near-miss delta. Lets the macOS (working) distribution be diffed against the
-        // Linux (broken) one to decide whether NEARMISS is benign.
-        if std::env::var_os("CRISOL_GCDUMP").is_some() {
-            use std::io::Write as _;
-            let classify = |p: *const usize| -> &'static str {
-                if p.is_null() || !p.is_aligned() {
-                    return "?";
-                }
-                // SAFETY: an aligned, non-null stack slot read at a safepoint.
-                if Value::from_bits(unsafe { *p } as u64)
-                    .as_address()
-                    .is_some()
-                {
-                    "ptr"
-                } else {
-                    "val"
-                }
-            };
-            let mut detail = String::new();
-            if matched == 0 {
-                for f in &frames {
-                    let ret = f.return_address as isize;
-                    let in_fn = rows
-                        .iter()
-                        .filter(|r| {
-                            let base = r.function as isize;
-                            ret >= base && ret < base + 0x4000
-                        })
-                        .map(|r| ret - (r.function as isize))
-                        .min_by_key(|d| d.abs());
-                    if let Some(off) = in_fn {
-                        let near = rows
-                            .iter()
-                            .map(|r| {
-                                ret - (r.function.wrapping_add(r.code_offset as usize) as isize)
-                            })
-                            .min_by_key(|d| d.abs())
-                            .unwrap_or(0);
-                        detail = format!(" nearmiss in-fn+{off:#x} delta={near:#x}");
-                        break;
-                    }
-                }
-            } else if let Some(f) = frames
-                .iter()
-                .find(|f| !m.live_at(f.return_address).is_empty())
-            {
-                // For the first matched frame, each live slot's value type plus a neighborhood scan
-                // (slot-16..+24). A matched slot reading `val` with a `ptr` at an adjacent offset is
-                // the signature of an off-by-N in `base`/`frame_offset` on this target.
-                for offset in m.live_at(f.return_address) {
-                    let slot = f.base.wrapping_byte_add(offset as usize);
-                    let nbrs: Vec<String> = [-16isize, -8, 0, 8, 16, 24]
-                        .iter()
-                        .map(|d| format!("{:+}:{}", d, classify(slot.wrapping_byte_offset(*d))))
-                        .collect();
-                    detail.push_str(&format!(" off{offset}[{}]", nbrs.join(",")));
-                }
-            }
-            if let Ok(mut fh) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/gcdiag2.log")
-            {
-                let _ = writeln!(fh, "matched={matched} frames={}{detail}", frames.len());
-            }
-        }
-        if matched > 0 {
-            // For the first matched frame, dump each live slot's value type plus a neighborhood scan
-            // (slot-16..+24). Two one-shots to stderr (so they surface on the failing aarch64-linux
-            // subprocess): OFFBYN fires on the first collection whose matched slot reads a non-pointer
-            // while an adjacent slot holds one — the off-by-N signature of a wrong base/frame_offset;
-            // MATCH fires once as a baseline for a platform where no such case appears.
-            let classify = |p: *const usize| -> &'static str {
-                if p.is_null() || !p.is_aligned() {
-                    return "?";
-                }
-                // SAFETY: an aligned, non-null stack slot read at a safepoint.
-                if Value::from_bits(unsafe { *p } as u64)
-                    .as_address()
-                    .is_some()
-                {
-                    "ptr"
-                } else {
-                    "val"
-                }
-            };
-            if let Some(f) = frames
-                .iter()
-                .find(|f| !m.live_at(f.return_address).is_empty())
-            {
-                let offs = m.live_at(f.return_address);
-                let signature = offs.iter().any(|&o| {
-                    let slot = f.base.wrapping_byte_add(o as usize);
-                    classify(slot) != "ptr"
-                        && [-16isize, -8, 8, 16, 24]
-                            .iter()
-                            .any(|d| classify(slot.wrapping_byte_offset(*d)) == "ptr")
-                });
-                let fire_bug =
-                    signature && !BUG_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed);
-                let fire_match =
-                    !signature && !MATCH_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed);
-                if fire_bug || fire_match {
-                    let detail: Vec<String> = offs
-                        .iter()
-                        .map(|&o| {
-                            let slot = f.base.wrapping_byte_add(o as usize);
-                            let nbrs: Vec<String> = [-16isize, -8, 0, 8, 16, 24]
-                                .iter()
-                                .map(|d| {
-                                    format!("{:+}:{}", d, classify(slot.wrapping_byte_offset(*d)))
-                                })
-                                .collect();
-                            format!("off{o}[{}]", nbrs.join(","))
-                        })
-                        .collect();
-                    eprintln!(
-                        "crisol-gc-diag: {} frames={} {}",
-                        if fire_bug { "OFFBYN" } else { "MATCH" },
-                        frames.len(),
-                        detail.join(" "),
-                    );
-                }
-            }
-        }
-        if matched == 0 && !NEARMISS_DUMPED.load(std::sync::atomic::Ordering::Relaxed) {
-            for f in &frames {
-                let ret = f.return_address as isize;
-                let in_fn = rows
-                    .iter()
-                    .filter(|r| {
-                        let base = r.function as isize;
-                        ret >= base && ret < base + 0x4000
-                    })
-                    .map(|r| ret - (r.function as isize))
-                    .min_by_key(|d| d.abs());
-                if let Some(off) = in_fn {
-                    let near = rows
-                        .iter()
-                        .map(|r| ret - (r.function.wrapping_add(r.code_offset as usize) as isize))
-                        .min_by_key(|d| d.abs())
-                        .unwrap_or(0);
-                    if !NEARMISS_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!(
-                            "crisol-gc-diag: NEARMISS in-fn+{off:#x} nearest-sp-delta={near:#x} frames={} rows={}",
-                            frames.len(),
-                            rows.len(),
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-    }
     let Some(maps) = maps else {
         return Vec::new();
     };
     let mut roots = Vec::new();
-    for frame in frames {
-        for offset in maps.live_at(frame.return_address) {
-            let slot = frame.base.wrapping_byte_add(offset as usize);
+    for (index, frame) in frames.iter().enumerate() {
+        // A safepoint's live slot is named relative to *its own function's* stack pointer, and that
+        // function is this frame's caller — the next frame out. Reaching the slot from this (callee)
+        // frame's `fp + 16` assumed the callee saved its frame record at the very top of its frame;
+        // that holds on Mach-O and x86-64 but not for every aarch64-linux frame, where LLVM saves
+        // callee-saved registers above the record, so the slot was read at the wrong address and live
+        // values were freed — the D-144 "second fault" (D-371). The caller is a compiled frame whose
+        // record *is* at the top, so `caller.base` (its `fp + 16`) is its incoming stack pointer and
+        // `caller.base - frame_size` is its stack pointer at the safepoint, independent of how this
+        // callee was laid out.
+        let Some(caller) = frames.get(index + 1) else {
+            continue;
+        };
+        for (offset, frame_size) in maps.live_at(frame.return_address) {
+            // `caller.base` is the caller's frame pointer plus sixteen (its own incoming stack
+            // pointer); `frame_size` is Cranelift's SP-to-FP span, so the caller's stack pointer at
+            // the safepoint is `caller.base - 16 - frame_size`, and the live value sits `offset`
+            // above that (offsets are SP-relative, per Cranelift's user stack maps).
+            let slot = caller
+                .base
+                .wrapping_byte_sub(frame_size as usize + 16)
+                .wrapping_byte_add(offset as usize);
             if slot.is_null() || !slot.is_aligned() {
                 continue;
             }
-            // SAFETY: `offset` came from a stack map the compiler emitted for this exact
-            // return address, so it names a slot inside this frame. The alignment check above
-            // rejects a malformed table rather than dereferencing whatever it named.
+            // SAFETY: `offset` and `frame_size` came from the stack map the compiler emitted for this
+            // exact return address, so `caller.base - frame_size + offset` names a slot inside the
+            // caller's frame. The alignment check above rejects a malformed table rather than
+            // dereferencing whatever it named.
             let bits = unsafe { *slot } as u64;
             roots.push(Value::from_bits(bits));
         }

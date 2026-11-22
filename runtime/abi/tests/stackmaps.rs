@@ -6,12 +6,15 @@
 
 use crisol_abi::{StackMapRow, live_at, walk_frames};
 
-/// A table for a function starting at `base`.
+/// A table for a function starting at `base`. A fixed `frame_size` of 64 rides along with every
+/// live offset — the collector needs it to reach the slot from the function's own frame pointer.
 fn row(base: *const u8, code_offset: u32, frame_offset: u32) -> StackMapRow {
     StackMapRow {
         function: base,
         code_offset,
         frame_offset,
+        frame_size: 64,
+        _padding: 0,
     }
 }
 
@@ -26,7 +29,11 @@ fn a_return_address_finds_the_offsets_live_at_it() {
     let rows = [row(base, 0x20, 8), row(base, 0x20, 16), row(base, 0x40, 24)];
     // 0x1000 + 0x20
     let live = live_at(&rows, address(0x1020));
-    assert_eq!(live, vec![8, 16], "both values live at that safepoint");
+    assert_eq!(
+        live,
+        vec![(8, 64), (16, 64)],
+        "both values live at that safepoint"
+    );
 }
 
 #[test]
@@ -48,7 +55,7 @@ fn the_match_is_exact_rather_than_a_range() {
         live_at(&rows, address(0x101F)).is_empty(),
         "one byte before"
     );
-    assert_eq!(live_at(&rows, address(0x1020)), vec![8]);
+    assert_eq!(live_at(&rows, address(0x1020)), vec![(8, 64)]);
 }
 
 #[test]
@@ -59,8 +66,8 @@ fn rows_from_different_functions_do_not_collide() {
         row(address(0x1000), 0x20, 8),
         row(address(0x2000), 0x20, 16),
     ];
-    assert_eq!(live_at(&rows, address(0x1020)), vec![8]);
-    assert_eq!(live_at(&rows, address(0x2020)), vec![16]);
+    assert_eq!(live_at(&rows, address(0x1020)), vec![(8, 64)]);
+    assert_eq!(live_at(&rows, address(0x2020)), vec![(16, 64)]);
 }
 
 #[test]

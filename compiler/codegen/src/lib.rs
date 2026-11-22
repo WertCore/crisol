@@ -786,7 +786,7 @@ pub struct Cranelift {
     triple: String,
     /// One row per live value at one safepoint, accumulated until [`Backend::finish`] can
     /// write them out with relocations.
-    rows: Vec<(cranelift_module::FuncId, u32, u32)>,
+    rows: Vec<(cranelift_module::FuncId, u32, u32, u32)>,
     module: ObjectModule,
     context: FunctionBuilderContext,
     /// The runtime helpers, one per operator that cannot be a native instruction.
@@ -970,17 +970,24 @@ impl Cranelift {
         // which is the worst way for this to be found.
         description.set_align(TABLE_ALIGN);
         let count = u64::try_from(self.rows.len()).unwrap_or(0);
-        let mut bytes = Vec::with_capacity(8 + self.rows.len() * 16);
+        // **Twenty-four bytes per row**, matching `StackMapRow`'s `#[repr(C)]`: an eight-byte
+        // function pointer, three `u32`s (code offset, frame offset, frame size), and four bytes of
+        // padding so the next row's pointer stays eight-aligned.
+        let mut bytes = Vec::with_capacity(8 + self.rows.len() * 24);
         bytes.extend_from_slice(&count.to_le_bytes());
 
         // The function addresses are written as zeroes and then relocated; the offsets are
         // known now.
         let mut relocations = Vec::with_capacity(self.rows.len());
-        for (index, (function, code_offset, frame_offset)) in self.rows.iter().enumerate() {
-            let at = 8 + index * 16;
+        for (index, (function, code_offset, frame_offset, frame_size)) in
+            self.rows.iter().enumerate()
+        {
+            let at = 8 + index * 24;
             bytes.extend_from_slice(&0u64.to_le_bytes());
             bytes.extend_from_slice(&code_offset.to_le_bytes());
             bytes.extend_from_slice(&frame_offset.to_le_bytes());
+            bytes.extend_from_slice(&frame_size.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
             relocations.push((u32::try_from(at).unwrap_or(u32::MAX), *function));
         }
 
@@ -1224,9 +1231,14 @@ impl Backend for Cranelift {
             })?;
         self.functions.push((function.id.index(), id));
         let safepoints = read_safepoints(&context);
+        // `map.span` is the size of the stack region the safepoint's offsets are measured within —
+        // the function's frame size. It rides into each row so the collector can reach a live slot
+        // from this function's own frame pointer (`fp + 16 - span + frame_offset`) rather than its
+        // callee's, which on aarch64-linux does not keep its frame record at the top of its frame
+        // (D-371/D-144).
         for map in &safepoints {
             for offset in &map.live_offsets {
-                self.rows.push((id, map.code_offset, *offset));
+                self.rows.push((id, map.code_offset, *offset, map.span));
             }
         }
         Ok(Report {
