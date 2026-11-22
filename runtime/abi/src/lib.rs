@@ -16753,6 +16753,37 @@ impl Runtime {
             }
         }
 
+        // **`get RegExp[Symbol.species]`** (D-366) — a getter answering its receiver, which is how a
+        // species-aware method finds the constructor to build its clone with. Reuses `iterator_self`
+        // (it returns `this`), so no new native. Installed before it is named: `native_function`
+        // hands back an unrooted handle reachable only once stored (the `Symbol.matchAll` hazard).
+        if let Some(globals) = GLOBALS.with(std::cell::Cell::get)
+            && let Some(constructor) = self.global_object(globals, "RegExp")
+        {
+            let named = PropertyKey::new("species");
+            let address = self
+                .heap
+                .shape_of(symbol)
+                .and_then(|shape| self.shapes.borrow().lookup(shape, &named))
+                .and_then(|slot| self.heap.get(symbol, slot.index()))
+                .and_then(|value| value.as_address());
+            if let Some(address) = address {
+                KEY_SYMBOLS.with(|symbols| {
+                    if let Ok(mut entries) = symbols.try_borrow_mut() {
+                        entries.insert(Value::symbol(address).to_bits());
+                    }
+                });
+                let index =
+                    NATIVES.len() + GLOBAL_NATIVES.len() + NAMESPACE_NATIVES.len() + ITERATOR_SELF;
+                let getter = self.native_function(index);
+                let key = PropertyKey::symbol(address, "Symbol.species");
+                self.install_accessor_keyed(constructor, &key, getter);
+                self.define_named(getter, "length", Value::number(0.0));
+                let name = self.string("get [Symbol.species]");
+                self.define_named(getter, "name", name);
+            }
+        }
+
         // **`Symbol.toStringTag` on the namespaces that carry one**, so
         // `Object.prototype.toString.call(Math)` is `"[object Math]"` rather than `"[object
         // Object]"`. The tag is read by `object_to_text`; defining it here is what gives it

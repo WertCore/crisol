@@ -1121,6 +1121,23 @@ fn regexp_methods_require_a_regexp_receiver() {
     );
 }
 
+/// **`RegExp` has a `Symbol.species` getter** (D-366) — it answers its receiver, with the standard
+/// accessor descriptor (`configurable`, not enumerable, no setter) and a getter of `length` 0.
+#[test]
+fn regexp_has_a_species_getter() {
+    check(
+        "species-returns-this",
+        "return typeof Object.getOwnPropertyDescriptor(RegExp, Symbol.species).get + \"/\" + (RegExp[Symbol.species] === RegExp);",
+        "function/true",
+    );
+    check(
+        "species-getter-desc",
+        "var d = Object.getOwnPropertyDescriptor(RegExp, Symbol.species); \
+         return d.get.length + \"/\" + (typeof d.set) + \"/\" + d.enumerable + \"/\" + d.configurable;",
+        "0/undefined/false/true",
+    );
+}
+
 /// **Duplicate named groups report the participating capture** (D-364) — the same name in distinct
 /// alternatives (ES2025) resolves `groups[name]` to the alternative that matched, not whichever the
 /// list held last, regardless of which side participates.

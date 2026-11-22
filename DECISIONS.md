@@ -9424,3 +9424,22 @@ that compiles each pattern+flags through the same `regress` engine the runtime u
 diagnostic, so compilation fails before anything runs. Using the runtime's own engine means what the compiler rejects and
 what `new RegExp(…)` rejects agree. A valid literal is unaffected (it compiles twice — once to validate, once at eval — a
 cost worth the correctness, and bounded by the number of literals). Covers both the script and module parse paths.
+
+## D-366
+
+**`RegExp[Symbol.species]` is a getter answering its receiver.**
+
+Status: Accepted
+
+`SpeciesConstructor` — which `@@split` (D-359) and `@@matchAll` use to build their clone — reads `constructor[@@species]`,
+and `RegExp` had no such accessor, so the default-constructor fallback was the only path. `RegExp` now carries
+`get [Symbol.species] { return this; }`, installed on the constructor via `install_accessor_keyed`, reusing the existing
+`iterator_self` native (it, too, returns its receiver) so no new native is added. The getter is **installed before it is
+named** — `native_function` returns an unrooted handle reachable only once stored, and building its `name` string
+allocates — the same ordering the `Symbol.matchAll` install uses. Its `length` is `0` and the accessor is configurable and
+non-enumerable with no setter, which is the descriptor `Object.getOwnPropertyDescriptor(RegExp, Symbol.species)` is checked
+for.
+
+(A false-start blamed this on a GC bug when a stale `libcrisol_abi.a` made the getter look collected under stress; a fresh
+archive and a from-scratch worktree both showed the GC traces accessor-pair getters correctly — the engine was never at
+fault. Recorded so the next stale-archive symptom is read correctly.)
