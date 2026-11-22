@@ -64,12 +64,11 @@ jobs:
           - name: Linux (arm64)
             os: ubuntu-24.04-arm
             budget_mib: 28 # same counter as x86-64; no separate reading yet
-            # **Known red, and kept that way deliberately** (D-144). Frame pointers fixed
-            # x86-64 and changed nothing here, so this target has a second fault of its own.
-            # Deleting the job would hide it and leaving it blocking would make every run red
-            # for something already understood and recorded — so it reports without failing
-            # the build, and the day it goes green this line comes out.
-            allow_failure: true
+            # Was the deliberately-red D-144 target: frame pointers fixed x86-64 and changed nothing
+            # here, so this had a second fault of its own — the collector reached a live slot from its
+            # callee's frame pointer, which only names the right slot when the callee kept its frame
+            # record at the top of its frame, and aarch64-linux does not. D-371 reaches the slot from
+            # the function's own frame pointer instead; this target is green, so it blocks again.
           - name: Windows (x86_64)
             os: windows-latest
             budget_mib: 8 # observed 3.4 (PrivateUsage)

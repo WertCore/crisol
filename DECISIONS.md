@@ -9499,3 +9499,36 @@ observable properties for a receiver built some other way or `RegExp.prototype` 
 current shape, so shadowing them still *reads back* as the shadow — only the match is insulated. This does not try to make
 the public `source`/`flags`/`global`/… prototype getters rather than own data properties (crisol's long-standing
 simplification); it fixes only the matcher's input, which is what the conformance gap was about.
+
+## D-371
+
+**The collector reaches a live slot from its own function's frame pointer.**
+
+Status: Accepted
+
+A safepoint's live offsets are measured from the stack pointer of the function they belong to. The collector reached them
+as `callee_fp + 16 + frame_offset` — the frame pointer of the matched frame (the function's *callee*, the runtime routine it
+had called) plus sixteen. That equals the function's stack pointer only when the callee saved its frame record `{fp, lr}` at
+the very top of its frame. Mach-O and x86-64 always do; aarch64-linux does not — LLVM there places callee-saved registers
+*above* the record, so `callee_fp + 16` fell short by that area (a per-function +8/+16/+24), the live slot was read at the
+wrong address, and the closure or constructor a running program held in a compiled frame was freed: `TypeError: is not a
+function` across the suite, only on aarch64-linux. This was the D-144 "second fault" — frame pointers (D-142/143) fixed
+`Linux (x86_64)` and Hidden linkage (below) fixed the others, and this target was left `allow_failure` until now.
+
+Three findings pinned it, all from CI diagnostics on the red job: the scan *did* match frames (so neither the frame walk nor
+the stack-map relocation was at fault); near-misses were benign (macOS has them too and passes); and at matched frames the
+row's slot read a number while a pointer sat a few slots higher — a wrong *base*, varying per function, which is the callee
+frame-record-placement tell.
+
+The fix reaches the slot from the function's **own** frame pointer, which is independent of how its callee was laid out.
+Each stack-map row now carries the function's SP-to-FP span (Cranelift's `active_size`), the collector finds the function's
+frame pointer one frame out from the matched callee, and reads `caller.base - 16 - span + frame_offset`. Cranelift keeps a
+compiled function's frame record at the top of its own frame, so this is correct on every target and reduces to the old
+`callee_fp + 16` wherever that was already right. The row grew to twenty-four bytes (pointer, code offset, frame offset,
+frame size, padding); `StackMapRow`, the emitter, and `live_at` moved together.
+
+Two linkage/link-mode changes landed alongside and are part of the same platform fix: compiled functions are declared
+`Linkage::Hidden` rather than `Export`, so the absolute relocation that fills each row's function pointer binds to the real
+entry instead of a preemptible PLT address in a PIE (this is what fixed Windows and `Linux (x86_64)`); and Linux links
+`-no-pie` so that relocation binds at static-link time. The CI "Build the runtime archive" step runs under `bash` so
+Windows stops dying on PowerShell's `rm -f`.
