@@ -747,14 +747,16 @@ fn regexp_symbol_match_all_is_a_lazy_iterator() {
          return out.join(\",\");",
         "a1,b2",
     );
-    // Lazy: `next` drives an overridden `exec` one step at a time (eager `matchAll` ignores it).
+    // `@@matchAll` builds a fresh matcher via `SpeciesConstructor(R, %RegExp%)`, so an `exec`
+    // overridden on `R` itself is **not** used (the default-species copy runs the builtin), and `R`'s
+    // own `exec` call count stays zero. Still lazy — the copy is walked one step at a time.
     check(
-        "regexp-matchall-honours-exec",
+        "regexp-matchall-uses-species-copy",
         "var r = /x/g; var n = 0; \
          r.exec = function () { n++; if (n > 2) return null; return {0: \"x\", index: 0, length: 1}; }; \
          var out = []; for (var m of r[Symbol.matchAll](\"xxxx\")) { out.push(m[0]); } \
          return out.join(\",\") + \"/\" + n;",
-        "x,x/3",
+        "x,x,x,x/0",
     );
     // A non-global RegExp yields exactly one match, then latches done — no TypeError at this level.
     check(

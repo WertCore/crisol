@@ -11531,6 +11531,12 @@ fn replace_via_exec(text: &str, rx: u64, replacement: u64) -> u64 {
             return named;
         }
         let has_named = !Value::from_bits(named).is_undefined();
+        // String replacement does `ToObject(namedCaptures)` when it is not undefined, and
+        // `ToObject(null)` is a `TypeError` (`result-coerce-groups-err`). A RegExp result's `groups`
+        // is an object, `null`, or `undefined`, so `null` is the only coercion that throws here.
+        if !functional && has_named && Value::from_bits(named).kind() == crisol_value::Kind::Null {
+            return raise("cannot convert null groups to an object", "TypeError");
+        }
         let piece = if functional {
             match with_rooted(&results, || {
                 call_exec_replacer(
@@ -11876,8 +11882,36 @@ extern "C" fn regexp_symbol_match_all(
             Ok(text) => text,
             Err(thrown) => return thrown,
         };
+        // **`matcher = Construct(SpeciesConstructor(R, %RegExp%), [R, flags])`** — a fresh copy the
+        // iterator owns, so a global `matchAll` moves the copy's `lastIndex` and leaves R's alone.
+        // `make_splitter` (reused with the unchanged flags) performs the species lookup and
+        // construction, propagating a throwing `constructor`/`@@species` getter or constructor
+        // (`species-constructor-*-throws`).
+        let matcher = match make_splitter(this_value, &flags_text) {
+            Ok(matcher) => matcher,
+            Err(thrown) => return thrown,
+        };
+        // `Set(matcher, "lastIndex", ToLength(? Get(R, "lastIndex")), true)` — a throwing `lastIndex`
+        // getter or coercion propagates (`this-tolength-lastindex-throws`).
+        let last_index = with_rooted(&[matcher], || property_of(this_value, "lastIndex"));
+        if Value::from_bits(last_index).is_exception() {
+            return last_index;
+        }
+        let cursor = match to_length_bits(last_index) {
+            Ok(index) => index,
+            Err(thrown) => return thrown,
+        };
+        #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+        let cursor_value = Value::number(cursor as f64).to_bits();
+        if let Some(thrown) = with_rooted(&[matcher], || {
+            set_honoring(matcher, "lastIndex", cursor_value)
+        }) {
+            return thrown;
+        }
         let global = flags_text.contains('g');
-        make_regexp_string_iterator(this_value, subject, global)
+        with_rooted(&[matcher, subject], || {
+            make_regexp_string_iterator(matcher, subject, global)
+        })
     })
 }
 
