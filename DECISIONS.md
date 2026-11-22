@@ -9406,3 +9406,21 @@ true)` runs with `Throw`, so a `lastIndex` made non-writable is a `TypeError` (`
 rejects an own, non-writable, non-accessor `lastIndex` with a `TypeError` before the store; a throwing *setter* is still
 left to the store, which calls it and surfaces the throw. `own_non_writable_data` does the own-property attribute lookup
 (`shape_of` → `lookup` → `attributes_of`), checking it is present, not deleted, a data property, and not writable.
+
+## D-367
+
+**An invalid regular-expression literal is a `SyntaxError` at compile, not at evaluation.**
+
+Status: Accepted
+
+A `RegExp` literal lowered to a `CreateRegExp` op that compiled the pattern only when the literal was *evaluated*, so an
+invalid one — an unsupported `\p{…}` property, a malformed class, a bad quantifier — threw a `SyntaxError` at runtime. The
+specification makes it an **early (parse-phase) error**: the program containing it must not run at all. test262's
+negative-syntax cases rely on this (they call `$DONOTEVALUATE()` at the top, which a correct engine never reaches), so
+crisol parsing the file and deferring the error failed them even though `regress` rejects the pattern.
+
+The frontend now validates every regex literal when the source is compiled — a small `oxc_ast_visit` pass (`regex_diagnostics`)
+that compiles each pattern+flags through the same `regress` engine the runtime uses and turns any failure into a parse
+diagnostic, so compilation fails before anything runs. Using the runtime's own engine means what the compiler rejects and
+what `new RegExp(…)` rejects agree. A valid literal is unaffected (it compiles twice — once to validate, once at eval — a
+cost worth the correctness, and bounded by the number of literals). Covers both the script and module parse paths.

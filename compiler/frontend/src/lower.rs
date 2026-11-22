@@ -110,6 +110,12 @@ pub fn lower(name: &str, source: &str) -> Result<Lowered, ParseFailed> {
             errors: parsed.diagnostics.iter().map(ToString::to_string).collect(),
         });
     }
+    let regex_errors = regex_diagnostics(&parsed.program);
+    if !regex_errors.is_empty() {
+        return Err(ParseFailed {
+            errors: regex_errors,
+        });
+    }
     let mut lowering = Lowering::new(name);
     // Answered before lowering, because whether a variable is a cell changes every read and
     // write of it — and the lowering only discovers a capture once it has already emitted the
@@ -117,6 +123,45 @@ pub fn lower(name: &str, source: &str) -> Result<Lowered, ParseFailed> {
     lowering.shared = crate::escape::shared_variables(&parsed.program);
     lowering.program(&parsed.program);
     Ok(lowering.finish())
+}
+
+/// Every regular-expression literal whose pattern the engine cannot compile.
+///
+/// **Reported at parse, where the specification puts it** (D-367): a literal with an invalid pattern
+/// — an unsupported `\p{…}` property, a malformed class, a bad quantifier — is a `SyntaxError` at the
+/// point the source is compiled, not a surprise the first time the literal is evaluated. The check
+/// uses the same `regress` engine the runtime does, so what it rejects and what `new RegExp(...)`
+/// rejects agree.
+fn regex_diagnostics(program: &Program<'_>) -> Vec<String> {
+    use oxc_ast_visit::Visit;
+
+    struct Check {
+        errors: Vec<String>,
+    }
+
+    impl<'a> Visit<'a> for Check {
+        fn visit_reg_exp_literal(&mut self, literal: &oxc_ast::ast::RegExpLiteral<'a>) {
+            let flags = literal.regex.flags.to_string();
+            let regress_flags = regress::Flags {
+                icase: flags.contains('i'),
+                multiline: flags.contains('m'),
+                dot_all: flags.contains('s'),
+                unicode: flags.contains('u'),
+                unicode_sets: flags.contains('v'),
+                ..regress::Flags::default()
+            };
+            let pattern = literal.regex.pattern.text.as_str();
+            if let Err(error) = regress::Regex::with_flags(pattern, regress_flags) {
+                self.errors.push(format!(
+                    "invalid regular expression /{pattern}/{flags}: {error}"
+                ));
+            }
+        }
+    }
+
+    let mut check = Check { errors: Vec::new() };
+    check.visit_program(program);
+    check.errors
 }
 
 /// What went wrong resolving or parsing a module graph (D-294).
@@ -256,6 +301,13 @@ pub fn lower_modules(entry: &std::path::Path) -> Result<Lowered, ModuleError> {
             return Err(ModuleError::Parse {
                 path: paths[index].display().to_string(),
                 errors: parsed.diagnostics.iter().map(ToString::to_string).collect(),
+            });
+        }
+        let regex_errors = regex_diagnostics(&parsed.program);
+        if !regex_errors.is_empty() {
+            return Err(ModuleError::Parse {
+                path: paths[index].display().to_string(),
+                errors: regex_errors,
             });
         }
         lowering.shared = crate::escape::shared_variables(&parsed.program);

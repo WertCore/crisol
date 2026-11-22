@@ -795,6 +795,7 @@ dependencies = [
  "oxc_resolver",
  "oxc_span",
  "oxc_syntax",
+ "regress",
 ]
 
 [[package]]

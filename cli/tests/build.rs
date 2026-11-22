@@ -149,6 +149,49 @@ fn check(name: &str, source: &str, expected: &str) {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// Asserts `source` fails to **compile** — the parse-phase error an invalid construct should be.
+fn check_build_fails(name: &str, source: &str) {
+    let Some(runtime) = runtime() else {
+        return;
+    };
+    let directory = std::env::temp_dir().join(format!("crisol-acceptance-{name}"));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("a working directory");
+    let file = directory.join("main.js");
+    std::fs::write(&file, source).expect("write the source");
+    let binary = directory.join("main");
+    assert!(
+        crisol::build::build(&file, &binary, &runtime).is_err(),
+        "{name} should fail to compile: {source}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// **An invalid regular-expression literal fails at compile** (D-367) — the engine validates the
+/// pattern when the source is compiled, so an unsupported `\p{…}` property or a malformed pattern is
+/// a `SyntaxError` at parse, not when the literal is first evaluated. A valid literal still compiles.
+#[test]
+fn an_invalid_regexp_literal_fails_to_compile() {
+    check_build_fails("re-unclosed-property", "var r = /\\p{/u; r;");
+    check_build_fails(
+        "re-unsupported-binary",
+        "var r = /\\p{Expands_On_NFKC}/u; r;",
+    );
+    check_build_fails(
+        "re-bad-gc-value",
+        "var r = /\\p{General_Category=Xyz}/u; r;",
+    );
+    check_build_fails("re-empty-value", "var r = /\\p{Script=}/u; r;");
+    check_build_fails("re-no-braces", "var r = /\\pL/u; r;");
+    check_build_fails("re-malformed-class", "var r = /[a-/u; r;");
+    // A valid property escape still compiles and runs.
+    check(
+        "re-valid-property",
+        "return /\\p{Script=Greek}/u.test(\"\\u03b1\");",
+        "true",
+    );
+}
+
 #[test]
 fn arithmetic_compiles_links_and_runs() {
     check("subtract", "return 6 - 4;", "2");

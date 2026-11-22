@@ -21,3 +21,6 @@ oxc_parser.workspace = true
 oxc_resolver.workspace = true
 oxc_span.workspace = true
 oxc_syntax.workspace = true
+# The same regex engine the runtime uses, so a pattern that will not compile is a `SyntaxError`
+# at parse rather than a surprise when the literal is first evaluated (`\p{…}` validity included).
+regress.workspace = true
