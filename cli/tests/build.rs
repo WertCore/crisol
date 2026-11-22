@@ -1166,6 +1166,27 @@ fn regexp_d_flag_reports_match_indices() {
     );
 }
 
+/// **`@@replace` propagates a throwing getter on the `exec` result's matched text or a capture**
+/// (`result-get-matched-err`/`result-get-capture-err`), and **`@@search` compares `lastIndex` with
+/// SameValue** so a `-0` is reset to `+0` before the search (the `-0` cases).
+#[test]
+fn regexp_replace_and_search_error_and_negzero() {
+    check(
+        "replace-result-get-matched-err",
+        "var o = {flags: '', exec: function () { return {length: 1, index: 0, \
+         get 0() { throw new RangeError('m'); }}; }}; \
+         try { RegExp.prototype[Symbol.replace].call(o, 'abc', 'x'); return 'no'; } \
+         catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
+    check(
+        "search-resets-negative-zero",
+        "var seen; var re = {lastIndex: -0, exec: function () { seen = this.lastIndex; return null; }}; \
+         RegExp.prototype[Symbol.search].call(re, 's'); return Object.is(seen, 0) + '/' + (seen === 0);",
+        "true/true",
+    );
+}
+
 /// **The `Symbol.*` methods read `flags` with `ToString`**, so a throwing `toString` on the flags
 /// value propagates rather than being swallowed to `""` (the `flags-tostring-error` cases).
 #[test]

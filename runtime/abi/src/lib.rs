@@ -11120,8 +11120,15 @@ extern "C" fn regexp_symbol_search(
             Ok(previous) => previous,
             Err(thrown) => return thrown,
         };
-        if previous != 0.0 {
-            set_last_index(this_value, 0.0);
+        // **SameValue, not `==`** (`Symbol.search` `-0` cases): -0 and +0 are distinct, so a `lastIndex`
+        // of -0 is still reset to +0 and then restored to -0 afterwards. The Set is the spec's
+        // `Throw=true` form, so a non-writable `lastIndex` propagates.
+        if previous.to_bits() != 0.0_f64.to_bits() {
+            if let Some(thrown) =
+                set_honoring(this_value, "lastIndex", Value::number(0.0).to_bits())
+            {
+                return thrown;
+            }
         }
         let result = regexp_exec_value(this_value, subject);
         if Value::from_bits(result).is_exception() {
@@ -11131,8 +11138,12 @@ extern "C" fn regexp_symbol_search(
             Ok(current) => current,
             Err(thrown) => return thrown,
         };
-        if current != previous {
-            set_last_index(this_value, previous);
+        if current.to_bits() != previous.to_bits() {
+            if let Some(thrown) =
+                set_honoring(this_value, "lastIndex", Value::number(previous).to_bits())
+            {
+                return thrown;
+            }
         }
         if Value::from_bits(result).kind() == crisol_value::Kind::Null {
             return Value::number(-1.0).to_bits();
@@ -11418,6 +11429,10 @@ fn replace_via_exec(text: &str, rx: u64, replacement: u64) -> u64 {
         let first = with_rooted(&results, || {
             with_rooted(&[subject], || indexed_get(result, 0))
         });
+        // A throwing `result[0]` getter is the answer (`result-get-matched-err`).
+        if Value::from_bits(first).is_exception() {
+            return first;
+        }
         let matched = match with_rooted(&results, || {
             with_rooted(&[subject], || string_argument(first))
         }) {
@@ -11461,6 +11476,10 @@ fn replace_via_exec(text: &str, rx: u64, replacement: u64) -> u64 {
         let first = with_rooted(&results, || {
             with_rooted(&[subject], || indexed_get(result, 0))
         });
+        // A throwing `result[0]` getter is the answer (`result-get-matched-err`).
+        if Value::from_bits(first).is_exception() {
+            return first;
+        }
         let matched = match with_rooted(&results, || {
             with_rooted(&[subject], || string_argument(first))
         }) {
@@ -11492,6 +11511,10 @@ fn replace_via_exec(text: &str, rx: u64, replacement: u64) -> u64 {
             let capture = with_rooted(&results, || {
                 with_rooted(&[subject], || indexed_get(result, capture_index))
             });
+            // A throwing `result[n]` getter is the answer (`result-get-capture-err`).
+            if Value::from_bits(capture).is_exception() {
+                return capture;
+            }
             if Value::from_bits(capture).is_undefined() {
                 captures.push(None);
             } else {
