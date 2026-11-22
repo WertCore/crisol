@@ -9367,11 +9367,15 @@ a RegExp with no match is still `null`/`false`, but a receiver `with_pattern` ca
 
 Status: Reverted
 
-**Reverted** — the implementation had a platform-dependent memory-safety bug: the `indices` pair arrays were read back as
-`NaN` under GC stress on Linux x86_64 while passing on macOS arm64 (a rooting hole exposed only on one target). It could not
-be reproduced locally or fixed reliably through CI alone, so the feature was backed out to keep the branch green and
-UB-free; it needs local x86_64 debugging of the nested-array GC rooting. The original design is left below for when it is
-retried.
+**Reverted** — the `indices` pair arrays are read back as `NaN` under GC stress. The "x86_64-only" framing was wrong (it
+came from a stale `libcrisol_abi.a` masking the local run): with a freshly built archive it **reproduces on arm64 too**, and
+the shape is specific — `/re/d.exec(s)` passes GC stress, but `s.match(/re/d)` with two or more capture groups fails, and
+only the *first* (whole-match) pair corrupts. So it is not the pair-building rooting in `match_indices_array` (that is the
+same for both paths and `exec` is clean) but something about the indices-bearing result surviving the deeper `@@match` call
+chain under aggressive collection — a GC tracing/stack-scan subtlety below the RegExp layer. Reordering the build (indices
+before the result array) did not help. Left reverted and accurately characterised for a focused GC-internals pass; the
+original design is below. (The subagent proved the GC traces accessor-pair/array getters correctly for the *bootstrap*
+`Symbol.species` case — D-366 — so the hole is specific to the per-call match result flow, not element tracing in general.)
 
 With `d`, a match result carries an `indices` array beside its captures: `indices[0]` is the `[start, end]` of the whole
 match, `indices[i]` the pair for group `i` (or `undefined` where the group did not participate), and `indices.groups` a
