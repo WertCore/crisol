@@ -1166,6 +1166,23 @@ fn regexp_d_flag_reports_match_indices() {
     );
 }
 
+/// **A global `@@match` sets `lastIndex` with `Throw`**, so a non-writable `lastIndex` (or a setter
+/// that throws) aborts the match rather than being silently ignored — the `set-lastindex-err` cases.
+#[test]
+fn regexp_global_match_sets_lastindex_throwing() {
+    check(
+        "g-match-ok",
+        "return JSON.stringify('a1b2'.match(/[a-z]/g));",
+        "[\"a\",\"b\"]",
+    );
+    check(
+        "g-init-lastindex-err",
+        "var re=/a/g; Object.defineProperty(re,'lastIndex',{value:0,writable:false}); \
+         try { 'aaa'.match(re); return 'no-throw'; } catch(e){ return e.constructor.name; }",
+        "TypeError",
+    );
+}
+
 /// **`RegExp.prototype`'s flag accessors are getters of length 0**, and `Object.prototype.toString`
 /// reports a `RegExp` instance as `[object RegExp]` (the prototype itself stays `[object Object]`).
 #[test]

@@ -11014,7 +11014,11 @@ extern "C" fn regexp_symbol_match(
         if !global {
             return regexp_exec_value(this_value, subject);
         }
-        set_last_index(this_value, 0.0);
+        // **A throwing `Set(rx, "lastIndex", 0)` aborts** (the specification sets it with `Throw`),
+        // so a non-writable `lastIndex` or a setter that throws is the answer, not silently ignored.
+        if let Some(thrown) = set_honoring(this_value, "lastIndex", Value::number(0.0).to_bits()) {
+            return thrown;
+        }
         let mut collected: Vec<u64> = Vec::new();
         loop {
             let result = with_rooted(&collected, || regexp_exec_value(this_value, subject));
@@ -11041,7 +11045,12 @@ extern "C" fn regexp_symbol_match(
                     Ok(at) => at,
                     Err(thrown) => return thrown,
                 };
-                set_last_index(this_value, at + 1.0);
+                // Also a throwing `Set` (the specification advances `lastIndex` with `Throw`).
+                if let Some(thrown) =
+                    set_honoring(this_value, "lastIndex", Value::number(at + 1.0).to_bits())
+                {
+                    return thrown;
+                }
             }
         }
         // **No matches at all is `null`, not an empty array** — `if (s.match(/x/g))` is how a
