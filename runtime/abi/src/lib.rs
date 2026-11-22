@@ -606,6 +606,8 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
             std::sync::atomic::AtomicBool::new(false);
         static NEARMISS_DUMPED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
+        static BUG_DUMPED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         let rows = m.rows();
         let matched = frames
             .iter()
@@ -617,7 +619,21 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
         // Linux (broken) one to decide whether NEARMISS is benign.
         if std::env::var_os("CRISOL_GCDUMP").is_some() {
             use std::io::Write as _;
-            let mut nm = String::new();
+            let classify = |p: *const usize| -> &'static str {
+                if p.is_null() || !p.is_aligned() {
+                    return "?";
+                }
+                // SAFETY: an aligned, non-null stack slot read at a safepoint.
+                if Value::from_bits(unsafe { *p } as u64)
+                    .as_address()
+                    .is_some()
+                {
+                    "ptr"
+                } else {
+                    "val"
+                }
+            };
+            let mut detail = String::new();
             if matched == 0 {
                 for f in &frames {
                     let ret = f.return_address as isize;
@@ -637,9 +653,24 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
                             })
                             .min_by_key(|d| d.abs())
                             .unwrap_or(0);
-                        nm = format!(" nearmiss in-fn+{off:#x} delta={near:#x}");
+                        detail = format!(" nearmiss in-fn+{off:#x} delta={near:#x}");
                         break;
                     }
+                }
+            } else if let Some(f) = frames
+                .iter()
+                .find(|f| !m.live_at(f.return_address).is_empty())
+            {
+                // For the first matched frame, each live slot's value type plus a neighborhood scan
+                // (slot-16..+24). A matched slot reading `val` with a `ptr` at an adjacent offset is
+                // the signature of an off-by-N in `base`/`frame_offset` on this target.
+                for offset in m.live_at(f.return_address) {
+                    let slot = f.base.wrapping_byte_add(offset as usize);
+                    let nbrs: Vec<String> = [-16isize, -8, 0, 8, 16, 24]
+                        .iter()
+                        .map(|d| format!("{:+}:{}", d, classify(slot.wrapping_byte_offset(*d))))
+                        .collect();
+                    detail.push_str(&format!(" off{offset}[{}]", nbrs.join(",")));
                 }
             }
             if let Ok(mut fh) = std::fs::OpenOptions::new()
@@ -647,48 +678,65 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
                 .append(true)
                 .open("/tmp/gcdiag2.log")
             {
-                let _ = writeln!(fh, "matched={matched} frames={}{nm}", frames.len());
+                let _ = writeln!(fh, "matched={matched} frames={}{detail}", frames.len());
             }
         }
-        if matched > 0 && !MATCH_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            // Inspect what a matched frame actually reads: for the first matched frame, each live
-            // `base + frame_offset` slot — is it a heap pointer (`ptr`), or a number/garbage (`val`)?
-            // On a working scan these are the live references; if Linux matches the row but reads a
-            // non-pointer where macOS reads a pointer, the slot (base/frame_offset) is the real bug.
-            let mut reads = Vec::new();
+        if matched > 0 {
+            // For the first matched frame, dump each live slot's value type plus a neighborhood scan
+            // (slot-16..+24). Two one-shots to stderr (so they surface on the failing aarch64-linux
+            // subprocess): OFFBYN fires on the first collection whose matched slot reads a non-pointer
+            // while an adjacent slot holds one — the off-by-N signature of a wrong base/frame_offset;
+            // MATCH fires once as a baseline for a platform where no such case appears.
+            let classify = |p: *const usize| -> &'static str {
+                if p.is_null() || !p.is_aligned() {
+                    return "?";
+                }
+                // SAFETY: an aligned, non-null stack slot read at a safepoint.
+                if Value::from_bits(unsafe { *p } as u64)
+                    .as_address()
+                    .is_some()
+                {
+                    "ptr"
+                } else {
+                    "val"
+                }
+            };
             if let Some(f) = frames
                 .iter()
                 .find(|f| !m.live_at(f.return_address).is_empty())
             {
-                for offset in m.live_at(f.return_address) {
-                    let slot = f.base.wrapping_byte_add(offset as usize);
-                    if slot.is_null() || !slot.is_aligned() {
-                        reads.push(format!("off{offset}:badslot"));
-                        continue;
-                    }
-                    // SAFETY: slot came from this frame's stack map, checked non-null and aligned.
-                    let bits = unsafe { *slot } as u64;
-                    let value = Value::from_bits(bits);
-                    reads.push(if value.as_address().is_some() {
-                        format!("off{offset}:ptr")
-                    } else {
-                        format!("off{offset}:val({:?})", value.kind())
-                    });
-                }
-            }
-            let line = format!(
-                "crisol-gc-diag: MATCH matched={matched} frames={} reads={reads:?}",
-                frames.len()
-            );
-            eprintln!("{line}");
-            if std::env::var_os("CRISOL_GCDUMP").is_some() {
-                use std::io::Write as _;
-                if let Ok(mut fh) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/gcdiag2.log")
-                {
-                    let _ = writeln!(fh, "{line}");
+                let offs = m.live_at(f.return_address);
+                let signature = offs.iter().any(|&o| {
+                    let slot = f.base.wrapping_byte_add(o as usize);
+                    classify(slot) != "ptr"
+                        && [-16isize, -8, 8, 16, 24]
+                            .iter()
+                            .any(|d| classify(slot.wrapping_byte_offset(*d)) == "ptr")
+                });
+                let fire_bug =
+                    signature && !BUG_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed);
+                let fire_match =
+                    !signature && !MATCH_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed);
+                if fire_bug || fire_match {
+                    let detail: Vec<String> = offs
+                        .iter()
+                        .map(|&o| {
+                            let slot = f.base.wrapping_byte_add(o as usize);
+                            let nbrs: Vec<String> = [-16isize, -8, 0, 8, 16, 24]
+                                .iter()
+                                .map(|d| {
+                                    format!("{:+}:{}", d, classify(slot.wrapping_byte_offset(*d)))
+                                })
+                                .collect();
+                            format!("off{o}[{}]", nbrs.join(","))
+                        })
+                        .collect();
+                    eprintln!(
+                        "crisol-gc-diag: {} frames={} {}",
+                        if fire_bug { "OFFBYN" } else { "MATCH" },
+                        frames.len(),
+                        detail.join(" "),
+                    );
                 }
             }
         }
