@@ -159,6 +159,11 @@ jobs:
       # `libcrisol_abi.a` the test suite then links against produces results that have nothing to do
       # with the commit under test. Deleting it forces a rebuild from the current source.
       - name: Build the runtime archive
+        # **`bash`, not the Windows default PowerShell** — this step runs on every matrix OS, and in
+        # PowerShell `rm` is an alias for `Remove-Item`, whose `-f` is ambiguous (`-Filter`/`-Force`),
+        # so the step died before building. Git Bash is present on the Windows runner and `rm -f` is a
+        # clean no-op there when the file is absent.
+        shell: bash
         run: |
           rm -f target/debug/libcrisol_abi.a target/release/libcrisol_abi.a
           cargo build -p crisol-abi
