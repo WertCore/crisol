@@ -9443,3 +9443,17 @@ for.
 (A false-start blamed this on a GC bug when a stale `libcrisol_abi.a` made the getter look collected under stress; a fresh
 archive and a from-scratch worktree both showed the GC traces accessor-pair getters correctly — the engine was never at
 fault. Recorded so the next stale-archive symptom is read correctly.)
+
+## D-368
+
+**The test262 runner credits a parse-phase negative test when the compiler refuses it.**
+
+Status: Accepted
+
+A `negative: { phase: parse }` (or `early`) case is a program that must **not** compile — the parse-phase `SyntaxError` is
+the whole point. The runner scored every build failure as `refused`, so once D-367 made invalid regex literals (and the
+other early errors) fail at compile, those cases moved from `failed` to `refused` rather than to `passed` — crisol was
+doing the right thing and getting no credit. `attempt` now reads the `negative` metadata: a parse/early case that fails to
+build is `passed`, and one that compiles when it should not have is `failed`. This is what a standard test262 harness does —
+it credits the refusal without re-deriving the exact message, since the only error a parse phase raises is a `SyntaxError`.
+Runtime-phase negatives are left as they were (scored by what they throw), to avoid crediting a throw of the wrong type.

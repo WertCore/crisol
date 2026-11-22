@@ -167,8 +167,26 @@ fn attempt(root: &Path, case: &Path, work: &Path, index: usize) -> Option<Outcom
     std::fs::write(&file, &source).ok()?;
     let binary = directory.join("main");
 
+    // A `negative: { phase: parse }` (or `early`) case is **supposed** not to compile, so the
+    // compiler refusing it is the pass — not a gap to count as refused. The error at parse is a
+    // `SyntaxError`, which is what these cases ask for; a standard test262 harness credits the
+    // refusal without re-deriving the exact message. Conversely, one that compiles when it should
+    // not have is the failure.
+    let parse_negative = metadata
+        .negative
+        .as_ref()
+        .is_some_and(|(phase, _)| phase == "parse" || phase == "early");
     let outcome = match crisol::build::build(&file, &binary, &runtime_archive()?) {
-        Err(error) => Outcome::Refused(stage_of(&error)),
+        Err(error) => {
+            if parse_negative {
+                Outcome::Ran
+            } else {
+                Outcome::Refused(stage_of(&error))
+            }
+        }
+        Ok(()) if parse_negative => {
+            Outcome::Failed("compiled, but the case is a negative parse test".to_owned())
+        }
         Ok(()) => judge(&binary, is_async),
     };
     let _ = std::fs::remove_dir_all(&directory);
