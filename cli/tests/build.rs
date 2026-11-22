@@ -6200,10 +6200,12 @@ fn a_global_regular_expression_advances_last_index() {
 /// rather than inside whatever later called `test`.
 #[test]
 fn an_invalid_pattern_raises_where_it_is_written() {
-    check(
+    // **An invalid regex literal is an early (parse-phase) `SyntaxError`** (D-367): the program never
+    // runs, so a `try`/`catch` around it cannot catch it — the whole source fails to compile, which
+    // is where the specification puts the error.
+    check_build_fails(
         "re-invalid",
         "let r = \"\"; try { let bad = /(/; } catch (e) { r = e.name; } return r;",
-        "SyntaxError",
     );
 }
 
