@@ -591,11 +591,48 @@ fn current_frame_pointer() -> *const usize {
 /// Must be called with the program stopped at a safepoint, for the reason in [`walk_frames`].
 #[must_use]
 pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
-    let Some(maps) = stack_maps() else {
-        return Vec::new();
-    };
+    // TEMPORARY platform diagnostic (D-371 investigation): a one-shot stderr line on the first
+    // collection, reporting which stage of the compiled-root scan produces nothing. Surfaces only
+    // on a failing run (the harness shows a subprocess's stderr when it exits non-zero), so green
+    // macOS stays quiet while red Linux/Windows reports. Remove once the platform gap is found.
+    static DIAGNOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let maps = stack_maps();
     // SAFETY: the caller promises the program is stopped at a safepoint.
     let frames = unsafe { walk_frames(limit) };
+    if !DIAGNOSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let rows = maps.map_or(0, |m| m.rows().len());
+        let matched = frames
+            .iter()
+            .filter(|f| maps.is_some_and(|m| !m.live_at(f.return_address).is_empty()))
+            .count();
+        let first_rows: Vec<String> = maps
+            .map(|m| {
+                m.rows()
+                    .iter()
+                    .take(3)
+                    .map(|r| {
+                        format!(
+                            "fn={:p}+{:#x}@off{}",
+                            r.function, r.code_offset, r.frame_offset
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let first_ret: Vec<String> = frames
+            .iter()
+            .take(3)
+            .map(|f| format!("{:p}", f.return_address))
+            .collect();
+        eprintln!(
+            "crisol-gc-diag: maps={} rows={rows} frames={} matched_frames={matched} first_rows={first_rows:?} first_ret={first_ret:?}",
+            if maps.is_some() { "Some" } else { "None" },
+            frames.len(),
+        );
+    }
+    let Some(maps) = maps else {
+        return Vec::new();
+    };
     let mut roots = Vec::new();
     for frame in frames {
         for offset in maps.live_at(frame.return_address) {
