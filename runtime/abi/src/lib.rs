@@ -11079,9 +11079,40 @@ fn advance_string_index(text: &str, units: usize, unicode: bool) -> usize {
 /// `Set(object, name, value)` honouring a setter — the thrown value if one throws (what
 /// `g-init-lastindex-err` requires), where the `define` [`set_last_index`] uses would bypass it.
 fn set_honoring(object: u64, name: &str, value: u64) -> Option<u64> {
+    // **A `Set` with `Throw` throws on a non-writable data property** (`g-init-lastindex-err`), which
+    // `crisol_property_store` — sloppy-mode `Set` — would ignore in silence. A setter is left to the
+    // store, which calls it and surfaces its throw; only an own, non-writable, non-accessor property
+    // is rejected here.
+    if own_non_writable_data(object, name) {
+        return Some(raise(
+            &format!("cannot assign to read-only '{name}'"),
+            "TypeError",
+        ));
+    }
     // SAFETY: `name` is a live Rust string of `name.len()` UTF-8 bytes.
     let out = unsafe { crisol_property_store(object, name.as_ptr(), name.len() as u64, value) };
     Value::from_bits(out).is_exception().then_some(out)
+}
+
+/// Whether `object` has an own data property `name` that is not writable.
+fn own_non_writable_data(object: u64, name: &str) -> bool {
+    let Some(handle) = handle_of(object) else {
+        return false;
+    };
+    let key = PropertyKey::new(name);
+    with_runtime(|runtime| {
+        let Some(shape) = runtime.heap.shape_of(handle) else {
+            return false;
+        };
+        let Some(slot) = runtime.shapes.borrow().lookup(shape, &key) else {
+            return false;
+        };
+        if runtime.heap.is_deleted(handle, slot.index()) {
+            return false;
+        }
+        let attributes = runtime.heap.attributes_of(handle, slot.index());
+        !attributes.accessor && !attributes.writable
+    })
 }
 
 /// `ToLength` of `bits` — `Get(result, "length")` as a non-negative integer, capped at 2^53-1, with

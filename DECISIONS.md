@@ -9393,3 +9393,16 @@ walking the captures last-wins set `groups.x` to the *non-participating* alterna
 the earlier branch. `deduped_named` now collapses repeats by name, keeping the range that participated — at most one
 alternative matches, so there is a single answer — which both `named_groups_object` and `named_indices_object` build from.
 A pattern with no duplicates is unchanged, in source order.
+
+## D-365
+
+**`@@replace`/`@@split` throw when `Set`-ing `lastIndex` on a non-writable property.**
+
+Status: Accepted
+
+A global `@@replace` (and `@@split`) sets `lastIndex` through `set_honoring`, which called `crisol_property_store` — a
+sloppy-mode `Set` that **silently ignores a non-writable data property**. The specification's `Set(rx, "lastIndex", …,
+true)` runs with `Throw`, so a `lastIndex` made non-writable is a `TypeError` (`g-init-lastindex-err`). `set_honoring` now
+rejects an own, non-writable, non-accessor `lastIndex` with a `TypeError` before the store; a throwing *setter* is still
+left to the store, which calls it and surfaces the throw. `own_non_writable_data` does the own-property attribute lookup
+(`shape_of` → `lookup` → `attributes_of`), checking it is present, not deleted, a data property, and not writable.

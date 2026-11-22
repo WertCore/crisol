@@ -919,6 +919,15 @@ fn regexp_symbol_replace_runs_on_exec() {
          try { \"x\".replace(r, \"Y\"); return \"no\"; } catch (e) { return e.name; }",
         "RangeError",
     );
+    // A global replace setting `lastIndex` on a non-writable property is a `TypeError`, not a silent
+    // no-op (the `Set` the specification runs with `Throw`).
+    check(
+        "replace-lastindex-nonwritable",
+        "var r = /./g; r[Symbol.replace](\"x\", \"x\"); \
+         Object.defineProperty(r, \"lastIndex\", { writable: false }); \
+         try { r[Symbol.replace](\"x\", \"x\"); return \"no\"; } catch (e) { return e.name; }",
+        "TypeError",
+    );
 }
 
 /// **`lastIndex` is in code units, not bytes** (D-358) — the cursor `regress` searches by is a byte
