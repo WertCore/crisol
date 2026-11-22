@@ -377,13 +377,24 @@ fn the_suite_is_attempted_and_the_result_reported() {
         return;
     }
 
-    let cases = discover(&root);
+    let mut cases = discover(&root);
     assert!(!cases.is_empty(), "the suite root has no cases");
+    // **A path filter narrows the run to one area.** Driving a single feature to zero — say the
+    // RegExp property escapes — means running every case under that directory and nothing else, so
+    // the signal is not diluted by a sample of the whole corpus. A substring match on the case path
+    // (`CRISOL_TEST262_FILTER=RegExp/property-escapes`), and when it is set every matching case runs:
+    // the sample exists for the undifferentiated whole, not for a deliberately chosen slice.
+    let filter = std::env::var("CRISOL_TEST262_FILTER").unwrap_or_default();
+    if !filter.is_empty() {
+        cases.retain(|case| case.to_string_lossy().contains(&filter));
+        assert!(!cases.is_empty(), "no case path contains {filter:?}");
+    }
     // **Empty counts as unset.** `std::env::var` answers `Ok("")` for a variable set to
     // nothing, and a workflow that computes this value writes an empty string when it means
     // "no" — so `is_ok()` alone would read that as a request for all twelve thousand cases,
     // which is the one outcome the sample size exists to avoid.
-    let all = std::env::var("CRISOL_TEST262_ALL").is_ok_and(|value| !value.is_empty());
+    let all = !filter.is_empty()
+        || std::env::var("CRISOL_TEST262_ALL").is_ok_and(|value| !value.is_empty());
     let limit = if all {
         cases.len()
     } else {

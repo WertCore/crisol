@@ -13,6 +13,13 @@ on:
           useful choice unless the wait is the point.
         required: false
         default: '1500'
+      test262_filter:
+        description: >-
+          Restrict the run to case paths containing this substring (for example
+          RegExp/property-escapes). When set, every matching case runs and the sample is ignored —
+          the way to drive one feature area to zero from CI without paying for the whole corpus.
+        required: false
+        default: ''
 
 # One run per ref. A push to a branch with an open pull request fires **two** workflows — the
 # `push` (or `pull_request`) event and any manual dispatch — and each spawns the whole matrix.
@@ -387,6 +394,7 @@ jobs:
         env:
           CRISOL_TEST262_SAMPLE: ${{ inputs.test262_sample }}
           CRISOL_TEST262_ALL: ${{ inputs.test262_sample == '' && '1' || '' }}
+          CRISOL_TEST262_FILTER: ${{ inputs.test262_filter }}
           # The full per-case failure list (not the capped examples) rides along in the uploaded
           # `test262.log`, so an area can be driven to zero from CI without a local run.
           CRISOL_TEST262_DUMP_FAILURES: "1"
