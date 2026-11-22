@@ -196,11 +196,9 @@ pub extern "C" fn crisol_add(left: u64, right: u64) -> u64 {
         // argument is dead *after* the call, but the collection happens *during* it), so without
         // rooting them here the other operand is freed mid-convert and `to_text` returns `None` —
         // surfacing as a spurious `NaN` under GC pressure (D-363 follow-up).
-        return with_rooted(&[left, right], || {
-            match (to_text(left), to_text(right)) {
-                (Some(a), Some(b)) => new_string(&(a + &b)),
-                _ => from_number(f64::NAN),
-            }
+        return with_rooted(&[left, right], || match (to_text(left), to_text(right)) {
+            (Some(a), Some(b)) => new_string(&(a + &b)),
+            _ => from_number(f64::NAN),
         });
     }
     // After the string check `+` behaves like the other arithmetic operators: two BigInts add,
