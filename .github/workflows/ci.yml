@@ -148,8 +148,13 @@ jobs:
       # been asserting its absence on every Linux run since `CRISOL_REQUIRE_TEST262` was
       # added. It passed locally because a developer runs `cargo build -p crisol-abi` by habit
       # before testing, which is precisely the difference a CI job exists to catch.
+      # Remove any cached archive first: `Swatinem/rust-cache` restores `target`, and a stale
+      # `libcrisol_abi.a` the test suite then links against produces results that have nothing to do
+      # with the commit under test. Deleting it forces a rebuild from the current source.
       - name: Build the runtime archive
-        run: cargo build -p crisol-abi
+        run: |
+          rm -f target/debug/libcrisol_abi.a target/release/libcrisol_abi.a
+          cargo build -p crisol-abi
 
       - name: Test
         run: cargo test --workspace --all-features
@@ -368,7 +373,9 @@ jobs:
           echo "CRISOL_REQUIRE_TEST262=1" >> "$GITHUB_ENV"
 
       - name: Build the runtime archive
-        run: cargo build -p crisol-abi
+        run: |
+          rm -f target/debug/libcrisol_abi.a target/release/libcrisol_abi.a
+          cargo build -p crisol-abi
 
       # **A large sample, not the whole corpus, by default.** Every case is a compile and a
       # link; twelve thousand of them is about five hours, which is past the ceiling above, and
