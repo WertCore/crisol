@@ -1166,6 +1166,28 @@ fn regexp_d_flag_reports_match_indices() {
     );
 }
 
+/// **The matcher uses the original source and flags, not the overridable view** — a `RegExp` keeps
+/// its `[[OriginalSource]]`/`[[OriginalFlags]]` as specification-internal slots, so shadowing the
+/// observable `source`, `flags`, or `unicode` property with `Object.defineProperty` changes what the
+/// property reports but never how the pattern matches.
+#[test]
+fn regexp_matcher_ignores_overridden_source_and_flags() {
+    check(
+        "source-shadowed",
+        "var re = /a/; Object.defineProperty(re, 'source', {value: 'b'}); return re.test('b') + '/' + re.test('a');",
+        "false/true",
+    );
+    check(
+        "flags-shadowed",
+        "var re = /a/i; Object.defineProperty(re, 'flags', {value: ''}); return re.test('A');",
+        "true",
+    );
+    check(
+        "unicode-shadowed",
+        "var re = /a/; Object.defineProperty(re, 'unicode', {value: true}); return re.unicode + '/' + re.test('a');",
+        "true/true",
+    );
+}
 /// **`+` roots both operands across the string conversion** — `object + string` converts the object
 /// with `to_text`, which allocates (an array joins its elements into a fresh string), and that
 /// allocation can collect. The operands arrive as plain arguments the caller's stack map does not

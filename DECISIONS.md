@@ -9478,3 +9478,24 @@ ABI path that holds a value across an allocation already uses. This is the gener
 exposed — any array freshly concatenated under collection hit it, not just match-index pairs. The arithmetic operators do
 **not** share it: `to_number` of an object short-circuits to `NaN` without converting (a deliberate choice — it would mean
 running user `valueOf`), so they never allocate while holding the other operand.
+
+## D-370
+
+**The matcher reads the original source and flags, not the observable view.**
+
+Status: Accepted
+
+A `RegExp` stores `source` and `flags` as ordinary own properties, and `with_pattern` (the builtin matcher) recompiled from
+them. That let a program change what a pattern matches: `Object.defineProperty(re, "source", { value: "b" })` made the
+matcher compile `/b/`, and `defineProperty(re, "unicode", { value: true })` fed the `flags` getter (which assembles its
+string from the individual boolean properties, per spec) a `"u"` the matcher then honoured. The specification forbids this —
+`RegExpBuiltinExec` reads `[[OriginalSource]]`/`[[OriginalFlags]]`, immutable slots fixed at construction, so shadowing the
+observable `source`/`flags`/`unicode` property changes what the property *reports* but never how the pattern *matches*.
+
+Crisol now keeps the originals in two internal slots written at construction with a new `define_internal` (non-writable,
+non-configurable, non-enumerable — a slot the program can neither redefine nor assign through, named with an unspellable
+`[[…]]` key like the iterator internals). `with_pattern` and the `d`-flag `hasIndices` check read those, falling back to the
+observable properties for a receiver built some other way or `RegExp.prototype` itself. The observable properties keep their
+current shape, so shadowing them still *reads back* as the shadow — only the match is insulated. This does not try to make
+the public `source`/`flags`/`global`/… prototype getters rather than own data properties (crisol's long-standing
+simplification); it fixes only the matcher's input, which is what the conformance gap was about.

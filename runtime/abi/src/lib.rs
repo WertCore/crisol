@@ -2200,6 +2200,15 @@ fn typed_natives_base() -> usize {
 /// Where a symbol keeps its description.
 const SYMBOL_DESCRIPTION: &str = "description";
 
+/// A `RegExp`'s immutable `[[OriginalSource]]` and `[[OriginalFlags]]` — what the matcher compiles
+/// from, kept apart from the observable `source`/`flags` properties a program is free to shadow.
+/// Non-writable, non-configurable, non-enumerable (via `define_internal`): a specification internal
+/// slot the matcher reads so that `defineProperty(re, "source", …)` changes the *view* but not the
+/// match. The names are deliberately unspellable identifiers so ordinary property access cannot name
+/// them, mirroring how the iterator internals are held.
+const REGEXP_ORIGINAL_SOURCE: &str = "[[OriginalSource]]";
+const REGEXP_ORIGINAL_FLAGS: &str = "[[OriginalFlags]]";
+
 /// `Symbol(description)`.
 ///
 /// **A symbol is a heap cell wearing a different tag.** It could have been a bare payload —
@@ -10214,8 +10223,13 @@ fn with_pattern<T>(
     this_value: u64,
     body: impl FnOnce(&mut crisol_builtins::JsRegExp) -> T,
 ) -> Option<T> {
-    let source = property_text(this_value, "source")?;
-    let flags_text = property_text(this_value, "flags")?;
+    // The matcher compiles from the immutable originals, not the observable `source`/`flags` — a
+    // program may shadow those, and the specification's `[[RegExpMatcher]]` is fixed at construction.
+    // The fallback keeps a receiver built some other way (or `RegExp.prototype` itself) working.
+    let source = property_text(this_value, REGEXP_ORIGINAL_SOURCE)
+        .or_else(|| property_text(this_value, "source"))?;
+    let flags_text = property_text(this_value, REGEXP_ORIGINAL_FLAGS)
+        .or_else(|| property_text(this_value, "flags"))?;
     let cursor = property_number(this_value, "lastIndex").unwrap_or(0.0);
 
     let (outcome, moved) = PATTERNS.with(|cache| {
@@ -10304,7 +10318,11 @@ extern "C" fn regexp_exec(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
-    let has_indices = property_text(this_value, "flags").is_some_and(|flags| flags.contains('d'));
+    // `hasIndices` is read from the original flags for the same reason the matcher is: the result's
+    // shape is fixed at construction, not by a shadowed `flags` property.
+    let has_indices = property_text(this_value, REGEXP_ORIGINAL_FLAGS)
+        .or_else(|| property_text(this_value, "flags"))
+        .is_some_and(|flags| flags.contains('d'));
     // Rooted across the array's allocation: `this_value` reached here in a register and the
     // text came out of it.
     match with_pattern(this_value, |pattern| pattern.exec(&text)) {
@@ -17528,6 +17546,32 @@ impl Runtime {
                 slot.index(),
                 crisol_value::Attributes {
                     writable: true,
+                    enumerable: false,
+                    configurable: false,
+                    accessor: false,
+                },
+            );
+        }
+    }
+
+    /// Like [`define_hidden`], but also non-writable — a slot the program can neither redefine
+    /// nor assign through, standing in for a specification internal slot that the program cannot
+    /// reach at all. A `RegExp` keeps its original source and flags this way so that overriding
+    /// the observable `source`/`flags`/`unicode` properties cannot change how the matcher matches
+    /// (the matcher reads `[[OriginalSource]]`/`[[OriginalFlags]]`, not the overridable view).
+    fn define_internal(&self, object: GcRef, name: &str, value: Value) {
+        self.define(object, name, value);
+        let key = PropertyKey::new(name);
+        let slot = self
+            .heap
+            .shape_of(object)
+            .and_then(|shape| self.shapes.borrow().lookup(shape, &key));
+        if let Some(slot) = slot {
+            self.heap.set_attributes(
+                object,
+                slot.index(),
+                crisol_value::Attributes {
+                    writable: false,
                     enumerable: false,
                     configurable: false,
                     accessor: false,
@@ -26105,10 +26149,18 @@ pub unsafe extern "C" fn crisol_create_regexp(
         let source_value = new_string(&source);
         with_runtime(|runtime| {
             runtime.define(handle, "source", Value::from_bits(source_value));
+            // The immutable original, beside the observable one: the matcher reads this so a later
+            // `defineProperty(re, "source", …)` cannot change what the pattern matches.
+            runtime.define_internal(
+                handle,
+                REGEXP_ORIGINAL_SOURCE,
+                Value::from_bits(source_value),
+            );
         });
         let flags_value = new_string(&flags_text);
         with_runtime(|runtime| {
             runtime.define(handle, "flags", Value::from_bits(flags_value));
+            runtime.define_internal(handle, REGEXP_ORIGINAL_FLAGS, Value::from_bits(flags_value));
             // `lastIndex` is the cursor, and it is a property because a program may assign to
             // it — the compiled pattern is set from it rather than owning it.
             runtime.define(handle, "lastIndex", Value::number(0.0));
