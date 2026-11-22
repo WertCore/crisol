@@ -53,7 +53,12 @@ jobs:
             os: macos-latest
             budget_mib: 10 # observed 4.6 (phys_footprint)
           - name: Linux (x86_64)
-            os: ubuntu-latest
+            # **Pinned to 24.04, not `ubuntu-latest`.** `latest` rolled to 26.04, whose lavapipe
+            # (mesa 26.0.8) segfaults partway through the `crisol-render-wgpu` software-Vulkan render
+            # tests — a driver crash in the CI image, not the renderer (it passes on macOS, Windows,
+            # and this same 24.04 lavapipe that the arm64 job already uses). Pin until `latest` ships
+            # a lavapipe that does not crash.
+            os: ubuntu-24.04
             budget_mib: 28 # observed 13.5 (VmRSS)
           # **Here to separate "Linux" from "x86-64" in D-142.** The collector fails on
           # `Linux (x86_64)` and passes on `macOS (arm64)`, which are two differences at once —
