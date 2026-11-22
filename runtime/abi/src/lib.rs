@@ -601,33 +601,35 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
     let frames = unsafe { walk_frames(limit) };
     if !DIAGNOSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         let rows = maps.map_or(0, |m| m.rows().len());
-        let matched = frames
+        // For each frame's return address, the signed distance to the nearest safepoint address
+        // (`row.function + code_offset`) over every row. A small consistent delta (±4/±8) is an
+        // off-by-N in `code_offset`; a huge one means the return address is in a function no row
+        // names (wrong base / wrong relocation). `in_fn` says whether the return address falls
+        // inside *some* row's function at all (base ≤ ret < base + 64 KiB), separating "wrong
+        // offset" from "wrong function entirely".
+        let nearest: Vec<String> = frames
             .iter()
-            .filter(|f| maps.is_some_and(|m| !m.live_at(f.return_address).is_empty()))
-            .count();
-        let first_rows: Vec<String> = maps
-            .map(|m| {
-                m.rows()
-                    .iter()
-                    .take(3)
-                    .map(|r| {
-                        format!(
-                            "fn={:p}+{:#x}@off{}",
-                            r.function, r.code_offset, r.frame_offset
-                        )
-                    })
-                    .collect()
+            .map(|f| {
+                let ret = f.return_address as isize;
+                let (delta, in_fn) = maps.map_or((0isize, false), |m| {
+                    let delta = m
+                        .rows()
+                        .iter()
+                        .map(|r| ret - (r.function.wrapping_add(r.code_offset as usize) as isize))
+                        .min_by_key(|d| d.abs())
+                        .unwrap_or(0);
+                    let in_fn = m.rows().iter().any(|r| {
+                        let base = r.function as isize;
+                        ret >= base && ret < base + 0x1_0000
+                    });
+                    (delta, in_fn)
+                });
+                format!("Δ{delta:#x}/in_fn={in_fn}")
             })
-            .unwrap_or_default();
-        let first_ret: Vec<String> = frames
-            .iter()
-            .take(3)
-            .map(|f| format!("{:p}", f.return_address))
             .collect();
         eprintln!(
-            "crisol-gc-diag: maps={} rows={rows} frames={} matched_frames={matched} first_rows={first_rows:?} first_ret={first_ret:?}",
+            "crisol-gc-diag: maps={} rows={rows} frames={} nearest={nearest:?}",
             if maps.is_some() { "Some" } else { "None" },
-            frames.len(),
         );
     }
     let Some(maps) = maps else {
