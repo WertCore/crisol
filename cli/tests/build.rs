@@ -1138,6 +1138,57 @@ fn regexp_has_a_species_getter() {
     );
 }
 
+/// **The `d` flag carries an `indices` array** (D-363) — `[start, end]` code-unit pairs per group,
+/// the whole match at `0`, a null-prototype `indices.groups` for named groups, and `undefined` for a
+/// group that did not participate. Absent without the flag.
+#[test]
+fn regexp_d_flag_reports_match_indices() {
+    check(
+        "indices-pairs",
+        "var m = \"ab\".match(/(a)(b)/d); return m.indices[0] + \"/\" + m.indices[1] + \"/\" + m.indices[2];",
+        "0,2/0,1/1,2",
+    );
+    check(
+        "indices-named",
+        "var m = /(?<x>a)/d.exec(\"a\"); return m.indices.groups.x + \"/\" + (Object.getPrototypeOf(m.indices.groups) === null);",
+        "0,1/true",
+    );
+    check(
+        "indices-nonparticipating",
+        "var m = /(a)|(b)/d.exec(\"a\"); return typeof m.indices[2];",
+        "undefined",
+    );
+    // No `d` flag: no `indices`. And `indices.groups` is `undefined` without named groups.
+    check(
+        "indices-absent-and-no-groups",
+        "return typeof /(a)/.exec(\"a\").indices + \"/\" + typeof /(a)/d.exec(\"a\").indices.groups;",
+        "undefined/undefined",
+    );
+}
+
+/// **`+` roots both operands across the string conversion** — `object + string` converts the object
+/// with `to_text`, which allocates (an array joins its elements into a fresh string), and that
+/// allocation can collect. The operands arrive as plain arguments the caller's stack map does not
+/// cover — an argument is dead *after* the call, but the collection happens *during* it — so the
+/// unconverted operand must be rooted here or it is freed mid-convert and the result is a spurious
+/// `NaN`. Object-on-the-left is the case that converts first, so it is the one that fails without the
+/// fix; this exercises both orders under the harness's GC-stress pass.
+#[test]
+fn addition_roots_both_operands_across_conversion() {
+    check("object-left", "var a = [1, 2]; return a + \"/\";", "1,2/");
+    check("object-right", "var a = [1, 2]; return \"/\" + a;", "/1,2");
+    check(
+        "object-both",
+        "var a = [1, 2]; var b = [3, 4]; return a + \"|\" + b;",
+        "1,2|3,4",
+    );
+    check(
+        "nested-array-elements",
+        "var a = [[1, 2], [3, 4]]; return a[0] + \"/\" + a[1];",
+        "1,2/3,4",
+    );
+}
+
 /// **Duplicate named groups report the participating capture** (D-364) — the same name in distinct
 /// alternatives (ES2025) resolves `groups[name]` to the alternative that matched, not whichever the
 /// list held last, regardless of which side participates.
@@ -1152,6 +1203,11 @@ fn regexp_duplicate_named_groups_pick_the_participant() {
         "dup-named-second",
         "return \"..ba\".match(/(?<x>a)|(?<x>b)/).groups.x;",
         "b",
+    );
+    check(
+        "dup-named-indices",
+        "return \"..ab\".match(/(?<x>a)|(?<x>b)/d).indices.groups.x.join(\",\");",
+        "2,3",
     );
 }
 

@@ -190,10 +190,18 @@ pub extern "C" fn crisol_add(left: u64, right: u64) -> u64 {
     // would turn `{} + ""` into something that reads plausibly and is wrong.
     let is_string = |bits: u64| Value::from_bits(bits).kind() == crisol_value::Kind::String;
     if is_string(left) || is_string(right) {
-        return match (to_text(left), to_text(right)) {
-            (Some(a), Some(b)) => new_string(&(a + &b)),
-            _ => from_number(f64::NAN),
-        };
+        // **Both operands are rooted across the conversion.** `to_text` of an object allocates —
+        // an array joins its elements into a fresh string — and that allocation can collect. The
+        // operands arrived as plain arguments, which the caller's stack map does not cover (an
+        // argument is dead *after* the call, but the collection happens *during* it), so without
+        // rooting them here the other operand is freed mid-convert and `to_text` returns `None` —
+        // surfacing as a spurious `NaN` under GC pressure (D-363 follow-up).
+        return with_rooted(&[left, right], || {
+            match (to_text(left), to_text(right)) {
+                (Some(a), Some(b)) => new_string(&(a + &b)),
+                _ => from_number(f64::NAN),
+            }
+        });
     }
     // After the string check `+` behaves like the other arithmetic operators: two BigInts add,
     // and a BigInt meeting a Number is a `TypeError`.
@@ -10298,10 +10306,13 @@ extern "C" fn regexp_exec(
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
+    let has_indices = property_text(this_value, "flags").is_some_and(|flags| flags.contains('d'));
     // Rooted across the array's allocation: `this_value` reached here in a register and the
     // text came out of it.
     match with_pattern(this_value, |pattern| pattern.exec(&text)) {
-        Some(Some(found)) => with_rooted(&[this_value], || match_result(&text, &found)),
+        Some(Some(found)) => {
+            with_rooted(&[this_value], || match_result(&text, &found, has_indices))
+        }
         // **`null`, not `undefined`**, which is what `while ((m = re.exec(s)) !== null)` tests.
         Some(None) => Value::NULL.to_bits(),
         // **A receiver with no `[[RegExpMatcher]]` is a `TypeError`, not a null match** — calling
@@ -12089,7 +12100,7 @@ extern "C" fn string_match(
         let Some(found) = compiled.exec(&text) else {
             return Value::NULL.to_bits();
         };
-        return match_result(&text, &found);
+        return match_result(&text, &found, flags.contains('d'));
     }
     let matched: Vec<String> = compiled
         .all_matches(&text)
@@ -12161,7 +12172,7 @@ extern "C" fn string_match_all(
             call_value(matcher, pattern, &[subject])
         });
     }
-    let Some((mut compiled, _flags)) = pattern_argument(pattern) else {
+    let Some((mut compiled, flags)) = pattern_argument(pattern) else {
         return new_array_iterator(array_of_values(&[]), 1.0);
     };
     let founds = compiled.all_matches(&text);
@@ -12173,7 +12184,7 @@ extern "C" fn string_match_all(
             return Value::UNDEFINED.to_bits();
         };
         for (index, found) in founds.iter().enumerate() {
-            let result = match_result(&text, found);
+            let result = match_result(&text, found, flags.contains('d'));
             with_runtime(|runtime| {
                 runtime
                     .heap
@@ -12273,12 +12284,73 @@ fn named_groups_object(text: &str, found: &crisol_builtins::Captured) -> u64 {
     object
 }
 
+/// A `[start, end]` index pair in **code units**, or `undefined` for a group that did not
+/// participate — the shape a `d`-flag `indices` entry takes.
+fn index_pair(text: &str, range: Option<(usize, usize)>) -> u64 {
+    let Some((start, end)) = range else {
+        return Value::UNDEFINED.to_bits();
+    };
+    #[expect(clippy::cast_precision_loss, reason = "indices into a string")]
+    let pair = [
+        Value::number(text.get(..start).unwrap_or_default().encode_utf16().count() as f64)
+            .to_bits(),
+        Value::number(text.get(..end).unwrap_or_default().encode_utf16().count() as f64).to_bits(),
+    ];
+    array_of_values(&pair)
+}
+
+/// The `indices.groups` object for a `d`-flag match — named groups to `[start, end]` pairs, with a
+/// null prototype, or `undefined` when the pattern names nothing (mirrors [`named_groups_object`]).
+fn named_indices_object(text: &str, found: &crisol_builtins::Captured) -> u64 {
+    if found.named.is_empty() {
+        return Value::UNDEFINED.to_bits();
+    }
+    let object = crisol_create_object();
+    with_rooted(&[object], || {
+        let Some(handle) = handle_of(object) else {
+            return;
+        };
+        with_runtime(|runtime| runtime.heap.set_prototype(handle, None));
+        for (name, range) in deduped_named(found) {
+            let value = with_rooted(&[object], || index_pair(text, range));
+            with_rooted(&[object, value], || {
+                with_runtime(|runtime| runtime.define(handle, name, Value::from_bits(value)));
+            });
+        }
+    });
+    object
+}
+
+/// `MakeMatchIndicesIndexPairArray` — the `indices` array a `d`-flag match carries: the whole match
+/// at `0`, then a `[start, end]` pair per group, plus `indices.groups` for named groups.
+///
+/// **Each pair is a heap array**, so they are collected into a `Vec` with the ones built so far held
+/// live across the next allocation (D-127), then the outer array is assembled from them — rather than
+/// nesting `with_new_array`, which let a pair be collected under GC stress and read back as `NaN`.
+fn match_indices_array(text: &str, found: &crisol_builtins::Captured) -> u64 {
+    let mut pairs: Vec<u64> = Vec::with_capacity(found.groups.len() + 1);
+    let whole = index_pair(text, Some((found.start, found.end)));
+    pairs.push(whole);
+    for group in &found.groups {
+        let value = with_rooted(&pairs, || index_pair(text, *group));
+        pairs.push(value);
+    }
+    let array = with_rooted(&pairs, || array_of_values(&pairs));
+    let groups = with_rooted(&[array], || named_indices_object(text, found));
+    with_rooted(&[array, groups], || {
+        if let Some(handle) = handle_of(array) {
+            with_runtime(|runtime| runtime.define(handle, "groups", Value::from_bits(groups)));
+        }
+    });
+    array
+}
+
 /// One match as the array `exec` answers: the whole match, then the groups, then `index`,
-/// `input`, and `groups` (the named-capture object).
+/// `input`, `groups` (the named-capture object), and — under the `d` flag — `indices`.
 ///
 /// Shared by `exec` and `match`, because a caller that compares the two — and test262 does,
 /// repeatedly — is comparing objects rather than the text in them.
-fn match_result(text: &str, found: &crisol_builtins::Captured) -> u64 {
+fn match_result(text: &str, found: &crisol_builtins::Captured, has_indices: bool) -> u64 {
     with_new_array(found.groups.len() + 1, |array| {
         let whole = new_string(text.get(found.start..found.end).unwrap_or_default());
         with_runtime(|runtime| {
@@ -12309,6 +12381,14 @@ fn match_result(text: &str, found: &crisol_builtins::Captured) -> u64 {
         with_rooted(&[groups], || {
             with_runtime(|runtime| runtime.define(array, "groups", Value::from_bits(groups)));
         });
+        // `indices` (the `d` flag): a `[start, end]` pair per group, built after the array holds its
+        // elements so a collection during its allocation finds them rooted through the live array.
+        if has_indices {
+            let indices = match_indices_array(text, found);
+            with_rooted(&[indices], || {
+                with_runtime(|runtime| runtime.define(array, "indices", Value::from_bits(indices)));
+            });
+        }
         array.to_value().to_bits()
     })
 }

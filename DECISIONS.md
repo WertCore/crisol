@@ -9365,17 +9365,15 @@ a RegExp with no match is still `null`/`false`, but a receiver `with_pattern` ca
 
 **The `d` flag reports match indices.**
 
-Status: Reverted
+Status: Accepted
 
-**Reverted** — the `indices` pair arrays are read back as `NaN` under GC stress. The "x86_64-only" framing was wrong (it
-came from a stale `libcrisol_abi.a` masking the local run): with a freshly built archive it **reproduces on arm64 too**, and
-the shape is specific — `/re/d.exec(s)` passes GC stress, but `s.match(/re/d)` with two or more capture groups fails, and
-only the *first* (whole-match) pair corrupts. So it is not the pair-building rooting in `match_indices_array` (that is the
-same for both paths and `exec` is clean) but something about the indices-bearing result surviving the deeper `@@match` call
-chain under aggressive collection — a GC tracing/stack-scan subtlety below the RegExp layer. Reordering the build (indices
-before the result array) did not help. Left reverted and accurately characterised for a focused GC-internals pass; the
-original design is below. (The subagent proved the GC traces accessor-pair/array getters correctly for the *bootstrap*
-`Symbol.species` case — D-366 — so the hole is specific to the per-call match result flow, not element tracing in general.)
+**Re-landed after the GC-stress `NaN` was root-caused (see D-369).** The feature was briefly reverted because
+`"ab".match(/(a)(b)/d).indices[0]` read back `NaN` under GC stress while `/re/d.exec(s)` did not. The earlier note blamed a
+"GC tracing subtlety below the RegExp layer" and an "x86_64-only" quirk — both wrong. The real fault was general and had
+nothing to do with the `d` flag or `match_indices_array` (whose rooting is correct, which is why `exec` was always clean):
+`crisol_add` did not root its operands across the string conversion, so `m.indices[0] + "/"` — an *array* on the left of `+`
+— freed the `"/"` string while converting the array, and `to_text` returning `None` surfaces as `NaN`. The d-flag test was
+simply the first thing to concatenate a freshly-built array under GC pressure. Fixed in D-369; the feature below is unchanged.
 
 With `d`, a match result carries an `indices` array beside its captures: `indices[0]` is the `[start, end]` of the whole
 match, `indices[i]` the pair for group `i` (or `undefined` where the group did not participate), and `indices.groups` a
@@ -9461,3 +9459,22 @@ doing the right thing and getting no credit. `attempt` now reads the `negative` 
 build is `passed`, and one that compiles when it should not have is `failed`. This is what a standard test262 harness does —
 it credits the refusal without re-deriving the exact message, since the only error a parse phase raises is a `SyntaxError`.
 Runtime-phase negatives are left as they were (scored by what they throw), to avoid crediting a throw of the wrong type.
+
+## D-369
+
+**`+` roots both operands across the string conversion.**
+
+Status: Accepted
+
+`crisol_add` took the string-concatenation branch when either operand was a string and ran `(to_text(left),
+to_text(right))`. `to_text` of an object **allocates** — an array joins its elements into a fresh string — and under GC
+pressure that allocation collects. The two operands arrived as plain C arguments, which the caller's stack map does not
+cover: a safepoint is recorded at the *return address*, where the call's arguments are already dead, but the collection
+happens *during* the call. So whichever operand had not yet been converted was unrooted and could be freed mid-convert;
+`to_text` then returned `None` and `+` produced a spurious `NaN`. The asymmetry this created is the tell — `obj + "str"`
+converts the object first (allocating while `"str"` is still needed) and failed, while `"str" + obj` converts `""`/`"str"`
+first (no allocation) and passed. The fix wraps the branch in `with_rooted(&[left, right], …)`, the same idiom every other
+ABI path that holds a value across an allocation already uses. This is the general bug that D-363's `indices` test first
+exposed — any array freshly concatenated under collection hit it, not just match-index pairs. The arithmetic operators do
+**not** share it: `to_number` of an object short-circuits to `NaN` without converting (a deliberate choice — it would mean
+running user `valueOf`), so they never allocate while holding the other operand.
