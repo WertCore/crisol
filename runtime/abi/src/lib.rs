@@ -599,39 +599,87 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
     let maps = stack_maps();
     // SAFETY: the caller promises the program is stopped at a safepoint.
     let frames = unsafe { walk_frames(limit) };
+    // Per-collection match count to a file (local capture, where the run passes so stderr is
+    // hidden). Answers "does compiled_roots ever match a frame on this platform?" — the question
+    // the first-collection dump cannot, since the first collection is during shadow-stack-rooted
+    // setup. If macOS shows matched>0 for a closure test and Linux never does, the scan itself is
+    // the gap.
+    if std::env::var_os("CRISOL_GCDUMP").is_some() {
+        let matched = frames
+            .iter()
+            .filter(|f| maps.is_some_and(|m| !m.live_at(f.return_address).is_empty()))
+            .count();
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/gcmatch.log")
+        {
+            let _ = writeln!(
+                f,
+                "matched={matched} frames={} rows={}",
+                frames.len(),
+                maps.map_or(0, |m| m.rows().len())
+            );
+        }
+    }
     if !DIAGNOSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let rows = maps.map_or(0, |m| m.rows().len());
-        // For each frame's return address, the signed distance to the nearest safepoint address
-        // (`row.function + code_offset`) over every row. A small consistent delta (±4/±8) is an
-        // off-by-N in `code_offset`; a huge one means the return address is in a function no row
-        // names (wrong base / wrong relocation). `in_fn` says whether the return address falls
-        // inside *some* row's function at all (base ≤ ret < base + 64 KiB), separating "wrong
-        // offset" from "wrong function entirely".
-        let nearest: Vec<String> = frames
+        // Full raw dump of the first collection's scan, normalised against the first row's function
+        // so the structure survives ASLR and is comparable across a working platform (macOS) and a
+        // broken one (Linux/Windows). Rows: each safepoint address `function + code_offset`. Frames:
+        // each return address. On a working scan some frame equals some row exactly (delta 0). To a
+        // stderr line for CI (shown on a failing subprocess) and, when `CRISOL_GCDUMP` is set, to
+        // `/tmp/gcdump.log` so the same can be captured locally where the run passes.
+        let anchor = maps
+            .and_then(|m| m.rows().first())
+            .map_or(0usize, |r| r.function as usize);
+        let rowlist: Vec<String> = maps
+            .map(|m| {
+                m.rows()
+                    .iter()
+                    .map(|r| {
+                        let sp = r.function.wrapping_add(r.code_offset as usize) as usize;
+                        format!("{:#x}", sp.wrapping_sub(anchor) as isize)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let framelist: Vec<String> = frames
             .iter()
             .map(|f| {
-                let ret = f.return_address as isize;
-                let (delta, in_fn) = maps.map_or((0isize, false), |m| {
-                    let delta = m
-                        .rows()
-                        .iter()
-                        .map(|r| ret - (r.function.wrapping_add(r.code_offset as usize) as isize))
-                        .min_by_key(|d| d.abs())
-                        .unwrap_or(0);
-                    let in_fn = m.rows().iter().any(|r| {
-                        let base = r.function as isize;
-                        ret >= base && ret < base + 0x1_0000
-                    });
-                    (delta, in_fn)
-                });
-                format!("Δ{delta:#x}/in_fn={in_fn}")
+                format!(
+                    "{:#x}",
+                    (f.return_address as usize).wrapping_sub(anchor) as isize
+                )
             })
             .collect();
-        eprintln!(
-            "crisol-gc-diag: maps={} rows={rows} frames={} nearest={nearest:?}",
+        // The unique `row.function` values (the table is static, so one collection shows them all).
+        // If ELF collapses them to one while Mach-O spreads them, the relocation is the bug.
+        let mut fns: Vec<usize> = maps
+            .map(|m| m.rows().iter().map(|r| r.function as usize).collect())
+            .unwrap_or_default();
+        fns.sort_unstable();
+        fns.dedup();
+        let fns_rel: Vec<String> = fns
+            .iter()
+            .map(|a| format!("{:#x}", a.wrapping_sub(anchor) as isize))
+            .collect();
+        let line = format!(
+            "crisol-gc-diag: maps={} anchor={anchor:#x} uniq_fns={} fns[-anchor]={fns_rel:?} rows[sp-anchor]={rowlist:?} frames[ret-anchor]={framelist:?}",
             if maps.is_some() { "Some" } else { "None" },
-            frames.len(),
+            fns.len(),
         );
+        eprintln!("{line}");
+        if std::env::var_os("CRISOL_GCDUMP").is_some() {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/gcdump.log")
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
     }
     let Some(maps) = maps else {
         return Vec::new();
