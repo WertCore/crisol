@@ -1166,6 +1166,30 @@ fn regexp_d_flag_reports_match_indices() {
     );
 }
 
+/// **The `Symbol.*` methods read `flags` with `ToString`**, so a throwing `toString` on the flags
+/// value propagates rather than being swallowed to `""` (the `flags-tostring-error` cases).
+#[test]
+fn regexp_symbol_methods_propagate_flags_tostring_throw() {
+    let thrower = "var o = {flags: {toString: function () { throw new RangeError('x'); }}, \
+                   exec: function () { return null; }, source: 'a', global: true}; ";
+    check(
+        "match-flags-tostring",
+        &format!(
+            "{thrower} try {{ RegExp.prototype[Symbol.match].call(o, 's'); return 'no'; }} \
+             catch (e) {{ return e.constructor.name; }}"
+        ),
+        "RangeError",
+    );
+    check(
+        "replace-flags-tostring",
+        &format!(
+            "{thrower} try {{ RegExp.prototype[Symbol.replace].call(o, 's', 'x'); return 'no'; }} \
+             catch (e) {{ return e.constructor.name; }}"
+        ),
+        "RangeError",
+    );
+}
+
 /// **`exec`/`test` consult and update `lastIndex` only when global or sticky.** A non-global,
 /// non-sticky match starts at zero (ignoring `lastIndex`) and leaves it untouched; a sticky match
 /// writes it back with `Throw`, so a non-writable `lastIndex` aborts.

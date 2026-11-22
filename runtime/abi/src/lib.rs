@@ -11025,7 +11025,13 @@ extern "C" fn regexp_symbol_match(
         if Value::from_bits(flags).is_exception() {
             return flags;
         }
-        let global = to_text(flags).is_some_and(|flags| flags.contains('g'));
+        // `ToString(flags)` — a throwing `toString` on the flags value is the answer, not swallowed
+        // to `""` (`flags-tostring-error`).
+        let flags_text = match string_argument(flags) {
+            Ok(text) => text,
+            Err(thrown) => return thrown,
+        };
+        let global = flags_text.contains('g');
         if !global {
             return regexp_exec_value(this_value, subject);
         }
@@ -11382,7 +11388,11 @@ fn replace_via_exec(text: &str, rx: u64, replacement: u64) -> u64 {
     if Value::from_bits(flags).is_exception() {
         return flags;
     }
-    let flags_text = to_text(flags).unwrap_or_default();
+    // `ToString(flags)` — a throwing `toString` propagates rather than being swallowed to `""`.
+    let flags_text = match string_argument(flags) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
     let global = flags_text.contains('g');
     let unicode = flags_text.contains('u') || flags_text.contains('v');
     if global && let Some(thrown) = set_honoring(rx, "lastIndex", Value::number(0.0).to_bits()) {
@@ -11646,7 +11656,11 @@ fn split_via_exec(text: &str, rx: u64, cap: usize) -> u64 {
     if Value::from_bits(flags).is_exception() {
         return flags;
     }
-    let flags_text = to_text(flags).unwrap_or_default();
+    // `ToString(flags)` — a throwing `toString` propagates rather than being swallowed to `""`.
+    let flags_text = match string_argument(flags) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
     let unicode = flags_text.contains('u') || flags_text.contains('v');
     let new_flags = if flags_text.contains('y') {
         flags_text
@@ -11836,7 +11850,12 @@ extern "C" fn regexp_symbol_match_all(
         if Value::from_bits(flags).is_exception() {
             return flags;
         }
-        let global = to_text(flags).is_some_and(|flags| flags.contains('g'));
+        // `ToString(flags)` — a throwing `toString` propagates (`this-tostring-flags-throws`).
+        let flags_text = match string_argument(flags) {
+            Ok(text) => text,
+            Err(thrown) => return thrown,
+        };
+        let global = flags_text.contains('g');
         make_regexp_string_iterator(this_value, subject, global)
     })
 }
