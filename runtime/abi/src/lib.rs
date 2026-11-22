@@ -630,6 +630,7 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
         eprintln!(
             "crisol-gc-diag: maps={} rows={rows} frames={} nearest={nearest:?}",
             if maps.is_some() { "Some" } else { "None" },
+            frames.len(),
         );
     }
     let Some(maps) = maps else {
