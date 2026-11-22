@@ -10274,7 +10274,16 @@ fn with_pattern<T>(
     // thrown value from a failing write-back, `Some(Ok)` the body's outcome, `None` a receiver that
     // is not a usable pattern.
     let global_or_sticky = flags_text.contains('g') || flags_text.contains('y');
-    let cursor = property_number(this_value, "lastIndex").unwrap_or(0.0);
+    // `ToLength(? Get(rx, "lastIndex"))` — a throwing `lastIndex` getter or a value whose coercion
+    // throws aborts the call (the `coerce-lastindex-err` cases), rather than being read as zero.
+    let last_index = property_of(this_value, "lastIndex");
+    if Value::from_bits(last_index).is_exception() {
+        return Some(Err(last_index));
+    }
+    let cursor = match to_length_bits(last_index) {
+        Ok(index) => index,
+        Err(thrown) => return Some(Err(thrown)),
+    };
 
     let (outcome, moved) = PATTERNS.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -10285,16 +10294,7 @@ fn with_pattern<T>(
             cache.insert(key.clone(), compiled);
         }
         let pattern = cache.get_mut(&key)?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a cursor past the end is handled by `exec`, and a negative one clamps"
-        )]
-        let start = if global_or_sticky {
-            cursor.max(0.0) as usize
-        } else {
-            0
-        };
+        let start = if global_or_sticky { cursor } else { 0 };
         pattern.set_last_index(start);
         let outcome = body(pattern);
         Some((outcome, pattern.last_index()))

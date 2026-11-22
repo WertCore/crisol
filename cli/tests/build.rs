@@ -1182,6 +1182,12 @@ fn regexp_exec_lastindex_semantics() {
          try { re.exec('a'); return 'no-throw'; } catch (e) { return e.constructor.name; }",
         "TypeError",
     );
+    check(
+        "coerce-lastindex-err",
+        "var re = /a/y; re.lastIndex = {valueOf: function () { throw new RangeError('x'); }}; \
+         try { re.exec('a'); return 'no-throw'; } catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
 }
 
 /// **A global `@@match` sets `lastIndex` with `Throw`**, so a non-writable `lastIndex` (or a setter
