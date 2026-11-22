@@ -1166,6 +1166,24 @@ fn regexp_d_flag_reports_match_indices() {
     );
 }
 
+/// **`exec`/`test` consult and update `lastIndex` only when global or sticky.** A non-global,
+/// non-sticky match starts at zero (ignoring `lastIndex`) and leaves it untouched; a sticky match
+/// writes it back with `Throw`, so a non-writable `lastIndex` aborts.
+#[test]
+fn regexp_exec_lastindex_semantics() {
+    check(
+        "non-global-ignores-lastindex",
+        "var re = /a/; re.lastIndex = 3; var m = re.exec('xxa'); return m.index + '/' + re.lastIndex;",
+        "2/3",
+    );
+    check(
+        "sticky-set-lastindex-err",
+        "var re = /a/y; Object.defineProperty(re, 'lastIndex', {value: 0, writable: false}); \
+         try { re.exec('a'); return 'no-throw'; } catch (e) { return e.constructor.name; }",
+        "TypeError",
+    );
+}
+
 /// **A global `@@match` sets `lastIndex` with `Throw`**, so a non-writable `lastIndex` (or a setter
 /// that throws) aborts the match rather than being silently ignored — the `set-lastindex-err` cases.
 #[test]

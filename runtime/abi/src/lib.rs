@@ -10261,7 +10261,7 @@ extern "C" fn regexp_has_indices_getter(
 fn with_pattern<T>(
     this_value: u64,
     body: impl FnOnce(&mut crisol_builtins::JsRegExp) -> T,
-) -> Option<T> {
+) -> Option<Result<T, u64>> {
     // The matcher compiles from the immutable originals, not the observable `source`/`flags` — a
     // program may shadow those, and the specification's `[[RegExpMatcher]]` is fixed at construction.
     // The fallback keeps a receiver built some other way (or `RegExp.prototype` itself) working.
@@ -10269,6 +10269,11 @@ fn with_pattern<T>(
         .or_else(|| property_text(this_value, "source"))?;
     let flags_text = property_text(this_value, REGEXP_ORIGINAL_FLAGS)
         .or_else(|| property_text(this_value, "flags"))?;
+    // **Only a global or sticky match consults and updates `lastIndex`** (`RegExpBuiltinExec`): one
+    // that is neither always starts at zero and leaves `lastIndex` untouched. `Some(Err)` is the
+    // thrown value from a failing write-back, `Some(Ok)` the body's outcome, `None` a receiver that
+    // is not a usable pattern.
+    let global_or_sticky = flags_text.contains('g') || flags_text.contains('y');
     let cursor = property_number(this_value, "lastIndex").unwrap_or(0.0);
 
     let (outcome, moved) = PATTERNS.with(|cache| {
@@ -10285,21 +10290,27 @@ fn with_pattern<T>(
             clippy::cast_sign_loss,
             reason = "a cursor past the end is handled by `exec`, and a negative one clamps"
         )]
-        let start = cursor.max(0.0) as usize;
+        let start = if global_or_sticky {
+            cursor.max(0.0) as usize
+        } else {
+            0
+        };
         pattern.set_last_index(start);
         let outcome = body(pattern);
         Some((outcome, pattern.last_index()))
     })?;
 
-    // Written back through the ordinary path, so a `lastIndex` the program made non-writable
-    // is honoured rather than bypassed.
-    if let Some(handle) = handle_of(this_value) {
-        let name = "lastIndex".to_owned();
+    // **A global or sticky match writes `lastIndex` back with `Throw`** — a non-writable `lastIndex`
+    // or a setter that throws aborts the call rather than being silently bypassed. A non-global,
+    // non-sticky match does not write it at all.
+    if global_or_sticky {
         #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
-        let value = Value::number(moved as f64);
-        with_runtime(|runtime| runtime.define(handle, &name, value));
+        let value = Value::number(moved as f64).to_bits();
+        if let Some(thrown) = set_honoring(this_value, "lastIndex", value) {
+            return Some(Err(thrown));
+        }
     }
-    Some(outcome)
+    Some(Ok(outcome))
 }
 
 /// A named property of `object`, as text, or `None` if it is not there.
@@ -10336,7 +10347,9 @@ extern "C" fn regexp_test(
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
     match with_pattern(this_value, |pattern| pattern.test(&text)) {
-        Some(found) => (if found { Value::TRUE } else { Value::FALSE }).to_bits(),
+        Some(Ok(found)) => (if found { Value::TRUE } else { Value::FALSE }).to_bits(),
+        // A throwing write-back of `lastIndex` is the answer.
+        Some(Err(thrown)) => thrown,
         // As `exec`: a non-RegExp receiver is a `TypeError`, not a quiet `false`.
         None => raise("RegExp.prototype.test needs a RegExp receiver", "TypeError"),
     }
@@ -10365,11 +10378,13 @@ extern "C" fn regexp_exec(
     // Rooted across the array's allocation: `this_value` reached here in a register and the
     // text came out of it.
     match with_pattern(this_value, |pattern| pattern.exec(&text)) {
-        Some(Some(found)) => {
+        Some(Ok(Some(found))) => {
             with_rooted(&[this_value], || match_result(&text, &found, has_indices))
         }
         // **`null`, not `undefined`**, which is what `while ((m = re.exec(s)) !== null)` tests.
-        Some(None) => Value::NULL.to_bits(),
+        Some(Ok(None)) => Value::NULL.to_bits(),
+        // A throwing write-back of `lastIndex` is the answer.
+        Some(Err(thrown)) => thrown,
         // **A receiver with no `[[RegExpMatcher]]` is a `TypeError`, not a null match** — calling
         // `RegExp.prototype.exec` as a plain function (`this` undefined) must throw, not answer null.
         None => raise("RegExp.prototype.exec needs a RegExp receiver", "TypeError"),
