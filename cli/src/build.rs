@@ -290,6 +290,17 @@ fn link(
     // message discarded — so the run reported twelve thousand refusals and no reason.
     if cfg!(target_os = "linux") {
         command.args(["-lpthread", "-ldl", "-lm"]);
+        // **`-no-pie` so the stack map's function pointers bind at link time.** The table holds an
+        // absolute (`R_AARCH64_ABS64` / `R_X86_64_64`) relocation per compiled function, and the
+        // collector matches a frame when `row.function + code_offset` equals a return address read
+        // off the live stack. GCC defaults to a PIE on Linux, where that absolute relocation is
+        // satisfied by a load-time dynamic fixup that does not land on the function's executed entry
+        // — so no row ever matched and GC under stress freed every value held in a compiled frame
+        // (D-371). Making the symbols `Hidden` fixed the Windows PE and left macOS (Mach-O) correct,
+        // but the ELF PIE path needed the link mode too: a non-PIE binds the relocation to the real
+        // absolute address at static-link time. The compiled code is position-independent and links
+        // into a non-PIE without issue.
+        command.arg("-no-pie");
     }
     let result = command.output().map_err(|error| BuildError::Link {
         message: format!("cannot run {compiler}: {error}"),
