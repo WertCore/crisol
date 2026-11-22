@@ -1011,9 +1011,20 @@ impl Backend for Cranelift {
         push_fixed_params(&mut signature, self.module.target_config().pointer_type());
         signature.returns.push(AbiParam::new(types::I64));
 
+        // **`Hidden`, not `Export`** — the stack map table holds a relocated pointer to each
+        // function, and `row.function + code_offset` must equal the *return address* the collector
+        // reads off a live frame. `Export` makes the symbol a preemptible global: in a PIE (the
+        // default link on Linux, and mandatory for a Windows PE), the absolute relocation that fills
+        // the table binds to the symbol's *dynamic* definition — a canonical/PLT address that is not
+        // where the function actually executes — so no row ever matches a frame and every value a
+        // running program held in a compiled frame is freed under GC stress (D-371). Mach-O's
+        // two-level namespace binds the same relocation locally, which is why macOS never saw it.
+        // `Hidden` keeps the symbol visible to the static linker (the C entry shim calls
+        // `crisol_program` by name) but non-preemptible and out of the dynamic table, so the
+        // relocation resolves to the real entry on every format.
         let id = self
             .module
-            .declare_function(&symbol_name(function), Linkage::Export, &signature)
+            .declare_function(&symbol_name(function), Linkage::Hidden, &signature)
             .map_err(|error| CodegenError::Backend {
                 message: error.to_string(),
             })?;
@@ -2368,7 +2379,7 @@ impl Jit {
 
         let id = self
             .module
-            .declare_function(&symbol_name(function), Linkage::Export, &signature)
+            .declare_function(&symbol_name(function), Linkage::Hidden, &signature)
             .map_err(|error| CodegenError::Backend {
                 message: error.to_string(),
             })?;
