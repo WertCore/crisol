@@ -11123,12 +11123,11 @@ extern "C" fn regexp_symbol_search(
         // **SameValue, not `==`** (`Symbol.search` `-0` cases): -0 and +0 are distinct, so a `lastIndex`
         // of -0 is still reset to +0 and then restored to -0 afterwards. The Set is the spec's
         // `Throw=true` form, so a non-writable `lastIndex` propagates.
-        if previous.to_bits() != 0.0_f64.to_bits() {
-            if let Some(thrown) =
+        if previous.to_bits() != 0.0_f64.to_bits()
+            && let Some(thrown) =
                 set_honoring(this_value, "lastIndex", Value::number(0.0).to_bits())
-            {
-                return thrown;
-            }
+        {
+            return thrown;
         }
         let result = regexp_exec_value(this_value, subject);
         if Value::from_bits(result).is_exception() {
@@ -11138,12 +11137,11 @@ extern "C" fn regexp_symbol_search(
             Ok(current) => current,
             Err(thrown) => return thrown,
         };
-        if current.to_bits() != previous.to_bits() {
-            if let Some(thrown) =
+        if current.to_bits() != previous.to_bits()
+            && let Some(thrown) =
                 set_honoring(this_value, "lastIndex", Value::number(previous).to_bits())
-            {
-                return thrown;
-            }
+        {
+            return thrown;
         }
         if Value::from_bits(result).kind() == crisol_value::Kind::Null {
             return Value::number(-1.0).to_bits();
