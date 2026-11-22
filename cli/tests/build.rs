@@ -1166,6 +1166,29 @@ fn regexp_d_flag_reports_match_indices() {
     );
 }
 
+/// **`RegExp.prototype`'s flag accessors are getters of length 0**, and `Object.prototype.toString`
+/// reports a `RegExp` instance as `[object RegExp]` (the prototype itself stays `[object Object]`).
+#[test]
+fn regexp_prototype_accessors_and_tostring_tag() {
+    check(
+        "getter-length",
+        "var d = Object.getOwnPropertyDescriptor(RegExp.prototype, 'global'); \
+         return (typeof d.get) + '/' + d.get.length + '/' + (typeof d.set);",
+        "function/0/undefined",
+    );
+    check(
+        "flags-getter-length",
+        "return Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get.length + '/' + \
+         Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get.length;",
+        "0/0",
+    );
+    check(
+        "tostring-tag",
+        "return Object.prototype.toString.call(/x/g) + '/' + Object.prototype.toString.call(RegExp.prototype);",
+        "[object RegExp]/[object Object]",
+    );
+}
+
 /// **The matcher uses the original source and flags, not the overridable view** — a `RegExp` keeps
 /// its `[[OriginalSource]]`/`[[OriginalFlags]]` as specification-internal slots, so shadowing the
 /// observable `source`, `flags`, or `unicode` property with `Object.defineProperty` changes what the

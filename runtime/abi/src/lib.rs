@@ -9491,6 +9491,11 @@ extern "C" fn object_to_text(
                     "Date"
                 } else if own_flag(this_value, ERROR_DATA) {
                     "Error"
+                } else if own_property(this_value, REGEXP_ORIGINAL_FLAGS).is_some() {
+                    // A RegExp instance (its immutable `[[OriginalFlags]]` slot, D-370) stands in for
+                    // the specification's `[[RegExpMatcher]]`, so `Object.prototype.toString` answers
+                    // `[object RegExp]`. `RegExp.prototype` itself has no such slot and stays `Object`.
+                    "RegExp"
                 } else {
                     match own_property(this_value, STRING_PRIMITIVE).map(|(_, value)| value.kind())
                     {
@@ -17744,6 +17749,9 @@ impl Runtime {
             self.install_accessor(prototype.handle(), name, getter);
             let named = self.string(&format!("get {name}"));
             self.define_named(getter, "name", named);
+            // A getter takes no arguments, so its `length` is 0 — an own property the specification
+            // requires and `getOwnPropertyDescriptor(RegExp.prototype, name).get.length` checks.
+            self.define_named(getter, "length", Value::number(0.0));
         }
     }
 
