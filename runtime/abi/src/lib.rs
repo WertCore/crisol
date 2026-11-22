@@ -611,11 +611,86 @@ pub unsafe fn compiled_roots(limit: usize) -> Vec<Value> {
             .iter()
             .filter(|f| !m.live_at(f.return_address).is_empty())
             .count();
+        // Per-collection distribution to a file (local macOS capture, where the run passes and
+        // stderr is hidden). One line per collection: the match count and, when zero, the nearest
+        // in-function near-miss delta. Lets the macOS (working) distribution be diffed against the
+        // Linux (broken) one to decide whether NEARMISS is benign.
+        if std::env::var_os("CRISOL_GCDUMP").is_some() {
+            use std::io::Write as _;
+            let mut nm = String::new();
+            if matched == 0 {
+                for f in &frames {
+                    let ret = f.return_address as isize;
+                    let in_fn = rows
+                        .iter()
+                        .filter(|r| {
+                            let base = r.function as isize;
+                            ret >= base && ret < base + 0x4000
+                        })
+                        .map(|r| ret - (r.function as isize))
+                        .min_by_key(|d| d.abs());
+                    if let Some(off) = in_fn {
+                        let near = rows
+                            .iter()
+                            .map(|r| {
+                                ret - (r.function.wrapping_add(r.code_offset as usize) as isize)
+                            })
+                            .min_by_key(|d| d.abs())
+                            .unwrap_or(0);
+                        nm = format!(" nearmiss in-fn+{off:#x} delta={near:#x}");
+                        break;
+                    }
+                }
+            }
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/gcdiag2.log")
+            {
+                let _ = writeln!(fh, "matched={matched} frames={}{nm}", frames.len());
+            }
+        }
         if matched > 0 && !MATCH_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
-                "crisol-gc-diag: MATCH matched={matched} frames={}",
+            // Inspect what a matched frame actually reads: for the first matched frame, each live
+            // `base + frame_offset` slot — is it a heap pointer (`ptr`), or a number/garbage (`val`)?
+            // On a working scan these are the live references; if Linux matches the row but reads a
+            // non-pointer where macOS reads a pointer, the slot (base/frame_offset) is the real bug.
+            let mut reads = Vec::new();
+            if let Some(f) = frames
+                .iter()
+                .find(|f| !m.live_at(f.return_address).is_empty())
+            {
+                for offset in m.live_at(f.return_address) {
+                    let slot = f.base.wrapping_byte_add(offset as usize);
+                    if slot.is_null() || !slot.is_aligned() {
+                        reads.push(format!("off{offset}:badslot"));
+                        continue;
+                    }
+                    // SAFETY: slot came from this frame's stack map, checked non-null and aligned.
+                    let bits = unsafe { *slot } as u64;
+                    let value = Value::from_bits(bits);
+                    reads.push(if value.as_address().is_some() {
+                        format!("off{offset}:ptr")
+                    } else {
+                        format!("off{offset}:val({:?})", value.kind())
+                    });
+                }
+            }
+            let line = format!(
+                "crisol-gc-diag: MATCH matched={matched} frames={} reads={reads:?}",
                 frames.len()
             );
+            eprintln!("{line}");
+            if std::env::var_os("CRISOL_GCDUMP").is_some() {
+                use std::io::Write as _;
+                if let Ok(mut fh) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/gcdiag2.log")
+                {
+                    let _ = writeln!(fh, "{line}");
+                }
+            }
         }
         if matched == 0 && !NEARMISS_DUMPED.load(std::sync::atomic::Ordering::Relaxed) {
             for f in &frames {
