@@ -1,0 +1,22 @@
+# The collector walks the stack by following frame pointers, so **every frame it walks through
+# has to have one** — not just the ones the JIT emits.
+#
+# Cranelift is told `preserve_frame_pointers` for the code it generates (see
+# `compiler/codegen`), and that covers the compiled JavaScript. It does not cover the Rust
+# frames between the allocation that triggers a collection and the JavaScript frame whose
+# roots are being looked for: `crisol_create_object` → `Heap::alloc` → `collect` →
+# `walk_frames`. Those are ordinary Rust, and rustc omits the frame pointer on Linux by
+# default.
+#
+# **macOS hid this for the life of the project.** Apple's ABI mandates the frame pointer on
+# arm64, so rustc emits it there whatever the flags say, and the chain was intact by accident
+# of platform. On Linux the walk lost the chain, never reached the JavaScript frames, found
+# none of their roots, and freed values that were live — which reads back as `undefined` from
+# a variable that was plainly assigned. Both Linux targets failed and only under GC stress;
+# macOS arm64 passed in both modes, which is what identified the operating system rather than
+# the architecture as the variable (D-142, D-143).
+#
+# Workspace-wide rather than per-crate, because the chain runs through several of them and a
+# gap anywhere in it breaks the walk at that point.
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]

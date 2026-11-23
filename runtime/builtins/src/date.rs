@@ -280,3 +280,75 @@ pub fn to_iso_string(time: f64) -> Option<String> {
 
 /// `Date.prototype.toString` for an invalid date.
 pub const INVALID_DATE: &str = "Invalid Date";
+
+/// The three-letter day names, Sunday first, as `Date.prototype.toString` spells them.
+///
+/// **Not localised, and that is the specification's own choice** for `toString` and
+/// `toUTCString`: both have a fixed English form, which is why a test can compare against a
+/// literal at all. `toLocaleString` is the one that may vary.
+const DAY_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// The three-letter month names, January first.
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// A year as `toString` spells it: four digits, and a leading `-` for a negative one.
+fn year_text(year: i64) -> String {
+    if year < 0 {
+        return format!("-{:06}", year.abs());
+    }
+    format!("{year:04}")
+}
+
+/// `Date.prototype.toDateString` — `"Thu Jan 01 1970"`.
+#[must_use]
+pub fn to_date_string(time: f64) -> Option<String> {
+    let f = fields(time)?;
+    let day = DAY_NAMES.get(f.week_day as usize)?;
+    let month = MONTH_NAMES.get(usize::try_from(f.month).ok()?)?;
+    Some(format!("{day} {month} {:02} {}", f.day, year_text(f.year)))
+}
+
+/// `Date.prototype.toTimeString` — `"00:00:00 GMT+0000 (Coordinated Universal Time)"`.
+///
+/// **The engine keeps one zone, and it is UTC.** `getTimezoneOffset` answers zero, so
+/// printing a local offset here would contradict it; the two have to agree or a program that
+/// reconstructs a date from its own printed form lands an hour out.
+#[must_use]
+pub fn to_time_string(time: f64) -> Option<String> {
+    let f = fields(time)?;
+    Some(format!(
+        "{:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+        f.hour, f.minute, f.second
+    ))
+}
+
+/// `Date.prototype.toString` — `"Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)"`.
+#[must_use]
+pub fn to_date_time_string(time: f64) -> Option<String> {
+    Some(format!(
+        "{} {}",
+        to_date_string(time)?,
+        to_time_string(time)?
+    ))
+}
+
+/// `Date.prototype.toUTCString` — `"Thu, 01 Jan 1970 00:00:00 GMT"`.
+///
+/// A different order and a comma, which is the whole difference from `toString` and the
+/// reason it cannot be spelled as a reformat of it.
+#[must_use]
+pub fn to_utc_string(time: f64) -> Option<String> {
+    let f = fields(time)?;
+    let day = DAY_NAMES.get(f.week_day as usize)?;
+    let month = MONTH_NAMES.get(usize::try_from(f.month).ok()?)?;
+    Some(format!(
+        "{day}, {:02} {month} {} {:02}:{:02}:{:02} GMT",
+        f.day,
+        year_text(f.year),
+        f.hour,
+        f.minute,
+        f.second
+    ))
+}

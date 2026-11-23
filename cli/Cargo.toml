@@ -24,6 +24,7 @@ path = "src/main.rs"
 crisol-codegen.workspace = true
 crisol-frontend.workspace = true
 crisol-ir.workspace = true
+crisol-value.workspace = true
 crisol-render-wgpu.workspace = true
 clap.workspace = true
 wgpu.workspace = true

@@ -48,6 +48,55 @@ impl ShapeId {
     }
 }
 
+/// What a property permits, beyond holding a value.
+///
+/// **Assignment and `defineProperty` default to opposite ends of this.** `o.x = 1` creates a
+/// property that is writable, enumerable and configurable; `Object.defineProperty(o, "x", {})`
+/// creates one that is none of those. Getting that backwards makes a defined property behave
+/// like an assigned one, which every test of the difference catches and nothing else does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Attributes {
+    /// Whether a write is allowed. A write to a non-writable property is silently ignored
+    /// outside strict mode, which is why it is not an error here.
+    pub writable: bool,
+    /// Whether `Object.keys` and `for-in` see it.
+    pub enumerable: bool,
+    /// Whether it can be deleted or redefined.
+    pub configurable: bool,
+    /// Whether the slot holds a getter and setter rather than a value.
+    ///
+    /// **An accessor is a property whose value is computed**, so the slot cannot hold what the
+    /// program sees — it holds the pair of functions that produce and receive it. Reading and
+    /// writing such a property means *calling* something, which is why this has to be known at
+    /// the point of access rather than inferred from what the slot contains.
+    pub accessor: bool,
+}
+
+impl Attributes {
+    /// What `o.x = 1` creates: everything permitted.
+    pub const DATA: Self = Self {
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        accessor: false,
+    };
+
+    /// What `Object.defineProperty` creates when the descriptor says nothing: nothing
+    /// permitted.
+    pub const DEFINED: Self = Self {
+        writable: false,
+        enumerable: false,
+        configurable: false,
+        accessor: false,
+    };
+}
+
+impl Default for Attributes {
+    fn default() -> Self {
+        Self::DATA
+    }
+}
+
 /// Where a property's value lives in an object's slot array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slot(u32);
