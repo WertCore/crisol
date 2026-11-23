@@ -1423,6 +1423,18 @@ fn regexp_exec_lastindex_semantics() {
          return (m === null) + '/' + re.lastIndex;",
         "true/0",
     );
+    // `exec`/`test` run `ToString(string)`, so a subject whose `toString` throws propagates (here a
+    // thrown string, not an Error).
+    check(
+        "exec-subject-tostring-throws",
+        "try { /[a-z]/.exec({toString: function () { throw 'boom'; }}); return 'no'; } catch (e) { return e; }",
+        "boom",
+    );
+    check(
+        "test-subject-tostring-throws",
+        "try { /[a-z]/.test({toString: function () { throw 'boom'; }}); return 'no'; } catch (e) { return e; }",
+        "boom",
+    );
     // An empty match advances `lastIndex` by `ToLength(Get(rx,"lastIndex"))` then `AdvanceStringIndex`,
     // so an `exec` that leaves a huge coercible `lastIndex` caps at 2^53-1 and steps to 2^53 — and a
     // throwing coercion propagates. Covers @@replace and @@match.

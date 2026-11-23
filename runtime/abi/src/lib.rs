@@ -10465,7 +10465,12 @@ extern "C" fn regexp_test(
     argv: *const u64,
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
+    // **`ToString(string)` propagates** (spec step 3): a subject whose `toString` throws is the
+    // answer, not swallowed to `""` (`exec`/`test` `A1_T7`/`A1_T8`, which `throw` a string).
+    let text = match string_argument(unsafe { argument(argc, argv, 0) }) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
     match with_pattern(this_value, |pattern| pattern.test(&text)) {
         Some(Ok(found)) => (if found { Value::TRUE } else { Value::FALSE }).to_bits(),
         // A throwing write-back of `lastIndex` is the answer.
@@ -10489,7 +10494,12 @@ extern "C" fn regexp_exec(
     argv: *const u64,
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
-    let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
+    // **`ToString(string)` propagates** (spec step 3): a subject whose `toString` throws is the
+    // answer, not swallowed to `""` (`exec`/`test` `A1_T7`/`A1_T8`, which `throw` a string).
+    let text = match string_argument(unsafe { argument(argc, argv, 0) }) {
+        Ok(text) => text,
+        Err(thrown) => return thrown,
+    };
     // `hasIndices` is read from the original flags for the same reason the matcher is: the result's
     // shape is fixed at construction, not by a shadowed `flags` property.
     let has_indices = original_flags(this_value).is_some_and(|flags| flags.contains('d'));
