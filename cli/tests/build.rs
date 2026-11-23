@@ -7377,6 +7377,13 @@ fn regexp_escape_makes_a_literal_pattern() {
         "return RegExp.escape(\"1\");",
         "\\x31",
     );
+    // Every Unicode whitespace is escaped, not just ASCII space — U+202F, U+205F, a thin space and
+    // the ideographic space all become `\\uXXXX`.
+    check(
+        "regexp-escape-unicode-whitespace",
+        "return RegExp.escape('\\u202F\\u205F\\u2009\\u3000');",
+        "\\u202f\\u205f\\u2009\\u3000",
+    );
     // Round-trip: the escaped string, as a pattern, matches the original and not a near miss.
     check(
         "regexp-escape-roundtrip",

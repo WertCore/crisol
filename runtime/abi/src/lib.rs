@@ -5865,15 +5865,28 @@ fn encode_for_regexp_escape(ch: char, out: &mut String) {
         '\u{0B}' => out.push_str("\\v"),
         '\u{0C}' => out.push_str("\\f"),
         '\r' => out.push_str("\\r"),
-        // The "other punctuators" the specification escapes, plus white space and the line and
-        // paragraph separators — each as a hex escape rather than a backslash.
+        // The "other punctuators" the specification escapes — each as a hex escape, not a backslash.
         ',' | '-' | '=' | '<' | '>' | '#' | '&' | '!' | '%' | ':' | ';' | '@' | '~' | '\''
-        | '`' | '"' | ' ' | '\u{A0}' | '\u{2028}' | '\u{2029}' | '\u{FEFF}' => {
+        | '`' | '"' => {
             push_regexp_hex(ch, out);
         }
         ch if (ch as u32) <= 0x1F => push_regexp_hex(ch, out),
+        // Every `WhiteSpace` and `LineTerminator`, which is every Unicode space separator (not just
+        // the ASCII space and `U+00A0`) — `U+202F`, `U+205F`, `U+2000`..`U+200A`, … are escaped too.
+        ch if is_regexp_escape_whitespace(ch) => push_regexp_hex(ch, out),
         ch => out.push(ch),
     }
+}
+
+/// Whether `ch` is a `WhiteSpace` or `LineTerminator` for `RegExp.escape` — the ASCII controls
+/// handled above as `\t`/`\n`/… aside, this is `U+00A0`/`U+FEFF` and every Unicode space separator
+/// (general category `Zs`) plus the line/paragraph separators.
+fn is_regexp_escape_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\u{00A0}' | '\u{FEFF}' | '\u{2028}' | '\u{2029}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
 }
 
 /// A character as `\xHH` for a single byte, or one `\uHHHH` per UTF-16 code unit above that.
