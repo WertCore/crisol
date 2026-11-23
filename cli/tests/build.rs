@@ -956,12 +956,15 @@ fn regexp_symbol_replace_runs_on_exec() {
          try { \"x\".replace(r, \"Y\"); return \"no\"; } catch (e) { return e.name; }",
         "RangeError",
     );
-    // A throwing `lastIndex` setter propagates (g-init-lastindex-err).
+    // A throwing `lastIndex` setter propagates (g-init-lastindex-err). A genuine RegExp's `lastIndex`
+    // is non-configurable, so the setter is installed on a RegExp-*like* receiver and `@@replace` is
+    // called on it directly — the global `Set(rx, "lastIndex", 0, true)` runs the setter and throws.
     check(
         "replace-exec-lastindex-throws",
-        "var r = /x/g; \
-         Object.defineProperty(r, \"lastIndex\", { get: function () { return 0; }, set: function () { throw new RangeError(\"LI\"); } }); \
-         try { \"x\".replace(r, \"Y\"); return \"no\"; } catch (e) { return e.name; }",
+        "var r = { source: \"x\", flags: \"g\", exec: function () { return null; }, \
+                   get lastIndex() { return 0; }, set lastIndex(v) { throw new RangeError(\"LI\"); } }; \
+         try { RegExp.prototype[Symbol.replace].call(r, \"x\", \"Y\"); return \"no\"; } \
+         catch (e) { return e.name; }",
         "RangeError",
     );
     // A global replace setting `lastIndex` on a non-writable property is a `TypeError`, not a silent
@@ -1210,6 +1213,47 @@ fn regexp_symbol_methods_propagate_flags_tostring_throw() {
              catch (e) {{ return e.constructor.name; }}"
         ),
         "RangeError",
+    );
+}
+
+/// **`RegExp(pattern, flags)` follows §21.2.3.1** — `IsRegExp`, the same-constructor short-circuit,
+/// RegExp-like `source`/`flags` reads (propagating, source first), canonical flag order, and a
+/// non-enumerable, non-configurable `lastIndex`.
+#[test]
+fn regexp_constructor_follows_the_spec() {
+    // `RegExp(re)` with no flags returns the same instance; `new RegExp(re)` copies.
+    check(
+        "ctor-same-instance",
+        "var r = /x/i; return (RegExp(r) === r) + ',' + (new RegExp(r) === r);",
+        "true,false",
+    );
+    // A RegExp-like with `constructor: RegExp` short-circuits through `RegExp(...)`.
+    check(
+        "ctor-regexp-like-short-circuit",
+        "var o = {constructor: RegExp}; o[Symbol.match] = true; return RegExp(o) === o;",
+        "true",
+    );
+    // A throwing `source` getter on a RegExp-like propagates, and is read before `flags`.
+    check(
+        "ctor-regexp-like-source-err",
+        "var o = {}; Object.defineProperty(o, 'source', {get: function () { throw new RangeError('S'); }}); \
+         Object.defineProperty(o, 'flags', {get: function () { throw new TypeError('F'); }}); \
+         o[Symbol.match] = true; \
+         try { new RegExp(o); return 'no'; } catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
+    // Flags read back in canonical `dgimsuy` order regardless of how they were written.
+    check(
+        "ctor-canonical-flags",
+        "return new RegExp('x', 'ig').flags + '/' + new RegExp('x', 'us').flags;",
+        "gi/su",
+    );
+    // `lastIndex` is writable but neither enumerable nor configurable.
+    check(
+        "ctor-lastindex-descriptor",
+        "var d = Object.getOwnPropertyDescriptor(/a/, 'lastIndex'); \
+         return d.writable + ',' + d.enumerable + ',' + d.configurable;",
+        "true,false,false",
     );
 }
 

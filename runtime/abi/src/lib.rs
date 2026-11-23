@@ -5891,33 +5891,116 @@ fn push_regexp_hex(ch: char, out: &mut String) {
 
 /// `RegExp(source, flags)` and `new RegExp(source, flags)`.
 extern "C" fn make_regexp(
-    _closure: u64,
+    closure: u64,
     _this_value: u64,
-    _new_target: u64,
+    new_target: u64,
     argc: u64,
     argv: *const u64,
 ) -> u64 {
     // SAFETY: the convention guarantees `argc` readable values at `argv`.
     let first = unsafe { argument(argc, argv, 0) };
-    // **An existing regular expression is re-read through `source`**, so `new RegExp(/a/g)`
-    // copies the pattern rather than stringifying the object into `"/a/g"`.
-    let source = property_text(first, "source")
-        .or_else(|| to_text(first))
-        .unwrap_or_default();
     // SAFETY: as above.
     let given = unsafe { argument(argc, argv, 1) };
-    let flags = if Value::from_bits(given).kind() == crisol_value::Kind::Undefined {
-        property_text(first, "flags").unwrap_or_default()
-    } else {
-        to_text(given).unwrap_or_default()
+    with_rooted(&[first, given], || {
+        make_regexp_inner(closure, new_target, first, given)
+    })
+}
+
+/// `RegExp ( pattern, flags )` (§21.2.3.1), separated so its arguments can be rooted first — the
+/// property reads below run user getters that allocate, and a bare argument would otherwise be
+/// freed mid-construction under GC stress.
+fn make_regexp_inner(closure: u64, new_target: u64, first: u64, given: u64) -> u64 {
+    let flags_undefined = Value::from_bits(given).kind() == crisol_value::Kind::Undefined;
+    // **`IsRegExp(pattern)`** — a throwing `@@match` getter propagates, and the answer decides both
+    // the short-circuit below and whether the pattern is re-read through `source`/`flags` or
+    // stringified.
+    let pattern_is_regexp = match is_regexp(first) {
+        Ok(answer) => answer,
+        Err(thrown) => return thrown,
     };
+
+    // **Called as `RegExp(re)` (no `new`) with a RegExp of the same constructor returns it
+    // unchanged** — the active function is this very closure, so `SameValue(closure, re.constructor)`
+    // is the test (`call_with_non_regexp_same_constructor`, `from-regexp-like-short-circuit`,
+    // `S15.10.3.1_A1`).
+    if Value::from_bits(new_target).is_undefined() && pattern_is_regexp && flags_undefined {
+        let constructor = property_of(first, "constructor");
+        if Value::from_bits(constructor).is_exception() {
+            return constructor;
+        }
+        if same_value(Value::from_bits(constructor), Value::from_bits(closure)) {
+            return first;
+        }
+    }
+
+    // **A genuine RegExp carries the pattern in its internal slots**, read directly (not through the
+    // overridable `source`/`flags`); a RegExp-*like* object is asked for `source`/`flags` with the
+    // reads propagating (`from-regexp-like-get-source-err`/`-get-flags-err`, source before flags);
+    // anything else is `ToString`'d, with `undefined` spelled as `""`.
+    let has_matcher = own_property(first, REGEXP_ORIGINAL_SOURCE).is_some();
+    let (source, flags_text) = if has_matcher {
+        let source = property_text(first, REGEXP_ORIGINAL_SOURCE).unwrap_or_default();
+        let flags_text = if flags_undefined {
+            property_text(first, REGEXP_ORIGINAL_FLAGS).unwrap_or_default()
+        } else {
+            match string_argument(given) {
+                Ok(text) => text,
+                Err(thrown) => return thrown,
+            }
+        };
+        (source, flags_text)
+    } else if pattern_is_regexp {
+        let source_value = property_of(first, "source");
+        if Value::from_bits(source_value).is_exception() {
+            return source_value;
+        }
+        let source = match string_argument(source_value) {
+            Ok(text) => text,
+            Err(thrown) => return thrown,
+        };
+        let flags_text = if flags_undefined {
+            let flags_value = property_of(first, "flags");
+            if Value::from_bits(flags_value).is_exception() {
+                return flags_value;
+            }
+            match string_argument(flags_value) {
+                Ok(text) => text,
+                Err(thrown) => return thrown,
+            }
+        } else {
+            match string_argument(given) {
+                Ok(text) => text,
+                Err(thrown) => return thrown,
+            }
+        };
+        (source, flags_text)
+    } else {
+        let source = if Value::from_bits(first).is_undefined() {
+            String::new()
+        } else {
+            match string_argument(first) {
+                Ok(text) => text,
+                Err(thrown) => return thrown,
+            }
+        };
+        let flags_text = if flags_undefined {
+            String::new()
+        } else {
+            match string_argument(given) {
+                Ok(text) => text,
+                Err(thrown) => return thrown,
+            }
+        };
+        (source, flags_text)
+    };
+
     // SAFETY: both strings are live for the call.
     unsafe {
         crisol_create_regexp(
             source.as_ptr(),
             source.len() as u64,
-            flags.as_ptr(),
-            flags.len() as u64,
+            flags_text.as_ptr(),
+            flags_text.len() as u64,
         )
     }
 }
@@ -26306,13 +26389,19 @@ pub unsafe extern "C" fn crisol_create_regexp(
                 Value::from_bits(source_value),
             );
         });
-        let flags_value = new_string(&flags_text);
+        // **The flags are stored in the canonical `dgimsuy` order**, not as the program wrote them, so
+        // `new RegExp("x", "yx").flags` reads back `"gimsuy"`-ordered (`flags/return-order`). Matching
+        // is order-insensitive (the originals are consulted by membership), so canonicalising here is
+        // safe and keeps the observable `flags` and the internal slot identical.
+        let canonical = canonical_flags(&parsed);
+        let flags_value = new_string(&canonical);
         with_runtime(|runtime| {
             runtime.define(handle, "flags", Value::from_bits(flags_value));
             runtime.define_internal(handle, REGEXP_ORIGINAL_FLAGS, Value::from_bits(flags_value));
-            // `lastIndex` is the cursor, and it is a property because a program may assign to
-            // it — the compiled pattern is set from it rather than owning it.
-            runtime.define(handle, "lastIndex", Value::number(0.0));
+            // `lastIndex` is the cursor, and it is a property because a program may assign to it — the
+            // compiled pattern is set from it rather than owning it. It is **writable but not
+            // enumerable or configurable** (`RegExpAlloc`), which `define_hidden` gives.
+            runtime.define_hidden(handle, "lastIndex", Value::number(0.0));
             runtime.define(handle, "global", boolean(parsed.global));
             runtime.define(handle, "ignoreCase", boolean(parsed.ignore_case));
             runtime.define(handle, "multiline", boolean(parsed.multiline));
@@ -26327,6 +26416,26 @@ pub unsafe extern "C" fn crisol_create_regexp(
         });
     });
     object
+}
+
+/// The flags string in the specification's fixed `dgimsuy` order, from the parsed flag bits.
+fn canonical_flags(parsed: &crisol_builtins::Flags) -> String {
+    let mut flags = String::with_capacity(8);
+    for (present, ch) in [
+        (parsed.has_indices, 'd'),
+        (parsed.global, 'g'),
+        (parsed.ignore_case, 'i'),
+        (parsed.multiline, 'm'),
+        (parsed.dot_all, 's'),
+        (parsed.unicode, 'u'),
+        (parsed.unicode_sets, 'v'),
+        (parsed.sticky, 'y'),
+    ] {
+        if present {
+            flags.push(ch);
+        }
+    }
+    flags
 }
 
 /// Whether `value` can be called.
