@@ -1034,6 +1034,15 @@ fn regexp_symbol_split_runs_on_exec() {
         "return \"a1b2c\".split(/\\d/, 2).join(\",\");",
         "a,b",
     );
+    // The limit is `ToUint32`: a negative value wraps to a huge cap (full split), a fraction
+    // truncates, and `NaN` is `0`.
+    check(
+        "split-limit-touint32",
+        "return [/./[Symbol.split]('abc', -23).length, \
+                 /./[Symbol.split]('abc', 1.9).length, \
+                 /./[Symbol.split]('abc', NaN).length].join(',');",
+        "4,1,0",
+    );
     // An empty-pattern split separates every character.
     check(
         "split-exec-empty-pattern",

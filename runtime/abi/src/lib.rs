@@ -11990,6 +11990,10 @@ fn split_via_exec(text: &str, rx: u64, cap: usize) -> u64 {
                     indexed_get(matched, capture_index)
                 })
             });
+            // A throwing capture getter on the `exec` result propagates (`str-result-get-capture-err`).
+            if Value::from_bits(capture).is_exception() {
+                return capture;
+            }
             pieces.push(capture);
             if pieces.len() >= cap {
                 return with_rooted(&pieces, || array_of_values(&pieces));
@@ -12250,16 +12254,19 @@ fn split_limit(limit: u64) -> Result<usize, u64> {
     if Value::from_bits(limit).is_undefined() {
         return Ok(usize::MAX);
     }
+    // `lim = ToUint32(limit)` — a negative limit wraps modulo 2^32 (so `-23` is a huge cap, i.e. a
+    // full split), a fraction truncates toward zero, and `NaN`/`0`/the infinities are `0`
+    // (`coerce-limit`). The old `<= 0` shortcut read every negative limit as an empty split.
     let number = coerce_number(limit)?;
-    if !number.is_finite() || number <= 0.0 {
+    if !number.is_finite() || number == 0.0 {
         return Ok(0);
     }
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "checked finite and positive"
+        reason = "ToUint32 wraps into [0, 2^32)"
     )]
-    let cap = number.min(f64::from(u32::MAX)) as usize;
+    let cap = number.trunc().rem_euclid(4_294_967_296.0) as usize;
     Ok(cap)
 }
 
