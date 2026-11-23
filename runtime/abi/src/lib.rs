@@ -11188,16 +11188,26 @@ extern "C" fn regexp_symbol_match(
             let piece = with_rooted(&collected, || new_string(&matched));
             collected.push(piece);
             // **An empty match has to be stepped over by hand**, because it leaves
-            // `lastIndex` where it was and the next call would find it again, for ever.
+            // `lastIndex` where it was and the next call would find it again, for ever. The index is
+            // `ToLength(? Get(rx, "lastIndex"))` — propagating a throwing coercion
+            // (`g-match-empty-coerce-lastindex-err`) — then `AdvanceStringIndex`, which steps a whole
+            // surrogate pair under `u`/`v`.
             if matched.is_empty() {
-                let at = match last_index_of(this_value) {
+                let unicode = flags_text.contains('u') || flags_text.contains('v');
+                let at_bits = with_rooted(&collected, || property_of(this_value, "lastIndex"));
+                if Value::from_bits(at_bits).is_exception() {
+                    return at_bits;
+                }
+                let at = match to_length_bits(at_bits) {
                     Ok(at) => at,
                     Err(thrown) => return thrown,
                 };
+                let subject_chars = text_of(subject).unwrap_or_default();
+                let next = advance_string_index(&subject_chars, at, unicode);
+                #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
+                let next = Value::number(next as f64).to_bits();
                 // Also a throwing `Set` (the specification advances `lastIndex` with `Throw`).
-                if let Some(thrown) =
-                    set_honoring(this_value, "lastIndex", Value::number(at + 1.0).to_bits())
-                {
+                if let Some(thrown) = set_honoring(this_value, "lastIndex", next) {
                     return thrown;
                 }
             }
@@ -11575,16 +11585,18 @@ fn replace_via_exec(text: &str, rx: u64, replacement: u64) -> u64 {
             Err(thrown) => return thrown,
         };
         if matched.is_empty() {
-            let last = match with_rooted(&results, || last_index_of(rx)) {
+            // `thisIndex = ToLength(? Get(rx, "lastIndex"))` — `ToLength`, not a bare number read, so a
+            // throwing coercion propagates (`coerce-lastindex-err`) and a huge `lastIndex` the `exec`
+            // left behind caps at 2^53-1 then advances (`coerce-lastindex`). `last_index_of` read an
+            // object `lastIndex` as `0`, stepping to `1` instead of past the end.
+            let last_bits = with_rooted(&results, || property_of(rx, "lastIndex"));
+            if Value::from_bits(last_bits).is_exception() {
+                return last_bits;
+            }
+            let last = match to_length_bits(last_bits) {
                 Ok(last) => last,
                 Err(thrown) => return thrown,
             };
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "a lastIndex this code reads back as a non-negative whole number"
-            )]
-            let last = if last < 0.0 { 0 } else { last as usize };
             let next = advance_string_index(text, last, unicode);
             #[expect(clippy::cast_precision_loss, reason = "an index into a string")]
             let next = Value::number(next as f64).to_bits();

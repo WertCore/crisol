@@ -1393,6 +1393,25 @@ fn regexp_exec_lastindex_semantics() {
          return (m === null) + '/' + re.lastIndex;",
         "true/0",
     );
+    // An empty match advances `lastIndex` by `ToLength(Get(rx,"lastIndex"))` then `AdvanceStringIndex`,
+    // so an `exec` that leaves a huge coercible `lastIndex` caps at 2^53-1 and steps to 2^53 — and a
+    // throwing coercion propagates. Covers @@replace and @@match.
+    check(
+        "empty-match-coerce-lastindex",
+        "var r = /./g; var done = false; \
+         r.exec = function () { if (done) return null; r.lastIndex = {valueOf: function () { return Math.pow(2,54); }}; \
+                                done = true; return {length: 1, 0: '', index: 0}; }; \
+         r[Symbol.replace]('', ''); return r.lastIndex === Math.pow(2,53);",
+        "true",
+    );
+    check(
+        "empty-match-coerce-lastindex-err",
+        "var r = /(?:)/g; var n = 0; \
+         r.exec = function () { n++; if (n > 1) return null; r.lastIndex = {valueOf: function () { throw new RangeError('L'); }}; \
+                                return {0: '', length: 1, index: 0}; }; \
+         try { r[Symbol.match]('ab'); return 'no'; } catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
 }
 
 /// **A global `@@match` sets `lastIndex` with `Throw`**, so a non-writable `lastIndex` (or a setter
