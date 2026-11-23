@@ -1213,6 +1213,34 @@ fn regexp_symbol_methods_propagate_flags_tostring_throw() {
     );
 }
 
+/// **`@@matchAll`'s default species builds the clone through the real `RegExp` constructor**, so a
+/// non-RegExp receiver re-throws a throwing `@@match` getter (`IsRegExp`) or a throwing `toString`
+/// (the pattern is `ToString(R)`), where the old shortcut read `R.source` and swallowed both.
+#[test]
+fn regexp_match_all_default_species_runs_constructor() {
+    check(
+        "matchall-isregexp-this-throws",
+        "var o = {get [Symbol.match]() { throw new RangeError('x'); }}; \
+         try { RegExp.prototype[Symbol.matchAll].call(o, ''); return 'no'; } \
+         catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
+    check(
+        "matchall-regexpcreate-this-throws",
+        "var o = {toString: function () { throw new RangeError('x'); }}; \
+         try { RegExp.prototype[Symbol.matchAll].call(o, ''); return 'no'; } \
+         catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
+    // A genuine RegExp still copies its source — the common path is unchanged.
+    check(
+        "matchall-regexp-still-works",
+        "var out = []; for (var m of /\\d/g[Symbol.matchAll]('a1b2')) { out.push(m[0]); } \
+         return out.join(',');",
+        "1,2",
+    );
+}
+
 /// **`exec`/`test` consult and update `lastIndex` only when global or sticky.** A non-global,
 /// non-sticky match starts at zero (ignoring `lastIndex`) and leaves it untouched; a sticky match
 /// writes it back with `Throw`, so a non-writable `lastIndex` aborts.

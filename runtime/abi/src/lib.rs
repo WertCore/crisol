@@ -11643,7 +11643,19 @@ fn regexp_species(rx: u64) -> Result<Option<u64>, u64> {
 fn make_splitter(rx: u64, new_flags: &str) -> Result<u64, u64> {
     match regexp_species(rx)? {
         None => {
-            let source = property_text(rx, "source").unwrap_or_default();
+            // The default species is `%RegExp%` itself, so the clone is `Construct(%RegExp%, « rx,
+            // new_flags »)`. That runs `IsRegExp(rx)` and, for a receiver that is *not* a RegExp, takes
+            // the pattern as `ToString(rx)` — so a throwing `@@match` getter (`isregexp-this-throws`) or
+            // a throwing `toString` (`regexpcreate-this-throws`) propagates, where the old shortcut read
+            // `rx.source` and swallowed both. A genuine RegExp still copies its `source`.
+            let source = match is_regexp(rx) {
+                Ok(true) => property_text(rx, "source").unwrap_or_default(),
+                Ok(false) => match string_argument(rx) {
+                    Ok(text) => text,
+                    Err(thrown) => return Err(thrown),
+                },
+                Err(thrown) => return Err(thrown),
+            };
             // SAFETY: both strings are live for the call.
             Ok(with_rooted(&[rx], || unsafe {
                 crisol_create_regexp(
