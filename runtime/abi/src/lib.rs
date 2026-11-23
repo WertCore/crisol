@@ -11244,30 +11244,32 @@ extern "C" fn regexp_symbol_search(
         Err(thrown) => return thrown,
     };
     with_rooted(&[this_value, subject], || {
-        let previous = match last_index_of(this_value) {
-            Ok(previous) => previous,
-            Err(thrown) => return thrown,
-        };
-        // **SameValue, not `==`** (`Symbol.search` `-0` cases): -0 and +0 are distinct, so a `lastIndex`
-        // of -0 is still reset to +0 and then restored to -0 afterwards. The Set is the spec's
-        // `Throw=true` form, so a non-writable `lastIndex` propagates.
-        if previous.to_bits() != 0.0_f64.to_bits()
+        // **The raw `Get(rx, "lastIndex")` is compared and restored, not a coerced number**: the spec
+        // reads the value and compares it by `SameValue` before any `ToLength`, so a `lastIndex`
+        // accessor answering `undefined` is still `SameValue(undefined, +0) === false` and triggers the
+        // reset `Set` (`set-lastindex-init-err`). Bit equality *is* `SameValue` for crisol values, so it
+        // also keeps `-0`/`+0` distinct (the `-0` cases). The Set is the `Throw=true` form, so a
+        // non-writable `lastIndex` or a throwing setter propagates.
+        let previous = property_of(this_value, "lastIndex");
+        if Value::from_bits(previous).is_exception() {
+            return previous;
+        }
+        if previous != Value::number(0.0).to_bits()
             && let Some(thrown) =
                 set_honoring(this_value, "lastIndex", Value::number(0.0).to_bits())
         {
             return thrown;
         }
-        let result = regexp_exec_value(this_value, subject);
+        let result = with_rooted(&[previous], || regexp_exec_value(this_value, subject));
         if Value::from_bits(result).is_exception() {
             return result;
         }
-        let current = match last_index_of(this_value) {
-            Ok(current) => current,
-            Err(thrown) => return thrown,
-        };
-        if current.to_bits() != previous.to_bits()
-            && let Some(thrown) =
-                set_honoring(this_value, "lastIndex", Value::number(previous).to_bits())
+        let current = property_of(this_value, "lastIndex");
+        if Value::from_bits(current).is_exception() {
+            return current;
+        }
+        if current != previous
+            && let Some(thrown) = set_honoring(this_value, "lastIndex", previous)
         {
             return thrown;
         }
@@ -11352,8 +11354,15 @@ fn own_non_writable_data(object: u64, name: &str) -> bool {
 /// a throwing coercion propagated (`result-coerce-length-err`).
 fn to_length_bits(bits: u64) -> Result<usize, u64> {
     let number = coerce_number(bits)?;
-    if !number.is_finite() || number <= 0.0 {
+    // `ToLength` is `min(max(ToIntegerOrInfinity(n), 0), 2^53-1)`. `NaN` and anything zero or below
+    // clamps to `0`; **positive infinity clamps to `2^53-1`, not `0`** — the `!is_finite()` shortcut
+    // got this wrong and read `re.lastIndex = Infinity` as `0`, matching from the start instead of
+    // failing past the end (`exec/failure-lastindex-set`).
+    if number.is_nan() || number <= 0.0 {
         return Ok(0);
+    }
+    if number.is_infinite() {
+        return Ok(9_007_199_254_740_991);
     }
     #[expect(
         clippy::cast_possible_truncation,

@@ -1190,6 +1190,16 @@ fn regexp_replace_and_search_error_and_negzero() {
          RegExp.prototype[Symbol.search].call(re, 's'); return Object.is(seen, 0) + '/' + (seen === 0);",
         "true/true",
     );
+    // `@@search` compares the *raw* `lastIndex` by SameValue before coercion, so an accessor answering
+    // `undefined` is `SameValue(undefined, +0) === false` and the reset `Set` runs its throwing setter.
+    check(
+        "search-init-lastindex-throws",
+        "var re = {get lastIndex() { return undefined; }, set lastIndex(_) { throw new RangeError('S'); }, \
+                   exec: function () { return null; }}; \
+         try { RegExp.prototype[Symbol.search].call(re, 's'); return 'no'; } \
+         catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
 }
 
 /// **The `Symbol.*` methods read `flags` with `ToString`**, so a throwing `toString` on the flags
@@ -1374,6 +1384,14 @@ fn regexp_exec_lastindex_semantics() {
         "var re = /a/y; re.lastIndex = {valueOf: function () { throw new RangeError('x'); }}; \
          try { re.exec('a'); return 'no-throw'; } catch (e) { return e.constructor.name; }",
         "RangeError",
+    );
+    // `ToLength(Infinity)` is `2^53-1`, not `0` — so a global match with `lastIndex` past the end
+    // fails and resets `lastIndex` to `0`, rather than matching from the start.
+    check(
+        "lastindex-infinity-fails",
+        "var re = /./g; re.lastIndex = Infinity; var m = re.exec('test'); \
+         return (m === null) + '/' + re.lastIndex;",
+        "true/0",
     );
 }
 
