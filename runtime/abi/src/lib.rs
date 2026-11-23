@@ -11334,9 +11334,56 @@ fn set_honoring(object: u64, name: &str, value: u64) -> Option<u64> {
             "TypeError",
         ));
     }
+    // **A `Set` with `Throw` on an accessor that has only a getter is a `TypeError`**, where sloppy
+    // assignment silently no-ops (`set-lastindex-init-err`'s non-writable receiver).
+    if setterless_accessor(object, name) {
+        return Some(raise(
+            &format!("cannot assign to '{name}', which has only a getter"),
+            "TypeError",
+        ));
+    }
     // SAFETY: `name` is a live Rust string of `name.len()` UTF-8 bytes.
     let out = unsafe { crisol_property_store(object, name.as_ptr(), name.len() as u64, value) };
     Value::from_bits(out).is_exception().then_some(out)
+}
+
+/// Whether writing `name` on `object` would reach an accessor property (own or inherited) with no
+/// callable setter. A `Set` with `Throw=true` on such a property throws; an own data property found
+/// first (writable or not) means this is not that case.
+fn setterless_accessor(object: u64, name: &str) -> bool {
+    let key = PropertyKey::new(name);
+    let mut current = handle_of(object);
+    for _ in 0..PROTOTYPE_CHAIN_LIMIT {
+        let Some(handle) = current else {
+            return false;
+        };
+        let resolved = with_runtime(|runtime| {
+            let shape = runtime.heap.shape_of(handle)?;
+            let slot = runtime.shapes.borrow().lookup(shape, &key)?;
+            if runtime.heap.is_deleted(handle, slot.index()) {
+                return None;
+            }
+            let is_accessor = runtime.heap.attributes_of(handle, slot.index()).accessor;
+            Some((is_accessor, runtime.heap.get(handle, slot.index())))
+        });
+        match resolved {
+            // Nothing at this level — keep walking the prototype chain.
+            None => current = with_runtime(|runtime| runtime.heap.prototype_of(handle)),
+            // A data property shadows any inherited accessor; the write is an ordinary store.
+            Some((false, _)) => return false,
+            // An accessor: a setter is at element 1 of the pair, absent if it is not callable.
+            Some((true, pair)) => {
+                let Some(pair) = pair else {
+                    return true;
+                };
+                return match elements_of(pair.to_bits()) {
+                    Some((functions, _)) => !is_callable(element_at(functions, 1)),
+                    None => true,
+                };
+            }
+        }
+    }
+    false
 }
 
 /// Whether `object` has an own data property `name` that is not writable.
@@ -27137,12 +27184,11 @@ fn bigint_loose_eq_primitive(big: u64, other: u64) -> bool {
 /// difference**: a string context asks for text first and a numeric one asks for a number
 /// first, and an object that answers both would otherwise give the wrong one to one of them.
 fn to_primitive_text(value: u64) -> u64 {
-    // **`@@toPrimitive` (string hint) wins when present** (D-332). A throwing one is left to fall
-    // through here, where this path has no way to raise; the primitive-returning case is the one that
-    // matters for `String(obj)` and a template.
-    if let Some(result) = symbol_to_primitive(value, "string")
-        && !Value::from_bits(result).is_exception()
-    {
+    // **`@@toPrimitive` (string hint) wins when present** (D-332), and when it throws **the throw is
+    // the answer** — it is returned as the exception sentinel so a caller that propagates (e.g.
+    // `string_argument`) surfaces it (`flags-tostring-error`), rather than being swallowed and falling
+    // through to `toString`/`valueOf`. A caller that cannot raise (`to_text`) still reads it as absence.
+    if let Some(result) = symbol_to_primitive(value, "string") {
         return result;
     }
     for name in ["toString", "valueOf"] {

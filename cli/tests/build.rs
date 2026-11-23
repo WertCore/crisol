@@ -1200,6 +1200,15 @@ fn regexp_replace_and_search_error_and_negzero() {
          catch (e) { return e.constructor.name; }",
         "RangeError",
     );
+    // The reset `Set(rx, "lastIndex", 0, true)` on a getter-only (setter-less) accessor is a TypeError,
+    // not a silent no-op.
+    check(
+        "search-init-lastindex-no-setter",
+        "var re = {get lastIndex() { return undefined; }, exec: function () { return null; }}; \
+         try { RegExp.prototype[Symbol.search].call(re, 's'); return 'no'; } \
+         catch (e) { return e.constructor.name; }",
+        "TypeError",
+    );
 }
 
 /// **The `Symbol.*` methods read `flags` with `ToString`**, so a throwing `toString` on the flags
@@ -1220,6 +1229,18 @@ fn regexp_symbol_methods_propagate_flags_tostring_throw() {
         "replace-flags-tostring",
         &format!(
             "{thrower} try {{ RegExp.prototype[Symbol.replace].call(o, 's', 'x'); return 'no'; }} \
+             catch (e) {{ return e.constructor.name; }}"
+        ),
+        "RangeError",
+    );
+    // The flags value may coerce through `@@toPrimitive`, and a throwing one propagates rather than
+    // being swallowed and falling through to `toString`/`valueOf` (`flags-tostring-error`).
+    let primitive_thrower = "var o = {flags: {}, exec: function () { return null; }, source: 'a'}; \
+         o.flags[Symbol.toPrimitive] = function () { throw new RangeError('p'); }; ";
+    check(
+        "match-flags-toprimitive",
+        &format!(
+            "{primitive_thrower} try {{ RegExp.prototype[Symbol.match].call(o, 's'); return 'no'; }} \
              catch (e) {{ return e.constructor.name; }}"
         ),
         "RangeError",
