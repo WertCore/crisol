@@ -10173,7 +10173,7 @@ fn regexp_is_prototype(this_value: u64) -> bool {
 /// lacks it is not a RegExp. Read straight from the slot (no `[[Get]]`) so an instance whose own flag
 /// getters are shadowed cannot recurse.
 fn regexp_instance_flags(this_value: u64) -> Option<String> {
-    own_property(this_value, "flags").and_then(|(_, value)| text_of(value.to_bits()))
+    own_property(this_value, REGEXP_ORIGINAL_FLAGS).and_then(|(_, value)| text_of(value.to_bits()))
 }
 
 /// One flag bit of `get RegExp.prototype.<flag>` (D-345). Not an object → `TypeError`; the prototype
@@ -10208,7 +10208,7 @@ extern "C" fn regexp_source_getter(
         // so the specification gives the prototype's source as `(?:)` rather than `""`.
         return new_string("(?:)");
     }
-    match own_property(this_value, "source") {
+    match own_property(this_value, REGEXP_ORIGINAL_SOURCE) {
         Some((_, source)) => source.to_bits(),
         None => raise("RegExp.prototype.source requires a RegExp", "TypeError"),
     }
@@ -10227,26 +10227,32 @@ extern "C" fn regexp_flags_getter(
     if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
         return raise("RegExp.prototype.flags requires an object", "TypeError");
     }
-    let mut flags = String::new();
-    for (ch, name) in [
-        ('d', "hasIndices"),
-        ('g', "global"),
-        ('i', "ignoreCase"),
-        ('m', "multiline"),
-        ('s', "dotAll"),
-        ('u', "unicode"),
-        ('v', "unicodeSets"),
-        ('y', "sticky"),
-    ] {
-        let bit = property_of(this_value, name);
-        if Value::from_bits(bit).is_exception() {
-            return bit;
+    // **`this_value` is rooted across the whole read.** Each flag is now an accessor that reads the
+    // instance's `[[OriginalFlags]]` slot, and the loop allocates (property keys, `new_string` at the
+    // end); without this a receiver held only by a native caller's frame could be collected mid-build
+    // under GC stress, taking `[[OriginalFlags]]` with it.
+    with_rooted(&[this_value], || {
+        let mut flags = String::new();
+        for (ch, name) in [
+            ('d', "hasIndices"),
+            ('g', "global"),
+            ('i', "ignoreCase"),
+            ('m', "multiline"),
+            ('s', "dotAll"),
+            ('u', "unicode"),
+            ('v', "unicodeSets"),
+            ('y', "sticky"),
+        ] {
+            let bit = property_of(this_value, name);
+            if Value::from_bits(bit).is_exception() {
+                return bit;
+            }
+            if is_truthy(Value::from_bits(bit)) {
+                flags.push(ch);
+            }
         }
-        if is_truthy(Value::from_bits(bit)) {
-            flags.push(ch);
-        }
-    }
-    new_string(&flags)
+        new_string(&flags)
+    })
 }
 
 /// `get RegExp.prototype.global`.
@@ -10354,10 +10360,8 @@ fn with_pattern<T>(
     // The matcher compiles from the immutable originals, not the observable `source`/`flags` — a
     // program may shadow those, and the specification's `[[RegExpMatcher]]` is fixed at construction.
     // The fallback keeps a receiver built some other way working.
-    let source = property_text(this_value, REGEXP_ORIGINAL_SOURCE)
-        .or_else(|| property_text(this_value, "source"))?;
-    let flags_text = property_text(this_value, REGEXP_ORIGINAL_FLAGS)
-        .or_else(|| property_text(this_value, "flags"))?;
+    let source = original_source(this_value)?;
+    let flags_text = original_flags(this_value)?;
     // **Only a global or sticky match consults and updates `lastIndex`** (`RegExpBuiltinExec`): one
     // that is neither always starts at zero and leaves `lastIndex` untouched. `Some(Err)` is the
     // thrown value from a failing write-back, `Some(Ok)` the body's outcome, `None` a receiver that
@@ -10417,6 +10421,20 @@ fn property_text(object: u64, name: &str) -> Option<String> {
     to_text(bits)
 }
 
+/// A RegExp's **fixed** source, read from its `[[OriginalSource]]` slot — a plain data slot, so no
+/// accessor runs and nothing allocates, which is what keeps the matcher-building and `IsRegExp`-ish
+/// detection paths off the `source` getter (the object-model change left `source` as a prototype
+/// accessor; routing the hot paths through it collected the receiver mid-read under GC stress). A
+/// RegExp-*like* object with no slot falls back to its observable `source`.
+fn original_source(object: u64) -> Option<String> {
+    property_text(object, REGEXP_ORIGINAL_SOURCE).or_else(|| property_text(object, "source"))
+}
+
+/// A RegExp's **fixed** flags, read from its `[[OriginalFlags]]` slot (see [`original_source`]).
+fn original_flags(object: u64) -> Option<String> {
+    property_text(object, REGEXP_ORIGINAL_FLAGS).or_else(|| property_text(object, "flags"))
+}
+
 /// A named property of `object`, as a number.
 fn property_number(object: u64, name: &str) -> Option<f64> {
     let key = name.to_owned();
@@ -10461,9 +10479,7 @@ extern "C" fn regexp_exec(
     let text = to_text(unsafe { argument(argc, argv, 0) }).unwrap_or_default();
     // `hasIndices` is read from the original flags for the same reason the matcher is: the result's
     // shape is fixed at construction, not by a shadowed `flags` property.
-    let has_indices = property_text(this_value, REGEXP_ORIGINAL_FLAGS)
-        .or_else(|| property_text(this_value, "flags"))
-        .is_some_and(|flags| flags.contains('d'));
+    let has_indices = original_flags(this_value).is_some_and(|flags| flags.contains('d'));
     // Rooted across the array's allocation: `this_value` reached here in a register and the
     // text came out of it.
     match with_pattern(this_value, |pattern| pattern.exec(&text)) {
@@ -10494,9 +10510,13 @@ extern "C" fn regexp_to_string(
     if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
         return raise("RegExp.prototype.toString requires an object", "TypeError");
     }
-    let source = property_text(this_value, "source").unwrap_or_default();
-    let flags = property_text(this_value, "flags").unwrap_or_default();
-    new_string(&format!("/{source}/{flags}"))
+    // Observable `Get(R, "source")`/`Get(R, "flags")` per spec — for a genuine RegExp these are the
+    // prototype accessors, which allocate, so `this_value` is rooted across them.
+    with_rooted(&[this_value], || {
+        let source = property_text(this_value, "source").unwrap_or_default();
+        let flags = property_text(this_value, "flags").unwrap_or_default();
+        new_string(&format!("/{source}/{flags}"))
+    })
 }
 
 /// Methods on `String.prototype`.
@@ -10703,7 +10723,7 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
     if all {
         match is_regexp(pattern) {
             Ok(true) => {
-                let flags = property_text(pattern, "flags").unwrap_or_default();
+                let flags = original_flags(pattern).unwrap_or_default();
                 if !flags.contains('g') {
                     return raise("replaceAll needs a global regular expression", "TypeError");
                 }
@@ -10714,7 +10734,7 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
     }
 
     // A regular expression pattern, recognised by its `source` rather than by a type tag.
-    if property_text(pattern, "source").is_some() {
+    if original_source(pattern).is_some() {
         // Asked of the pattern, which is what the specification says — see `symbol_method`.
         let replacer = symbol_method(pattern, "replace");
         if is_callable(replacer) {
@@ -10767,10 +10787,10 @@ fn replace_with(this_value: u64, argc: u64, argv: *const u64, all: bool) -> u64 
 /// Shared by `String.prototype.replace` and `RegExp.prototype[Symbol.replace]`, which are the
 /// same operation reached two ways — the string method is *defined* as asking the pattern.
 fn replace_using_pattern(text: &str, rx: u64, replacement: u64) -> u64 {
-    let Some(source) = property_text(rx, "source") else {
+    let Some(source) = original_source(rx) else {
         return new_string(text);
     };
-    let flags = property_text(rx, "flags").unwrap_or_default();
+    let flags = original_flags(rx).unwrap_or_default();
     let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
         return new_string(text);
     };
@@ -10999,8 +11019,8 @@ extern "C" fn string_replace_all(
 /// argument is given to the `RegExp` constructor rather than searched for — which is the one
 /// thing about `match` and `search` that a reader coming from `indexOf` gets wrong.
 fn pattern_argument(value: u64) -> Option<(crisol_builtins::JsRegExp, String)> {
-    let (source, flags_text) = match property_text(value, "source") {
-        Some(source) => (source, property_text(value, "flags").unwrap_or_default()),
+    let (source, flags_text) = match original_source(value) {
+        Some(source) => (source, original_flags(value).unwrap_or_default()),
         // `"".match()` with nothing is the empty pattern, which matches at zero.
         None if Value::from_bits(value).is_undefined() => (String::new(), String::new()),
         None => (to_text(value)?, String::new()),
@@ -11744,7 +11764,7 @@ fn make_splitter(rx: u64, new_flags: &str) -> Result<u64, u64> {
             // a throwing `toString` (`regexpcreate-this-throws`) propagates, where the old shortcut read
             // `rx.source` and swallowed both. A genuine RegExp still copies its `source`.
             let source = if is_regexp(rx)? {
-                property_text(rx, "source").unwrap_or_default()
+                original_source(rx).unwrap_or_default()
             } else {
                 string_argument(rx)?
             };
@@ -12412,12 +12432,8 @@ extern "C" fn string_match_all(
     // live past the delegation — now that `RegExp.prototype[Symbol.matchAll]` exists (D-354),
     // every real pattern delegates, and a check placed after it would never run.
     // A RegExp is one with `flags`; anything else is a string pattern, matched globally.
-    let is_regexp = handle_of(pattern).is_some() && property_text(pattern, "flags").is_some();
-    if is_regexp
-        && !property_text(pattern, "flags")
-            .unwrap_or_default()
-            .contains('g')
-    {
+    let is_regexp = handle_of(pattern).is_some() && original_flags(pattern).is_some();
+    if is_regexp && !original_flags(pattern).unwrap_or_default().contains('g') {
         return raise("matchAll must be called with a global RegExp", "TypeError");
     }
     // A pattern with its own `Symbol.matchAll` answers instead, exactly as `match` delegates — and
@@ -12732,7 +12748,9 @@ fn is_regexp(value: u64) -> Result<bool, u64> {
     if !Value::from_bits(matcher).is_undefined() {
         return Ok(is_truthy(Value::from_bits(matcher)));
     }
-    Ok(property_text(value, "source").is_some())
+    // No `@@match`: the fallback is whether the value has a `[[RegExpMatcher]]`, which crisol marks
+    // with the `[[OriginalSource]]` slot — read directly, not through the `source` accessor.
+    Ok(own_property(value, REGEXP_ORIGINAL_SOURCE).is_some())
 }
 
 /// Whether `needle` sits at `haystack[at..]`, both in UTF-16 code units.
@@ -13224,7 +13242,7 @@ extern "C" fn string_split(
         // pattern went through `ToString` and `"a1b".split(/[0-9]/)` looked for the literal
         // text `/[0-9]/` — which is never there, so it answered the whole string and looked
         // like a working call.
-        if property_text(given, "source").is_some() {
+        if original_source(given).is_some() {
             let splitter = symbol_method(given, "split");
             if is_callable(splitter) {
                 let subject = with_rooted(&[given, splitter], || new_string(&text));
@@ -13258,10 +13276,10 @@ extern "C" fn string_split(
 /// Shared by `String.prototype.split` and `RegExp.prototype[Symbol.split]`, which are the
 /// same operation reached two ways.
 fn split_using_pattern(text: &str, rx: u64, cap: usize) -> u64 {
-    let Some(source) = property_text(rx, "source") else {
+    let Some(source) = original_source(rx) else {
         return one_piece_array(text);
     };
-    let flags = property_text(rx, "flags").unwrap_or_default();
+    let flags = original_flags(rx).unwrap_or_default();
     let Ok(parsed) = crisol_builtins::Flags::parse(&flags) else {
         return one_piece_array(text);
     };
@@ -26399,9 +26417,10 @@ pub unsafe extern "C" fn crisol_create_regexp(
         // value the object was about to hold — which reads back as a string that is not there.
         let source_value = new_string(&source);
         with_runtime(|runtime| {
-            runtime.define(handle, "source", Value::from_bits(source_value));
-            // The immutable original, beside the observable one: the matcher reads this so a later
-            // `defineProperty(re, "source", …)` cannot change what the pattern matches.
+            // **`source` is a prototype accessor, not an own property** (§21.2.5): the instance carries
+            // only this immutable slot, so `re.source` resolves to the getter (non-writable, as the
+            // descriptor tests require) and a `defineProperty(re, "source", …)` cannot change what the
+            // pattern matches. All internal reads go through `original_source`, which reads this slot.
             runtime.define_internal(
                 handle,
                 REGEXP_ORIGINAL_SOURCE,
@@ -26415,20 +26434,17 @@ pub unsafe extern "C" fn crisol_create_regexp(
         let canonical = canonical_flags(&parsed);
         let flags_value = new_string(&canonical);
         with_runtime(|runtime| {
-            runtime.define(handle, "flags", Value::from_bits(flags_value));
+            // **`flags` and the individual flag names (`global`, `unicode`, …) are prototype
+            // accessors, not own properties** (§21.2.5): an instance carries only this immutable
+            // `[[OriginalFlags]]` slot, and every `re.flags`/`re.global` resolves to a getter that reads
+            // it. That makes them non-writable (`S15.10.7.*_A10`), lets a program install a throwing
+            // `global` getter the `flags` getter then runs (`get-global-err`), and keeps `re.flags`
+            // reflecting a reassigned `re.global` (`coerce-global`). Internal reads use `original_flags`.
             runtime.define_internal(handle, REGEXP_ORIGINAL_FLAGS, Value::from_bits(flags_value));
             // `lastIndex` is the cursor, and it is a property because a program may assign to it — the
             // compiled pattern is set from it rather than owning it. It is **writable but not
             // enumerable or configurable** (`RegExpAlloc`), which `define_hidden` gives.
             runtime.define_hidden(handle, "lastIndex", Value::number(0.0));
-            runtime.define(handle, "global", boolean(parsed.global));
-            runtime.define(handle, "ignoreCase", boolean(parsed.ignore_case));
-            runtime.define(handle, "multiline", boolean(parsed.multiline));
-            runtime.define(handle, "sticky", boolean(parsed.sticky));
-            runtime.define(handle, "unicode", boolean(parsed.unicode));
-            runtime.define(handle, "unicodeSets", boolean(parsed.unicode_sets));
-            runtime.define(handle, "dotAll", boolean(parsed.dot_all));
-            runtime.define(handle, "hasIndices", boolean(parsed.has_indices));
             if let Some(prototype) = REGEXP_PROTOTYPE.with(std::cell::Cell::get) {
                 runtime.heap.set_prototype(handle, Some(prototype));
             }

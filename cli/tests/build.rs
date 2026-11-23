@@ -1216,6 +1216,49 @@ fn regexp_symbol_methods_propagate_flags_tostring_throw() {
     );
 }
 
+/// **`source`/`flags`/the flag names are `RegExp.prototype` accessors, not own properties** — so an
+/// instance has no own copy, the reads are non-writable, the `flags` getter runs a program's
+/// overridden `global` getter, and `re.flags` reflects a reassigned `re.global`. The matcher itself
+/// is unaffected (it reads the immutable internal slots), which must hold under GC stress.
+#[test]
+fn regexp_flags_are_prototype_accessors() {
+    check(
+        "flags-not-own",
+        "var r = /x/gi; \
+         return r.hasOwnProperty('source') + ',' + r.hasOwnProperty('flags') + ',' \
+              + r.hasOwnProperty('global') + '/' + r.source + '/' + r.flags;",
+        "false,false,false/x/gi",
+    );
+    // A flag read is non-writable (an assignment is a silent no-op in sloppy mode).
+    check(
+        "flag-not-writable",
+        "var r = /a/; var before = r.global; r.global = true; return r.global === before;",
+        "true",
+    );
+    // The `flags` getter runs an overridden `global` getter, so a throwing one propagates.
+    check(
+        "flags-runs-global-getter",
+        "var r = /a/; Object.defineProperty(r, 'global', {get: function () { throw new RangeError('G'); }}); \
+         try { r.flags; return 'no'; } catch (e) { return e.constructor.name; }",
+        "RangeError",
+    );
+    // Reassigning `global` to a falsy value makes `@@match` take the non-global path (one `exec`).
+    check(
+        "coerce-global-redefine",
+        "var r = /a/g; var n = 0; r.exec = function () { n++; return n === 1 ? [''] : null; }; \
+         Object.defineProperty(r, 'global', {writable: true, configurable: true}); r.global = undefined; \
+         r[Symbol.match]('aa'); return n;",
+        "1",
+    );
+    // The matcher reads the immutable slot, so a shadowed `source`/`flags` cannot change matching —
+    // and `replaceAll` (which regressed here before) still works under GC stress.
+    check(
+        "matcher-ignores-shadow-and-gc",
+        "return 'aaa'.replaceAll(/a/g, 'b') + '/' + 'a1b2'.replace(/\\d/g, '#');",
+        "bbb/a#b#",
+    );
+}
+
 /// **Small `RegExp.prototype` conformance details** — the symbol methods' `length`, the
 /// `Type(R)` guard on `toString`, and the missing-`[[RegExpMatcher]]` guard on `exec`.
 #[test]
