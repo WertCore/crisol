@@ -1216,6 +1216,31 @@ fn regexp_symbol_methods_propagate_flags_tostring_throw() {
     );
 }
 
+/// **Small `RegExp.prototype` conformance details** — the symbol methods' `length`, the
+/// `Type(R)` guard on `toString`, and the missing-`[[RegExpMatcher]]` guard on `exec`.
+#[test]
+fn regexp_prototype_method_details() {
+    check(
+        "symbol-method-lengths",
+        "return RegExp.prototype[Symbol.replace].length + ',' \
+              + RegExp.prototype[Symbol.split].length + ',' \
+              + RegExp.prototype[Symbol.match].length + ',' \
+              + RegExp.prototype[Symbol.search].length;",
+        "2,2,1,1",
+    );
+    check(
+        "tostring-called-as-function",
+        "var f = RegExp.prototype.toString; \
+         try { f(); return 'no'; } catch (e) { return e.constructor.name; }",
+        "TypeError",
+    );
+    check(
+        "exec-on-prototype-throws",
+        "try { RegExp.prototype.exec('x'); return 'no'; } catch (e) { return e.constructor.name; }",
+        "TypeError",
+    );
+}
+
 /// **`RegExp(pattern, flags)` follows §21.2.3.1** — `IsRegExp`, the same-constructor short-circuit,
 /// RegExp-like `source`/`flags` reads (propagating, source first), canonical flag order, and a
 /// non-enumerable, non-configurable `lastIndex`.

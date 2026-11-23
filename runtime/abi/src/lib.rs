@@ -10345,9 +10345,15 @@ fn with_pattern<T>(
     this_value: u64,
     body: impl FnOnce(&mut crisol_builtins::JsRegExp) -> T,
 ) -> Option<Result<T, u64>> {
+    // **`RegExp.prototype` is not a pattern**, even though its `source`/`flags` accessors answer
+    // `"(?:)"`/`""`: it has no `[[RegExpMatcher]]`, so `RegExp.prototype.exec("")` is a `TypeError`
+    // (`no-regexp-matcher`), not a match against the empty pattern the fallback would otherwise build.
+    if regexp_is_prototype(this_value) {
+        return None;
+    }
     // The matcher compiles from the immutable originals, not the observable `source`/`flags` — a
     // program may shadow those, and the specification's `[[RegExpMatcher]]` is fixed at construction.
-    // The fallback keeps a receiver built some other way (or `RegExp.prototype` itself) working.
+    // The fallback keeps a receiver built some other way working.
     let source = property_text(this_value, REGEXP_ORIGINAL_SOURCE)
         .or_else(|| property_text(this_value, "source"))?;
     let flags_text = property_text(this_value, REGEXP_ORIGINAL_FLAGS)
@@ -10482,6 +10488,12 @@ extern "C" fn regexp_to_string(
     _argc: u64,
     _argv: *const u64,
 ) -> u64 {
+    // **`Type(R)` is checked before `source`/`flags` are read** (§21.2.5.14) — called as a top-level
+    // function `this` is `undefined`, which is a `TypeError`, and the throwing getters the
+    // `called-as-function` test installs must never be reached.
+    if Value::from_bits(this_value).kind() != crisol_value::Kind::Object {
+        return raise("RegExp.prototype.toString requires an object", "TypeError");
+    }
     let source = property_text(this_value, "source").unwrap_or_default();
     let flags = property_text(this_value, "flags").unwrap_or_default();
     new_string(&format!("/{source}/{flags}"))
@@ -17043,7 +17055,14 @@ impl Runtime {
             self.define_keyed(prototype, &key, function.to_value());
             let text = self.string(&format!("[Symbol.{name}]"));
             self.define_named(function, "name", text);
-            self.define_named(function, "length", Value::number(1.0));
+            // `@@replace(string, replaceValue)` and `@@split(string, limit)` take two arguments;
+            // `@@match`/`@@search` take one (§21.2.5).
+            let length = if matches!(*name, "replace" | "split") {
+                2.0
+            } else {
+                1.0
+            };
+            self.define_named(function, "length", Value::number(length));
         }
 
         // **`Symbol.matchAll` on `RegExp.prototype`** (D-354) — installed apart from the loop
