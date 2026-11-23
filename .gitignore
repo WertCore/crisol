@@ -10,3 +10,4 @@ tests/layout-snapshots/**/*.actual.json
 tests/ir-snapshots/**/*.actual
 
 .DS_Store
+.claude/
